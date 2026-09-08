@@ -2,6 +2,9 @@
 
 import { useEffect, useState } from 'react';
 import useSWR from 'swr';
+import PageHeader from '@/components/PageHeader';
+import { Panel } from '@/components/Panel';
+import { Empty, ErrorNote, Loading, Msg } from '@/components/States';
 import { Pct, fmtNum } from '@/components/QuoteTable';
 import { del, fetcher, post } from '@/lib/api';
 
@@ -64,83 +67,84 @@ export default function WatchlistPage() {
     }
   }
 
-  if (isLoading) return <div className="py-20 text-center text-neutral-400">加载中…</div>;
-  if (error) return <div className="py-20 text-center text-red-500">加载失败：{String(error)}</div>;
+  if (isLoading) return <Loading />;
+  if (error) return <ErrorNote>加载失败：{String(error)}</ErrorNote>;
 
   return (
-    <div className="space-y-4">
-      <h1 className="text-xl font-semibold">自选股</h1>
+    <div className="space-y-5">
+      <PageHeader
+        title="自选"
+        sub={`跟踪标的清单${rows?.length ? ` · ${rows.length} 只` : ''}`}
+      />
+
+      {msg ? <Msg text={msg} /> : null}
 
       {/* 添加：搜索标的名/代码 */}
-      <div className="rounded-xl border bg-white p-4">
-        <div className="mb-2 text-sm font-medium">添加自选</div>
+      <Panel title="添加自选">
         <input
           value={q}
           onChange={(e) => setQ(e.target.value)}
           placeholder="输入代码或名称搜索，如 600519 / 贵州茅台"
-          className="w-full max-w-md rounded-md border px-3 py-2 text-sm"
+          className="input w-full max-w-md"
         />
-        {msg && <div className="mt-2 text-sm">{msg}</div>}
         {suggestions && suggestions.length > 0 && (
-          <div className="mt-2 max-w-md divide-y rounded-md border">
+          <div className="mt-3 max-w-md divide-y divide-line border border-line bg-white">
             {suggestions.map((s) => (
               <button
                 key={s.symbol}
                 onClick={() => add(s.symbol)}
                 disabled={busy !== ''}
-                className="flex w-full items-center justify-between px-3 py-2 text-left text-sm hover:bg-neutral-50 disabled:opacity-40"
+                className="flex w-full items-center justify-between px-3 py-2 text-left text-sm hover:bg-paper disabled:opacity-40"
               >
                 <span>
                   <span className="font-medium">{s.name || '—'}</span>
-                  <span className="ml-2 font-mono text-xs text-neutral-400">{s.symbol}</span>
+                  <span className="ml-2 font-mono text-xs text-ink-faint">{s.symbol}</span>
                 </span>
-                <span className="text-xs text-neutral-400">
+                <span className="text-xs text-ink-faint">
                   {busy === s.symbol ? '添加中…' : '点击添加'}
                 </span>
               </button>
             ))}
           </div>
         )}
-      </div>
+      </Panel>
 
       {/* 列表：后端已带最近收盘与涨跌幅，首屏一次请求 */}
-      <div className="rounded-xl border bg-white p-4">
+      <Panel title="清单" bodyClass="">
         {!rows?.length ? (
-          <div className="py-10 text-center text-sm text-neutral-400">
-            还没有自选 —— 上方搜索添加第一只
-          </div>
+          <Empty>还没有自选 —— 上方搜索添加第一只</Empty>
         ) : (
-          <table className="w-full text-sm">
-            <thead className="text-xs text-neutral-400">
-              <tr className="border-b">
-                <th className="py-1.5 text-left font-normal">标的</th>
-                <th className="text-right font-normal">最新价</th>
-                <th className="text-right font-normal">涨跌幅</th>
-                <th className="text-right font-normal">数据日</th>
-                <th className="text-right font-normal">备注</th>
-                <th className="text-right font-normal">操作</th>
+          <table className="table-dense">
+            <thead>
+              <tr>
+                <th className="pl-4 text-left">标的</th>
+                <th className="text-right">最新价</th>
+                <th className="text-right">涨跌幅</th>
+                <th className="text-right">数据日</th>
+                <th className="text-right">备注</th>
+                <th className="pr-4 text-right">操作</th>
               </tr>
             </thead>
             <tbody>
               {rows.map((r) => (
-                <tr key={r.symbol} className="border-b border-neutral-50 hover:bg-neutral-50/60">
-                  <td className="py-2">
+                <tr key={r.symbol} className="hover:bg-white">
+                  <td className="py-2 pl-4">
                     <a href={`/security/${r.symbol}`} className="hover:underline">
                       <span className="font-medium">{r.name || r.symbol}</span>
-                      <span className="ml-1.5 font-mono text-xs text-neutral-400">{r.symbol}</span>
+                      <span className="ml-1.5 font-mono text-xs text-ink-faint">{r.symbol}</span>
                     </a>
                   </td>
-                  <td className="text-right tabular-nums">{fmtNum(r.close)}</td>
+                  <td className="text-right">{fmtNum(r.close)}</td>
                   <td className="text-right"><Pct value={r.change_pct} /></td>
-                  <td className="text-right tabular-nums text-neutral-400">{r.trade_date ?? '—'}</td>
-                  <td className="text-right text-neutral-400">{r.note || '—'}</td>
-                  <td className="text-right">
+                  <td className="text-right tabular-nums text-ink-faint">{r.trade_date ?? '—'}</td>
+                  <td className="text-right text-ink-faint">{r.note || '—'}</td>
+                  <td className="pr-4 text-right">
                     <button
                       onClick={() => remove(r.symbol)}
                       disabled={busy !== ''}
-                      className="text-xs text-neutral-400 hover:text-red-600 disabled:opacity-40"
+                      className="text-xs text-ink-faint hover:text-up disabled:opacity-40"
                     >
-                      {busy === r.symbol ? '删除中…' : '移除'}
+                      {busy === r.symbol ? '移除中…' : '移除'}
                     </button>
                   </td>
                 </tr>
@@ -148,7 +152,7 @@ export default function WatchlistPage() {
             </tbody>
           </table>
         )}
-      </div>
+      </Panel>
     </div>
   );
 }

@@ -2,6 +2,70 @@
 @tailwind components;
 @tailwind utilities;
 
-.text-up { color: #e5484d; }
-.text-down { color: #30a46c; }
-.text-flat { color: #8b8d98; }
+/* 「研报台」基础 —— 瓷灰纸面、墨色文字、宋体标题 */
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+  }
+  body {
+    @apply bg-paper text-ink font-sans;
+  }
+  ::selection {
+    @apply bg-up text-white;
+  }
+  /* 键盘焦点：墨色描边，不用默认蓝 */
+  :focus-visible {
+    @apply outline-none ring-2 ring-ink/60 ring-offset-1 ring-offset-paper;
+  }
+  h1, h2, h3 {
+    @apply font-song tracking-wide;
+  }
+}
+
+@layer components {
+  /* 按钮：发丝线描边，纸面无投影 */
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-[2px] border border-line-strong
+      bg-panel px-3 py-1.5 text-sm text-ink transition-colors
+      hover:bg-white disabled:pointer-events-none disabled:opacity-40;
+  }
+  .btn-primary {
+    @apply border-ink bg-ink text-paper hover:bg-black;
+  }
+  .btn-accent {
+    @apply border-up bg-up text-white hover:bg-[#a92d24];
+  }
+  .btn-sm {
+    @apply px-2 py-1 text-xs;
+  }
+
+  /* 输入控件 */
+  .input {
+    @apply rounded-[2px] border border-line-strong bg-white px-2.5 py-1.5 text-sm text-ink
+      placeholder:text-ink-faint focus:border-indigo focus:outline-none;
+  }
+  .input-mono {
+    @apply font-mono text-[13px];
+  }
+
+  /* 可点选的小标签（因子名 / 公式）：行情代码牌样式 */
+  .tag {
+    @apply rounded-[2px] border border-line px-1.5 py-0.5 font-mono text-xs text-ink-dim
+      transition-colors hover:border-up hover:text-up;
+  }
+  .tag-on {
+    @apply border-ink bg-ink text-paper hover:border-ink hover:text-paper;
+  }
+
+  /* 表格默认密度 */
+  .table-dense {
+    @apply w-full text-sm;
+  }
+  .table-dense th {
+    @apply border-b border-line-strong py-1.5 text-xs font-normal text-ink-faint;
+  }
+  .table-dense td {
+    @apply border-b border-line py-2 tabular-nums;
+  }
+}

@@ -33,23 +33,23 @@ export default function KChart({ bars, overlays = [], height = 380 }:
       height,
       layout: {
         background: { type: ColorType.Solid, color: 'transparent' },
-        textColor: '#737373',
+        textColor: '#5C6169',
         fontSize: 11,
       },
       grid: {
-        vertLines: { color: '#f5f5f5' },
-        horzLines: { color: '#f5f5f5' },
+        vertLines: { color: '#ECECE6' },
+        horzLines: { color: '#ECECE6' },
       },
       rightPriceScale: { borderVisible: false },
       timeScale: { borderVisible: false, timeVisible: false },
     });
 
     const candle = chart.addCandlestickSeries({
-      upColor: '#e5484d',
-      downColor: '#30a46c',
+      upColor: '#C3352B',
+      downColor: '#1E7C55',
       borderVisible: false,
-      wickUpColor: '#e5484d',
-      wickDownColor: '#30a46c',
+      wickUpColor: '#C3352B',
+      wickDownColor: '#1E7C55',
     });
     candle.setData(
       bars.map((b) => ({
@@ -88,7 +88,7 @@ export default function KChart({ bars, overlays = [], height = 380 }:
         bars.map((b) => ({
           time: b.trade_date,
           value: b.volume ?? 0,
-          color: b.close >= b.open ? 'rgba(229,72,77,0.4)' : 'rgba(48,164,108,0.4)',
+          color: b.close >= b.open ? 'rgba(195,53,43,0.35)' : 'rgba(30,124,85,0.35)',
         })),
       );
     }
@@ -106,8 +106,8 @@ export default function KChart({ bars, overlays = [], height = 380 }:
 
   if (!bars.length) {
     return (
-      <div className="rounded-xl border border-dashed bg-white py-16 text-center text-sm text-neutral-400">
-        暂无日线数据 —— 先跑 <code className="mx-1 rounded bg-neutral-100 px-1">lq data demo</code>
+      <div className="border border-dashed border-line-strong bg-panel py-16 text-center text-sm text-ink-faint">
+        暂无日线数据 —— 先跑 <code className="mx-1 bg-paper px-1">lq data demo</code>
       </div>
     );
   }

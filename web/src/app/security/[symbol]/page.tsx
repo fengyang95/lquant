@@ -1,9 +1,14 @@
 'use client';
 
+import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import useSWR from 'swr';
 import KChart, { type Overlay } from '@/components/KChart';
+import PageHeader from '@/components/PageHeader';
+import { Panel, Stat } from '@/components/Panel';
+import { Empty, ErrorNote, Loading } from '@/components/States';
 import { Pct, fmtNum, fmtYi } from '@/components/QuoteTable';
+import { C } from '@/lib/chart';
 import { fetcher } from '@/lib/api';
 
 type Quote = {
@@ -50,10 +55,10 @@ type FlowRow = {
 };
 
 const MA_COLORS: Record<string, string> = {
-  ma5: '#ea580c',
-  ma10: '#8b5cf6',
-  ma20: '#2563eb',
-  ma60: '#ca8a04',
+  ma5: C.gold,
+  ma10: '#6B4F9E',
+  ma20: C.indigo,
+  ma60: C.ink,
 };
 
 export default function SecurityPage() {
@@ -68,8 +73,8 @@ export default function SecurityPage() {
   );
   const { data: flows } = useSWR<FlowRow[]>(`/market/money-flow?symbol=${symbol}`, fetcher);
 
-  if (isLoading) return <div className="py-20 text-center text-neutral-400">加载中…</div>;
-  if (error) return <div className="py-20 text-center text-red-500">加载失败：{String(error)}</div>;
+  if (isLoading) return <Loading />;
+  if (error) return <ErrorNote>加载失败：{String(error)}</ErrorNote>;
 
   const last = rows?.[rows.length - 1];
   const prev = rows && rows.length > 1 ? rows[rows.length - 2] : undefined;
@@ -92,125 +97,127 @@ export default function SecurityPage() {
   const lastV = (k: keyof IndRow) => (last ? (last[k] as number | null) ?? null : null);
 
   return (
-    <div className="space-y-4">
-      {/* 报价头 */}
-      <div className="flex flex-wrap items-end justify-between gap-4 rounded-xl border bg-white p-5">
-        <div>
-          <div className="text-lg font-semibold">
-            {name ?? ''}
-            <span className="ml-2 font-mono text-sm text-neutral-400">{symbol}</span>
-          </div>
-          <div className="mt-1 flex items-baseline gap-3">
-            <span className={`text-4xl font-semibold tabular-nums ${chgPct != null && chgPct > 0 ? 'text-up' : chgPct != null && chgPct < 0 ? 'text-down' : ''}`}>
+    <div className="space-y-5">
+      <PageHeader
+        title={name ? `${name}` : symbol}
+        sub={
+          <>
+            <span className="font-mono">{symbol}</span>
+            {quote?.available
+              ? ` · 实时 · 开 ${fmtNum(quote.open)} 高 ${fmtNum(quote.high)} 低 ${fmtNum(quote.low)} 昨收 ${fmtNum(quote.prev_close)}`
+              : last
+                ? ` · 实时行情不可用，显示 ${last.trade_date} 收盘价`
+                : ' · 暂无行情'}
+          </>
+        }
+      />
+
+      {/* 报价头：宋体大数字 + 关键口径 */}
+      <Panel>
+        <div className="flex flex-wrap items-end justify-between gap-6">
+          <div className="flex items-end gap-4">
+            <span className={`font-song text-5xl font-semibold leading-none tabular-nums ${
+              chgPct != null && chgPct > 0 ? 'text-up' : chgPct != null && chgPct < 0 ? 'text-down' : 'text-ink'
+            }`}>
               {fmtNum(price)}
             </span>
-            <span className="text-lg"><Pct value={chgPct} /></span>
+            <span className="pb-1 text-lg"><Pct value={chgPct} /></span>
           </div>
-          <div className="mt-1 text-xs text-neutral-400">
-            {quote?.available
-              ? `实时 · 开 ${fmtNum(quote.open)} 高 ${fmtNum(quote.high)} 低 ${fmtNum(quote.low)} 昨收 ${fmtNum(quote.prev_close)}`
-              : last
-                ? `实时行情不可用，显示 ${last.trade_date} 收盘价`
-                : '暂无行情'}
+          <div className="grid grid-cols-3 gap-x-10">
+            <Stat label="成交额" value={fmtYi(quote?.available ? quote.amount : null)} />
+            <Stat label="总市值" value={quote?.available ? fmtYi(quote.market_cap) : '—'} />
+            <Stat label="数据截至" value={last?.trade_date ?? '—'} />
           </div>
         </div>
-        <div className="grid grid-cols-2 gap-x-8 gap-y-1 text-sm">
-          <div className="text-xs text-neutral-400">成交额</div>
-          <div className="tabular-nums">{fmtYi(quote?.available ? quote.amount : null)}</div>
-          <div className="text-xs text-neutral-400">总市值</div>
-          <div className="tabular-nums">{quote?.available ? fmtYi(quote.market_cap) : '—'}</div>
-          <div className="text-xs text-neutral-400">数据截至</div>
-          <div className="tabular-nums text-neutral-500">{last?.trade_date ?? '—'}</div>
-        </div>
-      </div>
+      </Panel>
 
-      {/* 技术指标卡（M3） */}
-      <div className="grid grid-cols-2 gap-3 rounded-xl border bg-white p-4 md:grid-cols-4">
-        <div>
-          <div className="text-xs text-neutral-400">MACD (12,26,9)</div>
-          <div className={`font-semibold tabular-nums ${(lastV('macd_hist') ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
-            DIF {lastV('macd_dif')?.toFixed(3) ?? '—'} · HIST {lastV('macd_hist')?.toFixed(3) ?? '—'}
+      {/* 技术指标（M3）：分栏指标条 */}
+      <Panel title="技术指标" meta="日线末根">
+        <div className="grid grid-cols-2 gap-y-4 divide-line md:grid-cols-4 sm:divide-x">
+          <div className="sm:pr-4">
+            <Stat label="MACD (12,26,9)"
+              value={<span className="text-base">DIF {lastV('macd_dif')?.toFixed(3) ?? '—'} · HIST {lastV('macd_hist')?.toFixed(3) ?? '—'}</span>}
+              tone={(lastV('macd_hist') ?? 0) >= 0 ? 'text-up' : 'text-down'} />
+          </div>
+          <div className="sm:px-4">
+            <Stat label="RSI(14)"
+              value={<span className="text-base">{lastV('rsi14')?.toFixed(1) ?? '—'}
+                <span className="ml-1 font-sans text-xs font-normal text-ink-faint">
+                  {(lastV('rsi14') ?? 50) >= 70 ? '超买' : (lastV('rsi14') ?? 50) <= 30 ? '超卖' : ''}
+                </span></span>}
+              tone={(lastV('rsi14') ?? 50) >= 70 ? 'text-up' : (lastV('rsi14') ?? 50) <= 30 ? 'text-down' : undefined} />
+          </div>
+          <div className="sm:px-4">
+            <Stat label="BOLL(20,2)"
+              value={<span className="text-base">{lastV('boll_lower')?.toFixed(2) ?? '—'} / {lastV('boll_mid')?.toFixed(2) ?? '—'} / {lastV('boll_upper')?.toFixed(2) ?? '—'}</span>} />
+          </div>
+          <div className="sm:px-4">
+            <Stat label="均线" value={
+              <span className="text-base">
+                {['ma5', 'ma20', 'ma60'].map((k) => (
+                  <span key={k} style={{ color: MA_COLORS[k] }} className="mr-2">
+                    {lastV(k as keyof IndRow) == null ? '—' : (lastV(k as keyof IndRow) as number).toFixed(2)}
+                  </span>
+                ))}
+              </span>
+            } />
           </div>
         </div>
-        <div>
-          <div className="text-xs text-neutral-400">RSI(14)</div>
-          <div className={`font-semibold tabular-nums ${(lastV('rsi14') ?? 50) >= 70 ? 'text-up' : (lastV('rsi14') ?? 50) <= 30 ? 'text-down' : ''}`}>
-            {lastV('rsi14')?.toFixed(1) ?? '—'}
-            <span className="ml-1 text-xs font-normal text-neutral-400">
-              {(lastV('rsi14') ?? 50) >= 70 ? '超买' : (lastV('rsi14') ?? 50) <= 30 ? '超卖' : ''}
-            </span>
-          </div>
-        </div>
-        <div>
-          <div className="text-xs text-neutral-400">BOLL(20,2)</div>
-          <div className="font-semibold tabular-nums text-xs">
-            {lastV('boll_lower')?.toFixed(2) ?? '—'} / {lastV('boll_mid')?.toFixed(2) ?? '—'} / {lastV('boll_upper')?.toFixed(2) ?? '—'}
-          </div>
-        </div>
-        <div>
-          <div className="text-xs text-neutral-400">均线</div>
-          <div className="font-semibold tabular-nums text-xs">
-            {['ma5', 'ma20', 'ma60'].map((k) => (
-              <span key={k} style={{ color: MA_COLORS[k] }} className="mr-2">
-                {lastV(k as keyof IndRow) == null ? '—' : (lastV(k as keyof IndRow) as number).toFixed(2)}
+      </Panel>
+
+      {/* K 线 + 均线叠加 */}
+      <Panel
+        title="日 K"
+        meta="近 250 交易日"
+        actions={
+          <div className="flex items-center gap-3">
+            {overlays.map((o) => (
+              <span key={o.name} className="flex items-center gap-1 text-xs text-ink-dim">
+                <span className="inline-block h-0.5 w-4" style={{ background: o.color }} />
+                {o.name.toUpperCase()}
               </span>
             ))}
           </div>
-        </div>
-      </div>
-
-      {/* K 线 + 均线叠加 */}
-      <div className="rounded-xl border bg-white p-4">
-        <div className="mb-2 flex items-center gap-3 text-sm font-medium">
-          <span>日 K（近 250 交易日）</span>
-          {overlays.map((o) => (
-            <span key={o.name} className="flex items-center gap-1 text-xs text-neutral-500">
-              <span className="inline-block h-0.5 w-4 rounded" style={{ background: o.color }} />
-              {o.name.toUpperCase()}
-            </span>
-          ))}
-        </div>
+        }
+      >
         <KChart bars={bars} overlays={overlays} />
-      </div>
+      </Panel>
 
       {/* 资金流 */}
-      <div className="rounded-xl border bg-white p-4">
-        <div className="mb-2 text-sm font-medium">主力资金流（近 30 日）</div>
+      <Panel title="主力资金流" meta="近 30 日">
         {!flows?.length ? (
-          <div className="py-6 text-center text-sm text-neutral-400">
-            暂无资金流数据 —— 在数据页采集后可见
-          </div>
+          <Empty>暂无资金流数据 —— 在数据页采集后可见</Empty>
         ) : (
-          <table className="w-full text-sm">
-            <thead className="text-xs text-neutral-400">
-              <tr className="border-b">
-                <th className="py-1.5 text-left font-normal">日期</th>
-                <th className="text-right font-normal">主力净流入</th>
-                <th className="text-right font-normal">超大单</th>
-                <th className="text-right font-normal">大单</th>
+          <table className="table-dense">
+            <thead>
+              <tr>
+                <th className="text-left">日期</th>
+                <th className="text-right">主力净流入</th>
+                <th className="text-right">超大单</th>
+                <th className="text-right">大单</th>
               </tr>
             </thead>
             <tbody>
               {flows.map((f) => (
-                <tr key={f.trade_date} className="border-b border-neutral-50">
-                  <td className="py-1.5 tabular-nums">{f.trade_date}</td>
-                  <td className="text-right tabular-nums">
+                <tr key={f.trade_date} className="hover:bg-white">
+                  <td className="tabular-nums">{f.trade_date}</td>
+                  <td className="text-right">
                     <span className={f.main_net_inflow != null && f.main_net_inflow > 0 ? 'text-up' : 'text-down'}>
                       {fmtYi(f.main_net_inflow)}
                     </span>
                   </td>
-                  <td className="text-right tabular-nums">{fmtYi(f.super_large_net)}</td>
-                  <td className="text-right tabular-nums">{fmtYi(f.large_net)}</td>
+                  <td className="text-right">{fmtYi(f.super_large_net)}</td>
+                  <td className="text-right">{fmtYi(f.large_net)}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         )}
-      </div>
+      </Panel>
 
-      <div className="text-xs text-neutral-400">
-        相关：涨停池/龙虎榜见 <a href="/sectors" className="text-blue-600 hover:underline">板块页</a> ·
-        把它加入自选去 <a href="/watchlist" className="text-blue-600 hover:underline">自选页</a>
+      <div className="text-xs text-ink-faint">
+        相关：涨停池/龙虎榜见 <Link href="/sectors" className="text-indigo hover:underline">板块页</Link> ·
+        把它加入自选去 <Link href="/watchlist" className="text-indigo hover:underline">自选页</Link>
       </div>
     </div>
   );

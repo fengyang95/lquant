@@ -1,10 +1,19 @@
 'use client';
 
+/**
+ * 大盘看板 —— 「研报台」版式：
+ * 指数条(竖线分栏) → 宽度截面(分栏指标) → 宽度历史 + 温度计 → 批量对比 → 情绪/北向。
+ * 数据逻辑与旧版一致（SWR 轮询、localStorage 池子、温度合成）。
+ */
+
 import { useEffect, useState } from 'react';
 import useSWR from 'swr';
-import ReactECharts from 'echarts-for-react';
-import { get } from '@/lib/api';
+import Chart from '@/components/Chart';
+import { Panel, Stat } from '@/components/Panel';
+import PageHeader from '@/components/PageHeader';
 import { Pct, fmtNum } from '@/components/QuoteTable';
+import { get } from '@/lib/api';
+import { C, SERIES_COLORS, axes, legend, tooltip } from '@/lib/chart';
 
 type Overview = {
   sentiment: {
@@ -31,33 +40,43 @@ type BatchData = {
   equal_weight_nav: (number | null)[];
 };
 
-const DEFAULT_POOL = '600519.SH,000001.SZ,601318.SH,510300.SH,159915.SZ,511260.SH';
-
-function Card({ title, extra, children }: { title: string; extra?: React.ReactNode; children: React.ReactNode }) {
-  return (
-    <div className="rounded-xl border bg-white p-4">
-      <div className="mb-2 flex items-center justify-between">
-        <div className="text-xs font-medium text-neutral-500">{title}</div>
-        {extra}
-      </div>
-      {children}
-    </div>
-  );
-}
-
-function Big({ value, unit, color }: { value: number | null | undefined; unit?: string; color?: string }) {
-  return (
-    <div className={`text-2xl font-semibold tabular-nums ${color ?? ''}`}>
-      {value ?? '—'}
-      {value != null && unit ? <span className="ml-0.5 text-sm font-normal text-neutral-400">{unit}</span> : null}
-    </div>
-  );
-}
-
 type IndexRow = {
   symbol: string; name: string; close: number; chg: number | null;
   trade_date: string; dates: string[]; closes: number[];
 };
+
+const DEFAULT_POOL = '600519.SH,000001.SZ,601318.SH,510300.SH,159915.SZ,511260.SH';
+
+/** 温度计：0~100 合成分 → 分段横条 + 针标 + 状态词 */
+function TempScale({ temp }: { temp: number }) {
+  const verdict = temp >= 50 ? '亢奋' : temp >= 20 ? '中性' : '冰点';
+  const tone = temp >= 55 ? 'text-up' : temp <= 20 ? 'text-down' : 'text-ink';
+  // 分段与合成公式对应：冰点 / 转暖 / 中性 / 偏热 / 亢奋
+  const segs = [
+    { w: 20, c: C.down }, { w: 25, c: '#8FBCA5' }, { w: 10, c: C.inkFaint },
+    { w: 25, c: '#D89A93' }, { w: 20, c: C.up },
+  ];
+  return (
+    <div>
+      <div className="flex items-end justify-between">
+        <span className={`font-song text-[34px] font-semibold leading-none ${tone}`}>{verdict}</span>
+        <span className="font-mono text-sm text-ink-dim">温度 {temp}</span>
+      </div>
+      <div className="relative mt-4 h-2">
+        <div className="flex h-full overflow-hidden rounded-[1px]">
+          {segs.map((s, i) => <div key={i} style={{ width: `${s.w}%`, background: s.c }} />)}
+        </div>
+        <div
+          className="absolute top-[-4px] h-[16px] w-[2px] bg-ink"
+          style={{ left: `calc(${Math.min(Math.max(temp, 0), 100)}% - 1px)` }}
+        />
+      </div>
+      <div className="mt-1.5 flex justify-between font-mono text-[10px] text-ink-faint">
+        <span>0 冰点</span><span>50 中性</span><span>100 亢奋</span>
+      </div>
+    </div>
+  );
+}
 
 export default function DashboardPage() {
   const { data: overview } = useSWR<Overview>('/market/overview', get, { refreshInterval: 30_000 });
@@ -90,55 +109,38 @@ export default function DashboardPage() {
     + Math.max(-1, Math.min(1, (b.med_chg ?? 0) / 0.03)) * 25
     + Math.max(-1, Math.min(1, ((b.limit_up ?? 0) - (b.limit_down ?? 0)) / 30)) * 15
   ))) : null;
-  const gaugeOption = temp != null ? {
-    series: [{
-      type: 'gauge', min: 0, max: 100, radius: '95%', center: ['50%', '58%'],
-      startAngle: 200, endAngle: -20,
-      axisLine: {
-        lineStyle: { width: 12, color: [[0.2, '#16a34a'], [0.45, '#86efac'], [0.55, '#fde68a'], [0.8, '#fca5a5'], [1, '#e5484d']] },
-      },
-      pointer: { length: '55%', width: 4, itemStyle: { color: '#525252' } },
-      axisTick: { show: false }, splitLine: { show: false },
-      axisLabel: { show: false },
-      title: { show: true, offsetCenter: [0, '35%'], fontSize: 11, color: '#737373' },
-      detail: {
-        valueAnimation: true, offsetCenter: [0, '5%'], fontSize: 26, fontWeight: 600,
-        formatter: () => (temp >= 50 ? '亢奋' : temp >= 20 ? '中性' : '冰点'),
-      },
-      data: [{ value: temp, name: `温度 ${temp}` }],
-    }],
-  } : null;
 
   const breadthOption = hist.length ? {
-    tooltip: { trigger: 'axis' },
-    legend: { top: 0, textStyle: { fontSize: 11 } },
-    grid: { left: 40, right: 16, top: 28, bottom: 22 },
-    xAxis: { type: 'category', data: hist.map((r) => r.trade_date.slice(5)), axisLabel: { fontSize: 10 } },
+    tooltip,
+    legend: legend({ top: 0 }),
+    grid: { left: 44, right: 44, top: 30, bottom: 22 },
+    ...axes({ data: hist.map((r) => r.trade_date.slice(5)) }),
+    // 中位涨跌挂在右轴 → 需要两个 yAxis
     yAxis: [
-      { type: 'value', axisLabel: { fontSize: 10 } },
-      { type: 'value', axisLabel: { fontSize: 10, formatter: (v: number) => `${(v * 100).toFixed(1)}%` } },
+      { type: 'value', axisLine: { show: false }, splitLine: { lineStyle: { color: C.line } }, axisLabel: { color: C.inkDim, fontSize: 10 } },
+      { type: 'value', axisLine: { show: false }, splitLine: { show: false }, axisLabel: { color: C.inkDim, fontSize: 10, formatter: (v: number) => `${(v * 100).toFixed(1)}%` } },
     ],
     series: [
-      { name: '上涨家数', type: 'bar', stack: 'ud', data: hist.map((r) => r.up), itemStyle: { color: '#e5484d' } },
-      { name: '下跌家数', type: 'bar', stack: 'ud', data: hist.map((r) => -r.down), itemStyle: { color: '#16a34a' } },
+      { name: '上涨家数', type: 'bar', stack: 'ud', data: hist.map((r) => r.up), itemStyle: { color: C.up } },
+      { name: '下跌家数', type: 'bar', stack: 'ud', data: hist.map((r) => -r.down), itemStyle: { color: C.down } },
       { name: '中位涨跌', type: 'line', yAxisIndex: 1, data: hist.map((r) => r.med_chg),
-        itemStyle: { color: '#f59e0b' }, showSymbol: false, lineStyle: { width: 1.5 } },
+        itemStyle: { color: C.gold }, showSymbol: false, lineStyle: { width: 1.5 } },
     ],
   } : null;
 
   const batchOption = batch?.dates?.length ? {
-    tooltip: { trigger: 'axis', valueFormatter: (v: number) => v?.toFixed(4) },
-    legend: { top: 0, textStyle: { fontSize: 11 } },
-    grid: { left: 48, right: 16, top: 28, bottom: 22 },
-    xAxis: { type: 'category', data: batch.dates.map((d) => d.slice(5)), axisLabel: { fontSize: 10 } },
-    yAxis: { type: 'value', scale: true, axisLabel: { fontSize: 10 } },
+    tooltip: { ...tooltip, valueFormatter: (v: number) => v?.toFixed(4) },
+    legend: legend({ top: 0 }),
+    grid: { left: 52, right: 16, top: 30, bottom: 22 },
+    ...axes({ data: batch.dates.map((d) => d.slice(5)) }, { scale: true }),
     series: [
-      ...Object.entries(batch.series).map(([sym, vals]) => ({
+      ...Object.entries(batch.series).map(([sym, vals], i) => ({
         name: batch.latest.find((r) => r.symbol === sym)?.name || sym,
-        type: 'line', data: vals, showSymbol: false, lineStyle: { width: 1.5 }, connectNulls: true,
+        type: 'line', data: vals, showSymbol: false, lineStyle: { width: 1.2, color: SERIES_COLORS[i % SERIES_COLORS.length] },
+        itemStyle: { color: SERIES_COLORS[i % SERIES_COLORS.length] }, connectNulls: true,
       })),
       { name: '等权净值', type: 'line', data: batch.equal_weight_nav, showSymbol: false,
-        lineStyle: { width: 2.5, type: 'dashed' }, connectNulls: true, itemStyle: { color: '#111' } },
+        lineStyle: { width: 2.5, type: 'dashed', color: C.ink }, itemStyle: { color: C.ink }, connectNulls: true },
     ],
   } : null;
 
@@ -148,202 +150,202 @@ export default function DashboardPage() {
   ];
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-baseline justify-between">
-        <h1 className="text-xl font-semibold">大盘看板</h1>
-        <span className="text-sm text-neutral-400">{b?.trade_date ?? s?.trade_date ?? ''}</span>
-      </div>
+    <div className="space-y-5">
+      <PageHeader
+        title="大盘"
+        sub={<>数据湖日线截面{b?.trade_date ? ` · ${b.trade_date}` : ''}{s?.trade_date && s.trade_date !== b?.trade_date ? ` / ${s.trade_date}` : ''}</>}
+      />
 
-      {/* 指数行情条（来源 index_daily 采集表，跑一轮收盘采集即有） */}
+      {/* 指数条：一根发丝线面板，竖线分栏 */}
       {indexQuotes?.length ? (
-        <div className="grid grid-cols-2 gap-3 md:grid-cols-6">
-          {indexQuotes.map((q) => {
-            const base = q.closes[0] ?? 1;
-            const spark = q.dates.map((d, i) => [d, +(q.closes[i] / base).toFixed(5)]);
-            return (
-              <div key={q.symbol} className="rounded-xl border bg-white p-3">
-                <div className="flex items-baseline justify-between">
-                  <span className="text-xs font-medium text-neutral-500">{q.name}</span>
-                  <Pct value={q.chg} />
+        <Panel bodyClass="">
+          <div className="grid grid-cols-2 divide-line sm:grid-cols-3 sm:divide-x md:grid-cols-6">
+            {indexQuotes.map((q) => {
+              const base = q.closes[0] ?? 1;
+              const spark = q.closes.map((c, i) => +(c / base).toFixed(5));
+              return (
+                <div key={q.symbol} className="border-b border-line p-3 sm:border-b-0">
+                  <div className="flex items-baseline justify-between gap-2">
+                    <span className="text-xs text-ink-dim">{q.name}</span>
+                    <Pct value={q.chg} />
+                  </div>
+                  <div className={`font-song text-xl font-semibold tabular-nums leading-snug ${(q.chg ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
+                    {q.close?.toFixed(2)}
+                  </div>
+                  <Chart
+                    height={34}
+                    option={{
+                      grid: { left: 0, right: 0, top: 2, bottom: 0 },
+                      xAxis: { type: 'category', show: false, data: q.dates },
+                      yAxis: { type: 'value', show: false, min: 'dataMin', max: 'dataMax' },
+                      series: [{
+                        type: 'line', data: spark, showSymbol: false,
+                        lineStyle: { width: 1.2, color: (q.chg ?? 0) >= 0 ? C.up : C.down },
+                      }],
+                    }}
+                  />
                 </div>
-                <div className={`text-lg font-semibold tabular-nums ${(q.chg ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
-                  {q.close?.toFixed(2)}
-                </div>
-                <ReactECharts
-                  option={{
-                    grid: { left: 0, right: 0, top: 2, bottom: 0 },
-                    xAxis: { type: 'category', show: false, data: spark.map((s) => s[0]) },
-                    yAxis: { type: 'value', show: false, min: 'dataMin', max: 'dataMax' },
-                    series: [{
-                      type: 'line', data: spark.map((s) => s[1]), showSymbol: false,
-                      lineStyle: { width: 1.2, color: (q.chg ?? 0) >= 0 ? '#e5484d' : '#16a34a' },
-                    }],
-                  }}
-                  style={{ height: 34 }} notMerge lazyUpdate
-                />
+              );
+            })}
+          </div>
+        </Panel>
+      ) : null}
+
+      {/* 宽度截面：一行指标，竖线分栏（不拆卡片） */}
+      <Panel>
+        <div className="grid grid-cols-2 gap-y-4 divide-line sm:grid-cols-3 sm:divide-x lg:grid-cols-6">
+          <div className="px-4 first:pl-0">
+            <Stat label="上涨 / 下跌" value={<><span className="text-up">{b?.up ?? '—'}</span><span className="mx-1 font-sans text-ink-faint">/</span><span className="text-down">{b?.down ?? '—'}</span></>} hint={`共 ${b?.n ?? '—'} 只（湖内）`} />
+          </div>
+          <div className="px-4">
+            <Stat label="上涨占比" value={b?.up_ratio == null ? '—' : `${(b.up_ratio * 100).toFixed(1)}%`} hint={
+              <div className="mt-1 h-1.5 w-full max-w-24 bg-paper">
+                <div className="h-full bg-up" style={{ width: `${(b?.up_ratio ?? 0) * 100}%` }} />
               </div>
-            );
-          })}
+            } />
+          </div>
+          <div className="px-4">
+            <Stat label="涨停 / 跌停" value={<><span className="text-up">{b?.limit_up ?? '—'}</span><span className="mx-1 font-sans text-ink-faint">/</span><span className="text-down">{b?.limit_down ?? '—'}</span></>} hint="按涨跌幅阈值判定" />
+          </div>
+          <div className="px-4">
+            <Stat label="中位涨跌幅" value={<Pct value={b?.med_chg} />} />
+          </div>
+          <div className="px-4">
+            <Stat label="成交额" value={b?.total_amount == null ? '—' : `${(b.total_amount / 1e8).toFixed(0)} 亿`} />
+          </div>
+          <div className="px-4">
+            <Stat label="情绪分 (0-100)" value={s?.score ?? '—'}
+              tone={s?.score == null ? 'text-ink-faint' : s.score >= 50 ? 'text-up' : s.score >= 20 ? 'text-ink' : 'text-down'}
+              hint={s?.score == null ? '待采集' : s.score >= 50 ? '亢奋' : s.score >= 20 ? '中性' : '冰点'} />
+          </div>
         </div>
-      ) : null}
+      </Panel>
 
-      {/* 市场宽度 —— 数据湖日线截面，不依赖采集任务 */}
-      <div className="grid grid-cols-2 gap-4 md:grid-cols-6">
-        <Card title="上涨 / 下跌">
-          <div className="flex items-baseline gap-2">
-            <Big value={b?.up ?? null} color="text-up" />
-            <span className="text-neutral-300">/</span>
-            <Big value={b?.down ?? null} color="text-down" />
-          </div>
-          <div className="mt-1 text-xs text-neutral-400">共 {b?.n ?? '—'} 只（湖内）</div>
-        </Card>
-        <Card title="上涨占比">
-          <Big value={b?.up_ratio == null ? null : +(b.up_ratio * 100).toFixed(1)} unit="%" />
-          <div className="mt-2 h-1.5 overflow-hidden rounded bg-neutral-100">
-            <div className="h-full bg-red-500" style={{ width: `${(b?.up_ratio ?? 0) * 100}%` }} />
-          </div>
-        </Card>
-        <Card title="涨停 / 跌停（近似）">
-          <div className="flex items-baseline gap-2">
-            <Big value={b?.limit_up ?? null} color="text-up" />
-            <span className="text-neutral-300">/</span>
-            <Big value={b?.limit_down ?? null} color="text-down" />
-          </div>
-          <div className="mt-1 text-xs text-neutral-400">按涨跌幅阈值判定</div>
-        </Card>
-        <Card title="中位涨跌幅">
-          <Pct value={b?.med_chg} />
-        </Card>
-        <Card title="成交额">
-          <Big value={b?.total_amount == null ? null : +(b.total_amount / 1e8).toFixed(0)} unit="亿" />
-        </Card>
-        <Card title="情绪分 (0-100)">
-          <Big value={s?.score ?? null}
-               color={s?.score == null ? '' : s.score >= 50 ? 'text-up' : s.score >= 20 ? 'text-flat' : 'text-down'} />
-          <div className="mt-1 text-xs text-neutral-400">
-            {s?.score == null ? '待采集' : s.score >= 50 ? '亢奋' : s.score >= 20 ? '中性' : '冰点'}
-          </div>
-        </Card>
-      </div>
-
-      {/* 宽度历史 + 市场温度计 */}
+      {/* 宽度历史 + 温度计 */}
       {hist.length ? (
-        <div className="grid gap-4 lg:grid-cols-4">
+        <div className="grid gap-5 lg:grid-cols-4">
           <div className="lg:col-span-3">
-            <Card title="市场宽度 · 近 90 日（上涨/下跌家数 + 中位涨跌幅）">
-              <ReactECharts option={breadthOption} style={{ height: 260 }} notMerge />
-            </Card>
+            <Panel title="市场宽度" meta="近 90 日 · 上涨/下跌家数 + 中位涨跌幅">
+              <Chart option={breadthOption} height={280} />
+            </Panel>
           </div>
-          <Card title="市场温度计">
-            {gaugeOption
-              ? <ReactECharts option={gaugeOption} style={{ height: 260 }} notMerge />
-              : <div className="py-16 text-center text-sm text-neutral-400">暂无宽度数据</div>}
-          </Card>
+          <Panel title="温度计" meta="合成分 0–100">
+            {temp != null
+              ? <div className="py-6"><TempScale temp={temp} /></div>
+              : <div className="py-16 text-center text-sm text-ink-faint">暂无宽度数据</div>}
+          </Panel>
         </div>
       ) : null}
 
-      {/* 批量个股 / ETF 聚合对比 */}
-      <Card
-        title="批量个股 / ETF 对比（等权净值 + 相对强弱）"
-        extra={
-          <div className="flex flex-wrap items-center gap-1">
+      {/* 批量对比 */}
+      <Panel
+        title="批量对比"
+        meta="等权净值 + 相对强弱"
+        actions={
+          <div className="flex items-center gap-1">
             {quickPools.map((p) => (
               <button key={p.label} onClick={() => applyPool(p.value)}
-                className={`rounded-full px-2 py-0.5 text-xs ${pool === p.value ? 'bg-neutral-900 text-white' : 'border text-neutral-500 hover:bg-neutral-100'}`}>
+                className={`tag ${pool === p.value ? 'tag-on' : ''}`}>
                 {p.label}
               </button>
             ))}
           </div>
         }
       >
-        <div className="mb-3 flex gap-2">
+        <div className="mb-4 flex gap-2">
           <input
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && applyPool(input)}
             placeholder="逗号分隔代码，如 600519,510300.SH（最多 20 只）"
-            className="flex-1 rounded-md border px-3 py-1.5 font-mono text-sm"
+            className="input input-mono flex-1"
           />
-          <button
-            onClick={() => applyPool(input)}
-            className="rounded-md bg-neutral-900 px-4 py-1.5 text-sm text-white hover:bg-neutral-700"
-          >
-            对比
-          </button>
+          <button onClick={() => applyPool(input)} className="btn btn-primary">对比</button>
         </div>
 
         {batch?.summary && (
-          <div className="mb-3 grid grid-cols-2 gap-2 text-sm md:grid-cols-5">
-            <div><span className="text-xs text-neutral-400">上涨/下跌</span>
-              <div className="font-semibold"><span className="text-up">{batch.summary.up}</span> / <span className="text-down">{batch.summary.down}</span></div></div>
-            <div><span className="text-xs text-neutral-400">平均涨跌</span><Pct value={batch.summary.avg_chg} /></div>
-            <div><span className="text-xs text-neutral-400">最强</span>
-              <div className="font-medium">{batch.summary.best?.name || batch.summary.best?.symbol} <Pct value={batch.summary.best?.chg} /></div></div>
-            <div><span className="text-xs text-neutral-400">最弱</span>
-              <div className="font-medium">{batch.summary.worst?.name || batch.summary.worst?.symbol} <Pct value={batch.summary.worst?.chg} /></div></div>
-            <div><span className="text-xs text-neutral-400">等权净值（区间）</span>
-              <div className="font-semibold tabular-nums">
-                {fmtNum(batch.equal_weight_nav?.[batch.equal_weight_nav.length - 1] ?? null, 4)}
-              </div></div>
+          <div className="mb-4 grid grid-cols-2 gap-y-3 divide-line border-y border-line py-3 text-sm sm:grid-cols-5 sm:divide-x">
+            <div className="pr-4">
+              <div className="text-xs text-ink-faint">上涨 / 下跌</div>
+              <div className="mt-0.5"><span className="text-up">{batch.summary.up}</span> / <span className="text-down">{batch.summary.down}</span></div>
+            </div>
+            <div className="px-4">
+              <div className="text-xs text-ink-faint">平均涨跌</div>
+              <div className="mt-0.5"><Pct value={batch.summary.avg_chg} /></div>
+            </div>
+            <div className="px-4">
+              <div className="text-xs text-ink-faint">最强</div>
+              <div className="mt-0.5">{batch.summary.best?.name || batch.summary.best?.symbol} <Pct value={batch.summary.best?.chg} /></div>
+            </div>
+            <div className="px-4">
+              <div className="text-xs text-ink-faint">最弱</div>
+              <div className="mt-0.5">{batch.summary.worst?.name || batch.summary.worst?.symbol} <Pct value={batch.summary.worst?.chg} /></div>
+            </div>
+            <div className="px-4">
+              <div className="text-xs text-ink-faint">等权净值（区间）</div>
+              <div className="mt-0.5 tabular-nums">{fmtNum(batch.equal_weight_nav?.[batch.equal_weight_nav.length - 1] ?? null, 4)}</div>
+            </div>
           </div>
         )}
 
         {batchOption ? (
-          <ReactECharts option={batchOption} style={{ height: 300 }} notMerge />
+          <Chart option={batchOption} height={300} />
         ) : (
-          <div className="py-6 text-center text-sm text-neutral-400">输入代码后对比（示例：600519,510300.SH）</div>
+          <div className="border border-dashed border-line-strong py-8 text-center text-sm text-ink-faint">
+            输入代码后对比（示例：600519,510300.SH）
+          </div>
         )}
 
         {batch?.latest?.length ? (
-          <table className="mt-3 w-full text-sm">
-            <thead className="text-xs text-neutral-400">
-              <tr className="border-b">
-                <th className="py-1.5 text-left font-normal">标的</th>
-                <th className="text-right font-normal">现价</th>
-                <th className="text-right font-normal">涨跌幅</th>
-                <th className="text-right font-normal">成交额(亿)</th>
+          <table className="table-dense mt-4">
+            <thead>
+              <tr>
+                <th className="text-left">标的</th>
+                <th className="text-right">现价</th>
+                <th className="text-right">涨跌幅</th>
+                <th className="text-right">成交额(亿)</th>
               </tr>
             </thead>
             <tbody>
               {batch.latest.map((r) => (
-                <tr key={r.symbol} className="border-b border-neutral-50">
-                  <td className="py-1.5">
+                <tr key={r.symbol} className="hover:bg-white">
+                  <td>
                     <a href={`/security/${r.symbol}`} className="hover:underline">
                       <span className="font-medium">{r.name || '—'}</span>
-                      <span className="ml-1.5 font-mono text-xs text-neutral-400">{r.symbol}</span>
+                      <span className="ml-1.5 font-mono text-xs text-ink-faint">{r.symbol}</span>
                     </a>
                   </td>
-                  <td className="text-right tabular-nums">{fmtNum(r.close)}</td>
+                  <td className="text-right">{fmtNum(r.close)}</td>
                   <td className="text-right"><Pct value={r.chg} /></td>
-                  <td className="text-right tabular-nums text-neutral-500">{r.amount_yi}</td>
+                  <td className="text-right text-ink-dim">{r.amount_yi}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         ) : null}
-      </Card>
+      </Panel>
 
       {/* 情绪 / 北向（采集数据，空态降级） */}
-      <div className="grid gap-4 md:grid-cols-2">
-        <Card title="情绪历史（采集）">
+      <div className="grid gap-5 md:grid-cols-2">
+        <Panel title="情绪历史" meta="采集表">
           {!overview?.sentiment_history?.length ? (
-            <div className="py-6 text-center text-sm text-neutral-400">
-              暂无 —— 跑 <code className="rounded bg-neutral-100 px-1">POST /api/market/collect</code> 或等待调度
+            <div className="border border-dashed border-line-strong py-8 text-center text-sm text-ink-faint">
+              暂无 —— 跑 <code className="bg-paper px-1">POST /api/market/collect</code> 或等待调度
             </div>
           ) : (
-            <table className="w-full text-sm">
-              <thead className="text-xs text-neutral-400">
-                <tr className="border-b">
-                  <th className="py-1.5 text-left font-normal">日期</th>
-                  <th className="text-right font-normal">情绪分</th>
-                  <th className="text-right font-normal">涨停数</th>
-                  <th className="text-right font-normal">炸板率</th>
+            <table className="table-dense">
+              <thead>
+                <tr>
+                  <th className="text-left">日期</th>
+                  <th className="text-right">情绪分</th>
+                  <th className="text-right">涨停数</th>
+                  <th className="text-right">炸板率</th>
                 </tr>
               </thead>
               <tbody>
                 {overview.sentiment_history.slice(0, 10).map((r) => (
-                  <tr key={r.trade_date} className="border-b border-neutral-50">
-                    <td className="py-1.5 tabular-nums">{r.trade_date}</td>
+                  <tr key={r.trade_date} className="hover:bg-white">
+                    <td className="tabular-nums">{r.trade_date}</td>
                     <td className="text-right tabular-nums">{r.sentiment_score}</td>
                     <td className="text-right tabular-nums text-up">{r.limit_up_count}</td>
                     <td className="text-right tabular-nums">{(r.broken_rate * 100).toFixed(1)}%</td>
@@ -352,24 +354,24 @@ export default function DashboardPage() {
               </tbody>
             </table>
           )}
-        </Card>
-        <Card title="北向资金（近 10 日，亿）">
+        </Panel>
+        <Panel title="北向资金" meta="近 10 日 · 亿">
           {!overview?.northbound?.length ? (
-            <div className="py-6 text-center text-sm text-neutral-400">暂无数据</div>
+            <div className="border border-dashed border-line-strong py-8 text-center text-sm text-ink-faint">暂无数据</div>
           ) : (
-            <table className="w-full text-sm">
-              <thead className="text-xs text-neutral-400">
-                <tr className="border-b">
-                  <th className="py-1.5 text-left font-normal">日期</th>
-                  <th className="text-right font-normal">沪股通</th>
-                  <th className="text-right font-normal">深股通</th>
-                  <th className="text-right font-normal">合计</th>
+            <table className="table-dense">
+              <thead>
+                <tr>
+                  <th className="text-left">日期</th>
+                  <th className="text-right">沪股通</th>
+                  <th className="text-right">深股通</th>
+                  <th className="text-right">合计</th>
                 </tr>
               </thead>
               <tbody>
                 {overview.northbound.slice(0, 10).map((r) => (
-                  <tr key={r.trade_date} className="border-b border-neutral-50">
-                    <td className="py-1.5 tabular-nums">{r.trade_date}</td>
+                  <tr key={r.trade_date} className="hover:bg-white">
+                    <td className="tabular-nums">{r.trade_date}</td>
                     <td className="text-right tabular-nums">{(r.sh_net_inflow / 1e8).toFixed(1)}</td>
                     <td className="text-right tabular-nums">{(r.sz_net_inflow / 1e8).toFixed(1)}</td>
                     <td className={`text-right tabular-nums ${r.total_net_inflow > 0 ? 'text-up' : 'text-down'}`}>
@@ -380,7 +382,7 @@ export default function DashboardPage() {
               </tbody>
             </table>
           )}
-        </Card>
+        </Panel>
       </div>
     </div>
   );
