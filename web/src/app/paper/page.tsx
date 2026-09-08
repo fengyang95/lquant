@@ -1,8 +1,12 @@
 'use client';
 
 import { useState } from 'react';
-import ReactECharts from 'echarts-for-react';
+import Chart from '@/components/Chart';
+import PageHeader from '@/components/PageHeader';
+import { Panel, Stat } from '@/components/Panel';
+import { Empty, ErrorNote, Msg } from '@/components/States';
 import { post } from '@/lib/api';
+import { C, axes, tooltip } from '@/lib/chart';
 
 type ReplayResp = {
   summary: {
@@ -23,6 +27,10 @@ type CompareResp = {
   nav_deviation: { max_nav_dev: number; corr: number | null; n_mismatch_days: number; verdict: string; detail: string };
   trade_comparison: { bt_trades: number; paper_trades: number; match_rate: number };
 };
+
+/** 对拍结论配色：ok 正常 / warning 金 / 越界朱砂 */
+const verdictTone = (v: string) =>
+  v === 'ok' ? 'text-ink' : v === 'warning' ? 'text-gold' : 'text-up';
 
 export default function PaperPage() {
   const [topN, setTopN] = useState(5);
@@ -59,119 +67,140 @@ export default function PaperPage() {
 
   const navOption = replay
     ? {
-        grid: { left: 80, right: 20, top: 20, bottom: 30 },
-        tooltip: { trigger: 'axis' as const },
-        xAxis: { type: 'category' as const, data: replay.nav.map((p) => p.trade_date) },
-        yAxis: { type: 'value' as const, scale: true },
-        series: [{ name: '模拟盘净值', type: 'line', data: replay.nav.map((p) => p.nav), showSymbol: false }],
+        tooltip,
+        grid: { left: 70, right: 20, top: 20, bottom: 30 },
+        ...axes({ data: replay.nav.map((p) => p.trade_date) }, { scale: true }),
+        series: [{
+          name: '模拟盘净值', type: 'line', data: replay.nav.map((p) => p.nav),
+          showSymbol: false, lineStyle: { width: 1.6, color: C.indigo }, itemStyle: { color: C.indigo },
+        }],
       }
     : null;
 
-  const verdictColor = (v: string) =>
-    v === 'ok' ? 'text-down' : v === 'warning' ? 'text-amber-500' : 'text-up';
+  const sum = replay?.summary;
 
   return (
-    <div className="space-y-4">
-      <h1 className="text-xl font-semibold">模拟盘</h1>
+    <div className="space-y-5">
+      <PageHeader
+        title="模拟盘"
+        sub="离线回放（撮合 / T+N / 费率 / 拒单）→ 与回测对拍 → 偏差可解释才谈实盘"
+      />
 
-      <div className="flex flex-wrap items-end gap-3 rounded-xl border bg-white p-4">
-        <label className="text-sm">
-          <div className="mb-1 text-xs text-neutral-400">TopN</div>
-          <input type="number" min={1} max={20} value={topN}
-                 onChange={(e) => setTopN(+e.target.value)}
-                 className="w-20 rounded-md border px-3 py-2 text-sm" />
-        </label>
-        <button onClick={doReplay} disabled={busy === 'replay'}
-                className="rounded-md bg-red-600 px-4 py-2 text-sm text-white hover:bg-red-500 disabled:opacity-40">
-          {busy === 'replay' ? '回放中…' : '离线回放'}
-        </button>
-        <div className="mx-2 h-8 w-px bg-neutral-200" />
-        <label className="text-sm">
-          <div className="mb-1 text-xs text-neutral-400">回测 Run ID（对拍用）</div>
-          <input value={runId} onChange={(e) => setRunId(e.target.value)} placeholder="先跑一次回测"
-                 className="w-56 rounded-md border px-3 py-2 font-mono text-xs" />
-        </label>
-        <button onClick={doCompare} disabled={busy === 'cmp' || !runId.trim() || !replay}
-                className="rounded-md bg-neutral-900 px-4 py-2 text-sm text-white hover:bg-neutral-700 disabled:opacity-40">
-          {busy === 'cmp' ? '对拍中…' : '与回测对拍'}
-        </button>
-        {err && <span className="text-sm text-red-500">{err}</span>}
-      </div>
+      {err ? <ErrorNote>{err}</ErrorNote> : null}
 
-      {replay && (
+      {/* 操作条 */}
+      <Panel bodyClass="p-4">
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="text-sm">
+            <div className="mb-1 text-xs text-ink-faint">TopN</div>
+            <input type="number" min={1} max={20} value={topN}
+              onChange={(e) => setTopN(+e.target.value)}
+              className="input input-mono w-20" />
+          </label>
+          <button onClick={doReplay} disabled={busy === 'replay'} className="btn btn-accent">
+            {busy === 'replay' ? '回放中…' : '离线回放'}
+          </button>
+          <div className="mx-2 h-8 w-px bg-line-strong" />
+          <label className="text-sm">
+            <div className="mb-1 text-xs text-ink-faint">回测 Run ID（对拍用）</div>
+            <input value={runId} onChange={(e) => setRunId(e.target.value)} placeholder="先跑一次回测"
+              className="input input-mono w-56" />
+          </label>
+          <button onClick={doCompare} disabled={busy === 'cmp' || !runId.trim() || !replay} className="btn btn-primary">
+            {busy === 'cmp' ? '对拍中…' : '与回测对拍'}
+          </button>
+        </div>
+      </Panel>
+
+      {!replay ? (
+        <Empty>设置 TopN 后点「离线回放」，用历史日线完整重放一遍撮合链路</Empty>
+      ) : (
         <>
-          <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
-            {[
-              { label: '期末净值', value: replay.summary.final_nav.toLocaleString() },
-              { label: '总收益', value: `${(replay.summary.total_return * 100).toFixed(2)}%` },
-              { label: '委托 / 成交', value: `${replay.summary.n_orders} / ${replay.summary.n_filled}` },
-              { label: '拒单', value: String(replay.summary.n_rejected) },
-              { label: '最大回撤', value: replay.summary.max_drawdown != null ? `${(replay.summary.max_drawdown * 100).toFixed(3)}%` : '—' },
-            ].map((c) => (
-              <div key={c.label} className="rounded-xl border bg-white p-3">
-                <div className="text-xs text-neutral-400">{c.label}</div>
-                <div className="text-lg font-semibold tabular-nums">{c.value}</div>
+          {/* 回放指标：一个面板分栏，不拆卡片 */}
+          <Panel title="回放结果" bodyClass="p-4">
+            <div className="grid grid-cols-2 gap-y-4 divide-line sm:grid-cols-3 lg:grid-cols-5 sm:divide-x">
+              <div className="pr-4">
+                <Stat label="期末净值" value={sum!.final_nav.toLocaleString()} />
               </div>
-            ))}
-          </div>
-
-          <div className="grid gap-4 md:grid-cols-2">
-            <div className="rounded-xl border bg-white p-4">
-              <ReactECharts option={navOption!} style={{ height: 280 }} notMerge />
+              <div className="px-4">
+                <Stat label="总收益" value={`${(sum!.total_return * 100).toFixed(2)}%`}
+                  tone={sum!.total_return >= 0 ? 'text-up' : 'text-down'} />
+              </div>
+              <div className="px-4">
+                <Stat label="委托 / 成交" value={`${sum!.n_orders} / ${sum!.n_filled}`} />
+              </div>
+              <div className="px-4">
+                <Stat label="拒单" value={String(sum!.n_rejected)} tone={sum!.n_rejected > 0 ? 'text-gold' : 'text-ink'} />
+              </div>
+              <div className="px-4">
+                <Stat label="最大回撤"
+                  value={sum!.max_drawdown != null ? `${(sum!.max_drawdown * 100).toFixed(3)}%` : '—'}
+                  tone="text-down" />
+              </div>
             </div>
-            <div className="rounded-xl border bg-white p-4">
-              <div className="mb-2 text-sm font-medium">持仓（{replay.positions.length}）</div>
-              <table className="w-full text-sm">
-                <thead className="text-xs text-neutral-400">
-                  <tr className="border-b">
-                    <th className="py-1.5 text-left font-normal">标的</th>
-                    <th className="text-right font-normal">持仓/可卖</th>
-                    <th className="text-right font-normal">成本</th>
-                    <th className="text-right font-normal">现价</th>
-                    <th className="text-right font-normal">盈亏</th>
+          </Panel>
+
+          <div className="grid gap-5 md:grid-cols-2">
+            <Panel title="净值曲线">
+              <Chart option={navOption} height={280} />
+            </Panel>
+            <Panel title="持仓" meta={`${replay.positions.length} 只`} bodyClass="">
+              <table className="table-dense">
+                <thead>
+                  <tr>
+                    <th className="pl-4 text-left">标的</th>
+                    <th className="text-right">持仓/可卖</th>
+                    <th className="text-right">成本</th>
+                    <th className="text-right">现价</th>
+                    <th className="pr-4 text-right">盈亏</th>
                   </tr>
                 </thead>
                 <tbody>
                   {replay.positions.map((p) => (
-                    <tr key={p.symbol} className="border-b border-neutral-50">
-                      <td className="py-1.5 font-mono text-xs">{p.symbol}</td>
-                      <td className="text-right tabular-nums">{p.qty} / {p.available}</td>
-                      <td className="text-right tabular-nums">{p.avg_cost.toFixed(2)}</td>
-                      <td className="text-right tabular-nums">{p.last_price.toFixed(2)}</td>
-                      <td className={`text-right tabular-nums ${p.pnl_pct >= 0 ? 'text-up' : 'text-down'}`}>
+                    <tr key={p.symbol} className="hover:bg-white">
+                      <td className="py-2 pl-4 font-mono text-xs">{p.symbol}</td>
+                      <td className="text-right">{p.qty} / {p.available}</td>
+                      <td className="text-right">{p.avg_cost.toFixed(2)}</td>
+                      <td className="text-right">{p.last_price.toFixed(2)}</td>
+                      <td className={`pr-4 text-right ${p.pnl_pct >= 0 ? 'text-up' : 'text-down'}`}>
                         {(p.pnl_pct * 100).toFixed(2)}%
                       </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
-            </div>
+            </Panel>
           </div>
 
           {cmp && (
-            <div className="rounded-xl border bg-white p-4">
-              <div className="mb-2 text-sm font-medium">
-                对拍结果：
-                <span className={`ml-1 font-semibold ${verdictColor(cmp.nav_deviation.verdict)}`}>
+            <Panel title="与回测对拍">
+              <p className="text-sm text-ink-dim">
+                <span className={`font-song text-lg font-semibold ${verdictTone(cmp.nav_deviation.verdict)}`}>
                   {cmp.nav_deviation.verdict.toUpperCase()}
                 </span>
+                <span className="ml-3">{cmp.nav_deviation.detail}</span>
+              </p>
+              <div className="mt-3 grid grid-cols-2 gap-y-3 divide-line border-t border-line pt-3 text-sm sm:grid-cols-4 sm:divide-x">
+                <div className="pr-4">
+                  <div className="text-xs text-ink-faint">最大 NAV 偏差</div>
+                  <div className="mt-0.5 tabular-nums">{(cmp.nav_deviation.max_nav_dev * 100).toFixed(2)}%</div>
+                </div>
+                <div className="px-4">
+                  <div className="text-xs text-ink-faint">净值相关性</div>
+                  <div className="mt-0.5 tabular-nums">{cmp.nav_deviation.corr ?? '—'}</div>
+                </div>
+                <div className="px-4">
+                  <div className="text-xs text-ink-faint">超阈天数</div>
+                  <div className="mt-0.5 tabular-nums">{cmp.nav_deviation.n_mismatch_days}</div>
+                </div>
+                <div className="px-4">
+                  <div className="text-xs text-ink-faint">成交匹配率</div>
+                  <div className="mt-0.5 tabular-nums">{(cmp.trade_comparison.match_rate * 100).toFixed(0)}%</div>
+                </div>
               </div>
-              <p className="text-sm text-neutral-600">{cmp.nav_deviation.detail}</p>
-              <div className="mt-2 grid grid-cols-2 gap-3 text-sm md:grid-cols-4">
-                <div><span className="text-xs text-neutral-400">最大 NAV 偏差 </span>{(cmp.nav_deviation.max_nav_dev * 100).toFixed(2)}%</div>
-                <div><span className="text-xs text-neutral-400">净值相关性 </span>{cmp.nav_deviation.corr ?? '—'}</div>
-                <div><span className="text-xs text-neutral-400">超阈天数 </span>{cmp.nav_deviation.n_mismatch_days}</div>
-                <div><span className="text-xs text-neutral-400">成交匹配率 </span>{(cmp.trade_comparison.match_rate * 100).toFixed(0)}%</div>
-              </div>
-            </div>
+            </Panel>
           )}
         </>
-      )}
-
-      {!replay && (
-        <div className="rounded-xl border border-dashed bg-white py-16 text-center text-sm text-neutral-400">
-          模拟盘验证链路：离线回放（撮合 / T+N / 费率 / 拒单）→ 与回测对拍 → 偏差可解释才谈实盘
-        </div>
       )}
     </div>
   );

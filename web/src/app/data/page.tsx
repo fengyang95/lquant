@@ -2,6 +2,9 @@
 
 import { useState } from 'react';
 import useSWR from 'swr';
+import PageHeader from '@/components/PageHeader';
+import { Panel, Stat } from '@/components/Panel';
+import { Empty, ErrorNote, Loading, Msg } from '@/components/States';
 import { fetcher, post } from '@/lib/api';
 
 type Cover = {
@@ -23,15 +26,6 @@ type CollectHealth = {
     today_gap: boolean;
   }[];
 };
-
-function Card({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <div className="rounded-xl border bg-white p-4">
-      <div className="mb-2 text-xs font-medium text-neutral-500">{title}</div>
-      {children}
-    </div>
-  );
-}
 
 export default function DataPage() {
   const { data, error, isLoading, mutate } = useSWR<Cover>('/data/coverage', fetcher);
@@ -59,90 +53,106 @@ export default function DataPage() {
     }
   }
 
-  if (isLoading) return <div className="py-20 text-center text-neutral-400">加载中…</div>;
-  if (error) return <div className="py-20 text-center text-red-500">加载失败：{String(error)}</div>;
+  if (isLoading) return <Loading />;
+  if (error) return <ErrorNote>加载失败：{String(error)}</ErrorNote>;
 
   const lake = data?.daily_lake;
   const totalRows = data?.tables.reduce((a, t) => a + (t.rows ?? 0), 0) ?? 0;
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-xl font-semibold">数据</h1>
-        <div className="flex gap-2">
-          <button
-            onClick={() => collect(true)}
-            disabled={busy !== ''}
-            className="rounded-md border px-3 py-1.5 text-sm hover:bg-neutral-100 disabled:opacity-40"
-          >
-            {busy === 'demo' ? '采集中…' : '采今日看板（demo）'}
-          </button>
-          <button
-            onClick={() => collect(false)}
-            disabled={busy !== ''}
-            className="rounded-md bg-neutral-900 px-3 py-1.5 text-sm text-white hover:bg-neutral-700 disabled:opacity-40"
-          >
-            {busy === 'live' ? '采集中…' : '采今日看板（真实源）'}
-          </button>
-        </div>
-      </div>
-      {msg && <div className="rounded-md border bg-white px-4 py-2 text-sm">{msg}</div>}
+    <div className="space-y-5">
+      <PageHeader
+        title="数据"
+        sub={`数据湖与采集表覆盖度 · 共 ${totalRows.toLocaleString()} 行`}
+        actions={
+          <>
+            <button onClick={() => collect(true)} disabled={busy !== ''} className="btn">
+              {busy === 'demo' ? '采集中…' : '采今日看板（demo）'}
+            </button>
+            <button onClick={() => collect(false)} disabled={busy !== ''} className="btn btn-primary">
+              {busy === 'live' ? '采集中…' : '采今日看板（真实源）'}
+            </button>
+          </>
+        }
+      />
+      <Msg text={msg} />
 
-      <Card title="日线数据湖（Parquet）">
+      <Panel title="日线数据湖" meta="Parquet">
         {lake?.rows ? (
-          <div className="grid grid-cols-2 gap-3 text-sm md:grid-cols-4">
-            <div><div className="text-xs text-neutral-400">总行数</div><div className="font-semibold tabular-nums">{lake.rows.toLocaleString()}</div></div>
-            <div><div className="text-xs text-neutral-400">标的数</div><div className="font-semibold tabular-nums">{lake.symbols.toLocaleString()}</div></div>
-            <div><div className="text-xs text-neutral-400">起始日</div><div className="font-semibold tabular-nums">{lake.start}</div></div>
-            <div><div className="text-xs text-neutral-400">最新日</div><div className="font-semibold tabular-nums">{lake.end}</div></div>
+          <div className="grid grid-cols-2 gap-y-4 divide-line sm:grid-cols-4 sm:divide-x">
+            <div className="sm:pr-4">
+              <Stat label="总行数" value={lake.rows.toLocaleString()} />
+            </div>
+            <div className="sm:px-4">
+              <Stat label="标的数" value={lake.symbols.toLocaleString()} />
+            </div>
+            <div className="sm:px-4">
+              <Stat label="起始日" value={lake.start ?? '—'} />
+            </div>
+            <div className="sm:px-4">
+              <Stat label="最新日" value={lake.end ?? '—'} />
+            </div>
           </div>
         ) : (
-          <div className="py-4 text-center text-sm text-neutral-400">
-            数据湖为空 —— 跑 <code className="mx-1 rounded bg-neutral-100 px-1">./lquant.sh bootstrap</code> 或{' '}
-            <code className="mx-1 rounded bg-neutral-100 px-1">lq data demo</code> 生成
-          </div>
+          <Empty>
+            数据湖为空 —— 跑 <code className="bg-paper px-1">./lquant.sh bootstrap</code> 或{' '}
+            <code className="bg-paper px-1">lq data demo</code> 生成
+          </Empty>
         )}
-      </Card>
+      </Panel>
 
       {/* M9 采集健康度 */}
       {health && (
-        <Card title={`采集健康度（${health.checked_at.slice(11, 16)} 检查）${health.any_gap ? ' · ⚠ 有当日缺口' : ''}`}>
+        <Panel
+          title="采集健康度"
+          meta={`${health.checked_at.slice(11, 16)} 检查${health.any_gap ? ' · 有当日缺口' : ''}`}
+        >
           <div className="grid gap-2 md:grid-cols-2">
             {health.jobs.map((j) => (
-              <div key={j.job} className={`flex items-center justify-between rounded-lg border px-3 py-2 text-sm ${j.today_gap ? 'border-orange-300 bg-orange-50' : ''}`}>
-                <div>
+              <div
+                key={j.job}
+                className={`flex items-center justify-between border px-3 py-2 text-sm ${
+                  j.today_gap ? 'border-gold/40 bg-[#F7EFE6]' : 'border-line bg-panel'
+                }`}
+              >
+                <div className="min-w-0">
                   <span className="font-medium">{j.label}</span>
-                  <span className="ml-2 text-xs text-neutral-400">{j.schedule}</span>
-                  {j.today_gap && <span className="ml-2 text-xs text-orange-600">当日缺口（易失数据不可回溯）</span>}
+                  <span className="ml-2 text-xs text-ink-faint">{j.schedule}</span>
+                  {j.today_gap && <span className="ml-2 text-xs text-gold">当日缺口（易失数据不可回溯）</span>}
                 </div>
-                <div className="text-right text-xs tabular-nums">
-                  <span className={j.success_rate == null ? 'text-neutral-300' : j.success_rate >= 0.9 ? 'text-up' : 'text-orange-600'}>
+                <div className="shrink-0 text-right text-xs tabular-nums">
+                  <span className={j.success_rate == null ? 'text-ink-faint' : j.success_rate >= 0.9 ? 'text-down' : 'text-gold'}>
                     {j.success_rate == null ? '—' : `${(j.success_rate * 100).toFixed(0)}%`}
                   </span>
-                  <span className="ml-2 text-neutral-400">{j.last_success ? `最近 ${j.last_success.slice(5)}` : '从未成功'}</span>
+                  <span className="ml-2 text-ink-faint">{j.last_success ? `最近 ${j.last_success.slice(5)}` : '从未成功'}</span>
                 </div>
               </div>
             ))}
           </div>
-        </Card>
+        </Panel>
       )}
 
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-4 lg:grid-cols-6">
-        {data?.tables.map((t) => (
-          <div key={t.table} className="rounded-lg border bg-white p-3">
-            <div className="text-xs text-neutral-400">{t.label || t.table}</div>
-            <div className={`mt-1 text-lg font-semibold tabular-nums ${t.rows ? '' : 'text-neutral-300'}`}>
-              {t.rows == null ? '✗' : t.rows.toLocaleString()}
-            </div>
-            <div className="mt-0.5 text-xs text-neutral-400">
-              {t.error ? '读取失败' : t.latest ? `最新 ${t.latest}` : t.rows === 0 ? '空表' : '—'}
-            </div>
+      <Panel title="采集表覆盖度">
+        {!data?.tables.length ? (
+          <Empty>暂无采集表</Empty>
+        ) : (
+          <div className="grid grid-cols-2 gap-y-4 divide-line sm:grid-cols-3 lg:grid-cols-6 sm:divide-x">
+            {data.tables.map((t) => (
+              <div key={t.table} className="sm:px-4 first:sm:pl-0">
+                <Stat
+                  label={t.label || t.table}
+                  value={t.rows == null ? '✗' : t.rows.toLocaleString()}
+                  tone={t.rows ? undefined : 'text-ink-faint'}
+                  hint={t.error ? '读取失败' : t.latest ? `最新 ${t.latest}` : t.rows === 0 ? '空表' : '—'}
+                />
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
+        )}
+      </Panel>
 
-      <div className="text-xs text-neutral-400">
-        共 {totalRows.toLocaleString()} 行 · 历史日线/财务/分钟线批量补数走 CLI（<code className="rounded bg-neutral-100 px-1">lq data --help</code>），
+      <div className="text-xs text-ink-faint">
+        共 {totalRows.toLocaleString()} 行 · 历史日线/财务/分钟线批量补数走 CLI（<code className="bg-paper px-1">lq data --help</code>），
         盘后看板数据由调度器自动采集，也可用右上角按钮手动触发。
       </div>
     </div>

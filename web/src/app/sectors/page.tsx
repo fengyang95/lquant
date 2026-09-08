@@ -1,6 +1,9 @@
 'use client';
 
 import useSWR from 'swr';
+import PageHeader from '@/components/PageHeader';
+import { Panel } from '@/components/Panel';
+import { Empty, ErrorNote, Loading } from '@/components/States';
 import { get } from '@/lib/api';
 
 type SectorRow = {
@@ -17,45 +20,46 @@ export default function SectorsPage() {
     refreshInterval: 60_000,
   });
 
-  if (isLoading) return <div className="py-20 text-center text-neutral-400">加载中…</div>;
-  if (error) return <div className="py-20 text-center text-red-500">加载失败</div>;
+  if (isLoading) return <Loading />;
+  if (error) return <ErrorNote>加载失败：{String(error)}</ErrorNote>;
   if (!data?.length)
     return (
-      <div className="rounded-xl border border-dashed bg-white py-20 text-center text-neutral-400">
-        暂无板块数据 —— 先 POST /api/market/collect 触发采集
+      <div className="space-y-5">
+        <PageHeader title="板块" sub={data?.[0]?.trade_date ?? ''} />
+        <Empty>
+          暂无板块数据 —— 先 <code className="bg-paper px-1">POST /api/market/collect</code> 触发采集
+        </Empty>
       </div>
     );
 
   const maxAbs = Math.max(...data.map((s) => Math.abs(s.change_pct)), 1);
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-baseline justify-between">
-        <h1 className="text-xl font-semibold">板块行情</h1>
-        <span className="text-sm text-neutral-400">{data[0]?.trade_date}</span>
-      </div>
-      <div className="rounded-xl border bg-white p-4">
-        <table className="w-full text-sm">
-          <thead className="text-xs text-neutral-400">
-            <tr className="border-b">
-              <th className="py-1.5 text-left font-normal">板块</th>
-              <th className="text-left font-normal">涨跌幅</th>
-              <th className="text-right font-normal">主力净流入（亿）</th>
-              <th className="text-right font-normal">涨/跌家数</th>
+    <div className="space-y-5">
+      <PageHeader title="板块" sub={<>板块涨跌与主力净流入 · {data[0]?.trade_date}</>} />
+
+      <Panel bodyClass="">
+        <table className="table-dense">
+          <thead>
+            <tr>
+              <th className="pl-4 text-left">板块</th>
+              <th className="text-left">涨跌幅</th>
+              <th className="text-right">主力净流入（亿）</th>
+              <th className="pr-4 text-right">涨/跌家数</th>
             </tr>
           </thead>
           <tbody>
             {data.map((s) => {
               const w = (Math.abs(s.change_pct) / maxAbs) * 100;
-              const bg = s.change_pct >= 0 ? 'bg-red-500' : 'bg-green-500';
+              const bg = s.change_pct >= 0 ? 'rgba(195,53,43,.12)' : 'rgba(30,124,85,.12)';
               return (
-                <tr key={s.sector_name} className="border-b border-neutral-50">
-                  <td className="py-1.5 font-medium">{s.sector_name}</td>
+                <tr key={s.sector_name} className="hover:bg-white">
+                  <td className="pl-4 font-medium">{s.sector_name}</td>
                   <td>
                     <div className="relative h-5 w-40">
                       <div
-                        className={`absolute top-0.5 h-4 ${bg} opacity-15`}
-                        style={{ width: `${w}%` }}
+                        className="absolute top-0.5 h-4"
+                        style={{ width: `${w}%`, background: bg }}
                       />
                       <span className={`relative text-xs font-medium ${s.change_pct >= 0 ? 'text-up' : 'text-down'}`}>
                         {s.change_pct >= 0 ? '+' : ''}
@@ -66,7 +70,7 @@ export default function SectorsPage() {
                   <td className={`text-right tabular-nums ${s.main_net_inflow >= 0 ? 'text-up' : 'text-down'}`}>
                     {(s.main_net_inflow / 1e8).toFixed(2)}
                   </td>
-                  <td className="text-right text-xs tabular-nums text-neutral-500">
+                  <td className="pr-4 text-right text-xs tabular-nums text-ink-dim">
                     <span className="text-up">{s.up_count ?? '—'}</span> / <span className="text-down">{s.down_count ?? '—'}</span>
                   </td>
                 </tr>
@@ -74,7 +78,7 @@ export default function SectorsPage() {
             })}
           </tbody>
         </table>
-      </div>
+      </Panel>
     </div>
   );
 }

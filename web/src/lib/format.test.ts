@@ -30,7 +30,8 @@ describe('fmtYi', () => {
   });
 
   it('超万亿自动换档', () => {
-    expect(fmtYi(2e12)).toBe('20.00万亿');
+    expect(fmtYi(2e12)).toBe('2.00万亿');
+    expect(fmtYi(2e13)).toBe('20.00万亿');
   });
 
   it('null / NaN → 占位符', () => {

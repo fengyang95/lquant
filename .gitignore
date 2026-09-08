@@ -39,3 +39,6 @@ web/tsconfig.tsbuildinfo
 # Env & secrets
 .env
 .env.*
+
+# TS build info
+*.tsbuildinfo
