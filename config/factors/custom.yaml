@@ -1,0 +1,32 @@
+# 因子定义：字符串表达式。收益不止是 DAG 调度与缓存 key ——
+# 1) LLM 可直接生成  2) 可静态遍历 AST 禁止未来算子
+factors:
+  - name: mom_20
+    expr: "Ts_Return($close, 20)"
+    category: momentum
+    universe: all
+    min_window: 20
+
+  - name: rev_5
+    expr: "-Ts_Return($close, 5)"
+    category: reversal
+    universe: all
+    min_window: 5
+
+  - name: vol_20
+    expr: "Ts_Std(Ts_Return($close, 1), 20)"
+    category: volatility
+    universe: all
+    min_window: 21
+
+  - name: turnover_liq
+    expr: "Ts_Mean($amount / $float_mv, 20)"
+    category: liquidity
+    universe: all
+    min_window: 20
+
+# 默认预处理配方：不做这一步，A 股 IC 会被极值股与行业暴露绑架
+preprocess_default:
+  - { op: winsorize, method: mad, n: 5 }
+  - { op: standardize, method: zscore }
+  - { op: neutralize, method: ols, by: [market_cap, industry_sw1] }

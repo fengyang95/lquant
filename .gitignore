@@ -1,0 +1,35 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Rust
+crates/target/
+target/
+
+# Node / Next.js
+node_modules/
+web/.next/
+web/out/
+
+# Data & runtime artifacts
+data/duckdb/
+data/parquet/
+data/cache/
+data/logs/
+data/reports/
+*.duckdb
+*.wal
+
+# Claude
+.claude/worktrees/
+
+# Env & secrets
+.env
+.env.*

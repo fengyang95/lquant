@@ -1,0 +1,201 @@
+"""聚宽兼容回测 API 测试：金标准手算 + 防未来 + T+1 + 费率覆盖 + 涨跌停。"""
+from __future__ import annotations
+
+from datetime import date
+
+import polars as pl
+import pytest
+
+from lquant.backtest.jqapi import JQRunner
+
+
+def make_df(days=6, start=date(2026, 1, 5)):
+    """两只股票：A 每天 +2%，B 每天 -1%。开盘=收盘（简化撮合）。"""
+    rows = []
+    px = {"600000.SH": 100.0, "000001.SZ": 50.0}
+    for i in range(days):
+        d = date.fromordinal(start.toordinal() + i)
+        for s in px:
+            p = px[s] * (1.02 ** i) if s.startswith("6") else px[s] * (0.99 ** i)
+            pre = p if i == 0 else (
+                px[s] * (1.02 ** (i - 1)) if s.startswith("6") else px[s] * (0.99 ** (i - 1)))
+            rows.append(dict(trade_date=d, symbol=s, open=p, high=p * 1.005, low=p * 0.995,
+                             close=p, pre_close=pre, volume=1e8, amount=p * 1e8))
+    return pl.DataFrame(rows)
+
+
+def test_buy_and_hold_golden():
+    """零费率开盘买入并持有：净值 = 现金 + 持股×收盘价，逐日手算对照。
+
+    买入价 100.05（万五滑点）→ 现金 499,744.9975（含 5.0025 过户费，
+    过户费不在 set_order_cost 覆盖范围，按规则表收取）。
+    """
+    code = '''
+def initialize(context):
+    set_order_cost(type="stock", open_tax=0, close_tax=0,
+                   open_commission=0, close_commission=0, min_commission=0)
+    run_daily(buy, time="open")
+
+def buy(context):
+    if context.portfolio.positions["600000.SH"].total_amount == 0:
+        order_target_value("600000.SH", 500000)
+'''
+    res = JQRunner(code, initial_cash=1_000_000).run(make_df())
+    assert res.error is None
+    assert len(res.trades) == 1
+    assert res.trades[0].qty == 5000.0                       # 500000/100，整百
+    cash = 1_000_000 - 5000 * 100.05 * (1 + 1e-5)            # 滑点价 + 过户费
+    for k, (d, v) in enumerate(res.nav):
+        px = 100.0 * (1.02 ** k)
+        expect = cash + 5000 * px
+        assert v == pytest.approx(expect, rel=1e-6), f"day {k}"
+    assert res.nav[-1][1] == pytest.approx(cash + 5000 * 100 * 1.02 ** 5, rel=1e-6)
+
+
+def test_order_target_value_rebalance_to_half():
+    """order_target_value 半仓调仓：两只标的各 ~50%。"""
+    code = '''
+def initialize(context):
+    set_order_cost(type="stock", open_tax=0, close_tax=0,
+                   open_commission=0, close_commission=0, min_commission=0)
+    run_monthly(rebal, monthday=1, time="open")
+
+def rebal(context):
+    half = context.portfolio.total_value / 2
+    order_target_value("600000.SH", half)
+    order_target_value("000001.SZ", half)
+'''
+    res = JQRunner(code, initial_cash=1_000_000).run(make_df())
+    assert res.error is None
+    assert len(res.trades) == 2                              # 只在第一个交易日调仓一次
+    last_pos = res.positions[max(res.positions)]
+    assert set(last_pos) == {"600000.SH", "000001.SZ"}
+
+
+def test_t_plus_1_sell_rejected_same_day():
+    """当日开盘买入，当日收盘 closeable=0 不能卖；首笔卖出必然晚于首笔买入。"""
+    code = '''
+def initialize(context):
+    set_order_cost(type="stock", open_tax=0, close_tax=0,
+                   open_commission=0, close_commission=0, min_commission=0)
+    run_daily(trade, time="open")
+    run_daily(try_sell, time="close")
+
+def trade(context):
+    if context.portfolio.positions["600000.SH"].total_amount == 0:
+        order_value("600000.SH", 200000)
+
+def try_sell(context):
+    if context.portfolio.positions["600000.SH"].closeable_amount > 0:
+        order_target("600000.SH", 0)
+'''
+    res = JQRunner(code, initial_cash=1_000_000).run(make_df())
+    assert res.error is None
+    buys = [t for t in res.trades if t.side.value == "buy"]
+    sells = [t for t in res.trades if t.side.value == "sell"]
+    assert buys and sells
+    assert sells[0].trade_date > buys[0].trade_date          # T+1
+
+
+def test_history_values_from_namespace():
+    """第 4 个交易日 history(3) 应等于前 3 日收盘 [100, 102, 104.04]；首日为空。"""
+    code = '''
+captured = {}
+def initialize(context):
+    run_daily(check, time="open")
+
+def check(context):
+    h = history(3, field="close", security_list=["600000.SH"])
+    captured[str(context.current_dt.date())] = list(h["600000.SH"])
+'''
+    runner = JQRunner(code, initial_cash=1_000_000)
+    res = runner.run(make_df())
+    assert res.error is None
+    cap = runner.ns["captured"]
+    days = sorted(cap)
+    assert cap[days[0]] == []                                # 首日无历史（防未来）
+    assert cap[days[3]] == pytest.approx([100.0, 102.0, 104.04])
+
+
+def test_set_order_cost_fees_applied():
+    """费率覆盖生效：万三佣金最低 5 元、千一印花税只在卖出收。"""
+    code = '''
+def initialize(context):
+    set_order_cost(type="stock", open_tax=0, close_tax=0.001,
+                   open_commission=0.0003, close_commission=0.0003, min_commission=5)
+    run_daily(trade, time="open")
+    run_daily(sell_tmr, time="close")
+
+def trade(context):
+    if context.portfolio.positions["600000.SH"].total_amount == 0:
+        order_value("600000.SH", 100000)
+
+def sell_tmr(context):
+    if context.portfolio.positions["600000.SH"].closeable_amount >= 1000 \
+            and len([o for o in _trades()]) == 0:
+        order_target("600000.SH", 0)
+
+def _trades():
+    return []
+'''
+    # 上面 sell_tmr 复杂了：换个简单策略——持有到最后一天全部卖出
+    code = '''
+def initialize(context):
+    set_order_cost(type="stock", open_tax=0, close_tax=0.001,
+                   open_commission=0.0003, close_commission=0.0003, min_commission=5)
+    run_daily(trade, time="open")
+    run_daily(sell_if_any, time="close")
+
+def trade(context):
+    if context.portfolio.positions["600000.SH"].total_amount == 0:
+        order_value("600000.SH", 100000)
+
+def sell_if_any(context):
+    pass
+'''
+    runner = JQRunner(code, initial_cash=1_000_000)
+    res = runner.run(make_df())
+    assert res.error is None
+    buy = res.trades[0]
+    assert buy.fee == pytest.approx(max(5, buy.qty * buy.price * 0.0003) + buy.qty * buy.price * 1e-5,
+                                    rel=1e-6)
+    # 手动触发一笔卖出验证印花税
+    runner._today = list(runner._dates)[-1]
+    runner._day_index = len(runner._dates) - 1
+    runner._bars_today = runner._bars_by_day[runner._today]
+    runner._bucket = "close"
+    o = runner._submit("600000.SH", -1000)                   # 负数 = 卖出 1000 股
+    assert o is not None
+    sell = res.trades[-1]
+    assert sell.side.value == "sell"
+    assert sell.fee == pytest.approx(max(5, sell.qty * sell.price * 0.0003)
+                                     + sell.qty * sell.price * 0.001
+                                     + sell.qty * sell.price * 1e-5, rel=1e-6)
+
+
+def test_limit_up_buy_rejected():
+    """开盘一字涨停 → 拒单（与撮合器共用规则）。"""
+    rows = []
+    d1, d2 = date(2026, 1, 5), date(2026, 1, 6)
+    rows.append(dict(trade_date=d1, symbol="600000.SH", open=100.0, high=110.0, low=100.0,
+                     close=110.0, pre_close=100.0, volume=1e8, amount=1e10))
+    rows.append(dict(trade_date=d2, symbol="600000.SH", open=121.0, high=121.0, low=121.0,
+                     close=121.0, pre_close=110.0, volume=1e6, amount=1.2e8))
+    df = pl.DataFrame(rows)
+    code = '''
+def initialize(context):
+    set_order_cost(type="stock", open_tax=0, close_tax=0,
+                   open_commission=0, close_commission=0, min_commission=0)
+    run_daily(buy, time="open")
+
+def buy(context):
+    order_value("600000.SH", 100000)      # 天天下单：day2 一字涨停应被拒
+'''
+    res = JQRunner(code, initial_cash=1_000_000).run(df)
+    assert all(t.trade_date == d1 for t in res.trades)
+    assert any("涨停" in r[2] for r in res.rejected)
+
+
+def test_syntax_error_raises():
+    with pytest.raises(ValueError, match="策略代码执行失败"):
+        JQRunner("def initialize(context\n    pass", initial_cash=1e6)

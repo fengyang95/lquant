@@ -1,0 +1,13 @@
+[package]
+name = "lq-backtest"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "lq_backtest"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { workspace = true }
+arrow = { workspace = true }
+serde = { workspace = true }

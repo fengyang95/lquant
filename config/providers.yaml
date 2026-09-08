@@ -1,0 +1,54 @@
+# 越靠前优先级越高。每个 Provider 必须声明 capability，
+# 路由层按需选源 —— Fallback 链解决不了「某源根本没有 1 分钟线」的问题。
+providers:
+  - name: baostock
+    enabled: true
+    module: lquant.data.providers.baostock
+    cls: BaoStockProvider
+    qps: 0            # 无速率限制
+    capability: [daily, minute_5, minute_15, minute_30, minute_60, etf_daily,
+                 etf_minute_60, etf_meta, index_daily, financial_pit, calendar,
+                 reference, adj_factor]
+    note: 免费免注册；批量请求会静默挂起，必须走 watchdog
+
+  - name: akshare
+    enabled: false
+    module: lquant.data.providers.akshare
+    cls: AkShareProvider
+    qps: 3            # 东财系极易封 IP
+    capability: [daily, minute_1, minute_5, etf_spot, etf_daily, etf_iopv,
+                 money_flow, limit_up, dragon_tiger, sector]
+    note: 覆盖最广但易封；仅用于独有数据
+
+  - name: efinance
+    enabled: false
+    module: lquant.data.providers.efinance
+    cls: EfinanceProvider
+    qps: 3
+    capability: [daily, minute_1, etf_daily, realtime]
+
+  - name: hithink
+    enabled: false
+    module: lquant.data.providers.hithink
+    cls: HiThinkProvider
+    env_key: HITHINK_API_KEY
+    qps: 5
+    capability: [daily, adj_factor, financial_pit, corporate_action]
+    note: 同花顺官方，无分钟线；权威基准源
+
+  - name: mootdx
+    enabled: false
+    module: lquant.market.providers.mootdx
+    cls: MootdxProvider
+    qps: 0
+    capability: [realtime, minute_1]
+    note: 通达信 TCP，不封 IP；看板热通路首选
+
+crosscheck:
+  enabled: true
+  # 一个源为主，比对只用于标记与降级，绝不用于取值
+  primary: baostock
+  peers: [hithink]
+  tolerance_pct: 0.1
+  # 不比：前复权价（基准日不同）、行业分类（体系不同）、ETF 份额（源太少）
+  fields: [open, high, low, close, pre_close, volume]

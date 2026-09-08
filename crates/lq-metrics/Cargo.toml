@@ -1,0 +1,11 @@
+[package]
+name = "lq-metrics"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "lq_metrics"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { workspace = true }

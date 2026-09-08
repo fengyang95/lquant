@@ -1,0 +1,90 @@
+"""模拟盘回归：撮合、T+N 解冻、涨跌停拒单、对拍检测。"""
+from datetime import date
+
+import polars as pl
+import pytest
+
+from lquant.paper import PaperConfig, PaperEngine, compare_nav
+
+
+class _OneShotBuy:
+    """首条行情把现金等分买入 syms。"""
+
+    def __init__(self, syms: list[str]) -> None:
+        self.syms = syms
+        self.done = False
+
+    def signals(self, broker, quote: dict) -> list[dict]:
+        if self.done or quote["symbol"] != self.syms[0]:
+            return []
+        self.done = True
+        out = []
+        for s in self.syms:
+            q = int(broker.cash / len(self.syms) / (quote["price"] * 1.01)) // 100 * 100
+            if q > 0:
+                out.append({"symbol": s, "side": "buy", "qty": q, "price": quote["price"]})
+        return out
+
+
+def _daily_df(days: int = 5) -> pl.DataFrame:
+    import datetime as dt
+
+    d0 = date(2026, 1, 5)
+    rows = []
+    for k in range(days):
+        d = d0 + dt.timedelta(days=k)
+        for i, px in enumerate([100.0, 200.0]):
+            rows.append({"trade_date": d, "symbol": f"60000{i}.SH",
+                         "close": px * (1 + 0.001 * k)})
+    return pl.DataFrame(rows)
+
+
+def test_buy_fees_and_t1_unfreeze():
+    eng = PaperEngine(_OneShotBuy(["600000.SH", "600001.SH"]),
+                      PaperConfig(initial_cash=1_000_000))
+    res = eng.replay(_daily_df(3))
+    assert res["n_filled"] == 2 and res["n_rejected"] == 0
+    # 买入后当日 available=0（T+1），日终解冻后 == qty
+    pf = eng.broker.positions_frame()
+    assert (pf["available"] == pf["qty"]).all()
+    # 现金 + 持仓 ≈ 净值，手续费使其略低于本金
+    assert eng.broker.nav() < 1_000_000
+
+
+def test_reject_on_insufficient_cash():
+    class _Oversize(_OneShotBuy):
+        def signals(self, broker, quote):
+            return [{"symbol": self.syms[0], "side": "buy", "qty": 10 ** 9,
+                     "price": quote["price"]}]
+
+    eng = PaperEngine(_Oversize(["600000.SH"]), PaperConfig())
+    eng.push({"symbol": "600000.SH", "price": 100.0})
+    assert eng.broker.orders[0].status == "rejected"
+    assert "资金不足" in eng.broker.orders[0].reason
+
+
+def test_reject_on_limit_up():
+    class _Always(_OneShotBuy):
+        def signals(self, broker, quote):
+            return [{"symbol": self.syms[0], "side": "buy", "qty": 100,
+                     "price": quote["price"]}]
+
+    eng = PaperEngine(_Always(["600000.SH"]), PaperConfig())
+    eng.push({"symbol": "600000.SH", "price": 110.0, "limit_up": 110.0})
+    assert eng.broker.orders[0].status == "rejected"
+    assert "涨停" in eng.broker.orders[0].reason
+
+
+def test_compare_nav_self_is_ok():
+    nav = pl.DataFrame({"trade_date": [date(2026, 1, 5), date(2026, 1, 6)],
+                        "nav": [1.0, 1.01]})
+    assert compare_nav(nav, nav).verdict == "ok"
+
+
+def test_compare_nav_flags_divergence():
+    a = pl.DataFrame({"trade_date": [date(2026, 1, 5), date(2026, 1, 6)],
+                      "nav": [1_000_000.0, 1_100_000.0]})
+    b = pl.DataFrame({"trade_date": [date(2026, 1, 5), date(2026, 1, 6)],
+                      "nav": [1_000_000.0, 1_000_001.0]})
+    rep = compare_nav(a, b)
+    assert rep.verdict == "critical"

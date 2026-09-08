@@ -1,0 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+.text-up { color: #e5484d; }
+.text-down { color: #30a46c; }
+.text-flat { color: #8b8d98; }

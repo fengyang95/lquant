@@ -1,0 +1,33 @@
+env: ${LQ_ENV:dev}
+
+paths:
+  data_dir: ${LQ_DATA_DIR:./data}
+  parquet: ${LQ_DATA_DIR:./data}/parquet
+  duckdb: ${LQ_DUCKDB_PATH:./data/duckdb/lquant.duckdb}
+  cache: ${LQ_DATA_DIR:./data}/cache
+
+timezone: Asia/Shanghai
+
+store:
+  # 日频按年单文件，不要按 symbol 分文件（小文件灾难）
+  daily_partition: year
+  minute_partition: year_month
+  compression: zstd
+  # DuckDB 只允许单个写进程：所有写操作收敛到 writer 角色
+  duckdb_write_role: writer
+
+ingest:
+  concurrency: ${LQ_INGEST_CONCURRENCY:4}
+  watchdog_sec: ${LQ_INGEST_WATCHDOG_SEC:120}
+  batch_size: 200
+  checkpoint_every: 500
+
+quality:
+  fatal_on: [price_range, ohlc_consistency, unit_normalize]
+  crosscheck_sample: 200
+  index_sentinels: ["000001.SH", "000300.SH", "000905.SH", "000852.SH", "399006.SZ"]
+
+logging:
+  level: INFO
+  file: ${LQ_DATA_DIR:./data}/logs/lquant.log
+  rotation: "50 MB"

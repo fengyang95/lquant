@@ -1,0 +1,18 @@
+[package]
+name = "lq-ops"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "lq_ops"
+crate-type = ["cdylib"]
+
+[dependencies]
+polars = { workspace = true }
+pyo3 = { workspace = true }
+pyo3-polars = { workspace = true }
+serde = { workspace = true }
+
+# ⚠️ 版本必须与 Python 侧 polars 完全一致
+[build]
+rustflags = ["-C", "target-cpu=native"]
