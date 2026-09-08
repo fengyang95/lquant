@@ -140,7 +140,25 @@ def check(start: str | None, end: str | None) -> None:
 
 
 @data.command()
-@click.option("--peers", default="hithink")
-def crosscheck(peers: str) -> None:
-    """跨源对拍（抽检，不取值）。"""
-    click.echo(f"crosscheck with {peers}")
+@click.option("--peers", default="", help="逗号分隔的同行源；留空用 config/providers.yaml 的 crosscheck.peers")
+@click.option("--start", default="2024-01-01")
+@click.option("--end", default=None)
+@click.option("--limit", default=200, type=int,
+              help="抽检标的数（§3.8.4 分层抽样的哨兵层）")
+def crosscheck(peers: str, start: str, end: str | None, limit: int) -> None:
+    """跨源对拍（抽检，标记与降级，绝不取值）。
+
+    以湖内为主，拉同行实价比对；偏差打 CROSS_SRC_DIFF 标记 + 落
+    data_quality_issue。同行源不可用/未启用 → 报 L0 跳过，不报错。
+    """
+    from lquant.data.ingest.crosscheck import run_crosscheck
+
+    out = run_crosscheck(
+        peers=[p.strip() for p in peers.split(",") if p.strip()],
+        start=start, end=end, limit=limit,
+    )
+    click.echo(f"crosscheck: {out['summary']}")
+    for lv in ("L1", "L2", "L3"):
+        if out["summary"].get(lv):
+            click.echo(f"  [{lv}] {len([i for i in out['issues'] if i.rule.endswith(lv)])} 条 issue 待查看")
+    click.echo(f"primary 打 CROSS_SRC_DIFF 标记: {out['flagged_rows']} 行")

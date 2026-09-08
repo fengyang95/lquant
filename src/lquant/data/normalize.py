@@ -11,7 +11,8 @@ from lquant.core.types import parse_symbol
 
 # 常见列名别名 → 内部列名
 ALIASES = {
-    "date": "trade_date", "trade_date": "trade_date", "datetime": "ts", "time": "ts",
+    "date": "trade_date", "trade_date": "trade_date", "日期": "trade_date",
+    "datetime": "ts", "time": "ts", "时间": "ts",
     "股票代码": "symbol", "证券代码": "symbol", "code": "symbol", "symbol": "symbol",
     "开盘": "open", "open": "open", "最高": "high", "high": "high",
     "最低": "low", "low": "low", "收盘": "close", "close": "close",
