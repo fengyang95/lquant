@@ -11,7 +11,7 @@ license = "MIT"
 # 版本错配要到运行时才炸，且报错看起来像编译器 bug。
 [workspace.dependencies]
 polars = { version = "0.49", features = ["lazy", "dtype-full"] }
-pyo3 = { version = "0.24", features = ["extension-module"] }
-pyo3-polars = { version = "0.23" }
+pyo3 = { version = "0.25", features = ["extension-module"] }
+pyo3-polars = { version = "0.22", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 arrow = "54"

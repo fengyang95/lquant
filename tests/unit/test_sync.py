@@ -21,6 +21,9 @@ pytestmark = pytest.mark.usefixtures("sync_env")
 @pytest.fixture(scope="module")
 def sync_env(tmp_path_factory):
     """每个模块一份隔离数据环境（拷真实 duckdb + parquet 湖）。"""
+    if not (LQ_ROOT / "data" / "duckdb" / "lquant.duckdb").exists():
+        pytest.skip("需要本地 data/duckdb/lquant.duckdb（不入库，CI 上跳过）",
+                    allow_module_level=True)
     base = tmp_path_factory.mktemp("sync")
     os.chdir(base)
     (base / "data" / "duckdb").mkdir(parents=True, exist_ok=True)

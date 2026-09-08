@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (cargo test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+      - name: cargo test
+        working-directory: crates
+        run: cargo test --workspace
+
+  python:
+    name: Python (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          key: python-maturin
+
+      - name: Install Python deps
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python -e ".[sources,factors,ml,server,dev]"
+
+      - name: Build Rust 扩展（验证 pyo3/polars ABI）
+        run: |
+          uv pip install --python .venv/bin/python maturin
+          source .venv/bin/activate
+          for c in lq-ops lq-backtest lq-metrics; do
+            (cd crates/$c && maturin develop)
+          done
+
+      - name: ABI 冒烟（断言 Rust 扩展真实加载，而非 python-fallback）
+        run: |
+          .venv/bin/python -c "
+          from lquant._rust.loader import status
+          st = status()
+          print(st)
+          assert all(v == 'rust' for v in st.values()), 'Rust 扩展加载失败（ABI 错配？）: ' + repr(st)
+          "
+
+      - name: Run pytest
+        run: .venv/bin/python -m pytest tests -m "not slow"
+
+  web:
+    name: Web (Next.js)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - name: Typecheck
+        run: npm run typecheck
+        working-directory: web
+      - name: Unit tests (vitest)
+        run: npm run test
+        working-directory: web
+      - name: Build
+        run: npm run build
+        working-directory: web

@@ -23,6 +23,9 @@ pytestmark = pytest.mark.usefixtures("api_env")
 @pytest.fixture(scope="module")
 def api_env(tmp_path_factory):
     """每个测试模块拷一份隔离数据环境（duckdb 9.8M + parquet 0.5M）。"""
+    if not (LQ_ROOT / "data" / "duckdb" / "lquant.duckdb").exists():
+        pytest.skip("需要本地 data/duckdb/lquant.duckdb（不入库，CI 上跳过）",
+                    allow_module_level=True)
     base = tmp_path_factory.mktemp("api")
     os.chdir(base)
     (base / "data" / "duckdb").mkdir(parents=True, exist_ok=True)

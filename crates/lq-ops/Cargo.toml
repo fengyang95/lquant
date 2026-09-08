@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 polars = { workspace = true }
 pyo3 = { workspace = true }
 pyo3-polars = { workspace = true }
+polars-arrow = "0.49"
 serde = { workspace = true }
 
 # ⚠️ 版本必须与 Python 侧 polars 完全一致
