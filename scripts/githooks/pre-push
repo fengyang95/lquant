@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# 推送前检查：跑测试（比 pre-commit 严格）
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+echo "==> pre-push: 测试"
+
+# 跳过开关（CI 上或临时放行）：git push --no-verify
+if [ "${LQ_SKIP_PUSH_CHECK:-0}" = "1" ]; then
+  echo "    LQ_SKIP_PUSH_CHECK=1，跳过"; exit 0
+fi
+
+if [ -x .venv/bin/python ] && [ -d tests ]; then
+  .venv/bin/python -m pytest -x -q tests/ || {
+    echo "✗ 测试失败，修复后再 push（临时放行: LQ_SKIP_PUSH_CHECK=1 git push）"; exit 1; }
+else
+  echo "    无 .venv 或 tests/，跳过"
+fi
+
+echo "==> pre-push 通过"
