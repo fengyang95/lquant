@@ -1,4 +1,4 @@
-.PHONY: help setup db-init db-reset bootstrap dev api worker web \
+.PHONY: help setup hooks db-init db-reset bootstrap dev api worker web \
         test lint fmt type rust-build rust-test docker-up docker-down clean smoke \
         start stop status logs bundle
 
@@ -25,6 +25,10 @@ help:
 
 setup:
 	bash lquant.sh install
+
+hooks:
+	git config core.hooksPath scripts/githooks
+	@echo "git hooks 已启用 (pre-commit / pre-push / post-rewrite / post-merge)"
 
 start:
 	bash lquant.sh start

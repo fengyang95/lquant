@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# rebase / commit --amend 之后触发：检查被改写的提交里是否混入了未跟踪文件
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+echo "==> post-rewrite: rebase 完成，提示状态"
+if [ -n "$(git status --porcelain)" ]; then
+  echo "    工作区有未提交改动，检查是否需要处理:"
+  git status --short
+fi
+
+# Python 依赖清单若被 rebase 改过，提醒重装
+if git diff "ORIG_HEAD" HEAD --name-only 2>/dev/null | grep -qE '^pyproject\.toml$|^uv\.lock$'; then
+  echo "⚠ pyproject.toml/uv.lock 在 rebase 中变化，建议: ./lquant.sh update"
+fi

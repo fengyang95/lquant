@@ -53,6 +53,29 @@ http_ok() {  # curl 存在才探测；--noproxy 防系统代理劫持 localhost
   curl -sf --noproxy '*' -o /dev/null -m 3 "http://localhost:${API_PORT}/api/health/ping"
 }
 
+# ---- 变更检测：输入文件的 shasum 未变则跳过该步骤 -------------------------
+# usage: if changed_since ".run/pydeps.sha" pyproject.toml; then ...; fi
+# 输入文件列表与 stamp 里记录的一致才算「未变」
+changed_since() {
+  local stamp="$1"; shift
+  local current
+  current="$(shasum -a 256 "$@" 2>/dev/null | shasum -a 256 | cut -d' ' -f1)" || return 0
+  [ -f "$stamp" ] || return 0
+  [ "$(cat "$stamp" 2>/dev/null)" = "$current" ] || return 0
+  return 1   # 1 = 未变，可跳过
+}
+mark_done() {  # mark_done <stamp> <files...> —— 成功后写入 stamp
+  local stamp="$1"; shift
+  shasum -a 256 "$@" 2>/dev/null | shasum -a 256 | cut -d' ' -f1 > "$stamp"
+}
+
+# 前端源码指纹：src + 配置 + package.json，源码没变就不重复 next build
+web_build_inputs() {
+  find web/src web/public -type f 2>/dev/null | sort | xargs shasum -a 256 2>/dev/null
+  shasum -a 256 web/package.json web/package-lock.json web/next.config.mjs \
+    web/tailwind.config.ts web/tsconfig.json web/postcss.config.mjs 2>/dev/null
+}
+
 # 选一个 >= ${PYTHON_MIN} 的 python
 pick_python() {
   for cand in python3.13 python3.12 python3 python; do
@@ -80,20 +103,36 @@ ensure_venv_python() {
 }
 
 install_python_deps() {
+  # pyproject.toml（及 uv.lock）没变就跳过重装
+  local inputs=(pyproject.toml); [ -f uv.lock ] && inputs+=(uv.lock)
+  if ! changed_since "$RUN_DIR/pydeps.sha" "${inputs[@]}"; then
+    dim "Python 依赖未变化（pyproject.toml），跳过重装"
+    return 0
+  fi
   info "安装 Python 依赖（镜像: ${PYPI_INDEX}）"
   if command -v uv >/dev/null 2>&1; then
     UV_DEFAULT_INDEX="$PYPI_INDEX" UV_HTTP_TIMEOUT=120 \
-      uv pip install --python .venv/bin/python -e ".[sources,factors,ml,server,dev]"
+      uv pip install --python .venv/bin/python -e ".[sources,factors,ml,server,dev]" \
+      && mark_done "$RUN_DIR/pydeps.sha" "${inputs[@]}"
   else
-    .venv/bin/python -m pip install -q --upgrade pip
-    .venv/bin/python -m pip install -q -i "$PYPI_INDEX" -e ".[sources,factors,ml,server,dev]"
+    .venv/bin/python -m pip install -q --upgrade pip \
+      && .venv/bin/python -m pip install -q -i "$PYPI_INDEX" -e ".[sources,factors,ml,server,dev]" \
+      && mark_done "$RUN_DIR/pydeps.sha" "${inputs[@]}"
   fi
 }
 
 install_node_deps() {
   command -v npm >/dev/null 2>&1 || { warn "未检测到 npm，跳过前端（brew install node）"; return 1; }
+  # package.json / lock 未变且 node_modules 存在就跳过
+  local inputs=(web/package.json)
+  [ -f web/package-lock.json ] && inputs+=(web/package-lock.json)
+  if [ -d web/node_modules ] && ! changed_since "$RUN_DIR/npmdeps.sha" "${inputs[@]}"; then
+    dim "前端依赖未变化（package.json），跳过 npm install"
+    return 0
+  fi
   info "安装前端依赖（registry: ${NPM_REGISTRY}）"
-  ( cd web && npm install --registry="$NPM_REGISTRY" --no-fund --no-audit )
+  ( cd web && npm install --registry="$NPM_REGISTRY" --no-fund --no-audit ) \
+    && mark_done "$RUN_DIR/npmdeps.sha" "${inputs[@]}"
 }
 
 start_redis() {
@@ -129,6 +168,23 @@ spawn() {  # name logfile cmd...
   local name="$1" log="$2"; shift 2
   ( "$@" >>"$log" 2>&1 & echo $! >"$RUN_DIR/$name.pid" )
   disown || true
+}
+
+free_port() {  # 端口被残留进程占用时先杀掉，确保能绑定
+  local port="$1"
+  local pids
+  pids="$(lsof -ti tcp:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+  [ -n "$pids" ] || return 0
+  warn "端口 $port 被占用 (pid: $(echo "$pids" | tr '\n' ' '))，先杀掉"
+  echo "$pids" | xargs kill 2>/dev/null || true
+  for _ in $(seq 1 10); do
+    pids="$(lsof -ti tcp:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+    [ -z "$pids" ] && break
+    sleep 0.5
+  done
+  # 仍不肯走就强杀
+  pids="$(lsof -ti tcp:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+  [ -n "$pids" ] && echo "$pids" | xargs kill -9 2>/dev/null || true
 }
 
 # ============================== 子命令 =====================================
@@ -189,12 +245,22 @@ cmd_install() {
   # 5) 前端
   install_node_deps || true
 
-  # 6) 建库
-  info "初始化 DuckDB"
-  py scripts/init_db.py
+  # 6) 建库（已建库则跳过，删 data/duckdb/lquant.duckdb 可重建）
+  if [ -f data/duckdb/lquant.duckdb ]; then
+    dim "DuckDB 已建库，跳过 init_db"
+  else
+    info "初始化 DuckDB"
+    py scripts/init_db.py
+  fi
 
   # 7) 冒烟
   py -c "import lquant._rust.loader as l; print('ABI:', l.status())" 2>/dev/null || true
+
+  # 8) git hooks（统一仓库级 hooks，随仓库分发）
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git config core.hooksPath scripts/githooks && dim "git hooks 已启用 (make hooks 可重开)"
+  fi
+
   info "安装完成。下一步: ./lquant.sh bootstrap && ./lquant.sh start"
 }
 
@@ -226,11 +292,19 @@ cmd_update() {
   # 2) 前端：npm install 幂等增量同步 package.json 依赖
   install_node_deps || warn "前端依赖更新失败，前端将以旧依赖继续运行"
 
-  # 3) 前端生产构建：已有生产构建或 --full 才重建（dev 模式无需构建）
+  # 3) 前端生产构建：已有生产构建或 --full 才重建（dev 模式无需构建）；源码没变则跳过
   if [ "$full" = 1 ] || { [ -d web/.next ] && [ -f web/.next/BUILD_ID ]; }; then
     if command -v npm >/dev/null 2>&1 && [ -d web/node_modules ]; then
-      info "前端生产构建 (next build)"
-      ( cd web && npx next build ) || warn "next build 失败，Web 将以旧构建或 dev 模式运行"
+      if [ "$full" = 0 ] && ! changed_since "$RUN_DIR/webbuild.sha" <(web_build_inputs); then
+        dim "前端源码未变化，跳过 next build"
+      else
+        info "前端生产构建 (next build)"
+        if ( cd web && npx next build ); then
+          web_build_inputs | shasum -a 256 | cut -d' ' -f1 > "$RUN_DIR/webbuild.sha"
+        else
+          warn "next build 失败，Web 将以旧构建或 dev 模式运行"
+        fi
+      fi
     else
       warn "npm/node_modules 缺失，跳过前端构建"
     fi
@@ -256,7 +330,12 @@ cmd_build() {
   [ -d web/node_modules ] || install_node_deps || fail "npm 不可用"
 
   info "前端生产构建 (next build, standalone)"
-  ( cd web && npx next build )
+  if ! changed_since "$RUN_DIR/webbuild.sha" <(web_build_inputs); then
+    dim "前端源码未变化，跳过 next build（删 .run/webbuild.sha 或 ./lquant.sh update --full 可强制重建）"
+  else
+    ( cd web && npx next build )
+    web_build_inputs | shasum -a 256 | cut -d' ' -f1 > "$RUN_DIR/webbuild.sha"
+  fi
 
   info "后端 wheel"
   if command -v uv >/dev/null 2>&1; then
@@ -311,6 +390,7 @@ cmd_start() {
 
   # 已在跑就不重复起
   if pid_ok "$RUN_DIR/api.pid"; then warn "API 已在运行 (pid $(cat "$RUN_DIR/api.pid"))"; else
+    free_port "$API_PORT"
     start_redis
     info "启动 API (uvicorn, port $API_PORT)"
     spawn api "$LOG_DIR/api.log" .venv/bin/uvicorn lquant.server.main:app --host 0.0.0.0 --port "$API_PORT"
@@ -335,6 +415,7 @@ sys.exit(0 if _redis_available() else 1)" 2>/dev/null; then
 
   if [ "$no_web" = 0 ]; then
     if pid_ok "$RUN_DIR/web.pid"; then warn "Web 已在运行 (pid $(cat "$RUN_DIR/web.pid"))"; else
+      free_port "$WEB_PORT"
       if [ -d web/.next ] && [ -f web/.next/BUILD_ID ]; then
         info "启动 Web（生产模式 next start, port ${WEB_PORT}）"
         spawn web "$LOG_DIR/web.log" bash -c "cd web && npx next start -p $WEB_PORT"
