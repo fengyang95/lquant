@@ -5,6 +5,10 @@
 
 滑点必须区分方向：买往上滑、卖往下滑。写成同一个符号等于负滑点，
 回测会出现「越交易越赚」的荒谬结果。
+
+apply 统一签名 (price, side, qty, volume)：不关心量的模型忽略后两个参数。
+签名统一让 Broker 可以无脑传全量参数，VolumePctSlippage 不再被静默降级
+（历史上 _price 只传 2 个参数，冲击成本从未生效 —— 教训写进 test_broker）。
 """
 from __future__ import annotations
 
@@ -22,7 +26,7 @@ class PctSlippage:
 
     rate: float = 0.0005
 
-    def apply(self, price: float, side: Side) -> float:
+    def apply(self, price: float, side: Side, qty: float = 0.0, volume: float = 0.0) -> float:
         return price * (1 + self.rate) if side == Side.BUY else price * (1 - self.rate)
 
 
@@ -33,7 +37,7 @@ class TickSlippage:
     tick: float = 0.01
     n: int = 1
 
-    def apply(self, price: float, side: Side) -> float:
+    def apply(self, price: float, side: Side, qty: float = 0.0, volume: float = 0.0) -> float:
         d = self.tick * self.n
         return price + d if side == Side.BUY else max(price - d, self.tick)
 
@@ -54,7 +58,7 @@ class VolumePctSlippage:
         rate = self.base_rate
         if volume > 0 and qty > 0:
             part = min(qty / volume, self.participation_cap)
-            rate += self.impact * (part ** 2)      # 平方根模型，冲击随占比超线性
+            rate += self.impact * (part ** 0.5)    # 平方根冲击模型（Kyle 形式）
         return price * (1 + rate) if side == Side.BUY else price * (1 - rate)
 
 
@@ -62,7 +66,7 @@ class VolumePctSlippage:
 class NoSlippage:
     """零滑点。只用于和真实滑点做对照，看成本到底吃掉多少。"""
 
-    def apply(self, price: float, side: Side) -> float:
+    def apply(self, price: float, side: Side, qty: float = 0.0, volume: float = 0.0) -> float:
         return price
 
 

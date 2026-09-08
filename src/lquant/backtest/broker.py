@@ -1,6 +1,7 @@
 """撮合：涨跌停不可成交、T+N 可用持仓、费率按规则表。"""
 from __future__ import annotations
 
+import inspect
 from datetime import date
 
 from lquant.backtest.events import Bar, Fill, Order, OrderStatus, Side
@@ -11,14 +12,29 @@ class Broker:
     def __init__(self, rules: dict[str, InstrumentRules], slippage=None) -> None:
         self.rules = rules
         self.slippage = slippage
+        # 滑点模型是否接受量参数（qty/volume）：内置模型统一四参签名，
+        # 聚宽风格的 duck-type 对象（apply(price, side)）也能接入
+        self._slip_takes_volume = False
+        if slippage is not None and callable(getattr(slippage, "apply", None)):
+            try:
+                n_params = len([
+                    p for p in inspect.signature(slippage.apply).parameters.values()
+                    if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+                ])
+                self._slip_takes_volume = n_params >= 4
+            except (TypeError, ValueError):
+                self._slip_takes_volume = False
         # 按订单追踪：累计成交额 + 已付佣金
         self._cum_amount: dict[str, float] = {}
         self._paid_comm: dict[str, float] = {}
 
-    def _price(self, bar: Bar, side: Side) -> float:
+    def _price(self, bar: Bar, side: Side, qty: float = 0.0) -> float:
         p = bar.open                      # 默认次日开盘价成交
         if self.slippage is not None:
-            p = self.slippage.apply(p, side)
+            if self._slip_takes_volume:
+                p = self.slippage.apply(p, side, qty=qty, volume=bar.volume)
+            else:
+                p = self.slippage.apply(p, side)
         return p
 
     def match(self, order: Order, bar: Bar, d: date, max_qty: float | None = None) -> Fill | None:
@@ -43,12 +59,15 @@ class Broker:
             order.reason = "跌停不可卖"
             return None
 
-        price = self._price(bar, order.side)
-        qty = min(order.qty - order.filled_qty, self._max_qty(order, price, r, max_qty))
+        # 数量先按成交量/资金/一手约束截断，再算滑点 —— 冲击成本必须
+        # 按实际成交数量计，不能给被截掉的部分付费（H1 教训）
+        qty = self._max_qty(order, r, max_qty)
         if qty <= 0:
             order.status = OrderStatus.REJECTED
             order.reason = "数量不足一手或资金不足"
             return None
+
+        price = self._price(bar, order.side, qty=qty)
 
         amount = qty * price
         transfer = amount * r.transfer_fee_rate
@@ -71,7 +90,7 @@ class Broker:
         order.status = OrderStatus.FILLED if order.filled_qty >= order.qty - 1e-9 else OrderStatus.PARTIAL
         return Fill(order.order_id, order.symbol, order.side, qty, price, fee, d)
 
-    def _max_qty(self, order: Order, price: float, r: InstrumentRules,
+    def _max_qty(self, order: Order, r: InstrumentRules,
                  max_qty: float | None = None) -> float:
         q = order.qty - order.filled_qty
         if max_qty is not None:

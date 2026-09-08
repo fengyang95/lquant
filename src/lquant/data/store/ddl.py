@@ -1,5 +1,47 @@
-"""DuckDB 表结构。幂等 DDL 列表。"""
+"""DuckDB 表结构。幂等 DDL 列表。
+
+质量三表（data_quality_issue / data_version / golden_expected）的 DDL
+在这里唯一定义，quality 层模块从这里 import —— 别处再写一份迟早漂移
+（collect_log 前车之鉴）。
+"""
 from __future__ import annotations
+
+DDL_DATA_QUALITY_ISSUE = """
+CREATE TABLE IF NOT EXISTS data_quality_issue (
+    issue_id     VARCHAR PRIMARY KEY,
+    dataset      VARCHAR,
+    symbol       VARCHAR,
+    trade_date   DATE,
+    rule_code    VARCHAR,     -- LIMIT_BREACH / ADJ_JUMP / ZOMBIE / CALENDAR_STRAY ...
+    severity     VARCHAR,     -- fatal / error / warn / info
+    detail       JSON,
+    count        INTEGER,
+    data_version VARCHAR,
+    resolved     BOOLEAN DEFAULT FALSE,
+    created_at   TIMESTAMP DEFAULT now()
+)
+"""
+
+DDL_DATA_VERSION = """
+CREATE TABLE IF NOT EXISTS data_version (
+    version   VARCHAR PRIMARY KEY,
+    dataset   VARCHAR,
+    trade_date DATE,
+    row_count BIGINT,
+    created_at TIMESTAMP DEFAULT now()
+)
+"""
+
+DDL_GOLDEN_EXPECTED = """
+CREATE TABLE IF NOT EXISTS golden_expected (
+    name       VARCHAR PRIMARY KEY,
+    kind       VARCHAR,          -- structural / calc / factor_ic
+    sql        VARCHAR,          -- 产出单值（首行首列）的查询
+    expected   DOUBLE,
+    tolerance  DOUBLE,
+    frozen_at  TIMESTAMP DEFAULT now()
+)
+"""
 
 DDL_STATEMENTS: list[str] = [
     """
@@ -134,6 +176,9 @@ DDL_STATEMENTS: list[str] = [
     # market/schema.py::ensure_market_tables 统一拥有（旧版这里的三张表
     # 结构与采集器列不匹配，曾导致资金流落库静默失败）。
     "CREATE TABLE IF NOT EXISTS collect_log (job VARCHAR, trade_date DATE, started_at TIMESTAMP, finished_at TIMESTAMP, rows INTEGER, status VARCHAR, message VARCHAR, PRIMARY KEY (job, trade_date))",
+    DDL_DATA_QUALITY_ISSUE,
+    DDL_DATA_VERSION,
+    DDL_GOLDEN_EXPECTED,
     """
     CREATE TABLE IF NOT EXISTS sync_job (
         sync_id      VARCHAR PRIMARY KEY,

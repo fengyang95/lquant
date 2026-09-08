@@ -115,9 +115,28 @@ def demo(start: str) -> None:
 
 
 @data.command()
-def check() -> None:
-    """跑质量校验。"""
-    click.echo("见 data.quality.validators")
+@click.option("--start", default=None, help="只检查该日期之后的数据（ISO）")
+@click.option("--end", default=None)
+def check(start: str | None, end: str | None) -> None:
+    """跑全湖质量校验（涨跌停/覆盖度/僵尸/复权/日历），issue 落库。
+
+    fatal / error 存在时退出码为 2 —— 让调度系统能感知质量恶化，
+    「fatal 只是落库不阻断」与「命令成功」是两回事。
+    """
+    from lquant.data.quality.pipeline import run_lake_checks
+
+    issues = run_lake_checks(start=start, end=end)
+    if not issues:
+        click.echo("quality: PASS（无 issue）")
+        return
+    by_sev: dict[str, int] = {}
+    for i in issues:
+        by_sev[i.severity] = by_sev.get(i.severity, 0) + 1
+    click.echo(f"quality: {len(issues)} 条 issue（{by_sev}），已落 data_quality_issue")
+    for i in issues[:20]:
+        click.echo(f"  [{i.severity}] {i.rule}: {i.detail}")
+    if by_sev.get("fatal") or by_sev.get("error"):
+        raise SystemExit(2)
 
 
 @data.command()
