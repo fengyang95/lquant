@@ -22,7 +22,7 @@ describe('api 请求封装', () => {
 
   it('后端 detail 透出为 ApiError 消息（比裸状态码有用）', async () => {
     vi.stubGlobal('fetch', mockFetch(404, { detail: '600519.SH 不在自选' }));
-    const err = await get('/watchlist/600519.SH').catch((e) => e);
+    const err = (await get('/watchlist/600519.SH').catch((e) => e)) as ApiError;
     expect(err).toBeInstanceOf(ApiError);
     expect(err.status).toBe(404);
     expect(err.message).toBe('600519.SH 不在自选');
@@ -32,7 +32,7 @@ describe('api 请求封装', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
       new Response('Internal Server Error', { status: 500 }),
     ));
-    const err = await get('/factors').catch((e) => e);
+    const err = (await get('/factors').catch((e) => e)) as ApiError;
     expect(err).toBeInstanceOf(ApiError);
     expect(err.message).toBe('500 /factors');
   });
