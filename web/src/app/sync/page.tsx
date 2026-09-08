@@ -133,7 +133,7 @@ export default function SyncPage() {
                 <td className="text-xs">
                   <span className="font-mono">{j.schedule_time}</span>
                   <span className="ml-1 text-neutral-400">{wdText(j.weekdays)}</span>
-                  {j.kind === 'collect' && j.params?.schedule && (
+                  {j.kind === 'collect' && j.params?.schedule != null && (
                     <span className="ml-1 text-neutral-400">({String(j.params.schedule)})</span>
                   )}
                 </td>

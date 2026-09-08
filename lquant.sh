@@ -80,7 +80,7 @@ ensure_venv_python() {
 }
 
 install_python_deps() {
-  info "安装 Python 依赖（镜像: $PYPI_INDEX）"
+  info "安装 Python 依赖（镜像: ${PYPI_INDEX}）"
   if command -v uv >/dev/null 2>&1; then
     UV_DEFAULT_INDEX="$PYPI_INDEX" UV_HTTP_TIMEOUT=120 \
       uv pip install --python .venv/bin/python -e ".[sources,factors,ml,server,dev]"
@@ -92,7 +92,7 @@ install_python_deps() {
 
 install_node_deps() {
   command -v npm >/dev/null 2>&1 || { warn "未检测到 npm，跳过前端（brew install node）"; return 1; }
-  info "安装前端依赖（registry: $NPM_REGISTRY）"
+  info "安装前端依赖（registry: ${NPM_REGISTRY}）"
   ( cd web && npm install --registry="$NPM_REGISTRY" --no-fund --no-audit )
 }
 
@@ -259,8 +259,12 @@ cmd_build() {
   ( cd web && npx next build )
 
   info "后端 wheel"
-  .venv/bin/python -m pip wheel . -w dist --no-deps -q 2>/dev/null \
-    || .venv/bin/python -m pip wheel . -w dist --no-deps
+  if command -v uv >/dev/null 2>&1; then
+    UV_HTTP_TIMEOUT=120 uv build --wheel --out-dir dist .
+  else
+    .venv/bin/python -m pip wheel . -w dist --no-deps -q 2>/dev/null \
+      || .venv/bin/python -m pip wheel . -w dist --no-deps
+  fi
 
   local ts; ts="$(date +%Y%m%d-%H%M%S)"
   local bundle="dist/lquant-bundle-$ts"
@@ -332,7 +336,7 @@ sys.exit(0 if _redis_available() else 1)" 2>/dev/null; then
   if [ "$no_web" = 0 ]; then
     if pid_ok "$RUN_DIR/web.pid"; then warn "Web 已在运行 (pid $(cat "$RUN_DIR/web.pid"))"; else
       if [ -d web/.next ] && [ -f web/.next/BUILD_ID ]; then
-        info "启动 Web（生产模式 next start, port $WEB_PORT）"
+        info "启动 Web（生产模式 next start, port ${WEB_PORT}）"
         spawn web "$LOG_DIR/web.log" bash -c "cd web && npx next start -p $WEB_PORT"
       else
         warn "无生产构建，用 dev 模式（跑 ./lquant.sh build 可切生产模式）"

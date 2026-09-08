@@ -228,7 +228,7 @@ export default function BacktestDetailPage() {
     { id: 'holdings', label: '每日持仓&收益' },
     { id: 'trades', label: '单笔进出' },
     { id: 'perf', label: '性能分析' },
-    ...(isJq ? [{ id: 'code', label: '策略代码' }] : []),
+    ...(isJq ? [{ id: 'code' as const, label: '策略代码' }] : []),
   ] as const;
 
   return (

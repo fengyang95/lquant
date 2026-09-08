@@ -24,8 +24,14 @@ data/parquet/
 data/cache/
 data/logs/
 data/reports/
+.run/
 *.duckdb
 *.wal
+
+# Build artifacts
+dist/
+*.tar.gz
+web/tsconfig.tsbuildinfo
 
 # Claude
 .claude/worktrees/

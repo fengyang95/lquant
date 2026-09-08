@@ -64,6 +64,7 @@ export default function FactorsPage() {
   const [expression, setExpression] = useState('Rank(Ts_Mean($close,5)/$close-1)');
   const [formula, setFormula] = useState('pct_change_20');
   const [evalRes, setEvalRes] = useState<EvalResult | null>(null);
+  const [evalSeries, setEvalSeries] = useState<EvalSeries | null>(null);
   const [busy, setBusy] = useState<'' | 'reg' | 'eval' | 'corr' | 'syn' | 'seed'>('');
   const [msg, setMsg] = useState('');
   // F6/F7
