@@ -47,6 +47,7 @@ def _startup() -> None:
         from lquant.core.db import writer
         from lquant.data.store.ddl import (
             DDL_STATEMENTS,
+            ensure_classify_snapshots,
             ensure_collect_log,
             ensure_factor_def,
         )
@@ -58,6 +59,8 @@ def _startup() -> None:
                 print("[migrate] factor_def → expression/description 结构")
             if ensure_collect_log(con):
                 print("[migrate] collect_log → 补主键")
+            if ensure_classify_snapshots(con):
+                print("[migrate] industry_classify → 补 (symbol, std_date) 主键")
     except Exception as e:  # noqa: BLE001 - 库未初始化时不应阻断服务启动
         print(f"[startup] schema 迁移跳过: {e}")
 

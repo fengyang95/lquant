@@ -34,7 +34,7 @@ __all__ = ["EngineConfig", "BacktestResult", "Engine", "build_rules"]
 class EngineConfig:
     initial_cash: float = 1_000_000.0
     rebalance: str = "daily"                # daily | weekly | monthly | none
-    price_mode: str = "next_open"           # next_open（防未来函数）| close
+    price_mode: str = "next_open"           # next_open|next_vwap|next_close|same_close（防未来函数）
     slippage: str = "pct"
     slippage_params: dict = field(default_factory=dict)
     participation: float = 0.1              # 单只最多吃掉当日成交量的比例
@@ -159,7 +159,7 @@ class Engine:
 
         symbols = sorted({s for b in bars_by_day.values() for s in b})
         self._rules = build_rules(symbols, self.ruleset, self._meta)
-        self.broker = Broker(self._rules, self.slippage)
+        self.broker = Broker(self._rules, self.slippage, price_mode=self.cfg.price_mode)
         self.account = Account(cash=self.cfg.initial_cash)
 
         res = BacktestResult()
@@ -273,10 +273,11 @@ class Engine:
             if qty > 0:
                 orders.append(self._order(sym, Side.SELL, qty))
 
-        if self.cfg.price_mode == "next_open":
+        if self.cfg.price_mode in ("next_open", "next_vwap", "next_close"):
+            # T 日收盘生成信号，推迟到 T+1 按对应成交价撮合 —— 防未来函数
             self._pending = orders
         else:
-            # 当日收盘成交（默认不用，仅做对照实验）
+            # same_close：T 日收盘成交（危险，仅研究对照）
             assert self.broker is not None
             for o in orders:
                 bar = bars.get(o.symbol)

@@ -109,6 +109,15 @@ DDL_STATEMENTS: list[str] = [
     CREATE TABLE IF NOT EXISTS industry_classify (
         symbol VARCHAR, std VARCHAR, code VARCHAR, name VARCHAR,
         std_date DATE,             -- 生效日：防止用今天的分类回测十年前
+        source VARCHAR,
+        PRIMARY KEY (symbol, std_date)                -- 同日内重投→OR REPLACE，幂等
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS index_cons (
+        index_code VARCHAR, symbol VARCHAR,
+        weight DOUBLE,          -- 成分权重（%）；公开文件只有部分指数会给
+        eff_date DATE,          -- 生效日：用真实成分公布日，不用今天的成分回测十年前
         source VARCHAR
     )
     """,
@@ -233,6 +242,22 @@ def ensure_factor_def(con) -> int:
     con.execute(f"INSERT INTO factor_def (name, expression, enabled, created_at) "
                 f"SELECT {select_cols} FROM factor_def_old")
     con.execute("DROP TABLE factor_def_old")
+    return 1
+
+
+def ensure_classify_snapshots(con) -> int:
+    """industry_classify 主键迁移：老库无 PK → 重建立 (symbol, std_date)。
+
+    申万分类表是 ingest 可重刷的小参考表，直接删表重建无损（同 collect_log 先例）。
+    不加这个，老库上 _upsert 无 PK 分支会因没有 epoch 键而退化成语义错误的「纯追加」，
+    重投一次胖一轮。返回是否重排了。
+    """
+    cols = con.execute("DESCRIBE industry_classify").fetchall()
+    if any(r[3] == "PRI" for r in cols):
+        return 0
+    con.execute("DROP TABLE industry_classify")
+    new_ddl = next(s for s in DDL_STATEMENTS if "CREATE TABLE IF NOT EXISTS industry_classify" in s)
+    con.execute(new_ddl)
     return 1
 
 

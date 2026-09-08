@@ -229,16 +229,16 @@ def test_slippage_monotonicity():
 
 
 def test_next_open_fill_price_and_delay():
-    """next_open：成交价必须等于次日开盘价（零滑点）；close 模式等于当日收盘。"""
+    """next_open：成交价必须等于次日开盘价（零滑点）；same_close 当日收盘成交。"""
     eng, res = run_golden()
     f = res.trades[0]
     assert f.trade_date == date(2026, 1, 6) and f.price == pytest.approx(9.9)
 
     cfg = EngineConfig(initial_cash=1_000_000, slippage="none", cash_buffer=0.0,
-                       min_order_value=50_000, participation=0.5, price_mode="close")
+                       min_order_value=50_000, participation=0.5, price_mode="same_close")
     res_c = Engine(BuyA(), ruleset=zero_fee_ruleset(), config=cfg).run(golden_df())
     fc = res_c.trades[0]
-    assert fc.trade_date == date(2026, 1, 5)          # 当日收盘成交（对照模式）
+    assert fc.trade_date == date(2026, 1, 5)          # 当日收盘成交（危险，仅研究对照）
     assert fc.price == pytest.approx(10.0)
 
 
