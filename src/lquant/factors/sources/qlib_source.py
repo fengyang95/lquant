@@ -50,7 +50,7 @@ def _rename_ops(node: Node) -> Node:
 
 def _preprocess(src: str) -> str:
     """$vwap 代理替换（qlib 的 $vwap = amount/volume 口径）+ 注释剥离。"""
-    s = src.split("#")[0].strip()
+    s = src.split("#", maxsplit=1)[0].strip()
     s = s.replace("$vwap", "($amount/$volume)")
     return s
 

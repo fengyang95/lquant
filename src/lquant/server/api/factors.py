@@ -182,6 +182,7 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
     import math
 
     import numpy as np
+
     from lquant.factors.evaluate import ic_by_year, ic_series, quantile_nav, quantile_summary
     from lquant.factors.evaluate.decay import decay_profile
 
@@ -361,10 +362,7 @@ def mine_run(req: dict) -> dict:
     import datetime as dt
     import uuid
 
-    import polars as pl
-
     from lquant.core.db import writer
-
     from lquant.data.store.parquet import read_daily
     from lquant.factors.agents import find_agent
     from lquant.factors.engine import FactorEngine
@@ -401,7 +399,7 @@ def mine_run(req: dict) -> dict:
                 [run_id, agent_name, generator, res.n_evaluated, res.n_static_fail,
                  res.n_redundant, res.n_size_proxy, res.n_survivors,
                  str(res.corrections)[:10000], dt.datetime.now()])
-    except Exception as e:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         pass  # 记账失败不阻断结果
     return {"run_id": run_id, "agent": agent_name, "generator": generator,
             "n_evaluated": res.n_evaluated, "n_static_fail": res.n_static_fail,

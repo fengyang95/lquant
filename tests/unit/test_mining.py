@@ -7,9 +7,8 @@ import numpy as np
 import polars as pl
 import pytest
 
-from lquant.core.errors import FactorError
 from lquant.factors.mining.fitness import corrected_threshold, fitness
-from lquant.factors.mining.gates import g0_static, g1_fast_screen
+from lquant.factors.mining.gates import g0_static
 from lquant.factors.mining.random_gen import make_generator
 from lquant.factors.mining.runner import run_session, split_dates
 from lquant.factors.ops import cs_ops, el_ops, ts_ops  # noqa: F401

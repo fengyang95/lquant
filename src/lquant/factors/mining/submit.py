@@ -60,10 +60,8 @@ def _split_eval(df, cov_cols, expr):
 def verify_and_register(spec: dict) -> tuple[bool, dict]:
     """重验入口：G0 -> 重算 -> 对照 claimed -> 分级 -> 入库/归档。"""
     from lquant.data.store.catalog import upsert
-    from lquant.factors.dsl.analyzer import check as dsl_check
-    from lquant.factors.dsl.parser import parse
-    from lquant.factors.evaluate.ic import _t_stat as tstat
     from lquant.factors.dsl.printer import canonical_id
+    from lquant.factors.evaluate.ic import _t_stat as tstat
 
     expr = spec["expr"]
     name = spec.get("name") or "cand_" + canonical_id(expr)

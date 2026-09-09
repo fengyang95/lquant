@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import polars as pl
 
-from lquant.core.errors import FactorError
 from lquant.core.registry import Registry
 
 PROVIDERS: Registry = Registry("covariate_providers")

@@ -9,7 +9,6 @@ import random
 from lquant.factors.dsl.ast_nodes import BinaryOp, Call, Field, Num, UnaryOp
 from lquant.factors.dsl.parser import parse
 from lquant.factors.dsl.printer import unparse
-from lquant.factors.mining.random_gen import _expr as _rand_expr
 
 
 class GPGenerator:

@@ -5,12 +5,12 @@
 """
 from __future__ import annotations
 
-import datetime as dt
 from dataclasses import dataclass, field
 
 import polars as pl
 
-from lquant.factors.evaluate.ic import _t_stat as tstat, ic_series
+from lquant.factors.evaluate.ic import _t_stat as tstat
+from lquant.factors.evaluate.ic import ic_series
 from lquant.factors.mining.fitness import corrected_threshold
 from lquant.factors.mining.gates import GateResult, g0_static, g1_fast_screen, g2_dedup
 

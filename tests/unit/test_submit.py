@@ -5,7 +5,6 @@ import datetime as dt
 
 import numpy as np
 import polars as pl
-import pytest
 
 
 def _panel(n_days=120, n_sym=8):

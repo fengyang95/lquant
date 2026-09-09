@@ -83,7 +83,6 @@ def g1_fast_screen(train, expr, ret_col, engine, covs=None, min_abs_ic=0.02):
 
 def g2_dedup(train_values, expr, survivors, engine, max_corr=0.7):
     """G2 去重：与幸存者相关性 |rho| >= max_corr 淘汰（方案 3.2: |rho|<0.7）。"""
-    import numpy as np
 
     from lquant.factors.analysis import correlation
 

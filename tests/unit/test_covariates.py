@@ -8,9 +8,7 @@ import polars as pl
 import pytest
 
 from lquant.core.errors import FactorError
-from lquant.factors.covariates import build_covariates, PROVIDERS
-from lquant.factors.evaluate import forward_return
-from lquant.factors.evaluate.ic import ic_series
+from lquant.factors.covariates import build_covariates
 from lquant.factors.ops import cs_ops, el_ops, ts_ops  # noqa: F401
 from lquant.factors.preprocess.pipeline import run as pipeline_run
 

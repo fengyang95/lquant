@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 
 def test_explore_two_stage_seeds_gp():
     from lquant.factors.mining.explore import make_explorer
@@ -17,9 +15,10 @@ def test_explore_two_stage_seeds_gp():
 
 
 def test_load_spec_fail_fast():
-    from lquant.factors.replication import load_spec
+    import os
+    import tempfile
 
-    import tempfile, os
+    from lquant.factors.replication import load_spec
     content = """
 name: t_spec
 expr: "Rank(Ts_Mean($close,5))"
@@ -42,7 +41,6 @@ def test_attribute_codes():
 
 
 def tmp_jsonl() -> str:
-    import os
     import tempfile
 
     fp = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
