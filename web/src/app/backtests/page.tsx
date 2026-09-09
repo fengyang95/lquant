@@ -7,6 +7,7 @@
 
 import { useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import useSWR from 'swr';
 import Chart from '@/components/Chart';
 import { Panel } from '@/components/Panel';
@@ -25,6 +26,15 @@ type RunRow = {
   metrics: Record<string, number>;
   created_at: string;
 };
+
+type StrategyMeta = {
+  id?: string;
+  name: string;
+  source: 'builtin' | 'user';
+  description?: string;
+};
+
+type RunCodeResult = { run_id: string };
 
 type CompareResult = {
   runs: { run_id: string; label: string; metrics: Record<string, number> }[];
@@ -46,6 +56,32 @@ export default function BacktestsPage() {
   const [picked, setPicked] = useState<string[]>([]);
   const [cmp, setCmp] = useState<CompareResult | null>(null);
   const [cmpBusy, setCmpBusy] = useState(false);
+  // 策略库运行
+  const { data: strategies } = useSWR<StrategyMeta[]>('/strategies', get);
+  const userStrategies = (strategies ?? []).filter((s) => s.source === 'user');
+  const [strategyId, setStrategyId] = useState('');
+  const [runStrategyBusy, setRunStrategyBusy] = useState(false);
+  const router = useRouter();
+
+  async function runStrategy() {
+    if (!strategyId) return;
+    setRunStrategyBusy(true);
+    setErr('');
+    try {
+      const detail = await get<{ source: string; benchmark?: string }>(`/strategies/${strategyId}`);
+      const r = await post<RunCodeResult>('/backtests/run-code', {
+        code: detail.source,
+        start: '2024-01-01',
+        end: '2024-12-31',
+        strategy_id: strategyId,
+      });
+      router.push(`/backtests/${r.run_id}`);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRunStrategyBusy(false);
+    }
+  }
 
   function toggle(id: string) {
     setCmp(null);
@@ -126,6 +162,40 @@ export default function BacktestsPage() {
             {busy ? '回测中…' : '运行回测'}
           </button>
         </div>
+      </Panel>
+
+      {/* 策略库运行入口 */}
+      <Panel title="从策略库运行" meta="自定义 Python 策略">
+        {userStrategies.length === 0 ? (
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-xs text-ink-faint">策略库还是空的 —— 先到编辑器保存一个策略</span>
+            <Link href="/strategies/editor" className="btn btn-sm btn-primary">
+              打开策略编辑器
+            </Link>
+          </div>
+        ) : (
+          <div className="flex flex-wrap items-end gap-3">
+            <label className="text-sm">
+              <div className="mb-1 text-xs text-ink-faint">用户策略</div>
+              <select value={strategyId} onChange={(e) => setStrategyId(e.target.value)} className="input w-56">
+                <option value="">选择策略…</option>
+                {userStrategies.map((s) => (
+                  <option key={s.id} value={s.id}>{s.name}</option>
+                ))}
+              </select>
+            </label>
+            <button
+              onClick={runStrategy}
+              disabled={!strategyId || runStrategyBusy}
+              className="btn btn-accent"
+            >
+              {runStrategyBusy ? '运行中…' : '运行策略'}
+            </button>
+            <Link href="/strategies/editor" className="btn btn-sm">
+              编辑器
+            </Link>
+          </div>
+        )}
       </Panel>
 
       {/* 回测记录 */}

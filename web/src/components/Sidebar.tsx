@@ -18,6 +18,7 @@ const GROUPS: { label: string; items: { href: string; label: string }[] }[] = [
     items: [
       { href: '/factors', label: '因子' },
       { href: '/backtests', label: '回测' },
+      { href: '/strategies/editor', label: '策略编辑' },
       { href: '/paper', label: '模拟盘' },
     ],
   },
