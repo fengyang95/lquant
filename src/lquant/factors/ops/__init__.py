@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from lquant.factors.ops import cs_ops, ts_ops  # noqa: F401  触发注册
+from lquant.factors.ops import cs_ops, el_ops, ts_ops  # noqa: F401  触发注册
 from lquant.factors.ops.registry import OPS, op
 
 try:  # Rust 算子可用时覆盖同名实现，失败则静默降级
