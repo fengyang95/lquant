@@ -5,6 +5,7 @@ FakeProvider 通过 tmp config_dir 的 daily_bar.yaml 走真实 load/apply 管�
 """
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -97,3 +98,85 @@ def test_post_normalize_hook(tmp_path: Path) -> None:
 
     out = Hooked().request("daily_bar", config_dir=_make_config(tmp_path))
     assert out["hook"].to_list() == ["hooked", "hooked"]
+
+
+MINUTE_YAML = """
+sources:
+  fake:
+    rename:
+      code: symbol
+      o: open
+      h: high
+      l: low
+      c: close
+    derive:
+      ts: "strptime(d, '%Y-%m-%d %H:%M')"
+    fill:
+      freq: 1min
+"""
+
+
+def _make_minute_config(tmp_path: Path) -> Path:
+    (tmp_path / "schema").mkdir(exist_ok=True)
+    (tmp_path / "schema" / "minute_bar.yaml").write_text(MINUTE_YAML, encoding="utf-8")
+    return tmp_path
+
+
+# ---------- fix round 1：params 分离（fill 白名单） ----------
+
+def test_request_freq_injects_minute_bar(tmp_path: Path) -> None:
+    minute_raw = {
+        "d": ["2024-01-02 09:30", "2024-01-02 09:31"],
+        "code": ["000001.SZ", "000002.SZ"],
+        "o": [10.0, 11.0],
+        "h": [10.5, 11.5],
+        "l": [9.8, 10.8],
+        "c": [10.2, 11.2],
+    }
+    out = FakeProvider(minute_raw).request(
+        "minute_bar", freq="5min", config_dir=_make_minute_config(tmp_path)
+    )
+    assert out["freq"].to_list() == ["5min", "5min"]
+
+
+def test_request_freq_on_daily_bar_raises(tmp_path: Path) -> None:
+    """daily_bar 无 freq 列：显式传 freq 必须 fail-fast，不得静默。"""
+    with pytest.raises(MappingError, match="freq"):
+        FakeProvider().request("daily_bar", freq="5min", config_dir=_make_config(tmp_path))
+
+
+def test_request_fetch_params_not_fill(tmp_path: Path) -> None:
+    """symbols/start/end 等 canonical fetch 参数绝不进入 fill，也不报错。"""
+    captured: dict[str, Any] = {}
+
+    class Recording(FakeProvider):
+        def _fetch_raw(self, table: str, **params: Any) -> pl.DataFrame:
+            captured.update(params)
+            return pl.DataFrame(self._raw)
+
+    out = Recording().request(
+        "daily_bar",
+        symbols=["000001.SZ", "000002.SZ"],
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 3),
+        config_dir=_make_config(tmp_path),
+    )
+    # 全部 params 到达 _fetch_raw
+    assert captured["symbols"] == ["000001.SZ", "000002.SZ"]
+    assert captured["start"] == date(2024, 1, 1)
+    assert captured["end"] == date(2024, 1, 3)
+    # 数据两行、真实 symbol 列未被 pl.lit 常量压扁
+    assert out["symbol"].to_list() == ["000001.SZ", "000002.SZ"]
+    assert out["amount"].to_list() == [30000.0, 31000.0]
+
+
+def test_request_raw_passthrough(tmp_path: Path) -> None:
+    """_raw 直传：_fetch_raw 不被调用，直接走映射管线。"""
+    raw = pl.DataFrame(GOOD_RAW)
+
+    class NoFetch(FakeProvider):
+        def _fetch_raw(self, table: str, **params: Any) -> pl.DataFrame:
+            raise AssertionError("_fetch_raw 不应在 _raw 直传时被调用")
+
+    out = NoFetch().request("daily_bar", _raw=raw, config_dir=_make_config(tmp_path))
+    assert out["amount"].to_list() == [30000.0, 31000.0]

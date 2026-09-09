@@ -10,18 +10,26 @@ mapping.yaml + 本引擎统一处理，避免每个 adapter 重复写归一化�
 from __future__ import annotations
 
 from abc import abstractmethod
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 import polars as pl
 
+from lquant.core.errors import MappingError
 from lquant.data.base import DataProvider
 from lquant.data.mapping import apply_mapping, load_table_mapping
 from lquant.data.normalize import assert_ohlc, assert_plausible_prices
-from lquant.data.schema import coerce
+from lquant.data.schema import SCHEMAS, coerce
 
 # 需要执行价格/OHLC 质量断言的表
 _ASSERT_TABLES = frozenset({"daily_bar", "minute_bar"})
+
+# 允许作为 fill 覆盖注入 apply_mapping 的 params 白名单。
+# 其余 params（symbols/start/end 等）只传给 _fetch_raw ——
+# 否则恰为 schema 列名的 fetch 参数（如 symbol）会以 pl.lit 常量
+# 覆盖真实数据列，多票数据被静默压扁。
+_FILL_OVERRIDE_KEYS = frozenset({"freq", "sec_type"})
 
 
 class MappingProvider(DataProvider):
@@ -35,22 +43,30 @@ class MappingProvider(DataProvider):
         """拉取源始数据：返回**源列名**的 DataFrame，映射交给引擎。"""
 
     # ---- DataProvider 6 个核心方法的默认实现：具体 adapter 按能力覆写 ----
-    def daily_bars(self, symbols: list[str], start, end) -> pl.DataFrame:
+    def daily_bars(
+        self, symbols: list[str], start: date, end: date
+    ) -> pl.DataFrame:
         raise NotImplementedError(f"{self.name} 未实现 daily_bars")
 
-    def minute_bars(self, symbols: list[str], start, end, freq: str) -> pl.DataFrame:
+    def minute_bars(
+        self, symbols: list[str], start: date, end: date, freq: str
+    ) -> pl.DataFrame:
         raise NotImplementedError(f"{self.name} 未实现 minute_bars")
 
-    def adj_factors(self, symbols: list[str], start, end) -> pl.DataFrame:
+    def adj_factors(
+        self, symbols: list[str], start: date, end: date
+    ) -> pl.DataFrame:
         raise NotImplementedError(f"{self.name} 未实现 adj_factors")
 
-    def financial_pit(self, symbols: list[str], start, end) -> pl.DataFrame:
+    def financial_pit(
+        self, symbols: list[str], start: date, end: date
+    ) -> pl.DataFrame:
         raise NotImplementedError(f"{self.name} 未实现 financial_pit")
 
     def securities(self) -> pl.DataFrame:
         raise NotImplementedError(f"{self.name} 未实现 securities")
 
-    def trade_calendar(self, start, end) -> pl.DataFrame:
+    def trade_calendar(self, start: date, end: date) -> pl.DataFrame:
         raise NotImplementedError(f"{self.name} 未实现 trade_calendar")
 
     def _post_normalize(self, df: pl.DataFrame, table: str) -> pl.DataFrame:
@@ -66,8 +82,12 @@ class MappingProvider(DataProvider):
     ) -> pl.DataFrame:
         """取数主流程：raw → mapping → coerce → 质量断言 → hook。
 
-        params 中的 freq / sec_type 等键会覆盖 yaml fill；
-        ``_raw`` 参数可直接注入已取好的源数据（测试/缓存场景）；
+        params 分离：
+        - ``_raw``：直接注入已取好的源数据（测试/缓存场景），不走 _fetch_raw
+        - 白名单键（freq / sec_type）：作为 fill 覆盖传给 apply_mapping，
+          仅当目标表确有该 schema 列；否则 fail-fast 抛 MappingError
+        - 其余（symbols/start/end 等 canonical fetch 参数）：只传给 _fetch_raw，
+          绝不进入 mapping fill，防止常量覆盖真实数据列
         ``config_dir`` 仅用于定位 mapping yaml，不参与 fill。
         """
         raw = params.pop("_raw") if "_raw" in params else self._fetch_raw(
@@ -76,7 +96,16 @@ class MappingProvider(DataProvider):
         tm = load_table_mapping(
             table, self.source or self.name, config_dir=config_dir
         )
-        out = apply_mapping(raw, tm, params)
+        fill_overrides = {
+            k: v for k, v in params.items()
+            if k in _FILL_OVERRIDE_KEYS and k in SCHEMAS[table]
+        }
+        for k in _FILL_OVERRIDE_KEYS & params.keys():
+            if k not in SCHEMAS[table]:
+                raise MappingError(
+                    f"{table} 无 {k!r} 列，不能作为 fill 覆盖传入 request"
+                )
+        out = apply_mapping(raw, tm, fill_overrides)
         out = coerce(out, table)
         if table in _ASSERT_TABLES:
             assert_plausible_prices(out)
