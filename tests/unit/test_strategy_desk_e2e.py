@@ -67,23 +67,27 @@ def analyze(result):
 def api_env(tmp_path_factory):
     """chdir 到 tmp 目录，用 generate_demo 造一份自包含合成数据环境。"""
     base = tmp_path_factory.mktemp("strategy_desk_e2e")
+    prev_cwd = os.getcwd()
     os.chdir(base)
-    from lquant.core.config import get_settings
+    try:
+        from lquant.core.config import get_settings
 
-    get_settings.cache_clear()
+        get_settings.cache_clear()
 
-    from lquant.core.db import writer
-    from lquant.data.ingest.demo import generate_demo
-    from lquant.market.schema import ensure_market_tables
+        from lquant.core.db import writer
+        from lquant.data.ingest.demo import generate_demo
+        from lquant.market.schema import ensure_market_tables
 
-    from lquant.data.store.ddl import DDL_STATEMENTS
-    with writer() as con:                # startup 前手动建库 + 看板表
-        for stmt in DDL_STATEMENTS:
-            con.execute(stmt)
-        ensure_market_tables(con)
-    generate_demo(start="2024-01-01", end="2026-06-30")
-    yield base
-    get_settings.cache_clear()
+        from lquant.data.store.ddl import DDL_STATEMENTS
+        with writer() as con:                # startup 前手动建库 + 看板表
+            for stmt in DDL_STATEMENTS:
+                con.execute(stmt)
+            ensure_market_tables(con)
+        generate_demo(start="2024-01-01", end="2026-06-30")
+        yield base
+        get_settings.cache_clear()
+    finally:
+        os.chdir(prev_cwd)
 
 
 @pytest.fixture(scope="module")

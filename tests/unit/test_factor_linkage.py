@@ -66,6 +66,59 @@ def test_panel_invalid_formula_raises_valueerror():
         compute_factor_columns(make_df(), ["not_exist_99"])
 
 
+# ---------------------------------------------------------------- 捷径公式
+
+
+def test_panel_shortcut_pct_change_20():
+    """编辑器模板默认公式 pct_change_20：与 factors.py 捷径口径一致。"""
+    df, colmap = compute_factor_columns(make_df(), ["pct_change_20"])
+    assert colmap == {"pct_change_20": "_f_pct_change_20"}
+    row = df.filter(pl.col("symbol") == "600000.SH").sort("trade_date")
+    vals = row["_f_pct_change_20"].to_list()
+    assert vals[25] == pytest.approx(1.02**20 - 1)  # 第 26 行起窗口填满
+    assert vals[0] is None  # 首行无前值 → null
+
+
+def test_panel_shortcut_turnover():
+    df, colmap = compute_factor_columns(make_df(), ["turnover"])
+    assert colmap == {"turnover": "_f_turnover"}
+    src = make_df().sort(["symbol", "trade_date"])
+    assert df["_f_turnover"][0] == pytest.approx(src["amount"][0] / 1e8)
+
+
+def test_panel_shortcut_rolling_std():
+    df, colmap = compute_factor_columns(make_df(), ["rolling_std_5"])
+    assert colmap == {"rolling_std_5": "_f_rolling_std_5"}
+    assert df["_f_rolling_std_5"].null_count() < len(df)
+
+
+# ---------------------------------------------------------------- NaN 卫生
+
+
+def test_factor_panels_drop_nan():
+    """面板构建剔除 NaN 值：停牌/缺行情产生的 NaN 不进 get_factor_values。"""
+    df = make_df()
+    dirty = df.with_columns(
+        pl.when(pl.col("symbol") == "000001.SZ")
+        .then(pl.lit(float("nan"))).otherwise(pl.col("close")).alias("close")
+    )
+    r = JQRunner("def handle_data(c, d):\n    pass\n",
+                 factor_formulas=["pct_change_5"])
+    panels = r._build_factor_panels(dirty)
+    assert panels and all(
+        v == v for vals in panels.values() for v in vals.values()  # NaN == NaN 为 False
+    )
+
+
+def test_record_skips_non_finite():
+    """record(NaN/Inf) 静默跳过，不污染曲线序列。"""
+    r = JQRunner("def handle_data(c, d):\n    pass\n")
+    r._today = date(2026, 1, 5)
+    r._record({"ok": 1.0, "nan": float("nan"), "inf": float("inf"), "bad": None})
+    assert [k for k in r.res.records] == ["ok"]
+    assert r.res.records["ok"] == [(date(2026, 1, 5), 1.0)]
+
+
 # ---------------------------------------------------------------- JQ API
 
 

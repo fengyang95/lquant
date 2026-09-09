@@ -17,23 +17,27 @@ pytestmark = pytest.mark.usefixtures("api_env")
 @pytest.fixture(scope="module")
 def api_env(tmp_path_factory):
     base = tmp_path_factory.mktemp("strategy_api")
+    prev_cwd = os.getcwd()
     os.chdir(base)
-    from lquant.core.config import get_settings
+    try:
+        from lquant.core.config import get_settings
 
-    get_settings.cache_clear()
+        get_settings.cache_clear()
 
-    from lquant.core.db import writer
-    from lquant.data.ingest.demo import generate_demo
-    from lquant.data.store.ddl import DDL_STATEMENTS
-    from lquant.market.schema import ensure_market_tables
+        from lquant.core.db import writer
+        from lquant.data.ingest.demo import generate_demo
+        from lquant.data.store.ddl import DDL_STATEMENTS
+        from lquant.market.schema import ensure_market_tables
 
-    with writer() as con:
-        for stmt in DDL_STATEMENTS:
-            con.execute(stmt)
-        ensure_market_tables(con)
-    generate_demo(start="2024-01-01", end="2026-06-30")
-    yield base
-    get_settings.cache_clear()
+        with writer() as con:
+            for stmt in DDL_STATEMENTS:
+                con.execute(stmt)
+            ensure_market_tables(con)
+        generate_demo(start="2024-01-01", end="2026-06-30")
+        yield base
+        get_settings.cache_clear()
+    finally:
+        os.chdir(prev_cwd)
 
 
 @pytest.fixture(scope="module")
@@ -104,6 +108,16 @@ def test_strategy_crud_roundtrip_and_versions(client):
     # 软删 + 404
     assert client.delete(f"/api/strategies/{sid}").status_code == 200
     assert client.get(f"/api/strategies/{sid}").status_code == 404
+
+
+def test_strategy_put_on_deleted_404(client):
+    """PUT / DELETE 一个已软删的策略 id 不复活：一律 404。"""
+    sid = client.post("/api/strategies", json={"name": "s_dead", "source": GOOD_SRC}).json()["id"]
+    assert client.delete(f"/api/strategies/{sid}").status_code == 200
+    put = client.put(f"/api/strategies/{sid}", json={"source": GOOD_SRC + "# zombie"})
+    assert put.status_code == 404
+    delete = client.delete(f"/api/strategies/{sid}")
+    assert delete.status_code == 404
 
 
 def test_strategy_get_404(client):
