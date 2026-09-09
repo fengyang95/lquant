@@ -31,3 +31,15 @@ def test_missing_initialize():
 def test_require_initialize_false():
     src = "def analyze(result):\n    return []\n"
     assert validate_source(src, require_initialize=False) == []
+
+def test_relative_import_rejected():
+    errs = validate_source("from . import os", require_initialize=False)
+    assert errs and any("相对导入" in e for e in errs)
+
+def test_syntax_error_message_wellformed():
+    errs = validate_source("x = (", require_initialize=False)
+    assert errs and "None" not in errs[0]
+
+def test_relative_import_inside_function_rejected():
+    errs = validate_source("def f():\n    from .. import x\n", require_initialize=False)
+    assert any("相对导入" in e for e in errs)
