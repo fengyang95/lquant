@@ -38,7 +38,8 @@
 ### 无 Redis / 无 cargo 也能跑
 
 - **Redis 缺失**：任务队列自动降级为 API 进程内本地线程执行，启动不阻塞
-- **cargo 缺失**：Rust 扩展自动降级为纯 Python 参考实现（`src/lquant/_rust/*.py`）
+- **cargo 缺失**：自动安装 rustup（国内走 rsproxy 镜像，可用 `LQ_RUSTUP_DIST_SERVER` 覆盖）；
+  装不上才降级为纯 Python 参考实现（`src/lquant/_rust/*.py`）
 - 脚本默认走清华 PyPI 镜像 + npmmirror，可用 `LQ_PYPI_INDEX` / `LQ_NPM_REGISTRY` 覆盖
 
 ## 数据层速览

@@ -20,7 +20,7 @@
 #   - 国内镜像加速（清华 PyPI / npmmirror），可用环境变量覆盖
 #   - 无 uv 自动装 uv，装不上自动降级 python3 -m venv + pip
 #   - 无 Redis 不阻塞启动，任务队列自动降级为本地线程
-#   - 无 cargo 跳过 Rust 扩展（自动降级 Python 参考实现）
+#   - 无 cargo 自动装 rustup（装不上才跳过 Rust 扩展，降级 Python 参考实现）
 # ============================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -29,6 +29,9 @@ export PATH="$HOME/.local/bin:$PATH"   # uv 默认装在这里
 # ----------------------------- 可配置项 ------------------------------------
 PYPI_INDEX="${LQ_PYPI_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 NPM_REGISTRY="${LQ_NPM_REGISTRY:-https://registry.npmmirror.com}"
+# rustup 国内镜像（rsproxy），海外环境可 LQ_RUSTUP_DIST_SERVER=https://static.rust-lang.org 覆盖
+RUSTUP_DIST_SERVER="${LQ_RUSTUP_DIST_SERVER:-https://rsproxy.cn}"
+RUSTUP_UPDATE_ROOT="${LQ_RUSTUP_UPDATE_ROOT:-https://rsproxy.cn/rustup/dist}"
 API_PORT="${LQ_API_PORT:-8000}"
 WEB_PORT="${LQ_WEB_PORT:-3000}"
 PYTHON_MIN="3.12"
@@ -135,6 +138,40 @@ install_node_deps() {
     && mark_done "$RUN_DIR/npmdeps.sha" "${inputs[@]}"
 }
 
+ensure_rust() {  # 装好 cargo 返回 0；失败返回 1（调用方降级）
+  if command -v cargo >/dev/null 2>&1; then
+    dim "cargo 已就绪 ($(cargo --version 2>/dev/null))"
+    return 0
+  fi
+  # 已有 rustup toolchain（rustup-init 装到一半中断很常见）→ 直接挂 PATH 复用
+  local tcbin
+  for tcbin in "$HOME"/.rustup/toolchains/*/bin; do
+    [ -x "$tcbin/cargo" ] || continue
+    export PATH="$tcbin:$PATH"
+    dim "复用已有 Rust 工具链 ($(cargo --version 2>/dev/null || echo '?'))"
+    return 0
+  done
+  info "安装 Rust 工具链（rustup，失败自动换源，日志: $LOG_DIR/rustup-install.log）"
+  command -v curl >/dev/null 2>&1 || { warn "无 curl，无法自动安装 rustup"; return 1; }
+  local dist
+  for dist in "$RUSTUP_DIST_SERVER" "https://static.rust-lang.org"; do
+    if RUSTUP_DIST_SERVER="$dist" RUSTUP_UPDATE_ROOT="$dist/rustup/dist" \
+      curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable >>"$LOG_DIR/rustup-install.log" 2>&1; then
+      break
+    fi
+    warn "rustup 源不可用（$dist），换源重试"
+  done
+  # rustup 默认装在 ~/.cargo，当前 shell 需要 source env 才能找到
+  if [ -s "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+  export PATH="$HOME/.cargo/bin:$PATH"
+  if command -v cargo >/dev/null 2>&1; then
+    dim "rustup 就绪 ($(cargo --version 2>/dev/null))"
+    return 0
+  fi
+  warn "rustup 安装失败，跳过 Rust 扩展（自动降级 Python 参考实现，功能不受影响）"
+  return 1
+}
+
 start_redis() {
   REDIS_MODE="none"
   if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
@@ -234,12 +271,10 @@ cmd_install() {
   # 3) .env
   [ -f .env ] || { cp .env.example .env 2>/dev/null && dim "已生成 .env" || true; }
 
-  # 4) Rust 扩展（可选）
-  if command -v cargo >/dev/null 2>&1; then
+  # 4) Rust 扩展（可选，无 cargo 自动装 rustup）
+  if ensure_rust; then
     info "编译 Rust 扩展（可选加速）"
     bash scripts/build_rust.sh || warn "Rust 编译失败，自动降级 Python 参考实现"
-  else
-    dim "无 cargo，跳过 Rust（运行时自动降级 Python 参考实现，功能不受影响）"
   fi
 
   # 5) 前端
