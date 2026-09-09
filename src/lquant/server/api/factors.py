@@ -401,6 +401,29 @@ def list_agents() -> list[dict]:
     return [a.__dict__ for a in load_agents()]
 
 
+@router.get("/agents/{name}/guide")
+def agent_guide(name: str) -> dict:
+    """一次性接入指引（方案 6.4）：装 SKILL.md 走 CLI，lq agent test 验收。"""
+    from lquant.factors.agents import find_agent
+
+    a = find_agent(name)
+    if not a:
+        raise HTTPException(404, f"Agent 未注册: {name}")
+    return {
+        "agent": a.name, "kind": a.kind, "driver": a.driver,
+        "quota_eval": a.quota_eval, "can_submit": a.can_submit,
+        "steps": [
+            "1. 阅读 docs/agent-skill/SKILL.md（操作手册 + 纪律）",
+            "2. lq data fields —— 先看字段白名单与覆盖率",
+            "3. lq factor check \"<expr>\" —— G0 静态校验，永远第一步",
+            "4. lq factor eval \"<expr>\" --agent " + a.name + " —— 平台算指标",
+            "5. lq factor corr \"<e1>\" \"<e2>\" —— 提交前自查相关性",
+            "6. lq factor submit spec.yaml —— 唯一入库通道（服务端重验）",
+        ],
+        "acceptance": f"lq agent test {a.name} 必须通过",
+    }
+
+
 @router.post("/mine/run")
 def mine_run(req: dict) -> dict:
     """平台驱动挖掘会话（同步，有界预算）。请求: {agent, generator, n}。"""
