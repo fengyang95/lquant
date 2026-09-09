@@ -81,22 +81,6 @@ def _check_targets(
             )
 
 
-def _check_targets(
-    table: str,
-    source: str,
-    kind: str,
-    targets: Any,
-    schema_cols: set[str],
-) -> None:
-    """fail-fast：目标列不在 SCHEMAS[table] 中直接抛 MappingError。"""
-    for col in targets:
-        if col not in schema_cols:
-            raise MappingError(
-                f"{table}.yaml sources.{source}.{kind}: 目标列 {col!r}"
-                f" 不在 SCHEMAS[{table}] 中"
-            )
-
-
 def _coerce_derive_rule(target: str, raw: Any) -> DeriveRule:
     """derive 规则两种写法：字符串表达式 或 {expr, from} 显式形式。"""
     if isinstance(raw, dict):
@@ -346,3 +330,27 @@ def validate_table_config(table: str, path: Path) -> list[str]:
         safe_sec = sec if isinstance(sec, dict) else {}
         _validate_source(table, f"sources.{src}", safe_sec, schema_cols, errors)
     return errors
+
+
+def validate_all_mappings(config_dir: Path | None = None) -> None:
+    """启动校验：遍历 `<config_dir>/schema/*.yaml` 全量静态校验。
+
+    任何错误逐文件收集后一次性抛 MappingError（fail-fast），
+    信息含文件名与全部错误行。目录/文件缺失优雅通过 ——
+    schema 目录可能只有 daily_bar/minute_bar 两份配置。
+    """
+    if config_dir is None:
+        config_dir = get_settings().config_dir
+    schema_dir = Path(config_dir) / "schema"
+    if not schema_dir.is_dir():
+        return
+    all_errors: list[str] = []
+    for path in sorted(schema_dir.glob("*.yaml")):
+        errs = validate_table_config(path.stem, path)
+        if errs:
+            all_errors.extend(f"{path.name}: {e}" for e in errs)
+    if all_errors:
+        raise MappingError(
+            f"映射配置校验失败（{len(all_errors)} 处），拒绝启动:\n"
+            + "\n".join(all_errors)
+        )

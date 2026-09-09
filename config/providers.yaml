@@ -70,6 +70,17 @@ providers:
     capability: [adj_factor]
     note: 复权因子源（hfq.js），端点无常量契约（实验性）
 
+  - name: tickdb
+    enabled: false   # 预留：未实现，勿启用
+    module: lquant.data.providers.tickdb
+    cls: TickdbProvider
+    qps: 0
+    capability: [tick]
+    note: >-
+      预留位。接入 = 两步：config/schema/<table>.yaml 加对应 sources.tickdb 映射节 +
+      实现 lquant/data/providers/tickdb.py（继承 MappingProvider 的薄类，仅写 _fetch_raw）。
+      _import_all 刻意不加载本模块（无实现文件，import 失败会被吞掉，明确不加避免噪音）。
+
 crosscheck:
   enabled: true
   # 一个源为主，比对只用于标记与降级，绝不用于取值

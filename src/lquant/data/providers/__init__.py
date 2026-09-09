@@ -15,7 +15,7 @@ PROVIDERS: Registry[type[DataProvider]] = Registry("providers")
 
 
 def _import_all() -> None:
-    import importlib
+    import importlib  # noqa: PLC0415
 
     for mod in ("baostock", "akshare", "efinance", "hithink", "sina", "tencent", "tushare"):
         # 已注册的源跳过重复 import：sys.modules 被测试 pop 后再 import
@@ -35,9 +35,15 @@ a718df (feat: tushare 完整接入声明式映射机制)
 
 @lru_cache(maxsize=1)
 def build_chain() -> FallbackProvider:
-    """按 config/providers.yaml 顺序构建 Fallback 链。"""
-    from lquant.data.ratelimit import TokenBucket
+    """按 config/providers.yaml 顺序构建 Fallback 链。
 
+    构建前对 config/schema/*.yaml 全量静态校验：映射错误启动即抛
+    （fail-fast），绝不带着坏映射静默取数。
+    """
+    from lquant.core.config import get_settings  # noqa: PLC0415
+    from lquant.data.mapping import validate_all_mappings  # noqa: PLC0415
+
+    validate_all_mappings(get_settings().config_dir)
     _import_all()
     cfg = load_providers()
     chain: list[DataProvider] = []
