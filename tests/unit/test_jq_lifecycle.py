@@ -88,3 +88,19 @@ def before_trading_start(context):
     res = JQRunner(code, initial_cash=1_000_000).run(make_df())
     assert res.error is not None
     assert "boom" in res.error
+
+
+def test_after_trading_end_close_bucket():
+    """after_trading_end 在 close 时点跑：current_dt 15:00，且 record 用同日。"""
+    code = """
+def after_trading_end(context):
+    record(px=context._r._ref_price('600519.SH'),
+           hour=context.current_dt.hour)
+"""
+    res = JQRunner(code, initial_cash=1_000_000).run(make_df())
+    assert res.error is None
+    rec = res.records["hour"]
+    assert [d for d, _ in rec] == DATES
+    assert all(v == 15 for _, v in rec)              # close 桶 → 15:00
+    # close 桶参考价 = 收盘价（100 → 101），record 记同日
+    assert res.records["px"] == [(DATES[0], 100.0), (DATES[1], 101.0)]

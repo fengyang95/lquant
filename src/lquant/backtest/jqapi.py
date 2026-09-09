@@ -749,9 +749,6 @@ class JQRunner:
         self.res.positions[d] = {
             s: p.qty for s, p in self.account.positions.items() if p.qty}
 
-        self._finalize()
-        return self.res
-
     def _finalize(self) -> None:
         rets = [self.res.nav[i][1] / self.res.nav[i - 1][1] - 1
                 for i in range(1, len(self.res.nav)) if self.res.nav[i - 1][1] > 0]
