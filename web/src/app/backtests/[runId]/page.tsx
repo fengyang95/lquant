@@ -16,8 +16,13 @@ import PageHeader from '@/components/PageHeader';
 import { Loading } from '@/components/States';
 import { get } from '@/lib/api';
 import { C, axes, legend, tooltip } from '@/lib/chart';
+import { customChartOption, recordChartOption } from '@/lib/backtestDetail';
 
 type NavPt = { date: string; nav: number; drawdown: number | null };
+type RecordPt = { date: string; value: number };
+type CustomAnalysisItem =
+  | { type: 'chart'; title?: string; data: Record<string, unknown>[]; x: string; ys: string[] }
+  | { type: 'table'; title?: string; columns: string[]; rows: unknown[][] };
 type Detail = {
   run_id: string; strategy: string; params: Record<string, unknown>; status: string;
   metrics: Record<string, number>;
@@ -32,6 +37,9 @@ type Detail = {
     alpha_annual?: number; beta?: number; information_ratio?: number | null;
     tracking_error?: number; excess_return?: number; benchmark?: string;
   };
+  records?: { [key: string]: RecordPt[] };
+  logs?: string[];
+  custom_analysis?: CustomAnalysisItem[];
 };
 type Attribution = {
   stock_contribution: { top: { symbol: string; contribution: number }[]; bottom: { symbol: string; contribution: number }[]; n_stocks: number };
@@ -270,6 +278,59 @@ export default function BacktestDetailPage() {
           <Panel title="净值与超额收益">
             {benchOption && <Chart option={benchOption} height={380} />}
           </Panel>
+          {Object.entries(d.records ?? {}).map(([key, pts]) => {
+            const opt = recordChartOption(key, pts);
+            return opt ? (
+              <Panel key={key} title={`自定义曲线 · ${key}`}>
+                <Chart option={opt} height={200} />
+              </Panel>
+            ) : null;
+          })}
+          {(d.custom_analysis?.length ?? 0) > 0 && (
+            <Panel title="自定义分析">
+              <div className="space-y-5">
+                {d.custom_analysis!.map((item, i) =>
+                  item.type === 'chart' ? (
+                    (() => {
+                      const opt = customChartOption(item);
+                      return opt ? (
+                        <div key={i}>
+                          {item.title && <div className="mb-1 text-xs text-ink-dim">{item.title}</div>}
+                          <Chart option={opt} height={240} />
+                        </div>
+                      ) : null;
+                    })()
+                  ) : item.columns?.length ? (
+                    <div key={i}>
+                      {item.title && <div className="mb-1 text-xs text-ink-dim">{item.title}</div>}
+                      <table className="table-dense text-xs">
+                        <thead>
+                          <tr>{item.columns.map((c) => <th key={c} className="text-left">{c}</th>)}</tr>
+                        </thead>
+                        <tbody>
+                          {item.rows.map((row, ri) => (
+                            <tr key={ri} className="hover:bg-white">
+                              {row.map((cell, ci) => <td key={ci}>{String(cell ?? '--')}</td>)}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : null,
+                )}
+              </div>
+            </Panel>
+          )}
+          {(d.logs?.length ?? 0) > 0 && (
+            <details className="rounded-[2px] border border-line bg-panel px-4 py-3">
+              <summary className="cursor-pointer text-sm font-medium text-ink-dim">
+                运行日志（{d.logs!.length} 条）
+              </summary>
+              <pre className="mt-2 max-h-[320px] overflow-auto text-xs leading-5 text-ink-dim">
+                {d.logs!.join('\n')}
+              </pre>
+            </details>
+          )}
           <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
             {monthlyOption && (
               <Panel title="月度收益热力（%）">
