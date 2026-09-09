@@ -49,6 +49,7 @@ from lquant.backtest.metrics import perf_from_returns, turnover_from_trades
 from lquant.backtest.rules.model import Commission, TaxSchedule
 from lquant.backtest.slippage import PctSlippage, TickSlippage
 from lquant.core.types import parse_symbol
+from lquant.factors.panel import compute_factor_columns
 
 __all__ = ["JQRunner", "JQResult"]
 
@@ -292,12 +293,14 @@ class JQRunner:
 
     def __init__(self, code: str, *, initial_cash: float = 1_000_000.0,
                  benchmark: str = "000300.SH", rebalance: str = "none",
-                 participation: float = 0.1, ruleset=None) -> None:
+                 participation: float = 0.1, ruleset=None,
+                 factor_formulas: list[str] | None = None) -> None:
         self.code = code
         self.initial_cash = initial_cash
         self.default_benchmark = benchmark
         self._ruleset = ruleset
         self._participation = participation
+        self._factor_formulas = [str(f) for f in (factor_formulas or [])]
 
         # 运行期状态
         self.account = Account(cash=initial_cash)
@@ -310,6 +313,7 @@ class JQRunner:
         self._day_index = 0
         self._dates: list[date] = []
         self._bars_by_day: dict[date, dict[str, Bar]] = {}
+        self._factor_panels: dict[str, dict[tuple[date, str], float]] = {}
 
         # 用户代码命名空间（exec 共享 globals，模块级变量等价聚宽的 g.*）
         self.ns: dict = {"__name__": "__jq__", "g": type("G", (), {})()}
@@ -436,6 +440,7 @@ class JQRunner:
             record=lambda **kv: r._record(kv),
             get_current_data=get_current_data, history=history,
             attribute_history=attribute_history, get_price=get_price,
+            get_factor_values=r._get_factor_values,
             get_all_securities=get_current_user_query_result,
             get_Ashares=get_current_user_query_result,
             FixedSlippage=FixedSlippage, PriceRelatedSlippage=PriceRelatedSlippage,
@@ -666,12 +671,48 @@ class JQRunner:
 
     # ---- 主循环 ----
 
+    def _get_factor_values(self, formula: str, security_list=None,
+                           count: int = 1) -> dict[str, list[float]]:
+        """聚宽 get_factor_values：{security: [值...]}，严格截至当日（无未来函数）。"""
+        f = str(formula).upper()
+        panel = self._factor_panels.get(f)
+        if panel is None:
+            raise ValueError(f"因子 {formula} 未注册（回测请求需带 factor_formulas）")
+        secs = [str(s) for s in (security_list or sorted(self._bars_today))]
+        i = self._day_index
+        out: dict[str, list[float]] = {}
+        for s in secs:
+            out[s] = [panel[(self._dates[j], s)]
+                      for j in range(max(0, i - int(count) + 1), i + 1)
+                      if (self._dates[j], s) in panel]
+        return out
+
+    def _build_factor_panels(self, raw_df: pl.DataFrame | None
+                             ) -> dict[str, dict[tuple[date, str], float]]:
+        """一次性算好全部因子面板 {formula.upper(): {(date, symbol): value}}。"""
+        if not self._factor_formulas or raw_df is None:
+            return {}
+        df2, colmap = compute_factor_columns(raw_df, self._factor_formulas)
+        panels: dict[str, dict[tuple[date, str], float]] = {}
+        for f, col in colmap.items():
+            sub = df2.select(["trade_date", "symbol", col]).drop_nulls()
+            panels[f.upper()] = {(r[0], r[1]): float(r[2]) for r in sub.iter_rows()}
+        return panels
+
+
     def run(self, data) -> JQResult:
+        if self._factor_formulas and not isinstance(data, pl.DataFrame):
+            raise ValueError(
+                "factor_formulas 需要 DataFrame 输入（bars_by_day dict 不支持因子面板）")
+        raw_df = data if isinstance(data, pl.DataFrame) else None
         bars_by_day = data if isinstance(data, dict) else Engine.prepare(data)
         self._bars_by_day = bars_by_day
         self._dates = sorted(bars_by_day)
         if not self._dates:
             return self.res
+
+        # 因子面板：panel.compute_factor_columns 统一算内置/DSL 因子（一次，主循环外）
+        self._factor_panels = self._build_factor_panels(raw_df)
 
         symbols = sorted({s for b in bars_by_day.values() for s in b})
         self.account = Account(cash=self.initial_cash)
