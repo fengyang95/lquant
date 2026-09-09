@@ -298,3 +298,19 @@ def test_build_chain_includes_tushare_with_token(
     names = [p.name for p in chain.providers]
     assert "tushare" in names
     pv.reset_chain()
+
+
+def test_build_chain_skips_unregistered_provider(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """enabled 但未注册的源（可选 SDK 未安装）→ 降级跳过，不炸启动。"""
+    monkeypatch.setenv("TUSHARE_TOKEN", "fake")
+    pv.reset_chain()
+    with caplog.at_level("WARNING"):
+        chain = pv.build_chain()
+    # mootdx 在本环境未安装：不在链中但启动不崩，其余源正常
+    names = [p.name for p in chain.providers]
+    assert "mootdx" not in names
+    assert "baostock" in names
+    assert any("mootdx" in r.message for r in caplog.records)
+    pv.reset_chain()

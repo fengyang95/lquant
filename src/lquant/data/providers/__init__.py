@@ -15,6 +15,7 @@ PROVIDERS: Registry[type[DataProvider]] = Registry("providers")
 
 
 def _import_all() -> None:
+    import contextlib  # noqa: PLC0415
     import importlib  # noqa: PLC0415
 
     for mod in ("baostock", "akshare", "efinance", "hithink", "sina", "tencent", "tushare"):
@@ -22,15 +23,12 @@ def _import_all() -> None:
         # 会让模块级 @PROVIDERS.register 装饰器重复注册炸掉
         if mod in PROVIDERS:
             continue
-a718df (feat: tushare 完整接入声明式映射机制)
         try:
             importlib.import_module(f"lquant.data.providers.{mod}")
         except ImportError:
             continue
-    try:
+    with contextlib.suppress(ImportError):
         importlib.import_module("lquant.market.providers.mootdx")
-    except ImportError:
-        pass
 
 
 @lru_cache(maxsize=1)
@@ -58,7 +56,12 @@ def build_chain() -> FallbackProvider:
                 "provider %s 已启用但缺少环境变量 %s，跳过", item["name"], env_key
             )
             continue
-        cls = PROVIDERS.get(item["name"])
+        name = item["name"]
+        if name not in PROVIDERS:
+            # 可选 SDK 未安装（如 mootdx）→ 降级跳过而非炸启动，与 token 门控同哲学
+            logging.warning("provider %s 已启用但未注册（SDK 未安装？），跳过", name)
+            continue
+        cls = PROVIDERS.get(name)
         caps = frozenset(Capability.parse(c) for c in item.get("capability", []))
         chain.append(cls(qps=item.get("qps", 1), capability=caps))   # type: ignore[call-arg]
     if not chain:
