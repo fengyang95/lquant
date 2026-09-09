@@ -29,6 +29,25 @@
 | 每日增量 | sync `daily` 作业改全市场（股票+ETF），回看 10 天，重启自动补跑 |
 | ETF 风险 | BaoStock ETF 日线非官方支持，失败不阻塞股票 phase，fallback 切 tushare |
 | 退市股拉取 | end 取 min(end, outDate)；outDate 未知则照常拉（下次 reference 同步修正） |
+| 时间范围重拉 | 任务 params 必带 start/end；前端弹窗可选起止日期，对已拉区间重跑 =
+  write_daily 按 (symbol, trade_date) 同键覆盖，幂等 |
+| 跨源印证 | 复用 run_crosscheck（抽样对拍、分歧分档、落 issue，peer 数值绝不写回湖），
+  补 API + 前端展示；任务完成后可选自动抽检 |
+
+## 2.2 跨源对拍设计（复用 data/ingest/crosscheck.py）
+
+已有能力：从湖抽哨兵样本 → 直接实例化 peer（不经过 enabled 门，运维动作）→
+classify_divergence 分档 → flag_cross_source 写回湖 → 落 data_quality_issue。
+
+新增：
+- `POST /api/data/crosscheck {start?, end?, peers?, limit?}` → summary + issues 列表
+- `GET /api/data/crosscheck/issues` → data_quality_issue 检索（含 resolve）
+- 任务完成后的自动抽检：data_task 参数 `auto_crosscheck: true`（默认 true，daily_update 也做），
+  执行器在 ok/partial 收尾时对本次窗口跑一次抽样对拍，结果记 failed_detail 同级字段
+- 前端数据页第三区加「跨源印证」卡：最近对拍 summary（比对标的数/分歧分档计数）+
+  分歧明细表（symbol/field/primary 值/peer 值/偏差%），可一键 resolve
+
+原则不变：对拍只用于标记与降级，peer 不可用不算失败，绝不做取值来源。
 
 ## 3. data_task 表（DuckDB）
 
