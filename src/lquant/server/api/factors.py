@@ -100,6 +100,7 @@ def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
 def _neutral_ladder(d: pl.DataFrame, col: str, ret_col: str) -> list[dict]:
     """逐段叠加协变量看 IC 怎么掉：原始 → +市值 → +行业 → +换手率。"""
     from lquant.factors.covariates import build_covariates
+    from lquant.factors.evaluate.ic import ic_series
     from lquant.factors.preprocess.pipeline import run as pipeline_run
 
     levels = [
