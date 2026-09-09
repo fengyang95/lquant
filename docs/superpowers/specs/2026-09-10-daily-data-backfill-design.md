@@ -49,6 +49,22 @@ classify_divergence 分档 → flag_cross_source 写回湖 → 落 data_quality_
 
 原则不变：对拍只用于标记与降级，peer 不可用不算失败，绝不做取值来源。
 
+## 2.3 主源 / peer 源可配置（settings 机制，配置后再拉）
+
+现有基础：`SettingsStore`（app_setting 表覆盖层 + 白名单校验）已有 `providers_order`
+（fallback 链，链头即主源）；`GET /settings/providers` 已返回各源启用状态与 capability。
+
+新增/明确：
+- 设置项 `crosscheck_peers`（list，新增到 SETTING_DEFS）：对拍 peer 源名单，
+  只允许填**已声明 daily/etf_daily capability 的源**（写入时校验，非法源 422）
+- 主源即 `providers_order` 第一位 —— 不另设 key，一个名单一个语义，
+  执行器/对拍都从 SettingsStore 读（每次任务创建时读取，改完配置**下一次拉取即生效**，
+  不需要重启服务）
+- 前端数据页「数据源配置」区：主源下拉（= providers_order 拖排序首位）+ peers 多选
+  （只列出 capability 支持日线的源）+ 「保存并立即生效」
+- 执行器与 run_crosscheck 改读 SettingsStore 而非 providers.yaml 的 crosscheck 节
+  （yaml 值退化为默认值，仍可写）
+
 ## 3. data_task 表（DuckDB）
 
     CREATE TABLE IF NOT EXISTS data_task (
