@@ -48,6 +48,10 @@ class CapabilityMissing(DataError):
         self.capability = capability
 
 
+class MappingError(DataError):
+    """源字段映射配置非法（rename/derive/fill 目标不在 schema 内、表达式越权等）。"""
+
+
 class DataQualityError(DataError):
     """质量断言失败。"""
 
