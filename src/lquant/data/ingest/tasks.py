@@ -26,7 +26,6 @@ from lquant.data.ingest.daily import backfill_pool
 _DDL = """
 CREATE TABLE IF NOT EXISTS data_task (
     task_id        VARCHAR PRIMARY KEY,
-    id_note        VARCHAR,
     kind           VARCHAR,
     params         JSON,
     status         VARCHAR,
@@ -180,25 +179,41 @@ def _reset_running(task_id: str) -> None:
         )
 
 
+def _sync_total(task_id: str, total: int) -> None:
+    """以执行时重建的池大小为准，收敛与 create 时的口径漂移。"""
+    with writer() as con:
+        con.execute(
+            "UPDATE data_task SET total_symbols=? WHERE task_id=?",
+            [total, task_id],
+        )
+
+
 def _progress_update(task_id, phase, done, failed, rows) -> None:
-    """每批进度 UPDATE（backfill_pool 批间调用，不嵌套 reader）。"""
+    """每批进度 UPDATE（backfill_pool 批间调用，不嵌套 reader）。
+
+    failed_symbols 列存契约字符串列表 ["SYM"]；failed_detail 存明细 dict 列表。
+    """
+    syms = [f["symbol"] for f in failed]
     with writer() as con:
         con.execute(
             "UPDATE data_task SET phase=?, done_symbols=?, "
             "failed_symbols=?::JSON, failed_detail=?::JSON, rows_written=? "
             "WHERE task_id=?",
             [phase, done,
-             json.dumps(failed, ensure_ascii=False),
+             json.dumps(syms, ensure_ascii=False),
              json.dumps(failed, ensure_ascii=False),
              rows, task_id],
         )
 
 
-def _finalize(task_id, total, failed_all, early, done_count) -> str:
-    """按结果定终态：早停/全失败 → failed；有失败 → partial；否则 ok。"""
+def _finalize(task_id, total, failed_all, early, *, done_count=None, error=None) -> str:
+    """按结果定终态：早停/全失败/异常 → failed；有失败 → partial；否则 ok。"""
     failed_syms = sorted({f["symbol"] for f in failed_all})
     done_count = done_count if done_count is not None else total - len(failed_syms)
-    if early:
+    if error:
+        status = "failed"
+        msg = f"执行异常终止：{error}"
+    elif early:
         status = "failed"
         msg = f"早停：连续失败过多，已失败 {len(failed_syms)} 只（可用 retry 补漏）"
     elif failed_syms and done_count <= 0:
@@ -240,6 +255,7 @@ def execute_task(task_id: str) -> dict:
     with reader() as con:
         phases = _pool_from_con(con, task["kind"], start, end)
     total = len(phases["stocks"]) + len(phases["etf"])
+    _sync_total(task_id, total)
     all_syms = phases["stocks"] + phases["etf"]
     base = {
         "done": sum(1 for s, _ in all_syms if cp.is_done(s)),
@@ -247,29 +263,35 @@ def execute_task(task_id: str) -> dict:
         "rows": 0,
     }
     early = False
-    for name in PHASES:
-        remaining = [(s, e) for s, e in phases[name] if not cp.is_done(s)]
-        if not remaining:
-            continue
-        def cb(frame, _base=base, _name=name):
-            _progress_update(task_id, _name, _base["done"] + frame["done"],
-                             [*_base["failed"], *frame["failed"]],
-                             _base["rows"] + frame["rows"])
-        res = backfill_pool(remaining, start, end=end, on_progress=cb)
-        failed_set = {f["symbol"] for f in base["failed"]} | {
-            f["symbol"] for f in res["failed"]}
-        newly = [s for s, _ in remaining if s not in failed_set]
-        cp.mark(newly)
-        base = {
-            "done": base["done"] + res["done"],
-            "failed": [*base["failed"], *res["failed"]],
-            "rows": base["rows"] + res["rows"],
-        }
-        if res["early_stopped"]:
-            early = True
-            break
+    error: str | None = None
+    try:
+        for name in PHASES:
+            remaining = [(s, e) for s, e in phases[name] if not cp.is_done(s)]
+            if not remaining:
+                continue
+            def cb(frame, _base=base, _name=name):
+                _progress_update(
+                    task_id, _name, _base["done"] + frame["done"],
+                    [*_base["failed"], *frame["failed"]],
+                    _base["rows"] + frame["rows"])
+            res = backfill_pool(remaining, start, end=end, on_progress=cb,
+                                cp_name=_CP_PREFIX + task_id)
+            failed_set = {f["symbol"] for f in base["failed"]} | {
+                f["symbol"] for f in res["failed"]}
+            newly = [s for s, _ in remaining if s not in failed_set]
+            cp.mark(newly)
+            base = {
+                "done": base["done"] + res["done"],
+                "failed": [*base["failed"], *res["failed"]],
+                "rows": base["rows"] + res["rows"],
+            }
+            if res["early_stopped"]:
+                early = True
+                break
+    except Exception as e:  # noqa: BLE001 — 执行期异常也落到 failed 终态，不卡 running
+        error = f"{type(e).__name__}: {e}"
     done = sum(1 for s, _ in all_syms if cp.is_done(s))
-    _finalize(task_id, total, base["failed"], early, done)
+    _finalize(task_id, total, base["failed"], early, done_count=done, error=error)
     return get_task(task_id)
 
 

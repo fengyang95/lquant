@@ -40,6 +40,7 @@ def backfill_pool(
     *,
     provider=None,
     batch_size: int = BATCH,
+    cp_name: str = _CP_NAME,
 ) -> dict:
     """逐批流式回填日线池。
 
@@ -52,6 +53,8 @@ def backfill_pool(
             回调异常不中断回填
         provider: 注入 provider（测试用）；默认 get_provider() 并解包 FallbackProvider
         batch_size: 每批标的数
+        cp_name: checkpoint 名（默认 "daily" 哨兵池；任务执行器传 f"daily:{task_id}"
+            隔离记账，避免旧 daily cp 被任务跑满导致每日增量空转）
 
     Returns:
         {"done": int, "failed": [{"symbol","reason"}...], "rows": int,
@@ -59,7 +62,7 @@ def backfill_pool(
     """
     from loguru import logger
 
-    cp = Checkpoint(_CP_NAME)
+    cp = Checkpoint(cp_name)
 
     todo = [(s, e) for s, e in pool if s not in cp.done]
     total = len(todo)

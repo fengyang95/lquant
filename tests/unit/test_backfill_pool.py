@@ -311,3 +311,17 @@ def test_backfill_daily_delegates(fake_settings, no_lake, monkeypatch):
         ("sz.000001", date(2024, 1, 31)),
     ]
     assert captured["start"] == date(2024, 1, 1)
+
+
+def test_cp_name_isolation(fake_settings, no_lake):
+    from lquant.data.ingest.daily import backfill_pool
+
+    Checkpoint("daily").mark(["sh.600000"])
+    p = FakeProvider([("ok", 1), ("ok", 1)])
+    res = backfill_pool(
+        [("sh.600000", D), ("sh.600001", D)], date(2024, 1, 1),
+        provider=p, cp_name="task1",
+    )
+    assert res["done"] == 2
+    assert Checkpoint("task1").done == {"sh.600000", "sh.600001"}
+    assert Checkpoint("daily").done == {"sh.600000"}

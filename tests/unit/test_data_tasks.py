@@ -303,3 +303,39 @@ _TASK_KEYS = {
     "done_symbols", "failed_symbols", "failed_detail", "rows_written",
     "started_at", "finished_at", "message",
 }
+
+
+def test_execute_crash_marks_failed(seeded_db, monkeypatch):
+    def boom(pool, start, end=None, on_progress=None, **kw):
+        raise RuntimeError("provider 起不来了")
+    monkeypatch.setattr(tasks_mod, "backfill_pool", boom)
+    t = _mk_task()
+    out = tasks_mod.execute_task(t["task_id"])
+    assert out["status"] == "failed"
+    assert "provider 起不来了" in out["message"]
+    t2 = _mk_task()
+    assert t2["status"] == "pending"
+
+
+def test_progress_visible_midrun(seeded_db, monkeypatch):
+    failed = [{"symbol": "000001.SZ", "reason": "boom"}]
+    monkeypatch.setattr(
+        tasks_mod, "backfill_pool",
+        _mock_backfill([], failed=failed, rows=4),
+    )
+    t = _mk_task()
+    mid = {}
+    def spy(fn):
+        def inner(pool, start, end=None, on_progress=None, **kw):
+            def cb(frame):
+                on_progress(frame)
+                mid.update(tasks_mod.get_task(t["task_id"]))
+            return fn(pool, start, end, on_progress=cb, **kw)
+        return inner
+    monkeypatch.setattr(tasks_mod, "backfill_pool", spy(tasks_mod.backfill_pool))
+    out = tasks_mod.execute_task(t["task_id"])
+    assert out["status"] == "partial"
+    assert mid["done_symbols"] >= 3
+    assert mid["phase"] in ("stocks", "etf")
+    assert mid["failed_symbols"] == ["000001.SZ"]
+    assert mid["failed_detail"] == [{"symbol": "000001.SZ", "reason": "boom"}]
