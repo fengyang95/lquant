@@ -27,7 +27,9 @@ DAILY_BAR = {
     "pb_mrq": pl.Float64,         # 市净率（pbMRQ）
     "ps_ttm": pl.Float64,         # 滚动市销率（psTTM）
     "pcf_ncf_ttm": pl.Float64,    # 滚动市现率（pcfNcfTTM）
-    "total_mv": pl.Float64,       # 总市值（元）
+    # 总市值（元）——目标态：baostock 不出总股本，恒 NULL，
+    # 待 tushare daily_basic 增强或 security join 填充
+    "total_mv": pl.Float64,
     "float_mv": pl.Float64,       # 流通市值（元，close×volume/turn 推导）
     "sec_type": pl.Utf8,
     "quality_flags": pl.Int32,   # 位掩码；0 = 干净

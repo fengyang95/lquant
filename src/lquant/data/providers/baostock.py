@@ -205,9 +205,11 @@ def _map_daily_raw(rows: list[list[str]]) -> pl.DataFrame:
         pl.col("date").str.to_date("%Y-%m-%d"),
         pl.col(["open", "high", "low", "close", "preclose", "volume",
                 "amount"]).cast(pl.Float64),
-        pl.when(pl.col("turn").cast(pl.Utf8).str.strip_chars() != "0")
-          .then(pl.col("turn").cast(pl.Float64, strict=False))
-          .otherwise(pl.lit(None, dtype=pl.Float64))
+        # turn 兜底：cast 后为 0（含 "0"/"0.0000"）→ null，防 float_mv 除法产 inf
+        # （float_mv derive 在 config/schema/daily_bar.yaml：turn 为 null 时除法结果自然为 null）
+        pl.when(pl.col("turn").cast(pl.Float64, strict=False) == 0)
+          .then(pl.lit(None, dtype=pl.Float64))
+          .otherwise(pl.col("turn").cast(pl.Float64, strict=False))
           .alias("turn"),
         pl.col(["pctChg", "peTTM", "pbMRQ", "psTTM", "pcfNcfTTM"])
           .cast(pl.Float64, strict=False),   # 空串 → null

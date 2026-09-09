@@ -64,7 +64,7 @@ def run_record_checks(df: pl.DataFrame, *, raise_on_fatal: bool = True,
     注意：复权因子跳变检查假设输入按 (symbol, trade_date) 有序 ——
     入湖前 write_daily 会排序，同步链路里的批次天然满足。
 
-    停牌豁免：is_suspended=True 的行不参与全部记录级断言（停牌日零量零额、
+    停牌豁免：is_suspended=True 的行不参与记录级断言（序列级 adj 跳变检查除外）（停牌日零量零额、
     价格静止都是常态，按正常行检查只会误报）。只影响断言，不影响入湖数据。
     """
     if not len(df):

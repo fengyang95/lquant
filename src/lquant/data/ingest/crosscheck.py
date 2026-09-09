@@ -66,6 +66,9 @@ def _cfg() -> dict:
     try:
         runtime = {i["key"]: i["value"] for i in SettingsStore().all()}
     except Exception:  # noqa: BLE001 - 表不可用时退回纯 yaml 配置
+        from loguru import logger  # noqa: PLC0415
+
+        logger.warning("settings 读取失败，crosscheck 配置回退纯 yaml（_cfg）")
         runtime = {}
     order = list(runtime.get("providers_order") or [])
     peers = list(runtime.get("crosscheck_peers") or [])

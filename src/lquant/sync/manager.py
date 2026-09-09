@@ -182,8 +182,10 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
                 # 全市场增量：建 data_task（历史可查）后走执行器
                 from lquant.data.ingest import tasks as data_tasks
 
+                # auto_crosscheck 透传 job params（缺省 True），运维可在 sync_job 里配置关闭
                 t = data_tasks.create_task(
-                    "daily_update", {"days": int(params.get("days", 10))})
+                    "daily_update", {"days": int(params.get("days", 10)),
+                                     "auto_crosscheck": params.get("auto_crosscheck", True)})
                 task = data_tasks.execute_task(t["task_id"])
                 rows = int(task.get("rows_written") or 0)
                 detail = {"task_id": t["task_id"], "task_status": task["status"],

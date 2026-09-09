@@ -86,7 +86,7 @@ classify_divergence 分档 → flag_cross_source 写回湖 → 落 data_quality_
 - 停牌行从「丢弃」改为「保留 + is_suspended=true，volume=0」；
   质量门禁断言同步（停牌行豁免量价断言）、回测撮合拒停牌（engine 已有涨跌停拒单，
   补停牌判断）
-- 中性化/市值暴露改用 float_mv 列（有值优先，回退现路径）
+- 中性化/市值暴露改用 float_mv 列（有值优先，回退现路径）（⚠️ 本期未实现，为合并后跟进任务——2026-09-10 全分支审查裁定）
 - schema 是「目标态」：旧湖文件缺列由 parquet 读取侧 `missing_columns='null'` 兼容，
   重拉区间自然补齐，无需迁移存量
 - 衍生指标（复权价/MA/涨跌停判定等）仍不入湖，读取侧按需计算
@@ -152,7 +152,7 @@ WS 复用 /ws/jobs/{id}：执行器每批推送 {done, total, phase, status}。
 1. 任务区：任务列表（状态徽章 + 进度条 + 行数/耗时），「全量回填」按钮（选起止日期）、
    「立即增量」按钮；running 任务 WS 实时刷新，WS 断开降级 2s 轮询
 2. 失败下钻：partial/failed 任务展开 failed_detail 表 + retry 按钮
-3. 覆盖度详情：现有 coverage 卡片 + 按月聚合的每日标的数 vs 应有标的数，缺口标橙
+3. 覆盖度详情：现有 coverage 卡片 + 按月聚合的每日标的数 vs 应有标的数，缺口标橙（⚠️ 本期未实现，为合并后跟进任务——2026-09-10 全分支审查裁定）
 
 涨红跌绿设计系统沿用 [[lquant-research-desk-design-system]]。
 

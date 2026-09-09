@@ -328,7 +328,7 @@ def _auto_crosscheck(task_id: str, start: date, end: date) -> None:
         summary = json.dumps(res.get("summary", {}), ensure_ascii=False)
         with writer() as con:
             con.execute(
-                "UPDATE data_task SET message = message || ? WHERE task_id=?",
+                "UPDATE data_task SET message = COALESCE(message, '') || ? WHERE task_id=?",
                 [f" | crosscheck: {summary}", task_id],
             )
     except Exception as e:  # noqa: BLE001 — 对拍失败不影响任务终态
@@ -342,6 +342,7 @@ def claim_retry(task_id: str) -> dict:
     消除端点「先预检再入队」的 TOCTOU：竞争失败（状态已不是 retriable，
     或已被其他请求抢先）抛 TaskConflictError，不存在抛 ValueError。
     返回认领后的 task。
+    （认领后若进程崩溃，任务残留 running，由 mark_interrupted_on_startup 兜底恢复）
     """
     task = get_task(task_id)
     if task is None:
