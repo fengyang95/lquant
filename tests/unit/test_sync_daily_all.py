@@ -14,40 +14,47 @@ from pathlib import Path
 
 import pytest
 
+from lquant.core.config import get_settings
+from lquant.core.db import reader, writer
+from lquant.data.ingest import daily as daily_mod
+from lquant.data.ingest import tasks as data_tasks
+from lquant.data.ingest.tasks import TaskConflictError
+from lquant.sync import manager
+
 LQ_ROOT = Path(__file__).resolve().parents[2]
 os.environ.setdefault("LQ_SYNC_WORKER", "0")
 
-pytestmark = pytest.mark.usefixtures("sync_env")
+_DB_OK = (LQ_ROOT / "data" / "duckdb" / "lquant.duckdb").exists()
 
 
 @pytest.fixture(scope="module")
 def sync_env(tmp_path_factory):
-    """模块级隔离数据环境（拷真实 duckdb + parquet 湖）。"""
-    if not (LQ_ROOT / "data" / "duckdb" / "lquant.duckdb").exists():
+    """模块级隔离数据环境（拷真实 duckdb + parquet 湖）；teardown 恢复 cwd。"""
+    if not _DB_OK:
         pytest.skip("需要本地 data/duckdb/lquant.duckdb（不入库，CI 上跳过）",
                     allow_module_level=True)
     base = tmp_path_factory.mktemp("sync_daily_all")
+    orig_cwd = os.getcwd()
     os.chdir(base)
-    (base / "data" / "duckdb").mkdir(parents=True, exist_ok=True)
-    shutil.copy2(LQ_ROOT / "data" / "duckdb" / "lquant.duckdb",
-                 base / "data" / "duckdb" / "lquant.duckdb")
-    src_parquet = LQ_ROOT / "data" / "parquet"
-    dst_parquet = base / "data" / "parquet"
-    if src_parquet.is_dir():
-        shutil.copytree(src_parquet, dst_parquet, dirs_exist_ok=True)
-    else:
-        dst_parquet.mkdir(parents=True, exist_ok=True)
-    from lquant.core.config import get_settings
-
-    get_settings.cache_clear()
-    yield base
-    get_settings.cache_clear()
+    try:
+        (base / "data" / "duckdb").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(LQ_ROOT / "data" / "duckdb" / "lquant.duckdb",
+                     base / "data" / "duckdb" / "lquant.duckdb")
+        src_parquet = LQ_ROOT / "data" / "parquet"
+        dst_parquet = base / "data" / "parquet"
+        if src_parquet.is_dir():
+            shutil.copytree(src_parquet, dst_parquet, dirs_exist_ok=True)
+        else:
+            dst_parquet.mkdir(parents=True, exist_ok=True)
+        get_settings.cache_clear()
+        yield base
+        get_settings.cache_clear()
+    finally:
+        os.chdir(orig_cwd)
 
 
 def _seed_security() -> None:
     """隔离库无 security 表 —— 建表并插 2 只在市股 + 1 只 ETF。"""
-    from lquant.core.db import writer
-
     with writer() as con:
         con.execute("""
             CREATE TABLE IF NOT EXISTS security (
@@ -67,12 +74,12 @@ def _job(params: dict) -> dict:
             "params": params}
 
 
+def _ensure_tables(con) -> None:
+    manager._ensure_tables(con)
+
+
 def _sync_runs() -> list[dict]:
-    from lquant.core.db import reader
-
     with reader() as con:
-        from lquant.sync.manager import _ensure_tables
-
         _ensure_tables(con)
         rows = con.execute(
             "SELECT kind, status, detail FROM sync_run ORDER BY started_at"
@@ -82,16 +89,13 @@ def _sync_runs() -> list[dict]:
 
 
 def test_seed_default_daily_params_has_market_all():
-    from lquant.sync import manager
-
+    """纯常量断言，不需要隔离数据环境。"""
     job = next(j for j in manager.DEFAULT_JOBS if j["sync_id"] == "daily")
     assert job["params"] == {"days": 10, "market": "all"}
 
 
+@pytest.mark.usefixtures("sync_env")
 def test_sync_daily_market_all_creates_data_task(monkeypatch):
-    from lquant.data.ingest import tasks as data_tasks
-    from lquant.sync import manager
-
     called = {}
 
     def fake_pool(pool, start, end=None, on_progress=None, **kw):
@@ -121,11 +125,8 @@ def test_sync_daily_market_all_creates_data_task(monkeypatch):
     assert runs[-1]["detail"].get("task_id") == res["detail"]["task_id"]
 
 
+@pytest.mark.usefixtures("sync_env")
 def test_sync_daily_market_sentinel_keeps_old_path(monkeypatch):
-    from lquant.data.ingest import daily as daily_mod
-    from lquant.data.ingest import tasks as data_tasks
-    from lquant.sync import manager
-
     called = {}
     monkeypatch.setattr(
         daily_mod, "backfill_daily",
@@ -140,10 +141,8 @@ def test_sync_daily_market_sentinel_keeps_old_path(monkeypatch):
     assert len(data_tasks.list_tasks()) == n_before   # 没建 data_task
 
 
+@pytest.mark.usefixtures("sync_env")
 def test_sync_daily_conflict_marks_failed(monkeypatch):
-    from lquant.data.ingest.tasks import TaskConflictError
-    from lquant.sync import manager
-
     def boom(kind, params=None):
         raise TaskConflictError("已有运行中的数据任务")
 
@@ -155,3 +154,15 @@ def test_sync_daily_conflict_marks_failed(monkeypatch):
     assert "已有运行中的数据任务" in json.dumps(res["detail"], ensure_ascii=False)
     runs = [r for r in _sync_runs() if r["kind"] == "daily"]
     assert runs and runs[-1]["status"] == "failed"
+
+
+@pytest.mark.usefixtures("sync_env")
+def test_sync_daily_invalid_market_rejected(monkeypatch):
+    # run_job 层白名单：非法 market → failed，不抛出、不建 data_task
+    res = manager.run_job(_job({"days": 3, "market": "hedge"}))
+    assert res["status"] == "failed"
+    assert "market" in json.dumps(res["detail"], ensure_ascii=False)
+
+    # upsert_job 层：非法 market 直接 ValueError 拒收
+    with pytest.raises(ValueError, match="market"):
+        manager.upsert_job("daily", "x", "daily", "18:30", params={"market": "hedge"})

@@ -117,6 +117,11 @@ def upsert_job(sync_id: str, name: str, kind: str, schedule_time: str,
     datetime.strptime(schedule_time, "%H:%M")
     if kind not in ("collect", "daily", "adj_factor"):
         raise ValueError(f"未知作业类型: {kind}")
+    if kind == "daily" and (params or {}).get("market") not in (
+            None, "all", "sentinel"):
+        raise ValueError(
+            f"daily 作业 params.market 只接受 all/sentinel，收到: "
+            f"{params['market']!r}")
     now = datetime.now()
     with writer() as con:
         _ensure_tables(con)
@@ -161,7 +166,11 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
             if res.get("errors"):
                 status = "partial"
         elif kind == "daily":
-            if params.get("market", "all") == "sentinel":
+            market = params.get("market", "all")
+            if market not in (None, "all", "sentinel"):
+                raise ValueError(
+                    f"daily 作业 params.market 只接受 all/sentinel，收到: {market!r}")
+            if market == "sentinel":
                 # 兼容旧路径：哨兵池增量（不建 data_task）
                 from lquant.data.ingest.daily import backfill_daily
 
