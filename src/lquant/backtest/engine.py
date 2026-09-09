@@ -17,7 +17,7 @@ from datetime import date
 
 import polars as pl
 
-from lquant.backtest.account import Account, Position
+from lquant.backtest.account import Account
 from lquant.backtest.broker import Broker
 from lquant.backtest.events import Bar, Fill, Order, OrderStatus, Side
 from lquant.backtest.metrics import perf_from_returns, turnover_from_trades
@@ -112,6 +112,7 @@ class Engine:
         self._pending: list[Order] = []
         self._seq = 0
         self._last_rebal_key: str | None = None
+        self._last_factor: dict[str, float] = {}
 
     # ---------- 数据准备 ----------
 
@@ -130,21 +131,40 @@ class Engine:
             raise KeyError(f"回测数据缺少列: {sorted(miss)}")
         fields = [c for c in (extra_fields or []) if c in df.columns]
 
+        # 缺失的可选列先补常量，后面统一走列式兜底（与旧逐行 `x or default` 语义一致）
+        lits = {"volume": 0.0, "amount": 0.0, "adj_factor": 1.0, "halted": False}
+        df = df.with_columns([pl.lit(v).alias(c) for c, v in lits.items() if c not in df.columns])
+        vol = pl.col("volume")
+        df = df.with_columns(
+            pl.when(pl.col("pre_close").fill_null(0.0) == 0.0).then(pl.col("close"))
+              .otherwise(pl.col("pre_close")).cast(pl.Float64).alias("pre_close"),
+            vol.fill_null(0.0).cast(pl.Float64).alias("volume"),
+            pl.col("amount").fill_null(0.0).cast(pl.Float64).alias("amount"),
+            pl.when(pl.col("adj_factor").fill_null(0.0) == 0.0).then(1.0)
+              .otherwise(pl.col("adj_factor")).cast(pl.Float64).alias("adj_factor"),
+            (pl.col("halted").fill_null(False)
+             | (vol.is_not_null() & (vol == 0.0))).alias("halted"),
+        )
+
         out: dict[date, dict[str, Bar]] = {}
+        cols = ["open", "high", "low", "close", "pre_close",
+                "volume", "amount", "adj_factor", "halted"]
         for sub in df.sort([date_col, symbol_col]).partition_by(date_col, as_dict=False):
             d = sub[date_col][0]
+            syms = sub[symbol_col].to_list()
+            cvals = {c: sub[c].to_list() for c in cols}
+            fvals = {c: sub[c].to_list() for c in fields}
             bars: dict[str, Bar] = {}
-            for r in sub.iter_rows(named=True):
-                extra = {c: r[c] for c in fields}
-                halted = bool(r.get("halted", False)) or r["volume"] == 0
-                bars[r[symbol_col]] = Bar(
-                    symbol=r[symbol_col], trade_date=d,
-                    open=float(r["open"]), high=float(r["high"]), low=float(r["low"]),
-                    close=float(r["close"]), pre_close=float(r.get("pre_close") or r["close"]),
-                    volume=float(r.get("volume") or 0.0),
-                    amount=float(r.get("amount") or 0.0),
-                    adj_factor=float(r.get("adj_factor") or 1.0),
-                    halted=halted, fields=extra,
+            for k, s in enumerate(syms):
+                bars[s] = Bar(
+                    symbol=s, trade_date=d,
+                    open=float(cvals["open"][k]), high=float(cvals["high"][k]),
+                    low=float(cvals["low"][k]), close=float(cvals["close"][k]),
+                    pre_close=float(cvals["pre_close"][k]),
+                    volume=float(cvals["volume"][k]), amount=float(cvals["amount"][k]),
+                    adj_factor=float(cvals["adj_factor"][k]),
+                    halted=bool(cvals["halted"][k]),
+                    fields={c: fvals[c][k] for c in fields},
                 )
             out[d] = bars
         return out
@@ -161,12 +181,18 @@ class Engine:
         self._rules = build_rules(symbols, self.ruleset, self._meta)
         self.broker = Broker(self._rules, self.slippage, price_mode=self.cfg.price_mode)
         self.account = Account(cash=self.cfg.initial_cash)
+        self._last_factor = {}
 
         res = BacktestResult()
-        prev_nav = self.cfg.initial_cash
 
         for i, d in enumerate(dates):
             bars = bars_by_day[d]
+
+            # 0) 公司行为：除权日按复权因子比放大持仓份额（分红默认再投资的份额调整法）
+            self._apply_corporate_actions(bars)
+            for s, b in bars.items():
+                if b.adj_factor > 0:
+                    self._last_factor[s] = b.adj_factor
 
             # 1) 撮合上一日挂单（用今日开盘价，防未来函数）
             if self._pending:
@@ -179,14 +205,38 @@ class Engine:
             # 3) 按收盘价估值
             prices = {s: b.close for s, b in bars.items()}
             nav = self.account.nav(prices)
+            if nav <= 0:
+                # NAV 非正说明账目已出问题（现金不足扣费/杠杆漏洞），继续算收益率只会出 NaN
+                raise ValueError(
+                    f"{d} NAV={nav:.2f} ≤ 0，账户账目异常，请检查费率/资金约束"
+                )
             res.nav.append((d, nav))
-            if nav > 0 and prev_nav > 0:
-                pass
-            prev_nav = nav
             res.positions[d] = {s: p.qty for s, p in self.account.positions.items() if p.qty}
 
         self._finalize(res)
         return res
+
+    # ---------- 公司行为 ----------
+
+    def _apply_corporate_actions(self, bars: dict[str, Bar]) -> None:
+        """除权日调整持仓份额：ratio = 今日复权因子 / 昨日复权因子。
+
+        数据层只提供后复权因子（无分红现金金额），因此采用份额调整法 ——
+        等价于假设分红全部再投资。停牌日无 bar 不调整，复牌后按累计因子比一次性补齐。
+        """
+        assert self.broker is not None
+        for sym, pos in self.account.positions.items():
+            if pos.qty <= 0:
+                continue
+            bar = bars.get(sym)
+            if bar is None:
+                continue
+            prev = self._last_factor.get(sym, bar.adj_factor)
+            if prev <= 0 or bar.adj_factor <= 0:
+                continue
+            ratio = bar.adj_factor / prev
+            if abs(ratio - 1.0) > 1e-12:
+                self.account.apply_corporate_action(sym, ratio)
 
     # ---------- 撮合 ----------
 
@@ -277,14 +327,20 @@ class Engine:
             # T 日收盘生成信号，推迟到 T+1 按对应成交价撮合 —— 防未来函数
             self._pending = orders
         else:
-            # same_close：T 日收盘成交（危险，仅研究对照）
-            assert self.broker is not None
+            # same_close：T 日收盘成交（危险，仅研究对照）。
+            # 行为与 next_* 分支保持一致：同样的量约束与 rejected 记录。
             for o in orders:
                 bar = bars.get(o.symbol)
-                if bar is None:
+                if bar is None or bar.halted:
+                    o.status = OrderStatus.REJECTED
+                    o.reason = "停牌或无行情"
+                    res.rejected.append((str(d), o.symbol, o.reason))
                     continue
-                f = self.broker.match(o, bar, d)
-                if f:
+                max_qty = bar.volume * self.cfg.participation if bar.volume > 0 else None
+                f = self.broker.match(o, bar, d, max_qty=max_qty)
+                if f is None:
+                    res.rejected.append((str(d), o.symbol, o.reason or "未成交"))
+                else:
                     self.account.apply_fill(f)
                     res.trades.append(f)
 
