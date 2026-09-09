@@ -214,6 +214,16 @@ DDL_STATEMENTS: list[str] = [
         rows INTEGER, status VARCHAR, detail JSON
     )
     """,
+    "CREATE TABLE IF NOT EXISTS strategy_def ("
+    " id VARCHAR, name VARCHAR, description VARCHAR, kind VARCHAR DEFAULT 'jq',"
+    " source VARCHAR, params_json VARCHAR, benchmark VARCHAR, config_json VARCHAR,"
+    " version INTEGER, is_latest BOOLEAN DEFAULT TRUE, deleted BOOLEAN DEFAULT FALSE,"
+    " created_at TIMESTAMP, updated_at TIMESTAMP)",
+    "CREATE TABLE IF NOT EXISTS analysis_def ("
+    " id VARCHAR, name VARCHAR, source VARCHAR, is_builtin BOOLEAN DEFAULT FALSE,"
+    " deleted BOOLEAN DEFAULT FALSE, created_at TIMESTAMP, updated_at TIMESTAMP)",
+    "CREATE TABLE IF NOT EXISTS backtest_record ("
+    " run_id VARCHAR, trade_date DATE, key VARCHAR, value DOUBLE)",
     """
     CREATE TABLE IF NOT EXISTS app_setting (
         setting_key VARCHAR PRIMARY KEY,
