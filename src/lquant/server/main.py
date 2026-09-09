@@ -9,10 +9,12 @@ from lquant.server import ws
 from lquant.server.api import (
     backtests,
     data,
+    etf,
     factors,
     health,
     market,
     paper,
+    settings,
     strategies,
     sync,
     watchlist,
@@ -28,7 +30,8 @@ def create_app() -> FastAPI:
         allow_origins=["http://localhost:3000"],
         allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
     )
-    for r in (health, data, factors, backtests, market, paper, watchlist, strategies, sync):
+    for r in (health, data, factors, backtests, market, paper, watchlist,
+              strategies, sync, etf, settings):
         app.include_router(r.router, prefix="/api")
     app.include_router(ws.router)  # /ws/jobs/{id}，无 /api 前缀（与前端代理一致）
     return app
@@ -47,6 +50,7 @@ def _startup() -> None:
         from lquant.core.db import writer
         from lquant.data.store.ddl import (
             DDL_STATEMENTS,
+            ensure_classify_snapshots,
             ensure_collect_log,
             ensure_factor_def,
         )
@@ -58,6 +62,8 @@ def _startup() -> None:
                 print("[migrate] factor_def → expression/description 结构")
             if ensure_collect_log(con):
                 print("[migrate] collect_log → 补主键")
+            if ensure_classify_snapshots(con):
+                print("[migrate] industry_classify → 补 (symbol, std_date) 主键")
     except Exception as e:  # noqa: BLE001 - 库未初始化时不应阻断服务启动
         print(f"[startup] schema 迁移跳过: {e}")
 

@@ -15,11 +15,15 @@ PROVIDERS: Registry[type[DataProvider]] = Registry("providers")
 def _import_all() -> None:
     import importlib
 
-    for mod in ("baostock", "akshare", "efinance", "hithink"):
+    for mod in ("baostock", "akshare", "efinance", "hithink", "sina", "tencent"):
         try:
             importlib.import_module(f"lquant.data.providers.{mod}")
         except ImportError:
             continue
+    try:
+        importlib.import_module("lquant.market.providers.mootdx")
+    except ImportError:
+        pass
 
 
 @lru_cache(maxsize=1)

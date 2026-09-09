@@ -115,13 +115,50 @@ def demo(start: str) -> None:
 
 
 @data.command()
-def check() -> None:
-    """跑质量校验。"""
-    click.echo("见 data.quality.validators")
+@click.option("--start", default=None, help="只检查该日期之后的数据（ISO）")
+@click.option("--end", default=None)
+def check(start: str | None, end: str | None) -> None:
+    """跑全湖质量校验（涨跌停/覆盖度/僵尸/复权/日历），issue 落库。
+
+    fatal / error 存在时退出码为 2 —— 让调度系统能感知质量恶化，
+    「fatal 只是落库不阻断」与「命令成功」是两回事。
+    """
+    from lquant.data.quality.pipeline import run_lake_checks
+
+    issues = run_lake_checks(start=start, end=end)
+    if not issues:
+        click.echo("quality: PASS（无 issue）")
+        return
+    by_sev: dict[str, int] = {}
+    for i in issues:
+        by_sev[i.severity] = by_sev.get(i.severity, 0) + 1
+    click.echo(f"quality: {len(issues)} 条 issue（{by_sev}），已落 data_quality_issue")
+    for i in issues[:20]:
+        click.echo(f"  [{i.severity}] {i.rule}: {i.detail}")
+    if by_sev.get("fatal") or by_sev.get("error"):
+        raise SystemExit(2)
 
 
 @data.command()
-@click.option("--peers", default="hithink")
-def crosscheck(peers: str) -> None:
-    """跨源对拍（抽检，不取值）。"""
-    click.echo(f"crosscheck with {peers}")
+@click.option("--peers", default="", help="逗号分隔的同行源；留空用 config/providers.yaml 的 crosscheck.peers")
+@click.option("--start", default="2024-01-01")
+@click.option("--end", default=None)
+@click.option("--limit", default=200, type=int,
+              help="抽检标的数（§3.8.4 分层抽样的哨兵层）")
+def crosscheck(peers: str, start: str, end: str | None, limit: int) -> None:
+    """跨源对拍（抽检，标记与降级，绝不取值）。
+
+    以湖内为主，拉同行实价比对；偏差打 CROSS_SRC_DIFF 标记 + 落
+    data_quality_issue。同行源不可用/未启用 → 报 L0 跳过，不报错。
+    """
+    from lquant.data.ingest.crosscheck import run_crosscheck
+
+    out = run_crosscheck(
+        peers=[p.strip() for p in peers.split(",") if p.strip()],
+        start=start, end=end, limit=limit,
+    )
+    click.echo(f"crosscheck: {out['summary']}")
+    for lv in ("L1", "L2", "L3"):
+        if out["summary"].get(lv):
+            click.echo(f"  [{lv}] {len([i for i in out['issues'] if i.rule.endswith(lv)])} 条 issue 待查看")
+    click.echo(f"primary 打 CROSS_SRC_DIFF 标记: {out['flagged_rows']} 行")

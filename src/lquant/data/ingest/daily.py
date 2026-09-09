@@ -7,11 +7,12 @@
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date
 
 import polars as pl
 
 from lquant.core.config import get_settings
+from lquant.core.errors import DataQualityError
 from lquant.core.types import now_cn
 from lquant.data.ingest.checkpoint import Checkpoint
 from lquant.data.store.parquet import write_daily
@@ -72,10 +73,20 @@ def backfill_daily(
                     failed.extend(sub)
                     continue
                 if len(sub_df):
-                    write_daily(_stamp(sub_df))
-                    df = sub_df
+                    try:
+                        write_daily(_stamp(sub_df))
+                    except DataQualityError as e3:
+                        # 质量门禁 fatal 只拦这一小批，不能让整个回填挂掉（H2）
+                        logger.error(f"  缩批 {j} 质量门禁拦截（fatal，不入湖）: {e3}")
+                        failed.extend(sub)
         except RuntimeError as e:
             logger.warning(f"批次 {i} 失败，跳过（下次重跑会重试）: {e}")
+            continue
+        except DataQualityError as e:
+            # 质量门禁 fatal：留证据（issue 已落库），批次不入湖。
+            # 只捕获这一类 —— Polars/IO 等程序性 bug 不该被伪装成数据问题（H7）
+            logger.error(f"批次 {i} 质量门禁拦截（fatal，批次不入湖）: {e}")
+            failed.extend(chunk)
             continue
         if len(df):
             write_daily(_stamp(df))
@@ -87,9 +98,24 @@ def backfill_daily(
 
 
 def _stamp(df: pl.DataFrame) -> pl.DataFrame:
-    """补血缘字段。"""
-    return df.with_columns(
+    """补血缘字段 + 质量门禁（记录级断言，fatal 阻断入湖）。
+
+    data_version 用 lineage.new_version()（YYYYMMDD.n）并登记到
+    data_version 表 —— 湖里的 data_version 必须能对上血缘登记，
+    否则因子缓存的失效锚点是死的（§3.6）。
+    fatal 抛 DataQualityError 会让整批不入湖 —— 这是设计行为
+    （§3.8.6：fatal 阻断下游，回滚到上一 data_version）。
+    warn 只打 quality_flags 标，批次照常落地。
+    """
+    from lquant.data import lineage
+    from lquant.data.quality.pipeline import gate_daily
+
+    version = lineage.new_version()
+    lineage.register(version, "daily_bar", row_count=len(df))
+    stamped = df.with_columns(
         source=pl.lit("baostock"),
         ingested_at=pl.lit(now_cn().replace(tzinfo=None), dtype=pl.Datetime),
-        data_version=pl.lit(datetime.now().strftime("%Y%m%d")),
+        data_version=pl.lit(version),
     )
+    out, _issues = gate_daily(stamped, data_version=version)
+    return out

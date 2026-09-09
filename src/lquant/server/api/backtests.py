@@ -17,8 +17,10 @@ from pydantic import BaseModel, Field
 
 from lquant.backtest.engine import Engine, EngineConfig
 from lquant.backtest.strategy.factor_topn import FactorTopNStrategy
+from lquant.backtest.sweep import SweepSpec, run_sweep
 from lquant.core.db import reader, writer
 from lquant.data.store.parquet import read_daily
+from lquant.server.jobs import enqueue, get_job
 
 router = APIRouter(prefix="/backtests", tags=["backtests"])
 
@@ -130,6 +132,71 @@ def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
         return df.with_columns(pl.col("close").pct_change().over("symbol")
                                .rolling_std(n).alias(formula.replace("_", "")))
     raise HTTPException(422, f"暂不支持的因子公式: {formula}")
+
+
+class SweepIn(BaseModel):
+    formula: str = "pct_change_20"
+    param: str = Field(default="top_n", pattern="^(top_n)$")  # 允许被扫的参数白名单
+    values: list[int] = Field(default=[1, 3, 5, 10], min_length=1, max_length=20)
+    top_n: int = Field(default=5, ge=1, le=100)   # param=top_n 时的上一档起点（保留余量）
+    rebalance: str = Field(default="monthly", pattern="^(daily|weekly|monthly|none)$")
+    initial_cash: float = Field(default=1_000_000, gt=0)
+    start: str = Field(default="2026-01-01", pattern=r"^\d{4}-\d{2}-\d{2}$")
+    tag: str | None = None
+
+
+def _run_sweep_job(formula: str, param: str, values: list, cfg: dict) -> list[dict]:
+    """后台执行体：读数据 → 逐档回测 → 返回网格表（JSON 安全 dict）。"""
+    df = read_daily(start=cfg["start"]).collect()
+    col = formula.replace("_", "")
+    d = _compute_factor(df, formula).drop_nulls([col])
+    grid = run_sweep(
+        d, param, values,
+        SweepSpec(factor=col, rebalance=cfg["rebalance"],
+                  initial_cash=cfg["initial_cash"]),
+        strategy_kwargs={"top_n": cfg.get("top_n", 5)},
+    )
+    rows = grid.to_dicts()
+    # value 可能是 int，前端要画轴，统一留浮点
+    for r in rows:
+        r["value"] = float(r["value"])
+        r["rebalance"] = cfg["rebalance"]
+        r["param"] = param
+    return rows
+
+
+@router.post("/sweep")
+def run_sweep_api(req: SweepIn) -> dict:
+    """异步参数扫描：入队即返回 sweep_id，客户端轮询 GET /sweep/{id}。
+
+    单档数据量小时逐档秒级；这里统一走 jobs 队列（Redis 或本地降级），
+    与 /run 现阶段同步执行的口径不同 —— 扫描档数多，不值得占住请求线程。
+    """
+    cfg = {"formula": req.formula, "param": req.param, "values": list(req.values),
+           "rebalance": req.rebalance, "initial_cash": req.initial_cash,
+           "start": req.start, "top_n": req.top_n}
+    job = enqueue("lquant-backtest", _run_sweep_job, req.formula, req.param,
+                  list(req.values), cfg)
+    # 直接用任务 id 当 sweep_id：本地降级（JobRegistry）和 RQ 模式都能 get_job 查到
+    return {"sweep_id": job.id, "status": "queued",
+            "param": req.param, "n_points": len(req.values), "tag": req.tag}
+
+
+@router.get("/sweep/{sweep_id}")
+def get_sweep(sweep_id: str) -> dict:
+    """取扫描结果：queued → done + grid 数据。"""
+    job = get_job(sweep_id)
+    if job is None:
+        raise HTTPException(404, f"未找到扫描任务 {sweep_id}")
+    status = job.get_status()
+    # 本地降级 Job 有 .error；RQ Job 没有，异常在 .exc_info 里 —— 两种都读，别丢报错
+    error = getattr(job, "error", None)
+    if error is None and status == "failed":
+        exc = getattr(job, "exc_info", None)
+        error = exc if isinstance(exc, str) and exc.strip() else (str(exc) if exc else None)
+    result = getattr(job, "result", None)
+    return {"sweep_id": sweep_id, "status": status, "error": error,
+            "grid": list(result) if status in ("finished", "done") and result else None}
 
 
 @router.post("/run")

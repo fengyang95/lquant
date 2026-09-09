@@ -12,12 +12,17 @@ import pytest
 
 from lquant.backtest.engine import Engine, EngineConfig
 from lquant.backtest.metrics import max_drawdown, perf_from_nav
-from lquant.backtest.slippage import make_slippage
+from lquant.backtest.slippage import NoSlippage, make_slippage
 from lquant.backtest.strategy import get_strategy
 from lquant.backtest.strategy.base import Context, Strategy
 
 
 # ---------- 合成数据 ----------
+
+def make_single(rows) -> pl.DataFrame:
+    """确定性单标的 panel，供撮合价格断言。"""
+    return pl.DataFrame(rows).with_columns(pl.col("trade_date").cast(pl.Date))
+
 
 def make_daily(n_days: int = 120, symbols: tuple[str, ...] = ("600000", "000001", "300750"),
                seed: int = 7) -> pl.DataFrame:
@@ -106,6 +111,98 @@ def test_engine_rebalance_none_freezes_portfolio():
     eng = Engine(AllInOne(), config=EngineConfig(rebalance="none"))
     res = eng.run(df)
     assert all(not p for p in res.positions.values())     # 永不下单
+
+
+# ---------- 撮合模式 ----------
+
+def _match_mode_panel() -> pl.DataFrame:
+    """单标的 600000；day2 的 open/close/vwap 互不相同，便于断言各撮合模式的成交价。
+
+    所有价格都落在 pre_close±10% 涨停带内（A 股物理约束），否则撮合价检查
+    会把「涨超涨停」的成交判为不可成交，测试数据本身就失真。
+    """
+    return make_single([
+        # day1 收盘生成信号；vwap=amount/volume
+        {"trade_date": date(2026, 1, 5), "symbol": "600000", "open": 10.0,
+         "high": 10.2, "low": 9.8, "close": 10.0, "pre_close": 9.9,
+         "volume": 100000.0, "amount": 1_000_000.0},
+        # day2 pre_close=10.0（day1 收盘）；open=10.5, close=10.8,
+        # vwap=2_150_000/200000=10.75 —— 三价互不相同且在 [9.0,11.0] 内
+        {"trade_date": date(2026, 1, 6), "symbol": "600000", "open": 10.5,
+         "high": 10.9, "low": 10.4, "close": 10.8, "pre_close": 10.0,
+         "volume": 200000.0, "amount": 2_150_000.0},
+        {"trade_date": date(2026, 1, 7), "symbol": "600000", "open": 10.9,
+         "high": 11.0, "low": 10.5, "close": 10.9, "pre_close": 10.8,
+         "volume": 100000.0, "amount": 1_090_000.0},
+    ])
+
+
+def _first_fill_price(mode: str) -> tuple[float, date]:
+    df = _match_mode_panel()
+    # 无滑点：断言的是撮合模式本身的成交价，不应被默认 pct 滑点污染
+    eng = Engine(AllInOne(), config=EngineConfig(price_mode=mode, participation=1.0),
+                 slippage=NoSlippage())
+    res = eng.run(df)
+    trades = res.trades_frame()
+    assert trades is not None and len(trades) > 0
+    f = trades.row(0, named=True)
+    return f["price"], f["trade_date"]
+
+
+def test_match_mode_next_open_fills_t1_open():
+    price, d = _first_fill_price("next_open")
+    assert price == pytest.approx(10.5)          # T+1 开盘
+    assert d == date(2026, 1, 6)
+
+
+def test_match_mode_next_vwap_fills_t1_vwap():
+    price, d = _first_fill_price("next_vwap")
+    assert price == pytest.approx(2_150_000.0 / 200_000.0)   # T+1 amount/volume
+    assert d == date(2026, 1, 6)
+
+
+def test_match_mode_next_close_fills_t1_close():
+    price, d = _first_fill_price("next_close")
+    assert price == pytest.approx(10.8)          # T+1 收盘
+    assert d == date(2026, 1, 6)
+
+
+def test_match_mode_same_close_fills_same_day_at_close():
+    price, d = _first_fill_price("same_close")
+    assert price == pytest.approx(10.0)          # T 日收盘
+    assert d == date(2026, 1, 5)
+
+
+def test_match_mode_limit_band_guards_fill_price():
+    """平开但收盘封板的 bar：next_close 以涨停收盘价成交 → 不可成交。
+
+    涨停校验必须落在**实际成交价**上（收盘/VWAP），不能只查开盘价 ——
+    否则 next_close 会把根本买不进去的涨停价计进收益。
+    """
+    df = make_single([
+        {"trade_date": date(2026, 1, 5), "symbol": "600000", "open": 10.0,
+         "high": 10.0, "low": 9.8, "close": 10.0, "pre_close": 9.9,
+         "volume": 100000.0, "amount": 1_000_000.0},
+        # day2 平开 10.0，收盘直接封到涨停 11.0（pre_close=10.0 → +10%）
+        {"trade_date": date(2026, 1, 6), "symbol": "600000", "open": 10.0,
+         "high": 11.0, "low": 10.0, "close": 11.0, "pre_close": 10.0,
+         "volume": 200000.0, "amount": 2_000_000.0},
+    ])
+    eng = Engine(AllInOne(), config=EngineConfig(price_mode="next_close",
+                                                 participation=1.0),
+                 slippage=NoSlippage())
+    res = eng.run(df)
+    # 买单被拒：以 11.0（涨停价）成交不可信
+    assert res.trades == []
+    assert any("涨停" in r[2] for r in res.rejected)
+
+
+def test_unknown_match_mode_rejected():
+    from lquant.backtest.broker import MATCH_MODES
+
+    with pytest.raises(ValueError):
+        Engine(AllInOne(), config=EngineConfig(price_mode="vwap")).run(_match_mode_panel())
+    assert "next_open" in MATCH_MODES
 
 
 # ---------- 滑点 ----------

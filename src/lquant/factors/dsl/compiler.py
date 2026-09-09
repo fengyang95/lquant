@@ -54,6 +54,11 @@ def _split(node: Node, steps: list[Node]) -> Node:
     return node
 
 
+def _int_window(v: float) -> int | float:
+    """整值数字 → int（rolling 窗口要 int）；真小数保持原样。"""
+    return int(v) if float(v).is_integer() else v
+
+
 def compile_expr(node: Node) -> pl.Expr:
     if isinstance(node, Field):
         return pl.col(node.name)
@@ -69,6 +74,12 @@ def compile_expr(node: Node) -> pl.Expr:
         }[node.op]
     if isinstance(node, Call):
         fn = OPS.get(node.name)
-        args = [compile_expr(a) for a in node.args]
+        # 数字实参（窗口等）直接传 Python 数，不能编译成 pl.lit ——
+        # 否则 Ts_Mean(close,5) 给 rolling_mean 一个 Expr 会崩。
+        # 非数字实参（字段/子表达式）才编译成 Expr。整值窗口 5.0 → 5（rolling 要 int）。
+        args = [
+            _int_window(a.value) if isinstance(a, Num) else compile_expr(a)
+            for a in node.args
+        ]
         return fn(*args)
     raise FactorError(f"无法编译节点: {type(node)}")

@@ -60,7 +60,25 @@ def get_all_securities(types=None, date=None):
 
 
 def get_index_stocks(index_symbol, date=None):
-    raise NotImplementedError("需要指数成分表")
+    """指数当下成分（默认今天）。date 指定时按该日已生效成分返回（防前视）。
+
+    index_symbol 用 JQ 习惯的 '000300.XSHG' 或平台内码 '000300.SH' 皆可。
+    """
+    from datetime import date as _date  # 参数名 date 遮蔽了模块级类名，用别名引用
+
+    from lquant.core.types import parse_symbol
+    from lquant.data.store.catalog import IndexConsRepo
+
+    try:
+        sym = parse_symbol(index_symbol)
+    except ValueError:
+        # 非标准格式原样用；没有成分就返回空（宁可空，不臆造）
+        code = index_symbol
+    else:
+        code = str(sym)
+    if date is None:
+        date = _date.today()
+    return IndexConsRepo().symbols_as_of(code, date)
 
 
 def get_trade_days(start_date=None, end_date=None, count=None):

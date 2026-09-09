@@ -29,8 +29,15 @@ def sync_env(tmp_path_factory):
     (base / "data" / "duckdb").mkdir(parents=True, exist_ok=True)
     shutil.copy2(LQ_ROOT / "data" / "duckdb" / "lquant.duckdb",
                  base / "data" / "duckdb" / "lquant.duckdb")
-    shutil.copytree(LQ_ROOT / "data" / "parquet", base / "data" / "parquet",
-                    dirs_exist_ok=True)
+    # data/ 全 gitignore：全新 checkout 常见「duckdb 已被采集期创建、
+    # parquet 湖仍缺」。parquet 缺失时给隔离环境建空目录，让 store 优雅返回
+    # 空帧而非 shutil.copytree 抛 FileNotFoundError。
+    src_parquet = LQ_ROOT / "data" / "parquet"
+    dst_parquet = base / "data" / "parquet"
+    if src_parquet.is_dir():
+        shutil.copytree(src_parquet, dst_parquet, dirs_exist_ok=True)
+    else:
+        dst_parquet.mkdir(parents=True, exist_ok=True)
     from lquant.core.config import get_settings
 
     get_settings.cache_clear()
@@ -162,11 +169,12 @@ def test_refresh_adj_factors_merges_into_lake():
     from lquant.data.ingest.adj import refresh_adj_factors
     from lquant.data.store.parquet import read_daily
 
-    lake = read_daily(start="2026-06-01").select(
-        ["symbol", "trade_date"]).collect()
+    # 先 collect 再判空：空湖 read_daily 返回无 schema 的空帧，直接 .select
+    # 会抛 ColumnNotFoundError（没有 "symbol" 列）。先取行数，0 行即跳过。
+    lake = read_daily(start="2026-06-01").collect()
     if not len(lake):
         pytest.skip("湖为空")
-    keys = lake.head(20)
+    keys = lake.select(["symbol", "trade_date"]).head(20)
 
     class FakeProvider:
         def adj_factors(self, symbols, start, end):
