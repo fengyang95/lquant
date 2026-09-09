@@ -23,7 +23,7 @@ class FactorEngine:
         避免多因子共用 panel 时中间列互相覆盖。
         """
         ast = parse(expr, name)
-        check(ast)   # 静态分析：未来函数 + 未注册算子
+        check(ast, allowed_fields=set(df.columns))   # 静态分析：未来函数 + 未注册算子 + 字段白名单
 
         steps = plan(ast.root)
         pref = f"{name}__s" if len(steps) > 1 else name

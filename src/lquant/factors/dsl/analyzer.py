@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from lquant.core.errors import LookaheadError
+from lquant.core.errors import FactorError, LookaheadError
 from lquant.factors.dsl.ast_nodes import BinaryOp, Call, Field, Node, Num, UnaryOp
 from lquant.factors.ops.registry import OPS
 
@@ -48,12 +48,24 @@ def analyze(node: Node) -> tuple[int, set[str], set[str]]:
     raise TypeError(f"未知节点 {type(node)}")
 
 
-def check(expr_ast: "object") -> None:
-    """入口：对 FactorExpr 做静态检查，失败直接抛。"""
+def check(expr_ast: "object", allowed_fields: set[str] | None = None) -> None:
+    """入口：对 FactorExpr 做静态检查，失败直接抛。
+
+    allowed_fields 非 None 时额外做字段白名单校验 —— 拼错字段（$closs）
+    在静态期报错并给 difflib 近似候选，而不是算出全 null 静默污染 IC（缺陷 #6）。
+    """
     from lquant.factors.dsl.ast_nodes import FactorExpr
 
     if not isinstance(expr_ast, FactorExpr):
         raise TypeError("需要 FactorExpr")
     w, fields, _ops = analyze(expr_ast.root)
+    if allowed_fields is not None:
+        import difflib
+
+        for f in sorted(fields - allowed_fields):
+            cand = difflib.get_close_matches(f, sorted(allowed_fields), n=3)
+            hint = f"，是否想用: {cand}?" if cand else ""
+            raise FactorError(
+                f"字段 {f!r} 不在数据列中{hint}；可用字段: {sorted(allowed_fields)}")
     expr_ast.min_window = w
     expr_ast.fields = fields
