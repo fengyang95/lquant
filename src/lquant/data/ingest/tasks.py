@@ -305,8 +305,34 @@ def _run_task(task_id: str) -> dict:
     except Exception as e:  # noqa: BLE001 — 执行期异常也落到 failed 终态，不卡 running
         error = f"{type(e).__name__}: {e}"
     done = sum(1 for s, _ in all_syms if cp.is_done(s))
-    _finalize(task_id, total, base["failed"], early, done_count=done, error=error)
+    status = _finalize(task_id, total, base["failed"], early, done_count=done,
+                       error=error)
+    if status in ("ok", "partial") and params.get("auto_crosscheck", True):
+        _auto_crosscheck(task_id, start, end)
     return get_task(task_id)
+
+
+def _auto_crosscheck(task_id: str, start: date, end: date) -> None:
+    """任务收尾自动对拍（§T9）：对本次 [start, end] 窗口跑一次抽样对拍。
+
+    失败只 log 不影响任务终态（对拍不是同步链路的单点故障）；
+    e2e/单测环境无 peer 源时 run_crosscheck 回退 L0，同样不算失败。
+    summary JSON 追加进 message 字段，任务详情接口可直接展示。
+    """
+    from loguru import logger
+
+    try:
+        from lquant.data.ingest.crosscheck import run_crosscheck
+
+        res = run_crosscheck(start=str(start), end=str(end))
+        summary = json.dumps(res.get("summary", {}), ensure_ascii=False)
+        with writer() as con:
+            con.execute(
+                "UPDATE data_task SET message = message || ? WHERE task_id=?",
+                [f" | crosscheck: {summary}", task_id],
+            )
+    except Exception as e:  # noqa: BLE001 — 对拍失败不影响任务终态
+        logger.warning(f"任务 {task_id} 自动对拍失败（忽略）: {e}")
 
 
 def claim_retry(task_id: str) -> dict:
