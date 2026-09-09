@@ -42,9 +42,11 @@ pub struct Fill {
 }
 /// 撮合：返回成交与费用。
 /// 最低佣金按订单累计（分多次成交只收一次）。
-pub fn match_order(order: &mut Order, price: f64, r: &InstrumentRules) -> Option<Fill> {
+/// `max_qty`：单次撮合的最大成交量（None = 剩余全部成交），用于分批成交。
+pub fn match_order(order: &mut Order, price: f64, r: &InstrumentRules, max_qty: Option<f64>) -> Option<Fill> {
     let remain = order.qty - order.filled_qty;
-    let qty = (remain / r.lot_size).floor() * r.lot_size;
+    let fillable = max_qty.unwrap_or(remain).min(remain);
+    let qty = (fillable / r.lot_size).floor() * r.lot_size;
     if qty <= 0.0 {
         return None;
     }
@@ -85,7 +87,7 @@ fn match_order_py(symbol: &str, is_buy: bool, qty: f64, price: f64,
         commission_rate, commission_min, commission_per_order: true,
         transfer_fee_rate, tax_rate, lot_size, sellable_after_days: 1,
     };
-    match match_order(&mut o, price, &r) {
+    match match_order(&mut o, price, &r, None) {
         Some(f) => (f.qty, f.fee),
         None => (0.0, 0.0),
     }
@@ -108,7 +110,7 @@ mod tests {
         let r = InstrumentRules { commission_rate: 0.00025, commission_min: 5.0,
                                   commission_per_order: true, transfer_fee_rate: 0.0,
                                   tax_rate: 0.0, lot_size: 100.0, sellable_after_days: 0 };
-        let f = match_order(&mut o, 4.0, &r).unwrap();
+        let f = match_order(&mut o, 4.0, &r, None).unwrap();
         assert_eq!(f.qty, 1000.0);
         // 4000 元 * 0.00025 = 1 元 < 最低 5 元 → 补到 5 元，且无印花税
         assert_eq!(f.fee, 5.0);
@@ -123,8 +125,8 @@ mod tests {
         let r = InstrumentRules { commission_rate: 0.00025, commission_min: 5.0,
                                   commission_per_order: true, transfer_fee_rate: 0.0,
                                   tax_rate: 0.0, lot_size: 100.0, sellable_after_days: 1 };
-        let f1 = match_order(&mut o, 10.0, &r).unwrap();
-        let f2 = match_order(&mut o, 10.0, &r).unwrap();
+        let f1 = match_order(&mut o, 10.0, &r, Some(200.0)).unwrap();
+        let f2 = match_order(&mut o, 10.0, &r, Some(200.0)).unwrap();
         assert_eq!(f1.qty, 200.0);
         assert_eq!(f2.qty, 200.0);
         assert!((f1.fee - 5.0).abs() < 1e-9);   // 第一笔补足到 5 元

@@ -42,3 +42,6 @@ web/tsconfig.tsbuildinfo
 
 # TS build info
 *.tsbuildinfo
+
+# OMC 会话状态
+.omc/

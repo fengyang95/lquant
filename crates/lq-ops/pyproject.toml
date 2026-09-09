@@ -4,6 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "lq-ops"
+version = "0.1.0"
 requires-python = ">=3.9"
 # ⚠️ 必须与 Cargo.toml 的 polars / pyo3 版本匹配
 dependencies = ["polars>=1.30"]
