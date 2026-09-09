@@ -45,7 +45,7 @@ def rebalance(context):
     for s in set(context.portfolio.positions) - set(picks):
         order_target_value(s, 0)
     record(total=context.portfolio.total_value)
-    log.info(f"rebalance n_picks={len(picks)}")
+    log.info("n_picks=%d", len(picks))
 '''
 
 ANALYSIS_SOURCE = '''
@@ -126,6 +126,13 @@ def run_metrics(client):
     assert body["n_nav_points"] > 10
     assert body["metrics"], "metrics 不应为空"
     assert body["logs"], "log.info 未产生日志"
+    # 因子联动必须是承重的：选股数 > 0 且真实产生过订单
+    import re as _re
+
+    counts = [int(m.group(1)) for lg in body["logs"]
+              if (m := _re.search(r"n_picks=(\d+)", str(lg)))]
+    assert counts and max(counts) > 0, f"get_factor_values 选股全空: {body['logs']}"
+    assert body["n_trades"] > 0, "策略未产生任何成交（选股联动失效）"
 
     # 3. 详情：records / logs / custom_analysis
     detail = client.get(f"/api/backtests/{body['run_id']}")
@@ -158,7 +165,9 @@ def test_02_analysis_saved_smoke_ok(client):
     saved = r.json()
     assert saved["name"] == "e2e_metrics_chart"
     assert client.get(f"/api/analyses/{saved['id']}").status_code == 200
-    assert client.get("/api/analyses").json()           # 列表含该分析
+    lst = client.get("/api/analyses").json()
+    assert any(a["id"] == saved["id"] and a["name"] == "e2e_metrics_chart"
+               for a in lst), "保存的分析未出现在列表里"
 
 
 def test_03_run_user_analysis_chart(client, run_metrics):
