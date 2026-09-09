@@ -166,6 +166,9 @@ DDL_STATEMENTS: list[str] = [
         name VARCHAR, expr VARCHAR, claimed_ic DOUBLE, recomputed_ic DOUBLE,
         grade VARCHAR, agent VARCHAR, payload VARCHAR, created_at TIMESTAMP,
         PRIMARY KEY (name, expr, created_at)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS factor_value (
         factor VARCHAR, symbol VARCHAR, trade_date DATE,
         raw DOUBLE, processed DOUBLE,
