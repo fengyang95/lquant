@@ -65,6 +65,32 @@ classify_divergence 分档 → flag_cross_source 写回湖 → 落 data_quality_
 - 执行器与 run_crosscheck 改读 SettingsStore 而非 providers.yaml 的 crosscheck 节
   （yaml 值退化为默认值，仍可写）
 
+## 2.4 DAILY_BAR schema 扩展（全部纳入）
+
+`DAILY_BAR`（`data/schema.py`）新增 9 列，BaoStock 日线接口全部免费直出：
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| pct_chg | Float64 | 当日涨跌幅%（源站 pctChg） |
+| is_st | Boolean | ST/*ST 标记（源站 isST） |
+| is_suspended | Boolean | 停牌标记（tradestatus=0 → 行保留并标记，**不再丢行**） |
+| pe_ttm | Float64 | 滚动市盈率（peTTM） |
+| pb_mrq | Float64 | 市净率（pbMRQ） |
+| ps_ttm | Float64 | 滚动市销率（psTTM） |
+| pcf_ncf_ttm | Float64 | 滚动市现率（pcfNcfTTM） |
+| total_mv | Float64 | 总市值（元，总股本×close 换算） |
+| float_mv | Float64 | 流通市值（元） |
+
+配套改动：
+- baostock adapter：_DAILY_FIELDS 扩列 + 映射层加字段（ETF 无估值字段 → null）
+- 停牌行从「丢弃」改为「保留 + is_suspended=true，volume=0」；
+  质量门禁断言同步（停牌行豁免量价断言）、回测撮合拒停牌（engine 已有涨跌停拒单，
+  补停牌判断）
+- 中性化/市值暴露改用 float_mv 列（有值优先，回退现路径）
+- schema 是「目标态」：旧湖文件缺列由 parquet 读取侧 `missing_columns='null'` 兼容，
+  重拉区间自然补齐，无需迁移存量
+- 衍生指标（复权价/MA/涨跌停判定等）仍不入湖，读取侧按需计算
+
 ## 3. data_task 表（DuckDB）
 
     CREATE TABLE IF NOT EXISTS data_task (
