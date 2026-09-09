@@ -187,7 +187,7 @@ def _year_slices(start: date, end: date):
 
 
 def _attach_is_st(out: pl.DataFrame, raw: pl.DataFrame) -> pl.DataFrame:
-    """把 fetch 侧的 is_st 布尔列挂回引擎输出（is_st 非日线路图列，映射层会丢）。
+    """把 fetch 侧的 is_st 列挂回引擎输出（映射层已保留 raw is_st 时跳过）。
 
     纯函数、无实例状态：长度不匹配 fail-fast；raw 无 is_st 时输出补全 null 列，
     保持旧 daily_bars 输出恒有该列。
@@ -201,7 +201,10 @@ def _attach_is_st(out: pl.DataFrame, raw: pl.DataFrame) -> pl.DataFrame:
             "is_st_attach",
             f"is_st 行数与映射输出不一致: raw={len(raw)} out={len(out)}",
         )
-    return out.with_columns(raw["is_st"].cast(pl.Boolean).alias("is_st"))
+    return out.with_columns(
+        raw["is_st"].cast(pl.Utf8).str.to_lowercase().str.strip_chars()
+        .is_in(["1", "true"]).alias("is_st")
+    )
 
 
 def _guess_sellable_days(name: str, track_index: str | None = None) -> int:

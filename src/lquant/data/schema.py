@@ -20,6 +20,15 @@ DAILY_BAR = {
     "amount": pl.Float64,     # 元（源站万元/亿元必须换算）
     "turnover_rate": pl.Float64,
     "adj_factor": pl.Float64,
+    "pct_chg": pl.Float64,        # 当日涨跌幅%（源站 pctChg）
+    "is_st": pl.Boolean,          # ST/*ST（源站 isST）
+    "is_suspended": pl.Boolean,   # 停牌标记（行保留不再丢）
+    "pe_ttm": pl.Float64,         # 滚动市盈率（peTTM）
+    "pb_mrq": pl.Float64,         # 市净率（pbMRQ）
+    "ps_ttm": pl.Float64,         # 滚动市销率（psTTM）
+    "pcf_ncf_ttm": pl.Float64,    # 滚动市现率（pcfNcfTTM）
+    "total_mv": pl.Float64,       # 总市值（元）
+    "float_mv": pl.Float64,       # 流通市值（元，close×volume/turn 推导）
     "sec_type": pl.Utf8,
     "quality_flags": pl.Int32,   # 位掩码；0 = 干净
     "source": pl.Utf8,
@@ -127,7 +136,17 @@ def coerce(df: pl.DataFrame, name: str) -> pl.DataFrame:
     cols = []
     for c, dt in target.items():
         if c in df.columns:
-            cols.append(df[c].cast(dt, strict=False))
+            cols.append(_cast_to_schema(df[c], dt))
         else:
             cols.append(pl.lit(None, dtype=dt).alias(c))
     return df.with_columns(cols).select(list(target))
+
+
+def _cast_to_schema(s: pl.Series, dt: pl.DataType) -> pl.Series:
+    """cast 到 schema dtype；Utf8 → Boolean 走 "1"/"true" 白名单（polars 不支持直转）。"""
+    if dt == pl.Boolean and s.dtype == pl.Utf8:
+        return (
+            s.cast(pl.Utf8).str.to_lowercase().str.strip_chars()
+            .is_in(["1", "true", "t", "yes"])
+        )
+    return s.cast(dt, strict=False)

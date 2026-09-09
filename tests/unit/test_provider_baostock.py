@@ -62,7 +62,7 @@ def test_daily_mapping_via_engine(provider: BaoStockProvider) -> None:
     raw = _daily_raw_after_fetch()
     out = provider.request("daily_bar", _raw=raw)
     out = _attach_is_st(out, raw)
-    assert out.columns[:16] == list(SCHEMAS["daily_bar"])
+    assert out.columns == list(SCHEMAS["daily_bar"])
     assert out["symbol"].to_list() == ["600000.SH", "600000.SH"]
     assert out["trade_date"].dtype == pl.Date
     assert out["amount"].to_list() == [3000.0, 3300.0]  # 已是元，直接透传
