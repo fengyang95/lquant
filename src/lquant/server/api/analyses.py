@@ -39,7 +39,7 @@ def _smoke(source: str) -> None:
 
 
 def _get_live(aid: str) -> dict:
-    """get_analysis 不过滤软删，存活校验用 list_analyses 的过滤口径。"""
+    """get_analysis 不过滤软删，存活校验用 list_analyses 的过滤口径（按 id）。"""
     from lquant.backtest.strategy_store import get_analysis, list_analyses
 
     if not any(a["id"] == aid for a in list_analyses()):
@@ -72,11 +72,17 @@ def get_analysis_api(aid: str) -> dict:
 
 @router.put("/{aid}")
 def update_analysis(aid: str, req: AnalysisSourceIn) -> dict:
-    """PUT = 同名再存一条并软删旧条（分析无版本概念，等效于更新）。"""
-    from lquant.backtest.strategy_store import delete_analysis, get_analysis, save_analysis
+    """PUT = 同名再存一条并软删旧条（分析无版本概念，等效于更新）。
+
+    存活校验按 name 口径：id 已被软删但同名仍有存活条 → 等效更新仍可用；
+    整个 name 已软删 → 404，PUT 不复活。
+    """
+    from lquant.backtest.strategy_store import delete_analysis, get_analysis, list_analyses, save_analysis
 
     try:
         cur = get_analysis(aid)
+        if not any(a["name"] == cur["name"] for a in list_analyses()):
+            raise KeyError(aid)
     except KeyError as e:
         raise HTTPException(404, f"分析不存在: {aid}") from e
     _smoke(req.source)
@@ -90,7 +96,7 @@ def delete_analysis_api(aid: str) -> dict:
     from lquant.backtest.strategy_store import delete_analysis, get_analysis
 
     try:
-        get_analysis(aid)
+        get_analysis(aid)  # id 级校验：重复 DELETE 已替换/软删的 id 保持幂等 200
     except KeyError as e:
         raise HTTPException(404, f"分析不存在: {aid}") from e
     delete_analysis(aid)

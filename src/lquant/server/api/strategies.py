@@ -33,12 +33,14 @@ class ValidateIn(BaseModel):
 
 
 def _get_live(sid: str) -> dict:
-    """get_strategy 不过滤软删，存活校验用 list_strategies 的过滤口径。"""
+    """get_strategy 不过滤软删：先按任意历史版本 id 解析，再校验该策略（按 name）
+    仍有存活版本 —— 软删后的 id 不复活，历史版本 id 仍可 PUT。"""
     from lquant.backtest.strategy_store import get_strategy, list_strategies
 
-    if not any(s["id"] == sid for s in list_strategies()):
+    cur = get_strategy(sid)
+    if not any(s["name"] == cur["name"] for s in list_strategies()):
         raise KeyError(sid)
-    return get_strategy(sid)
+    return cur
 
 
 @router.get("")
@@ -80,10 +82,10 @@ def get_strategy_api(sid: str) -> dict:
 @router.put("/{sid}")
 def update_strategy(sid: str, req: StrategySourceIn) -> dict:
     """PUT = 以任意历史版本 id 定位策略，再以同名保存一版（版本 +1）。"""
-    from lquant.backtest.strategy_store import get_strategy, save_strategy
+    from lquant.backtest.strategy_store import save_strategy
 
     try:
-        cur = get_strategy(sid)
+        cur = _get_live(sid)
     except KeyError as e:
         raise HTTPException(404, f"策略不存在: {sid}") from e
     try:
@@ -112,10 +114,10 @@ def strategy_versions(sid: str) -> list[dict]:
 @router.delete("/{sid}")
 def delete_strategy_api(sid: str) -> dict:
     """软删整个策略（该 name 下所有版本）。"""
-    from lquant.backtest.strategy_store import delete_strategy, get_strategy, list_versions
+    from lquant.backtest.strategy_store import delete_strategy, list_versions
 
     try:
-        cur = get_strategy(sid)
+        cur = _get_live(sid)
     except KeyError as e:
         raise HTTPException(404, f"策略不存在: {sid}") from e
     for v in list_versions(cur["name"]):
