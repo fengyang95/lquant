@@ -16,9 +16,19 @@ providers:
     module: lquant.data.providers.akshare
     cls: AkShareProvider
     qps: 3            # 东财系极易封 IP
-    capability: [daily, minute_1, minute_5, etf_spot, etf_daily, etf_iopv,
-                 money_flow, limit_up, dragon_tiger, sector]
-    note: 覆盖最广但易封；仅用于独有数据
+    capability: [daily, minute_1, minute_5, minute_15, minute_30, minute_60,
+                 adj_factor, reference, etf_daily]
+    note: 覆盖最广但易封；已接入声明式映射机制（daily/minute/adj_factor/securities/ETF 日线），保持关闭由用户开启
+
+  - name: tushare
+    enabled: true
+    module: lquant.data.providers.tushare
+    cls: TushareProvider
+    env_key: TUSHARE_TOKEN   # 环境变量缺失 → build_chain 跳过该源（warning，不抛错）
+    qps: 1            # 按积分档位限流，默认最低档
+    capability: [daily, minute_1, minute_5, minute_15, minute_30, minute_60,
+                 adj_factor, financial_pit, reference, calendar, etf_daily]
+    note: pro 接口需 token；stk_mins 需 2000 积分，不足时报权限错误转 SourceUnavailable 切源
 
   - name: efinance
     enabled: false
@@ -59,6 +69,17 @@ providers:
     qps: 5
     capability: [adj_factor]
     note: 复权因子源（hfq.js），端点无常量契约（实验性）
+
+  - name: tickdb
+    enabled: false   # 预留：未实现，勿启用
+    module: lquant.data.providers.tickdb
+    cls: TickdbProvider
+    qps: 0
+    capability: [tick]
+    note: >-
+      预留位。接入 = 两步：config/schema/<table>.yaml 加对应 sources.tickdb 映射节 +
+      实现 lquant/data/providers/tickdb.py（继承 MappingProvider 的薄类，仅写 _fetch_raw）。
+      _import_all 刻意不加载本模块（无实现文件，import 失败会被吞掉，明确不加避免噪音）。
 
 crosscheck:
   enabled: true

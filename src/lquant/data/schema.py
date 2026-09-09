@@ -48,7 +48,7 @@ FINANCIAL_PIT = {
     "symbol": pl.Utf8,
     "stat_date": pl.Date,     # 报告期
     "pub_date": pl.Date,      # 公告日 —— 回测只能用 pub_date <= t
-    "report_type": pl.Utf8,   # Q1/H1/Q3/ANNUAL
+    "report_type": pl.Utf8,   # 带年季：2024Q1 / 2024Q2 / 2024Q3 / 2024Q4（年报）
     "item": pl.Utf8,
     "value": pl.Float64,
     "unit": pl.Utf8,

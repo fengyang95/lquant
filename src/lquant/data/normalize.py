@@ -30,6 +30,23 @@ def rename_columns(df: pl.DataFrame) -> pl.DataFrame:
     return df.rename(mapping)
 
 
+def normalize_60min_bounds(df: pl.DataFrame) -> pl.DataFrame:
+    """60min 边界归一：上午收盘那根 11:30 → 11:00（baostock / akshare 共用）。
+
+    仅当 freq 列首行为 "60min" 时生效；14:00 / 15:00 保持不变。
+    """
+    if df.is_empty() or df["freq"][0] != "60min":
+        return df
+    return df.with_columns(
+        pl.when(
+            (pl.col("ts").dt.hour() == 11) & (pl.col("ts").dt.minute() == 30)
+        )
+        .then(pl.col("ts") - pl.duration(minutes=30))
+        .otherwise(pl.col("ts"))
+        .alias("ts")
+    )
+
+
 def normalize_symbols(df: pl.DataFrame, col: str = "symbol") -> pl.DataFrame:
     """把源站的 sh.600000 / 600000 / 600519.SH 统一成 600000.SH。"""
     return df.with_columns(

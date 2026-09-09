@@ -1,0 +1,35 @@
+# minute_bar 字段映射（唯一事实源：lquant.data.schema.SCHEMAS["minute_bar"]）
+# baostock 分钟线 time 列解析（YYYYmmddHHMMSSmmm → ts）、60min 边界归一
+# 在 provider 的 _fetch_raw / _post_normalize 做；freq 由 request params 覆盖。
+table: minute_bar
+sources:
+  baostock:
+    rename: {code: symbol}
+    fill: {freq: "5min", source: baostock, adj_factor: 1.0}   # freq 由 params 覆盖
+    required: [symbol, ts, open, high, low, close, volume]
+
+  akshare:
+    # stock_zh_a_hist_min_em：时间列已在 provider _fetch_raw 解析为 ts
+    # （bar 结束时刻），volume 是手 → ×100。freq 由 request params 覆盖。
+    rename:
+      股票代码: symbol
+      开盘: open
+      收盘: close
+      最高: high
+      最低: low
+      成交量: volume
+      成交额: amount
+    derive:
+      volume: {expr: "volume * 100", from: [volume]}   # 手 → 股
+    fill: {freq: "1min", source: akshare, adj_factor: 1.0}   # freq 由 params 覆盖
+    required: [symbol, ts, open, high, low, close, volume]
+
+  tushare:
+    # pro.stk_mins：trade_time 已在 provider _fetch_raw 解析为 ts（bar 结束
+    # 时刻）；vol 是手 → ×100 股，amount 是千元 → ×1000 元（与 daily 同口径）。
+    rename: {ts_code: symbol}
+    derive:
+      volume: {expr: "vol * 100", from: [vol]}        # 手 → 股
+      amount: {expr: "amount * 1000", from: [amount]} # 千元 → 元
+    fill: {freq: "1min", source: tushare, adj_factor: 1.0}   # freq 由 params 覆盖
+    required: [symbol, ts, open, high, low, close, volume]
