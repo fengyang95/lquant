@@ -60,6 +60,7 @@ dev = [
   "pre-commit>=4.0",
   # mootdx 锁 httpx<0.26，dev 测试客户端跟随该上限
   "httpx>=0.25,<0.26",
+  "hypothesis>=6.100",
 ]
 
 [project.scripts]

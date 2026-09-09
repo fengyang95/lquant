@@ -115,14 +115,16 @@ def quantile_summary(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
     groups = []
     for q in range(1, n_groups + 1):
         sub = g.filter(pl.col("q") == q).sort(date_col)
-        r = sub["ret"].to_numpy()
-        p = perf_from_returns(r, periods_per_year=periods_per_year)
+        # 股票数 < n_groups 时部分分位组可能为空 —— mean 为 None，按 NaN 处理
+        m = sub["ret"].mean()
+        r = sub["ret"].to_numpy() if len(sub) else []
+        p = perf_from_returns(r, periods_per_year=periods_per_year) if len(sub) else {}
         groups.append({
             "q": q,
-            "mean_ret": float(sub["ret"].mean()),
-            "annual_return": p["annual_return"],
-            "sharpe": p["sharpe"],
-            "max_drawdown": p["max_drawdown"],
+            "mean_ret": float(m) if m is not None else float("nan"),
+            "annual_return": p.get("annual_return", float("nan")),
+            "sharpe": p.get("sharpe", float("nan")),
+            "max_drawdown": p.get("max_drawdown", float("nan")),
             "n_periods": len(sub),
         })
 
@@ -130,9 +132,12 @@ def quantile_summary(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
     ls_perf = perf_from_returns(ls["ret_long_short"].to_numpy(),
                                 periods_per_year=periods_per_year) if len(ls) else {}
 
-    means = [g["mean_ret"] for g in groups]
-    # 单调性：Spearman 相关（组序 vs 组平均收益），越接近 1 越单调
-    mono = _spearman(list(range(1, n_groups + 1)), means)
+    # 空分位组的 mean_ret 是 NaN —— 只用有效组算单调性与 spread，否则 NaN 毒化结果
+    pairs = [(g["q"], g["mean_ret"]) for g in groups
+             if isinstance(g["mean_ret"], float) and not math.isnan(g["mean_ret"])]
+    mono = _spearman([q for q, _ in pairs], [m for _, m in pairs]) if len(pairs) >= 2 \
+        else float("nan")
+    spread = pairs[-1][1] - pairs[0][1] if len(pairs) >= 2 else float("nan")
 
     return {
         "factor": factor,
@@ -143,7 +148,7 @@ def quantile_summary(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
                        ("total_return", "annual_return", "annual_vol", "sharpe",
                         "max_drawdown", "win_rate", "calmar")},
         "monotonicity": mono,
-        "top_bottom_spread": (means[-1] - means[0]) if means else float("nan"),
+        "top_bottom_spread": spread,
     }
 
 
