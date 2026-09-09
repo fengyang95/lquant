@@ -1,38 +1,40 @@
 //! lq-ops：因子重算子的 Rust 实现。
 //!
-//! 通过 pyo3-polars 的 `#[polars_expr]` 插件机制暴露 —— GIL-free，
-//! 且能自动享受 Polars 的并行与 lazy/streaming 优化。
+//! 用 `#[pyfunction]` + `Vec<Option<f64>>` 暴露（与 lq-metrics 同构），
+//! 而非 `#[polars_expr]` polars 插件：
+//! - 仓库 Rust 侧 polars 0.49 与 Python 侧 polars 1.44 的插件 FFI 协议不同，
+//!   跨版本调用会 ABI 错配；`#[pyfunction]` 走 pyo3 纯边界，彻底绕开。
+//! - 确定性数组接口与 `lquant/_rust/ops_ref.py` 逐字段镜像，对拍可逐位比较。
 //!
-//! 每个算子在 Python 侧都有参考实现（`lquant/_rust/ops_ref.py`），
-//! 加载失败自动降级，且两者单测对拍。
+//! 每个算子都在 Python 侧有参考实现（`lquant/_rust/ops_ref.py`），
+//! 两者单测对拍（tests/unit/test_rust_alignment.py）。
 
-use polars::prelude::*;
-use pyo3_polars::derive::polars_expr;
+use pyo3::prelude::*;
 
-/// 时序相关系数：滚动窗口内的 Pearson 相关。
-/// 对应算子 Ts_Corr(x, y, n)，category = TS。
-#[polars_expr(output_type=Float64)]
-fn ts_corr(inputs: &[Series]) -> PolarsResult<Series> {
-    let x = &inputs[0];
-    let y = &inputs[1];
-    let n = inputs[2].get(0)?.try_extract::<usize>()?;
-
-    let xa = x.cast(&DataType::Float64)?;
-    let ya = y.cast(&DataType::Float64)?;
-    let xf = xa.f64()?;
-    let yf = ya.f64()?;
-
-    let mut out: Vec<Option<f64>> = Vec::with_capacity(xf.len());
-    for i in 0..xf.len() {
+/// 时序相关系数：滚动窗口内的 Pearson 相关。对应参考 `ops_ref.ts_corr`。
+///
+/// 语义与参考逐一对齐：`i + 1 < n` 窗口不足 → None；窗口内有空值或
+/// `cnt < n` → None；零方差 → None（而非 NaN）。
+#[pyfunction]
+fn ts_corr(x: Vec<Option<f64>>, y: Vec<Option<f64>>, n: usize) -> Vec<Option<f64>> {
+    let len = x.len();
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
         if i + 1 < n {
             out.push(None);
             continue;
         }
-        let (mut sx, mut sy, mut sxx, mut syy, mut sxy, mut cnt) = (0.0, 0.0, 0.0, 0.0, 0.0, 0usize);
+        let (mut sx, mut sy, mut sxx, mut syy, mut sxy, mut cnt) =
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0usize);
         for j in (i + 1 - n)..=i {
-            match (xf.get(j), yf.get(j)) {
+            match (x[j], y[j]) {
                 (Some(a), Some(b)) => {
-                    sx += a; sy += b; sxx += a * a; syy += b * b; sxy += a * b; cnt += 1;
+                    sx += a;
+                    sy += b;
+                    sxx += a * a;
+                    syy += b * b;
+                    sxy += a * b;
+                    cnt += 1;
                 }
                 _ => {}
             }
@@ -51,28 +53,29 @@ fn ts_corr(inputs: &[Series]) -> PolarsResult<Series> {
             out.push(Some(cov / (vx * vy).sqrt()));
         }
     }
-    Ok(Series::new("ts_corr".into(), out))
+    out
 }
 
-/// 回归 beta：Ts_Regbeta(y, x, n)。
-#[polars_expr(output_type=Float64)]
-fn ts_regbeta(inputs: &[Series]) -> PolarsResult<Series> {
-    let y = inputs[0].cast(&DataType::Float64)?;
-    let x = inputs[1].cast(&DataType::Float64)?;
-    let n = inputs[2].get(0)?.try_extract::<usize>()?;
-    let yf = y.f64()?;
-    let xf = x.f64()?;
-
-    let mut out: Vec<Option<f64>> = Vec::with_capacity(yf.len());
-    for i in 0..yf.len() {
+/// 回归 beta（y 对 x）。对应参考 `ops_ref.ts_regbeta`。
+#[pyfunction]
+fn ts_regbeta(y: Vec<Option<f64>>, x: Vec<Option<f64>>, n: usize) -> Vec<Option<f64>> {
+    let len = y.len();
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
         if i + 1 < n {
             out.push(None);
             continue;
         }
         let (mut sx, mut sy, mut sxx, mut sxy, mut cnt) = (0.0, 0.0, 0.0, 0.0, 0usize);
         for j in (i + 1 - n)..=i {
-            match (xf.get(j), yf.get(j)) {
-                (Some(a), Some(b)) => { sx += a; sy += b; sxx += a * a; sxy += a * b; cnt += 1; }
+            match (x[j], y[j]) {
+                (Some(a), Some(b)) => {
+                    sx += a;
+                    sy += b;
+                    sxx += a * a;
+                    sxy += a * b;
+                    cnt += 1;
+                }
                 _ => {}
             }
         }
@@ -85,14 +88,14 @@ fn ts_regbeta(inputs: &[Series]) -> PolarsResult<Series> {
             out.push(Some(cov / vx));
         }
     }
-    Ok(Series::new("ts_regbeta".into(), out))
+    out
 }
 
-use pyo3::prelude::*;
-
-/// 注册为 Polars 插件命名空间 `lq_ops`。
+/// 模块：显式注册算子为可直呼的 Python 函数。
 #[pymodule]
 fn lq_ops(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add_function(wrap_pyfunction!(ts_corr, m)?)?;
+    m.add_function(wrap_pyfunction!(ts_regbeta, m)?)?;
     Ok(())
 }

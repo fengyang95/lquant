@@ -14,7 +14,6 @@ from __future__ import annotations
 import importlib
 import math
 
-import polars as pl
 import pytest
 
 from lquant._rust.broker_ref import match_order as ref_match_order
@@ -119,25 +118,19 @@ _NO_RUST = "未编译 Rust：先 make rust-build"
 @pytest.mark.rust
 @pytest.mark.skipif(LQ_OPS is None, reason=_NO_RUST)
 class TestOpsParity:
+    # lq-ops 走 `#[pyfunction]` 数组接口（与 ops_ref 同形，绕开 polars 插件
+    # FFI 的 Rust0.49/Python1.44 版本错配）。逐位比较 Rust 输出与参考实现。
     def test_ts_corr_parity(self):
         x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
         y = [2.0, 1.0, 4.0, 3.0, 6.0, 5.0]
         n = 3
-        df = pl.DataFrame({"x": x, "y": y})
-        out = df.with_columns(
-            LQ_OPS.ts_corr(pl.col("x"), pl.col("y"), pl.lit(n)).alias("c"),
-        )["c"].to_list()
-        _finite_close(out, ts_corr(x, y, n))
+        _finite_close(LQ_OPS.ts_corr(x, y, n), ts_corr(x, y, n))
 
     def test_ts_regbeta_parity(self):
         x = [1.0, 2.0, 3.0, 4.0, 5.0]
         y = [2.0, 3.0, 5.0, 7.0, 11.0]
         n = 3
-        df = pl.DataFrame({"y": y, "x": x})
-        out = df.with_columns(
-            LQ_OPS.ts_regbeta(pl.col("y"), pl.col("x"), pl.lit(n)).alias("b"),
-        )["b"].to_list()
-        _finite_close(out, ts_regbeta(y, x, n))
+        _finite_close(LQ_OPS.ts_regbeta(y, x, n), ts_regbeta(y, x, n))
 
 
 @pytest.mark.rust

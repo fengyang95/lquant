@@ -49,7 +49,9 @@ def read_daily(symbols: list[str] | None = None, start=None, end=None) -> pl.Laz
     from datetime import date as _date
 
     root = _root() / "daily"
-    if not any(root.rglob("*.parquet")):
+    # data 目录 gitignore，全新 checkout 下根目录不存在 → rglob 会抛
+    # FileNotFoundError。用 is_dir 短路：无库即空帧，而不是炸读取。
+    if not root.is_dir() or not any(root.rglob("*.parquet")):
         return pl.DataFrame().lazy()
     # 字符串日期显式转 Date，避免 filter 时类型比较失败
     if isinstance(start, str):
@@ -114,7 +116,7 @@ def write_minute(df: pl.DataFrame, freq: str | None = None) -> list[Path]:
 def read_minute(symbols: list[str] | None = None, freq: str = "60min",
                 start=None, end=None) -> pl.LazyFrame:
     root = _root() / "minute" / f"freq={freq}"
-    if not any(root.rglob("*.parquet")):
+    if not root.is_dir() or not any(root.rglob("*.parquet")):
         return pl.DataFrame().lazy()
     lf = pl.scan_parquet(str(root / "**" / "*.parquet"))
     if symbols:
