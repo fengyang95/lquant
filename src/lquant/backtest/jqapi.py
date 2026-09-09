@@ -14,7 +14,9 @@
             order_target_value(s, context.portfolio.total_value / 2)
 
 兼容面（日频子集）：
-    生命周期   initialize / handle_data / run_daily / run_weekly / run_monthly
+    生命周期   initialize / handle_data / before_trading_start / after_trading_end
+               run_daily / run_weekly / run_monthly
+    采集       record(**kv)（每日每键一条 (trade_date, value) 自定义曲线）
     设置       set_benchmark / set_option / set_order_cost / set_slippage / set_universe
     下单       order / order_value / order_target / order_target_value / cancel_order
     行情       get_price / history / attribute_history / get_current_data
@@ -61,6 +63,7 @@ class JQResult:
     positions: dict[date, dict[str, float]] = field(default_factory=dict)
     metrics: dict = field(default_factory=dict)
     logs: list[str] = field(default_factory=list)
+    records: dict[str, list[tuple[date, float]]] = field(default_factory=dict)
     error: str | None = None
 
     def to_frame(self) -> pl.DataFrame:
@@ -322,6 +325,8 @@ class JQRunner:
             raise ValueError(f"策略代码执行失败: {e}\n{traceback.format_exc(limit=4)}") from e
         self._initialize_fn = self.ns.get("initialize")
         self._handle_data_fn = self.ns.get("handle_data")
+        self._before_trading_fn = self.ns.get("before_trading_start")
+        self._after_trading_fn = self.ns.get("after_trading_end")
         self._sched: list[tuple] = []          # run() 里 initialize 之后构建
 
     def _build_sched(self) -> None:
@@ -428,6 +433,7 @@ class JQRunner:
             run_daily=run_daily, run_weekly=run_weekly, run_monthly=run_monthly,
             order=order, order_value=order_value, order_target=order_target,
             order_target_value=order_target_value, cancel_order=cancel_order,
+            record=lambda **kv: r._record(kv),
             get_current_data=get_current_data, history=history,
             attribute_history=attribute_history, get_price=get_price,
             get_all_securities=get_current_user_query_result,
@@ -439,6 +445,23 @@ class JQRunner:
         ns["context"] = self.context
 
     # ---- 内部工具 ----
+
+    def _record(self, kv: dict) -> None:
+        """record(**kv)：自定义曲线采集，每日每键一条 (trade_date, value)。"""
+        for k, v in kv.items():
+            self.res.records.setdefault(str(k), []).append((self._today, float(v)))
+
+    def _run_hook(self, fn, d: date, when: str) -> str | None:
+        """跑生命周期钩子；异常时返回错误文本（调用方置 res.error 并终止）。"""
+        self._bucket = "open" if when == "open" else "close"
+        self.context.current_dt = datetime.combine(
+            d, dtime(9, 30) if when == "open" else dtime(15, 0))
+        try:
+            fn(self.context) if fn.__code__.co_argcount else fn()
+        except Exception as e:                    # noqa: BLE001
+            name = getattr(fn, "__name__", "?")
+            return (f"{d} {when} 钩子 {name} 异常: {e}\n{traceback.format_exc(limit=4)}")
+        return None
 
     def _round_lot(self, sym: str, qty: float) -> float:
         rules = self._rules.get(sym)
@@ -678,13 +701,18 @@ class JQRunner:
         self._rules = build_rules(symbols, ruleset)
         self._broker = Broker(self._rules, self._slippage)
 
-        prev_nav = self.initial_cash
         for i, d in enumerate(self._dates):
             self._today = d
             self._day_index = i
             self._bars_today = bars_by_day[d]
             self.context.current_dt = datetime.combine(d, dtime(9, 30))
             self.context.previous_date = self._dates[i - 1] if i > 0 else None
+
+            # 盘前钩子（bucket=open）
+            if self._before_trading_fn and (err := self._run_hook(
+                    self._before_trading_fn, d, "open")):
+                self.res.error = err
+                return self.res
 
             for fn, bucket in self._due_funcs(d, i):
                 self._bucket = bucket
@@ -699,14 +727,27 @@ class JQRunner:
                                       f"异常: {e}\n{traceback.format_exc(limit=4)}")
                     return self.res
 
+            # 盘后钩子（bucket=close）
+            if self._after_trading_fn and (err := self._run_hook(
+                    self._after_trading_fn, d, "close")):
+                self.res.error = err
+                return self.res
+
             # 收盘估值 + 持仓快照
-            self._bucket = "close"
-            prices = {s: b.close for s, b in self._bars_today.items()}
-            nav = self.account.nav(prices)
-            if nav > 0:
-                self.res.nav.append((d, nav))
-            prev_nav = nav
-            self.res.positions[d] = {s: p.qty for s, p in self.account.positions.items() if p.qty}
+            self._settle(d)
+
+        self._finalize()
+        return self.res
+
+    def _settle(self, d: date) -> None:
+        """收盘估值 + 持仓快照。"""
+        self._bucket = "close"
+        prices = {s: b.close for s, b in self._bars_today.items()}
+        nav = self.account.nav(prices)
+        if nav > 0:
+            self.res.nav.append((d, nav))
+        self.res.positions[d] = {
+            s: p.qty for s, p in self.account.positions.items() if p.qty}
 
         self._finalize()
         return self.res
