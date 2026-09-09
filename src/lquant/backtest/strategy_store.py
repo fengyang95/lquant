@@ -27,10 +27,12 @@ def save_strategy(name: str, source: str, *, description: str = "",
         now = _now()
         con.execute("UPDATE strategy_def SET is_latest = FALSE WHERE name = ?", [name])
         con.execute(
-            "INSERT INTO strategy_def VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO strategy_def (id, name, description, kind, source, "
+            "params_json, benchmark, config_json, version, is_latest, deleted, "
+            "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,FALSE,?,?)",
             [sid, name, description, "jq", source,
-             json.dumps(config or {}), benchmark, json.dumps({}),
-             ver, True, False, now, now])
+             json.dumps({}), benchmark, json.dumps(config or {}),
+             ver, True, now, now])
     return get_strategy(sid)
 
 
@@ -53,17 +55,18 @@ def get_strategy(strategy_id: str) -> dict:
     if not row:
         raise KeyError(strategy_id)
     return {"id": row[0], "name": row[1], "description": row[2], "kind": row[3],
-            "source": row[4], "config": json.loads(row[5] or "{}"),
-            "benchmark": row[6], "config_json": json.loads(row[7] or "{}"),
+            "source": row[4], "params": json.loads(row[5] or "{}"),
+            "benchmark": row[6], "config": json.loads(row[7] or "{}"),
             "version": row[8], "is_latest": row[9], "updated_at": str(row[10])}
 
 
 def list_versions(name: str) -> list[dict]:
     with reader() as con:
         rows = con.execute(
-            "SELECT id, version, updated_at, is_latest FROM strategy_def "
-            "WHERE name = ? AND NOT deleted ORDER BY version DESC", [name]).fetchall()
-    return [{"id": r[0], "version": r[1], "updated_at": str(r[2]), "is_latest": r[3]}
+            "SELECT id, version, updated_at, is_latest, deleted FROM strategy_def "
+            "WHERE name = ? ORDER BY version DESC", [name]).fetchall()
+    return [{"id": r[0], "version": r[1], "updated_at": str(r[2]), "is_latest": r[3],
+             "deleted": r[4]}
             for r in rows]
 
 
@@ -100,7 +103,7 @@ def get_analysis(analysis_id: str) -> dict:
     with reader() as con:
         row = con.execute(
             "SELECT id, name, source, is_builtin, created_at, updated_at "
-            "FROM analysis_def WHERE id = ? AND NOT deleted",
+            "FROM analysis_def WHERE id = ?",
             [analysis_id]).fetchone()
     if not row:
         raise KeyError(analysis_id)

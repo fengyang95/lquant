@@ -35,10 +35,23 @@ def test_same_name_bumps_version(store):
     assert len(list_versions("demo")) == 2
 
 
+def test_config_roundtrip(store):
+    row = save_strategy("cfg", "def initialize(ctx): pass",
+                        config={"cash": 100000, "bench": "000300.SH"})
+    got = get_strategy(row["id"])
+    assert got["config"] == {"cash": 100000, "bench": "000300.SH"}
+    assert got["params"] == {}
+
+
 def test_soft_delete(store):
     row = save_strategy("tbd", "def initialize(ctx): pass")
     delete_strategy(row["id"])
     assert all(r["id"] != row["id"] for r in list_strategies())
+    # 软删：单行读仍可取，版本历史保留并带 deleted 标记
+    got = get_strategy(row["id"])
+    assert got["source"].startswith("def initialize")
+    vers = list_versions("tbd")
+    assert len(vers) == 1 and vers[0]["deleted"] is True
 
 
 def test_analysis_crud(store):
