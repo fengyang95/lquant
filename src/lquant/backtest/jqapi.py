@@ -452,9 +452,18 @@ class JQRunner:
     # ---- 内部工具 ----
 
     def _record(self, kv: dict) -> None:
-        """record(**kv)：自定义曲线采集，每日每键一条 (trade_date, value)。"""
+        """record(**kv)：自定义曲线采集，每日每键一条 (trade_date, value)。
+
+        非有限值（NaN/Inf）静默跳过，避免污染曲线序列。
+        """
         for k, v in kv.items():
-            self.res.records.setdefault(str(k), []).append((self._today, float(v)))
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(fv):
+                continue
+            self.res.records.setdefault(str(k), []).append((self._today, fv))
 
     def _run_hook(self, fn, d: date, when: str) -> str | None:
         """跑生命周期钩子；异常时返回错误文本（调用方置 res.error 并终止）。"""
@@ -696,6 +705,8 @@ class JQRunner:
         panels: dict[str, dict[tuple[date, str], float]] = {}
         for f, col in colmap.items():
             sub = df2.select(["trade_date", "symbol", col]).drop_nulls()
+            # NaN（如停牌前 pct_change 的溢出值）与 null 一并剔除
+            sub = sub.filter(pl.col(col).is_not_nan())
             panels[f.upper()] = {(r[0], r[1]): float(r[2]) for r in sub.iter_rows()}
         return panels
 
