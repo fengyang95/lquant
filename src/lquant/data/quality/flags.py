@@ -19,10 +19,14 @@ OHLC_CONFLICT = 1 << 5        # high/low 与 open/close 矛盾
 NEG_QTY = 1 << 6              # 负成交量 / 负成交额
 UNIT_MISMATCH = 1 << 7        # 单位错（amount 与 close*volume 差数量级）
 PRE_CLOSE_MISSING = 1 << 8    # 昨收缺失（上市首日合法，warn 不阻断）
+NEW_LISTING = 1 << 9          # 新股（上市未满 min_listed_days，波动/涨跌停口径特殊）
+SUSPENDED = 1 << 10           # 停牌（当日零成交）
+ST_RISK = 1 << 11             # ST 风险警示（特殊涨跌幅限制，需单独处理）
 
 __all__ = ["PRICE_OUT_OF_RANGE", "ADJ_ANOMALY", "ZOMBIE", "CROSS_SOURCE_DIFF",
            "SUSPENSION_FILL", "OHLC_CONFLICT", "NEG_QTY", "UNIT_MISMATCH",
-           "PRE_CLOSE_MISSING", "or_flags", "hit"]
+           "PRE_CLOSE_MISSING", "NEW_LISTING", "SUSPENDED", "ST_RISK",
+           "or_flags", "hit"]
 
 
 def hit(mask: int, condition: pl.Expr) -> pl.Expr:
