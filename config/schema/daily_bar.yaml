@@ -14,3 +14,21 @@ sources:
       amount: {expr: "amount * 100", from: [amount]}   # 千元 → 元
     fill: {sec_type: stock, source: baostock, quality_flags: 0, adj_factor: 1.0}
     required: [symbol, trade_date, open, high, low, close, volume]
+
+  akshare:
+    # stock_zh_a_hist / fund_etf_hist_em：amount 已是元直接 rename；
+    # volume 是手 → ×100 换算成股。akshare 日线无 preclose/turnover，
+    # 留空（不为 required），保持 None。
+    rename:
+      股票代码: symbol
+      日期: trade_date
+      开盘: open
+      收盘: close
+      最高: high
+      最低: low
+      成交量: volume
+      成交额: amount
+    derive:
+      volume: {expr: "volume * 100", from: [volume]}   # 手 → 股
+    fill: {sec_type: stock, source: akshare, quality_flags: 0, adj_factor: 1.0}
+    required: [symbol, trade_date, open, high, low, close, volume]

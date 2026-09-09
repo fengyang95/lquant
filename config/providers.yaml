@@ -18,7 +18,7 @@ providers:
     qps: 3            # 东财系极易封 IP
     capability: [daily, minute_1, minute_5, etf_spot, etf_daily, etf_iopv,
                  money_flow, limit_up, dragon_tiger, sector]
-    note: 覆盖最广但易封；仅用于独有数据
+    note: 覆盖最广但易封；已接入声明式映射机制（daily/minute/adj_factor/securities/ETF 日线），保持关闭由用户开启
 
   - name: efinance
     enabled: false
