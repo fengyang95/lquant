@@ -18,10 +18,13 @@ class StrategyIn(BaseModel):
 
 
 class StrategySourceIn(BaseModel):
-    """PUT 用 body（name 沿用现有策略，不可改名）。"""
+    """PUT 用 body（name 沿用现有策略，不可改名）。
+
+    description/config/benchmark 用 None 哨兵：省略时沿用现有值，不静默清空。
+    """
     source: str = Field(min_length=10, max_length=200_000)
-    description: str = ""
-    config: dict = {}
+    description: str | None = None
+    config: dict | None = None
     benchmark: str | None = None
 
 
@@ -84,8 +87,13 @@ def update_strategy(sid: str, req: StrategySourceIn) -> dict:
     except KeyError as e:
         raise HTTPException(404, f"策略不存在: {sid}") from e
     try:
-        return save_strategy(cur["name"], req.source, description=req.description,
-                             config=req.config, benchmark=req.benchmark)
+        sent = req.model_fields_set          # 区分「省略」与「显式 null」
+        return save_strategy(
+            cur["name"], req.source,
+            description=req.description if "description" in sent
+            else cur["description"],
+            config=req.config if "config" in sent else cur["config"],
+            benchmark=req.benchmark if "benchmark" in sent else cur["benchmark"])
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
 

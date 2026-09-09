@@ -110,6 +110,32 @@ def test_strategy_get_404(client):
     assert client.get("/api/strategies/ghost").status_code == 404
 
 
+def test_strategy_put_preserves_metadata(client):
+    """PUT 只改 source 时，description/config/benchmark 沿用现有值不被清空。"""
+    r = client.post("/api/strategies", json={
+        "name": "meta_s", "source": GOOD_SRC, "description": "说明",
+        "config": {"top_n": 5}, "benchmark": "000905.SH"})
+    assert r.status_code == 200
+    sid = r.json()["id"]
+
+    # 只带 source 的 PUT：元数据沿用
+    put = client.put(f"/api/strategies/{sid}", json={"source": GOOD_SRC + "# meta v2"})
+    assert put.status_code == 200
+    body = put.json()
+    assert body["version"] == 2
+    assert body["description"] == "说明"
+    assert body["config"] == {"top_n": 5}
+    assert body["benchmark"] == "000905.SH"
+
+    # 显式传 null 的 benchmark + 显式 config：覆盖
+    put2 = client.put(f"/api/strategies/{sid}", json={
+        "source": GOOD_SRC + "# meta v3", "config": {"top_n": 8}, "benchmark": None})
+    assert put2.status_code == 200
+    assert put2.json()["config"] == {"top_n": 8}
+    assert put2.json()["benchmark"] is None
+    assert put2.json()["description"] == "说明"     # 未传，继续沿用
+
+
 def test_strategy_validate_endpoint(client):
     ok = client.post("/api/strategies/validate", json={"source": GOOD_SRC})
     assert ok.status_code == 200
