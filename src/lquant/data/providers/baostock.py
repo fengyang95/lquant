@@ -41,8 +41,9 @@ _T0_KEYWORDS = (
     "货币", "现金", "保证金",
 )
 
+# 日线 17 字段：新增 pctChg + 估值四列（peTTM/pbMRQ/psTTM/pcfNcfTTM）
 _DAILY_FIELDS = ("date,code,open,high,low,close,preclose,volume,amount,"
-                 "turn,tradestatus,isST")
+                 "turn,tradestatus,isST,pctChg,peTTM,pbMRQ,psTTM,pcfNcfTTM")
 _MINUTE_FIELDS = "date,time,code,open,high,low,close,volume,amount,adjustflag"
 
 
@@ -186,12 +187,45 @@ def _year_slices(start: date, end: date):
     return out
 
 
+_DAILY_RAW_SCHEMA = ["date", "code", "open", "high", "low", "close", "preclose",
+                     "volume", "amount", "turn", "tradestatus", "isST",
+                     "pctChg", "peTTM", "pbMRQ", "psTTM", "pcfNcfTTM"]
+
+
+def _map_daily_raw(rows: list[list[str]]) -> pl.DataFrame:
+    """把 baostock 日线原始行转成**源列名** df（模块级，spawn 可 pickle）。
+
+    只做 frames→DataFrame→cast：日期解析、量价 cast、turn=0/空串 → null
+    （防 float_mv 除法产 inf）。列名对齐 schema 交给 mapping 引擎；
+    停牌行**保留**：tradestatus=="0" 的取反语义映射白名单表达不了，
+    在这里就地转成 is_suspended 布尔列（schema 同名，映射层透传）。
+    """
+    df = pl.DataFrame(rows, schema=_DAILY_RAW_SCHEMA, orient="row")
+    return df.with_columns(
+        pl.col("date").str.to_date("%Y-%m-%d"),
+        pl.col(["open", "high", "low", "close", "preclose", "volume",
+                "amount"]).cast(pl.Float64),
+        pl.when(pl.col("turn").cast(pl.Utf8).str.strip_chars() != "0")
+          .then(pl.col("turn").cast(pl.Float64, strict=False))
+          .otherwise(pl.lit(None, dtype=pl.Float64))
+          .alias("turn"),
+        pl.col(["pctChg", "peTTM", "pbMRQ", "psTTM", "pcfNcfTTM"])
+          .cast(pl.Float64, strict=False),   # 空串 → null
+        (pl.col("tradestatus").cast(pl.Utf8).str.strip_chars() == "0")
+          .alias("is_suspended"),            # "0"=停牌 → True；行保留不丢
+        (pl.col("isST").cast(pl.Utf8).str.strip_chars() == "1")
+          .alias("is_st"),                   # "1"=ST → True
+    ).drop("tradestatus", "isST")
+
+
 def _attach_is_st(out: pl.DataFrame, raw: pl.DataFrame) -> pl.DataFrame:
-    """把 fetch 侧的 is_st 列挂回引擎输出（映射层已保留 raw is_st 时跳过）。
+    """把 fetch 侧的 is_st 列挂回引擎输出（映射层已产出非空 is_st 时跳过）。
 
     纯函数、无实例状态：长度不匹配 fail-fast；raw 无 is_st 时输出补全 null 列，
     保持旧 daily_bars 输出恒有该列。
     """
+    if "is_st" in out.columns and out["is_st"].is_not_null().any():
+        return out   # 映射层已产出 is_st（rename isST），不覆写
     if "is_st" not in out.columns:
         out = out.with_columns(pl.lit(None, dtype=pl.Boolean).alias("is_st"))
     if raw.is_empty() or "is_st" not in raw.columns:
@@ -254,7 +288,7 @@ class BaoStockProvider(MappingProvider):
     ) -> pl.DataFrame:
         """watchdog 拉日线：产出**源列名** df，映射交给 engine。
 
-        行级逻辑留在 provider：停牌过滤 + isST 布尔转换。
+        停牌行保留（is_suspended 由映射层得出），行级转换收敛到 _map_daily_raw。
         """
         from lquant.data.watchdog import run_with_watchdog
 
@@ -265,28 +299,12 @@ class BaoStockProvider(MappingProvider):
                 _bs_query, _bs_code(sym), _DAILY_FIELDS,
                 start.isoformat(), end.isoformat(), "1d", "3",
             )
-            if not rows:
-                continue
-            frames.append(pl.DataFrame(
-                rows,
-                schema=["date", "code", "open", "high", "low", "close",
-                        "preclose", "volume", "amount", "turn",
-                        "tradestatus", "isST"],
-                orient="row",
-            ))
+            if rows:
+                frames.append(_map_daily_raw(rows))
         if not frames:
             return pl.DataFrame()
-        df = pl.concat(frames, how="diagonal").with_columns(
-            pl.col("date").str.to_date("%Y-%m-%d"),   # 保持源列名 date，映射层 rename
-            pl.col(["open", "high", "low", "close", "preclose", "volume",
-                    "amount"]).cast(pl.Float64),
-            pl.col("turn").cast(pl.Float64, strict=False),
-        )
-        # 停牌日 volume=0 且 tradestatus=0 —— 不剔除会污染量价因子
-        df = df.filter(pl.col("tradestatus").cast(pl.Utf8) != "0")
-        return df.drop("tradestatus").with_columns(
-            is_st=pl.col("isST").cast(pl.Utf8).str.strip_chars().is_in(["1"]),
-        ).drop("isST")
+        # 停牌日 volume=0 —— 行保留，is_suspended 供门禁豁免/回测拒单
+        return pl.concat(frames, how="diagonal")
 
     def _fetch_minute(
         self, symbols: list[str], start: date, end: date, freq: str = "60min"

@@ -30,7 +30,8 @@ _OPEN, _HIGH, _LOW, _CLOSE, _PRE_CLOSE = 10.0, 10.5, 9.8, 10.2, 10.1
 _VOLUME_SHARES = 120_000.0        # 股
 _AMOUNT_YUAN = 1_224_000.0        # 元
 
-# baostock：amount 已是元（直接透传，无 derive）、volume 股、code sh.600000
+# baostock：amount 已是元（直接透传）、volume 股、code sh.600000；
+# is_suspended/is_st 已在 provider 侧转成布尔（schema 同名，映射层透传）
 _BAOSTOCK_RAW = pl.DataFrame({
     "date": ["2024-01-02"],
     "code": ["sh.600000"],
@@ -39,8 +40,10 @@ _BAOSTOCK_RAW = pl.DataFrame({
     "volume": [_VOLUME_SHARES],
     "amount": [_AMOUNT_YUAN],             # 元，直接透传
     "turn": [0.12],
-    "is_st": ["0"],
-# 日期解析（_fetch_daily 产出即 pl.Date）与 baostock 源列保持一致
+    "is_suspended": [False],
+    "is_st": [False],
+    "pctChg": ["0.5"], "peTTM": ["12.0"], "pbMRQ": ["1.2"],
+    "psTTM": ["2.0"], "pcfNcfTTM": ["8.0"],
 }).with_columns(pl.col("date").str.to_date("%Y-%m-%d"))
 
 # akshare：中文列、volume 手（derive ×100）、amount 已是元直接 rename

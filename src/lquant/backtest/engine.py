@@ -134,6 +134,8 @@ class Engine:
         # 缺失的可选列先补常量，后面统一走列式兜底（与旧逐行 `x or default` 语义一致）
         lits = {"volume": 0.0, "amount": 0.0, "adj_factor": 1.0, "halted": False}
         df = df.with_columns([pl.lit(v).alias(c) for c, v in lits.items() if c not in df.columns])
+        if "is_suspended" not in df.columns:
+            df = df.with_columns(pl.lit(False).alias("is_suspended"))
         vol = pl.col("volume")
         df = df.with_columns(
             pl.when(pl.col("pre_close").fill_null(0.0) == 0.0).then(pl.col("close"))
@@ -142,13 +144,15 @@ class Engine:
             pl.col("amount").fill_null(0.0).cast(pl.Float64).alias("amount"),
             pl.when(pl.col("adj_factor").fill_null(0.0) == 0.0).then(1.0)
               .otherwise(pl.col("adj_factor")).cast(pl.Float64).alias("adj_factor"),
-            (pl.col("halted").fill_null(False)
-             | (vol.is_not_null() & (vol == 0.0))).alias("halted"),
+            (pl.col("is_suspended").fill_null(False)
+             | (pl.col("halted").fill_null(False)
+                | (vol.is_not_null() & (vol == 0.0)))).alias("halted"),
+            pl.col("is_suspended").fill_null(False).alias("suspended"),
         )
 
         out: dict[date, dict[str, Bar]] = {}
         cols = ["open", "high", "low", "close", "pre_close",
-                "volume", "amount", "adj_factor", "halted"]
+                "volume", "amount", "adj_factor", "halted", "suspended"]
         for sub in df.sort([date_col, symbol_col]).partition_by(date_col, as_dict=False):
             d = sub[date_col][0]
             syms = sub[symbol_col].to_list()
@@ -164,6 +168,7 @@ class Engine:
                     volume=float(cvals["volume"][k]), amount=float(cvals["amount"][k]),
                     adj_factor=float(cvals["adj_factor"][k]),
                     halted=bool(cvals["halted"][k]),
+                    suspended=bool(cvals["suspended"][k]),
                     fields={c: fvals[c][k] for c in fields},
                 )
             out[d] = bars
@@ -244,7 +249,17 @@ class Engine:
         assert self.broker is not None
         for order in self._pending:
             bar = bars.get(order.symbol)
-            if bar is None or bar.halted:
+            if bar is None:
+                order.status = OrderStatus.REJECTED
+                order.reason = "无行情"
+                res.rejected.append((str(d), order.symbol, order.reason))
+                continue
+            if bar.suspended:
+                order.status = OrderStatus.REJECTED
+                order.reason = "suspended"
+                res.rejected.append((str(d), order.symbol, order.reason))
+                continue
+            if bar.halted:
                 order.status = OrderStatus.REJECTED
                 order.reason = "停牌或无行情"
                 res.rejected.append((str(d), order.symbol, order.reason))
@@ -331,7 +346,17 @@ class Engine:
             # 行为与 next_* 分支保持一致：同样的量约束与 rejected 记录。
             for o in orders:
                 bar = bars.get(o.symbol)
-                if bar is None or bar.halted:
+                if bar is None:
+                    o.status = OrderStatus.REJECTED
+                    o.reason = "无行情"
+                    res.rejected.append((str(d), o.symbol, o.reason))
+                    continue
+                if bar.suspended:
+                    o.status = OrderStatus.REJECTED
+                    o.reason = "suspended"
+                    res.rejected.append((str(d), o.symbol, o.reason))
+                    continue
+                if bar.halted:
                     o.status = OrderStatus.REJECTED
                     o.reason = "停牌或无行情"
                     res.rejected.append((str(d), o.symbol, o.reason))
