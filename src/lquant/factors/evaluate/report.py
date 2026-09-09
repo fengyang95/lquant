@@ -206,7 +206,7 @@ footer{{margin-top:40px;color:#999;font-size:12px}}
 <div class="card"><div class="k">IC 均值</div><div class="v {_cls(icv.get("mean"))}">{_fmt(icv.get("mean"))}</div></div>
 <div class="card"><div class="k">RankIC 均值</div><div class="v {_cls(ric.get("mean"))}">{_fmt(ric.get("mean"))}</div></div>
 <div class="card"><div class="k">IR</div><div class="v {_cls(icv.get("ir"))}">{_fmt(icv.get("ir"))}</div></div>
-<div class="card"><div class="k">t 值</div><div class="v {_cls(icv.get("t_stat"))}">{_fmt(icv.get("t_stat"), nd=2)}</div></div>
+<div class="card"><div class="k">t 值 (NW)</div><div class="v {_cls(icv.get("t_stat_nw"))}">{_fmt(icv.get("t_stat_nw"), nd=2)}</div></div>
 <div class="card"><div class="k">IC 正比例</div><div class="v">{_fmt(icv.get("positive_rate"), pct=True)}</div></div>
 <div class="card"><div class="k">半衰期</div><div class="v">{_fmt(hl, nd=1)} 天</div></div>
 <div class="card"><div class="k">分层单调性</div><div class="v">{_fmt(qs.get("monotonicity"))}</div></div>
