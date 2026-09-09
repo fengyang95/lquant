@@ -64,6 +64,19 @@ def _persist_result(run_id: str, strategy: str, params: dict, res,
             con.execute("INSERT INTO backtest_position SELECT run_id, trade_date, symbol, qty, avg_cost FROM _pos")
 
 
+def _persist_records(run_id: str, records: dict[str, list[tuple]]) -> None:
+    """record(**kv) 自定义曲线落库 backtest_record（同 run 重跑先清后写）。"""
+    rows = [{"run_id": run_id, "trade_date": d, "key": k, "value": v}
+            for k, series in records.items() for d, v in series]
+    with writer() as con:
+        con.execute("DELETE FROM backtest_record WHERE run_id = ?", [run_id])
+        if rows:
+            con.register("_rec", pl.DataFrame(rows))
+            con.execute(
+                "INSERT INTO backtest_record "
+                "SELECT run_id, trade_date, key, value FROM _rec")
+
+
 def _benchmark_nav_aligned(run_dates: set, run_nav: dict) -> tuple[list[dict], str, dict[str, float]]:
     """基准净值（优先沪深300 指数，降级全市场等权），与 run 日期对齐且首日归一。
 
@@ -230,6 +243,9 @@ class JQCodeIn(BaseModel):
     end: str | None = None
     initial_cash: float = Field(default=1_000_000, gt=0)
     benchmark: str = "000300.SH"
+    factor_formulas: list[str] = Field(default_factory=list, max_length=10)
+    strategy_id: str | None = None
+    run_analysis: bool = True
 
 
 @router.post("/run-code")
@@ -246,7 +262,8 @@ def run_jq_code(req: JQCodeIn) -> dict:
 
     try:
         runner = JQRunner(req.code, initial_cash=req.initial_cash,
-                          benchmark=req.benchmark)
+                          benchmark=req.benchmark,
+                          factor_formulas=req.factor_formulas or None)
         res = runner.run(df)
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
@@ -258,8 +275,12 @@ def run_jq_code(req: JQCodeIn) -> dict:
     run_id = uuid.uuid4().hex[:12]
     params = {"code": req.code, "start": req.start, "end": req.end,
               "initial_cash": req.initial_cash,
-              "benchmark": runner.benchmark, "engine": "jq_compat"}
+              "benchmark": runner.benchmark, "engine": "jq_compat",
+              "strategy_id": req.strategy_id,
+              "factor_formulas": req.factor_formulas,
+              "logs": res.logs[-100:]}
     _persist_result(run_id, "jq_custom", params, res)
+    _persist_records(run_id, res.records)
     m = res.metrics
     return {"run_id": run_id,
             "metrics": {k: (round(v, 4) if isinstance(v, float) else v)
@@ -492,6 +513,10 @@ def get_run(run_id: str) -> dict:
         orders = con.execute(
             "SELECT ts, symbol, side, qty, price, fee FROM backtest_order WHERE run_id = ? ORDER BY ts",
             [run_id]).fetchall()
+        rec_rows = con.execute(
+            "SELECT trade_date, key, value FROM backtest_record WHERE run_id = ? "
+            "ORDER BY trade_date", [run_id]).fetchall()
+        params_dict = json.loads(row[1]) if row[1] else {}
 
     navs = [float(r[1]) for r in nav]
     rets = np.diff(navs) / np.array(navs[:-1]) if len(navs) > 1 else np.array([])
@@ -547,9 +572,13 @@ def get_run(run_id: str) -> dict:
     if risk:
         risk["benchmark"] = benchmark_label
 
+    records: dict[str, list] = {}
+    for d, k, v in rec_rows:
+        records.setdefault(k, []).append({"date": str(d), "value": v})
+
     return {
         "run_id": run_id, "strategy": row[0],
-        "params": json.loads(row[1]) if row[1] else {},
+        "params": params_dict,
         "status": row[2], "metrics": json.loads(row[3]) if row[3] else {},
         "nav": [{"date": str(r[0]), "nav": r[1], "drawdown": r[2]} for r in nav],
         "orders": [{"ts": str(r[0]), "symbol": r[1], "side": r[2],
@@ -558,4 +587,8 @@ def get_run(run_id: str) -> dict:
         "return_hist": hist, "benchmark": benchmark,
         "benchmark_label": benchmark_label,
         "risk_vs_benchmark": risk,
+        "records": records,
+        "logs": params_dict.get("logs", []),
+        # 自定义分析自动执行（默认全量启用的 analyses）在后续迭代接线，先占位空列表
+        "custom_analysis": [],
     }
