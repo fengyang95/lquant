@@ -84,6 +84,19 @@ _PRICE: dict[str, str] = {
 _NAME_RE = re.compile(r"^(?P<fam>[A-Z]+)(?P<d>\d+)$")
 
 
+def has_factor(name: str) -> bool:
+    """formula 是否命中内置因子目录（大小写不敏感）；不抛错。
+
+    供 API 探测用：先查白名单再调用 compute，避免 except KeyError 把
+    数据缺列错误一并吞掉（缺陷 #1）。
+    """
+    try:
+        resolve_name(name)
+        return True
+    except KeyError:
+        return False
+
+
 def list_builtin() -> list[dict]:
     """全部内置因子清单（158 个）。"""
     out = [{"name": n, "family": "kbar", "window": None, "formula": f}

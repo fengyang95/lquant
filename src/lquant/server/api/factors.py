@@ -76,17 +76,16 @@ def register_factor(f: FactorIn) -> dict:
 
 
 def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
-    """现算因子。优先命中 Qlib Alpha158 内置因子（158 个），其次研究常用形态。"""
-    try:
-        from lquant.factors.qlib_alpha import compute as qlib_compute
+    """现算因子。优先命中 Qlib Alpha158 内置因子（白名单探测），其次研究常用形态。"""
+    from lquant.factors.qlib_alpha import compute as qlib_compute
+    from lquant.factors.qlib_alpha import has_factor
 
+    if has_factor(formula):
         return qlib_compute(df, formula)
-    except KeyError:
-        pass
-    if formula.startswith("pct_change_"):
+    if formula.startswith("pct_change_") and formula.rsplit("_", 1)[1].isdigit():
         n = int(formula.rsplit("_", 1)[1])
         return df.with_columns(pl.col("close").pct_change(n).over("symbol").alias("_factor"))
-    if formula.startswith("rolling_std_"):
+    if formula.startswith("rolling_std_") and formula.rsplit("_", 1)[1].isdigit():
         n = int(formula.rsplit("_", 1)[1])
         return df.with_columns(pl.col("close").pct_change().over("symbol")
                                .rolling_std(n).alias("_factor"))

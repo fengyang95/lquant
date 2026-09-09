@@ -1,0 +1,56 @@
+"""缺陷 #1：内置因子探测改白名单查询，缺列错误不被吞成 422。"""
+from __future__ import annotations
+
+import datetime as dt
+
+import polars as pl
+import pytest
+from fastapi import HTTPException
+
+
+def _panel() -> pl.DataFrame:
+    rows = []
+    for sym in ("A", "B"):
+        px = 10.0
+        for i in range(30):
+            rows.append({"symbol": sym, "trade_date": dt.date(2025, 1, 1) + dt.timedelta(days=i),
+                         "open": px, "high": px * 1.01, "low": px * 0.99,
+                         "close": px, "volume": 1e6, "amount": 1e7})
+            px *= 1.001
+    return pl.DataFrame(rows)
+
+
+def test_has_factor_whitelist():
+    from lquant.factors.qlib_alpha import has_factor
+
+    assert has_factor("KMID")
+    assert has_factor("ma20")
+    assert not has_factor("pct_change_5")
+    assert not has_factor("NOPE123")
+
+
+def test_unknown_formula_raises_422_with_hint():
+    from lquant.server.api.factors import _compute_factor
+
+    with pytest.raises(HTTPException) as ei:
+        _compute_factor(_panel(), "pct_change_abc")
+    assert ei.value.status_code == 422
+    assert "builtin" in ei.value.detail or "内置" in ei.value.detail
+
+
+def test_missing_column_error_not_swallowed():
+    """qlib 内部缺列（如 KMID 需要 open）必须抛原始错误，不能被 422 吞掉。"""
+    from lquant.server.api.factors import _compute_factor
+
+    bad = _panel().drop("open")
+    with pytest.raises(Exception) as ei:
+        _compute_factor(bad, "KMID")
+    assert not (isinstance(ei.value, HTTPException) and ei.value.status_code == 422), \
+        f"缺列错误被误报为 422: {ei.value}"
+
+
+def test_pct_change_still_works():
+    from lquant.server.api.factors import _compute_factor
+
+    out = _compute_factor(_panel(), "pct_change_5")
+    assert "_factor" in out.columns
