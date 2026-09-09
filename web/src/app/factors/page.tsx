@@ -76,6 +76,7 @@ export default function FactorsPage() {
   const [formula, setFormula] = useState('pct_change_20');
   const [evalRes, setEvalRes] = useState<EvalResult | null>(null);
   const [evalSeries, setEvalSeries] = useState<EvalSeries | null>(null);
+  const [seriesError, setSeriesError] = useState<string | null>(null);
   const [busy, setBusy] = useState<'' | 'reg' | 'eval' | 'corr' | 'syn' | 'seed'>('');
   const [msg, setMsg] = useState('');
   // 相关性 / 合成
@@ -216,12 +217,11 @@ export default function FactorsPage() {
     setMsg('');
     try {
       const params = { factor: name || 'tmp', formula, n_groups: 5 };
-      const r = await post<EvalResult>('/factors/evaluate', params);
+      const r = await post<EvalResult & { series?: EvalSeries }>('/factors/evaluate', params);
       setEvalRes(r);
-      // 图表数据包（失败不阻塞主评价结果）
-      try {
-        setEvalSeries(await post<EvalSeries>('/factors/evaluate/series', params));
-      } catch { setEvalSeries(null); }
+      // 图表数据包随主评价一次返回（后端已合并计算）
+      setEvalSeries(r.series ?? null);
+      setSeriesError(r.series ? null : '图表数据缺失：评价响应未包含 series 字段');
     } catch (e) {
       setMsg(`✗ ${e instanceof Error ? e.message : e}`);
     } finally {
@@ -383,6 +383,13 @@ export default function FactorsPage() {
             </div>
           </div>
         </Panel>
+      )}
+
+      {/* 图表加载失败显式提示（缺陷 #4：不再伪装成「样本不足」） */}
+      {seriesError && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {seriesError}
+        </div>
       )}
 
       {/* 评价图表：IC / 分层 / 衰减 */}

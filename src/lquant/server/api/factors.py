@@ -94,16 +94,97 @@ def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
     raise HTTPException(422, f"暂不支持的因子公式: {formula}（内置因子见 GET /api/factors/builtin）")
 
 
-@router.post("/evaluate")
-def run_evaluate(req: EvaluateIn) -> dict:
-    """现算因子 → 全套评价 → 存报告。返回关键指标。"""
+def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
+    """一次现算 + 评价，返回 (metrics, series)。
+
+    /evaluate 与 /evaluate/series 共用同一份计算（缺陷 #2：原先两端点
+    各自全量重算，2 倍开销且两次结果可能不一致）。
+    """
     df = read_daily(start=req.start).collect()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
     d = _compute_factor(df, req.formula).drop_nulls(["_factor"])
     d = forward_return(d, "close", periods=req.horizons)
-
     ret_col = f"fwd_ret_{min(req.horizons)}"
+    if ret_col not in d.columns:
+        raise HTTPException(500, f"前瞻收益列缺失: {ret_col}")
+
+    # ---- metrics（原 run_evaluate 计算体） ----
+    res = evaluate(d, "_factor", ret_col=ret_col, n_groups=req.n_groups,
+                   horizons=req.horizons)
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    report_path = save_report(res["report"], REPORT_DIR / f"{req.factor}.html")
+    ic = res["ic"]["ic"]
+    ls = res["quantile"]["long_short"]
+    metrics = {
+        "factor": req.factor,
+        "formula": req.formula,
+        "n_samples": len(d),
+        "ic": {"mean": round(ic["mean"], 4), "ir": round(ic["ir"], 3),
+               "t_stat": round(ic["t_stat"], 2), "positive_rate": round(ic["positive_rate"], 4)},
+        "rank_ic_mean": round(res["ic"]["rank_ic"]["mean"], 4),
+        "long_short": {"annual_return": round(ls["annual_return"], 4),
+                       "sharpe": round(ls["sharpe"], 2),
+                       "max_drawdown": round(ls["max_drawdown"], 4)},
+        "monotonicity": round(res["quantile"]["monotonicity"], 3),
+        "half_life": res["decay"]["half_life"],
+        "suggested_rebalance": res["decay"]["suggested_rebalance"],
+        "report_url": f"/api/factors/reports/{report_path.stem}",
+    }
+
+    # ---- series（原 evaluate_series 计算体） ----
+    import math
+
+    import numpy as np
+    from lquant.factors.evaluate import ic_by_year, ic_series, quantile_nav, quantile_summary
+    from lquant.factors.evaluate.decay import decay_profile
+
+    def _jf(v, nd=4) -> float | None:
+        return round(float(v), nd) if v is not None and math.isfinite(v) else None
+
+    s = ic_series(d, "_factor", ret_col)
+    ic_dates = [str(x) for x in s["trade_date"].to_list()]
+    ic_vals = [_jf(v) for v in s["ic"].to_list()]
+    ic_ranks = [_jf(v) for v in s["rank_ic"].to_list()]
+    cum = np.nancumsum(np.array([v if v is not None else 0.0 for v in ic_vals])) if ic_vals else []
+    cum_ic = [round(float(v), 4) for v in cum]
+
+    qnav = quantile_nav(d, "_factor", ret_col, req.n_groups)
+    qdates = [str(x) for x in qnav["trade_date"].to_list()] if len(qnav) else []
+    curves = {c: [_jf(v, 4) for v in qnav[c].to_list()]
+              for c in qnav.columns if c != "trade_date"}
+
+    qsum = quantile_summary(d, "_factor", ret_col, req.n_groups)
+    groups = [{"q": g["q"], "annual_return": _jf(g["annual_return"]),
+               "sharpe": _jf(g["sharpe"], 2), "mean_ret": _jf(g["mean_ret"], 5)}
+              for g in qsum.get("groups", [])]
+
+    prof = decay_profile(d, "_factor", req.horizons)
+    decay = {"horizons": [int(h) for h in prof["horizon"].to_list()],
+             "ic": [_jf(v) for v in prof["ic"].to_list()],
+             "rank_ic": [_jf(v) for v in prof["rank_ic"].to_list()]}
+    icy = ic_by_year(d, "_factor", ret_col)
+    ic_year = [{"year": int(r["year"]), "ic_mean": _jf(r["ic_mean"]),
+                "ir": _jf(r["ir"], 3), "positive_rate": _jf(r["positive_rate"], 4)}
+               for r in icy.to_dicts()] if len(icy) else []
+
+    series = {
+        "factor": req.factor, "formula": req.formula,
+        "n_groups": req.n_groups, "n_samples": len(d),
+        "ic": {"dates": ic_dates, "ic": ic_vals, "rank_ic": ic_ranks, "cum_ic": cum_ic},
+        "quantile": {"dates": qdates, "curves": curves, "groups": groups,
+                     "monotonicity": _jf(qsum.get("monotonicity"), 3)},
+        "decay": decay, "ic_by_year": ic_year,
+    }
+    return metrics, series
+
+
+@router.post("/evaluate")
+def run_evaluate(req: EvaluateIn) -> dict:
+    """现算因子 → 全套评价 → 存报告。一次计算同时返回指标与图表序列。"""
+    m, s = _evaluate_full(req)
+    m["series"] = s
+    return m
     if ret_col not in d.columns:
         raise HTTPException(500, f"前瞻收益列缺失: {ret_col}")
 
@@ -132,69 +213,9 @@ def run_evaluate(req: EvaluateIn) -> dict:
 
 @router.post("/evaluate/series")
 def evaluate_series(req: EvaluateIn) -> dict:
-    """评价的图表数据包（JSON 序列，供前端 ECharts 渲染）：
-
-    - ic: 逐日 IC / RankIC / 累计 IC
-    - quantile: 分组净值曲线 + 各组年化柱
-    - decay: 各持有期 IC 衰减
-    - ic_by_year: 分年度 IC
-    """
-    import math
-
-    import numpy as np
-    from lquant.factors.evaluate import ic_by_year, ic_series, quantile_nav, quantile_summary
-    from lquant.factors.evaluate.decay import decay_profile
-
-    df = read_daily(start=req.start).collect()
-    if not len(df):
-        raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
-    d = _compute_factor(df, req.formula).drop_nulls(["_factor"])
-    d = forward_return(d, "close", periods=req.horizons)
-    ret_col = f"fwd_ret_{min(req.horizons)}"
-    if ret_col not in d.columns:
-        raise HTTPException(500, f"前瞻收益列缺失: {ret_col}")
-
-    def _jf(v, nd=4) -> float | None:
-        return round(float(v), nd) if v is not None and math.isfinite(v) else None
-
-    # 1) IC 序列 + 累计 IC
-    s = ic_series(d, "_factor", ret_col)
-    ic_dates = [str(x) for x in s["trade_date"].to_list()]
-    ic_vals = [_jf(v) for v in s["ic"].to_list()]
-    ic_ranks = [_jf(v) for v in s["rank_ic"].to_list()]
-    cum = np.nancumsum(np.array([v if v is not None else 0.0 for v in ic_vals])) if ic_vals else []
-    cum_ic = [round(float(v), 4) for v in cum]
-
-    # 2) 分层净值曲线（各组累计净值 + 多空）
-    qnav = quantile_nav(d, "_factor", ret_col, req.n_groups)
-    qdates = [str(x) for x in qnav["trade_date"].to_list()] if len(qnav) else []
-    curves = {c: [_jf(v, 4) for v in qnav[c].to_list()]
-              for c in qnav.columns if c != "trade_date"}
-
-    # 3) 分组年化（柱状，看单调性）
-    qsum = quantile_summary(d, "_factor", ret_col, req.n_groups)
-    groups = [{"q": g["q"], "annual_return": _jf(g["annual_return"]),
-               "sharpe": _jf(g["sharpe"], 2), "mean_ret": _jf(g["mean_ret"], 5)}
-              for g in qsum.get("groups", [])]
-
-    # 4) IC 衰减 + 5) 分年度 IC
-    prof = decay_profile(d, "_factor", req.horizons)
-    decay = {"horizons": [int(h) for h in prof["horizon"].to_list()],
-             "ic": [_jf(v) for v in prof["ic"].to_list()],
-             "rank_ic": [_jf(v) for v in prof["rank_ic"].to_list()]}
-    icy = ic_by_year(d, "_factor", ret_col)
-    ic_year = [{"year": int(r["year"]), "ic_mean": _jf(r["ic_mean"]),
-                "ir": _jf(r["ir"], 3), "positive_rate": _jf(r["positive_rate"], 4)}
-               for r in icy.to_dicts()] if len(icy) else []
-
-    return {
-        "factor": req.factor, "formula": req.formula,
-        "n_groups": req.n_groups, "n_samples": len(d),
-        "ic": {"dates": ic_dates, "ic": ic_vals, "rank_ic": ic_ranks, "cum_ic": cum_ic},
-        "quantile": {"dates": qdates, "curves": curves, "groups": groups,
-                     "monotonicity": _jf(qsum.get("monotonicity"), 3)},
-        "decay": decay, "ic_by_year": ic_year,
-    }
+    """图表数据包端点（兼容别名）：内部走同一 helper，一次计算两处复用。"""
+    _, s = _evaluate_full(req)
+    return s
 
 
 @router.get("/builtin")
