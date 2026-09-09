@@ -45,21 +45,9 @@ src/lquant/data/
 
 ## 字段映射 YAML
 
-每张统一表一个文件，按源分节：
-
-```yaml
-# config/schema/daily_bar.yaml
-table: daily_bar
-sources:
-  baostock:
-    rename: {code: symbol, tradestatus: status}
-    derive:
-      amount: {expr: "amount_wan * 10000", from: [amount_wan]}
-    fill: {sec_type: stock}
-    required: [symbol, trade_date, open, close]
-  akshare:
-    rename: {日期: trade_date, 股票代码: symbol, 成交额: amount}
-```
+每张统一表一个文件，按源分节。本次实现 daily_bar 与 minute_bar 两份映射
+作为模板，其余表（financial_pit / security 等）在对应 capability 实装时
+按同样结构补充。
 
 三类操作，按序应用：
 
@@ -67,6 +55,98 @@ sources:
 2. **derive**：派生/换算列，`expr` 只允许白名单函数（算术、`concat`、
    `strptime` 等显式列出），`from` 声明依赖的源列
 3. **fill**：常量填充（如 sec_type）
+
+### 日级配置（config/schema/daily_bar.yaml）
+
+```yaml
+table: daily_bar
+sources:
+  baostock:
+    rename:
+      code: symbol
+      date: trade_date
+      open: open
+      high: high
+      low: low
+      close: close
+      preclose: pre_close
+      volume: volume          # baostock 已是股
+    derive:
+      amount: {expr: "amount * 100", from: [amount]}   # baostock 千元 → 元
+    fill: {sec_type: stock}
+    required: [symbol, trade_date, open, high, low, close, volume]
+  akshare:
+    rename:
+      股票代码: symbol
+      日期: trade_date
+      开盘: open
+      收盘: close
+      最高: high
+      最低: low
+      成交量: volume          # akshare 日线手 → 股
+    derive:
+      volume: {expr: "volume * 100", from: [volume]}
+      amount: {expr: "成交额", from: [成交额]}          # 已是元，仅显式声明
+    fill: {sec_type: stock}
+    required: [symbol, trade_date, open, high, low, close, volume]
+```
+
+### 分钟级配置（config/schema/minute_bar.yaml）
+
+**一张 `minute_bar` 表承载全部频率**（1/5/15/30/60 分钟，60 分钟即小时级），
+`freq` 列区分，映射 YAML 按源写一份，`freq` 由 fetch 层作为参数传入 fill，
+而不是每条频率一张表。
+
+时间语义统一约定：
+
+- `ts` = **bar 结束时刻**（10:45 的 15 分钟 bar 覆盖 10:30~10:45）
+- 60 分钟 bar 对齐到 11:00 / 14:00 / 15:00（含午休边界处理：baostock 的
+  hour 线切在 11:30/14:00，需要合并 10:00-11:30 与 13:00-14:00 两段；
+  akshare 东财 60 分钟线天然按 11:00/11:30/14:00/15:00 切，迁移时在
+  `_post_normalize` 中归一到统一边界）
+
+```yaml
+table: minute_bar
+sources:
+  baostock:
+    rename:
+      code: symbol
+      time: ts_raw
+    derive:
+      ts: {expr: "strptime(ts_raw, '%Y-%m-%d %H:%M:%S')", from: [ts_raw]}
+      volume: {expr: "volume", from: [volume]}         # 已是股
+      amount: {expr: "amount", from: [amount]}          # 已是元
+    required: [symbol, ts, open, high, low, close, volume]
+  akshare:
+    rename:
+      股票代码: symbol
+      时间: ts_raw
+      开盘: open
+      收盘: close
+      最高: high
+      最低: low
+      成交量: volume          # 手 → 股
+      成交额: amount
+    derive:
+      ts: {expr: "strptime(ts_raw, '%Y-%m-%d %H:%M:%S')", from: [ts_raw]}
+      volume: {expr: "volume * 100", from: [volume]}
+    required: [symbol, ts, open, high, low, close, volume]
+```
+
+`freq` 参数化填充：engine 调 `_fetch_raw(table, freq=...)`，fetch 类将统一
+freq 翻译为源参数并填入返回 df 的 `freq` 列：
+
+| 统一 freq | baostock | akshare |
+|---|---|---|
+| 1min | 不支持（不声明 MINUTE_1 能力） | period="1" |
+| 5min | frequency="5" | period="5" |
+| 15min | frequency="15" | period="15" |
+| 30min | frequency="30" | period="30" |
+| 60min | frequency="60" | period="60" |
+
+非 bar 类表（financial_pit / security / industry_classify / etf_meta）映射
+文件结构相同，本次实现 daily_bar 与 minute_bar 两份作为模板，其余表在对应
+capability 实装时按同样结构补充。
 
 ## mapping.py 职责
 
