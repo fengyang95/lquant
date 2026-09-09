@@ -52,9 +52,9 @@ DEFAULT_JOBS: list[dict] = [
     {"sync_id": "preopen", "name": "盘前采集（校验与补采）",
      "kind": "collect", "schedule_time": "09:00", "weekdays": "1,2,3,4,5",
      "params": {"schedule": "preopen"}, "enabled": False},
-    {"sync_id": "daily", "name": "日线增量同步（哨兵池）",
+    {"sync_id": "daily", "name": "日线增量同步（全市场）",
      "kind": "daily", "schedule_time": "18:30", "weekdays": "1,2,3,4,5",
-     "params": {"days": 10}},
+     "params": {"days": 10, "market": "all"}},
     {"sync_id": "adj", "name": "复权因子刷新",
      "kind": "adj_factor", "schedule_time": "08:00", "weekdays": "6",
      "params": {"days": 120}},
@@ -161,11 +161,28 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
             if res.get("errors"):
                 status = "partial"
         elif kind == "daily":
-            from lquant.data.ingest.daily import backfill_daily
+            if params.get("market", "all") == "sentinel":
+                # 兼容旧路径：哨兵池增量（不建 data_task）
+                from lquant.data.ingest.daily import backfill_daily
 
-            n = backfill_daily(full=False, start=(started.date()
-                                                  - timedelta(days=int(params.get("days", 10)))).isoformat())
-            rows = n
+                rows = backfill_daily(
+                    full=False,
+                    start=(started.date()
+                           - timedelta(days=int(params.get("days", 10)))).isoformat())
+            else:
+                # 全市场增量：建 data_task（历史可查）后走执行器
+                from lquant.data.ingest import tasks as data_tasks
+
+                t = data_tasks.create_task(
+                    "daily_update", {"days": int(params.get("days", 10))})
+                task = data_tasks.execute_task(t["task_id"])
+                rows = int(task.get("rows_written") or 0)
+                detail = {"task_id": t["task_id"], "task_status": task["status"],
+                          "message": task.get("message")}
+                if task["status"] == "partial":
+                    status = "partial"
+                elif task["status"] == "failed":
+                    status = "failed"
         elif kind == "adj_factor":
             from lquant.data.ingest.adj import refresh_adj_factors
 
