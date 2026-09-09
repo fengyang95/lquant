@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import click
 
-from lquant.cli.commands import backtest, data, factor, strategy
+from lquant.cli.commands import agent, backtest, data, factor, strategy
 
 
 @click.group()
@@ -14,6 +14,7 @@ def cli() -> None:
 
 cli.add_command(data.data)
 cli.add_command(factor.factor)
+cli.add_command(agent.agent)
 cli.add_command(backtest.backtest)
 cli.add_command(strategy.strategy)
 

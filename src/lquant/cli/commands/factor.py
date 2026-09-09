@@ -110,3 +110,73 @@ def submit(spec_path: str) -> None:
 @click.option("--name", required=True)
 def run(name: str) -> None:
     click.echo(f"compute {name}")
+
+
+@factor.command()
+@click.option("--agent", default="gp-internal")
+@click.option("--generator", default="gp", type=click.Choice(["gp", "random", "proposals"]))
+@click.option("--n", default=100, help="候选数量（预算）")
+@click.option("--proposals", default=None, help="JSONL 提案文件（generator=proposals）")
+@click.option("--start", default=None)
+def mine(agent: str, generator: str, n: int, proposals: str | None, start: str | None) -> None:
+    """平台驱动挖掘会话：G0-G3 门禁 + 记账落 factor_mining_run。"""
+    import json
+    import uuid
+
+    from lquant.core.db import writer
+    from lquant.data.store.parquet import read_daily
+    from lquant.factors.agents import find_agent
+    from lquant.factors.engine import FactorEngine
+    from lquant.factors.evaluate import forward_return
+    from lquant.factors.mining.runner import run_session
+
+    a = find_agent(agent)
+    if not a:
+        raise click.ClickException(f"Agent 未注册: {agent}（见 lq agent list）")
+    if not a.enabled:
+        raise click.ClickException(f"Agent 已冻结: {agent}")
+    if n > a.quota_eval:
+        raise click.ClickException(f"超出配额: n={n} > quota={a.quota_eval}")
+
+    df = read_daily(start=start).collect()
+    if not len(df):
+        raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")
+    eng = FactorEngine(df.lazy())
+
+    if generator == "gp":
+        from lquant.factors.mining.gp import GPGenerator
+
+        gen = GPGenerator(seed=None)
+    elif generator == "random":
+        from lquant.factors.mining.random_gen import make_generator
+
+        gen = make_generator()
+    else:
+        from lquant.factors.mining.llm import load_proposals, make_generator as mg
+
+        gen = mg(load_proposals(proposals))
+
+    res, survivors = run_session(eng, df, gen, agent=agent, n_candidates=n)
+
+    # 记账落库
+    run_id = uuid.uuid4().hex[:12]
+    import datetime as dt
+
+    import polars as pl
+
+    try:
+        with writer() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO factor_mining_run VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                [run_id, agent, generator, res.n_evaluated, res.n_static_fail,
+                 res.n_low_ic, res.n_redundant, res.n_size_proxy, res.n_survivors,
+                 str(res.corrections)[:10000], dt.datetime.now()])
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"[warn] 记账落库失败（结果仍有效）: {e}")
+    click.echo(json.dumps({
+        "run_id": run_id, "agent": agent, "generator": generator,
+        "n_evaluated": res.n_evaluated, "n_static_fail": res.n_static_fail,
+        "n_low_ic": res.n_low_ic, "n_redundant": res.n_redundant,
+        "n_size_proxy": res.n_size_proxy, "n_survivors": res.n_survivors,
+        "survivors": survivors[:10],
+    }, ensure_ascii=False))

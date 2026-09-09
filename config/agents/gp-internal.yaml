@@ -1,0 +1,10 @@
+# 内置 GP 挖掘 Agent（builtin + platform：平台循环驱动）
+name: gp-internal
+kind: builtin
+driver: platform
+generator: gp
+permissions:
+  quota_eval: 5000
+  can_submit: true
+  can_export_data: false
+enabled: true

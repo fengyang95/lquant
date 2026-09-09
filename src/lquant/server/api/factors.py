@@ -347,7 +347,85 @@ def seed_builtin(req: SeedBuiltinIn) -> dict:
             "sample": [x["name"] for x in items[:5]]}
 
 
-@router.get("/reports")
+@router.get("/agents")
+def list_agents() -> list[dict]:
+    """Agent 注册表（config/agents/*.yaml，fail-fast）。"""
+    from lquant.factors.agents import load_agents
+
+    return [a.__dict__ for a in load_agents()]
+
+
+@router.post("/mine/run")
+def mine_run(req: dict) -> dict:
+    """平台驱动挖掘会话（同步，有界预算）。请求: {agent, generator, n}。"""
+    import datetime as dt
+    import uuid
+
+    import polars as pl
+
+    from lquant.core.db import writer
+
+    from lquant.data.store.parquet import read_daily
+    from lquant.factors.agents import find_agent
+    from lquant.factors.engine import FactorEngine
+    from lquant.factors.mining.runner import run_session
+
+    agent_name = (req or {}).get("agent", "gp-internal")
+    generator = (req or {}).get("generator", "gp")
+    n = int((req or {}).get("n", 100))
+    a = find_agent(agent_name)
+    if not a:
+        raise HTTPException(404, f"Agent 未注册: {agent_name}")
+    if not a.enabled:
+        raise HTTPException(423, f"Agent 已冻结: {agent_name}")
+    if n > a.quota_eval:
+        raise HTTPException(422, f"超出配额: n={n} > quota={a.quota_eval}")
+    df = read_daily(start=None).collect()
+    if not len(df):
+        raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
+    eng = FactorEngine(df.lazy())
+    if generator == "gp":
+        from lquant.factors.mining.gp import GPGenerator
+        gen = GPGenerator()
+    elif generator == "random":
+        from lquant.factors.mining.random_gen import make_generator
+        gen = make_generator()
+    else:
+        raise HTTPException(422, f"未知生成器: {generator}（可选 gp/random）")
+    res, survivors = run_session(eng, df, gen, agent=agent_name, n_candidates=n)
+    run_id = uuid.uuid4().hex[:12]
+    try:
+        with writer() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO factor_mining_run VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                [run_id, agent_name, generator, res.n_evaluated, res.n_static_fail,
+                 res.n_redundant, res.n_size_proxy, res.n_survivors,
+                 str(res.corrections)[:10000], dt.datetime.now()])
+    except Exception as e:  # noqa: BLE001
+        pass  # 记账失败不阻断结果
+    return {"run_id": run_id, "agent": agent_name, "generator": generator,
+            "n_evaluated": res.n_evaluated, "n_static_fail": res.n_static_fail,
+            "n_low_ic": res.n_low_ic, "n_redundant": res.n_redundant,
+            "n_size_proxy": res.n_size_proxy, "n_survivors": res.n_survivors,
+            "survivors": survivors[:10]}
+
+
+def list_mining_runs(limit: int = Query(default=50, ge=1, le=500)) -> list[dict]:
+    """挖掘会话台账（factor_mining_run）。"""
+    with reader() as con:
+        try:
+            rows = con.execute(
+                "SELECT run_id, agent, generator, n_evaluated, n_static_fail, n_low_ic, "
+                "n_redundant, n_size_proxy, n_survivors, created_at "
+                "FROM factor_mining_run ORDER BY created_at DESC LIMIT ?",
+                [limit]).fetchall()
+        except Exception:  # noqa: BLE001
+            return []
+    return [{"run_id": r[0], "agent": r[1], "generator": r[2],
+             "n_evaluated": r[3], "n_static_fail": r[4], "n_low_ic": r[5],
+             "n_redundant": r[6], "n_size_proxy": r[7], "n_survivors": r[8],
+             "created_at": str(r[9])} for r in rows]
+
 def list_reports() -> list[dict]:
     if not REPORT_DIR.exists():
         return []

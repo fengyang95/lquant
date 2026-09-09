@@ -1,0 +1,9 @@
+# Claude Code / 人类研究员（skill + agent：装 SKILL.md 走 CLI）
+name: claude-code
+kind: skill
+driver: agent
+permissions:
+  quota_eval: 2000
+  can_submit: true
+  can_export_data: false
+enabled: true
