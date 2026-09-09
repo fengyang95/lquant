@@ -47,6 +47,11 @@ class Checkpoint:
         self._data["done"] = sorted(d)
         self._flush()
 
+    def unmark(self, retry_keys: list[str] | set[str]) -> None:
+        """从 done 集合移除（retry 场景），下次重跑自动重试这些键。"""
+        self._data["done"] = sorted(self.done - set(retry_keys))
+        self._flush()
+
     def remaining(self, keys: list[str]) -> list[str]:
         done = self.done
         return [k for k in keys if k not in done]
