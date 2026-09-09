@@ -172,9 +172,9 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
 
     icv = ic.get("ic", {})
     ric = ic.get("rank_ic", {})
-    s = ic.get("series")
-    dates = s[date_col].to_list() if s is not None and len(s) else []
-    ic_vals = s["ic"].to_list() if s is not None and len(s) else []
+    s = ic_series(df, factor, ret_col, date_col=date_col)   # ic_summary 不再返回 series
+    dates = s[date_col].to_list() if len(s) else []
+    ic_vals = s["ic"].to_list() if len(s) else []
     cum_ic = []
     acc = 0.0
     for v in ic_vals:

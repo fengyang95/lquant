@@ -103,8 +103,9 @@ def ic_summary(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
                *, method: str = "both", **kw) -> dict:
     """汇总：IC / RankIC 的均值、标准差、IR、t 值、正比例。
 
-    method="pearson" 只算普通 IC，"spearman" 只算 RankIC（省一半计算），
-    "both"（默认）都算，兼容旧行为。
+    method="pearson" 时结果只含普通 IC，"spearman" 只含 RankIC，
+    "both"（默认）都算。注意：ic_series 始终同时计算两种相关，
+    method 只影响输出哪些汇总，不减少计算量。
     """
     if method not in ("pearson", "spearman", "both"):
         raise ValueError(f"method 必须是 pearson/spearman/both，得到: {method}")

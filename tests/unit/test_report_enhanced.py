@@ -59,6 +59,13 @@ def test_report_backward_compatible():
     assert "换手率" in html
 
 
+def test_report_cum_ic_chart_has_data():
+    """回归：ic_summary 不返回 series 曾导致累计 IC 图静默空白。"""
+    html = factor_report(_df(), "mom", "fwd_ret_1")
+    assert "累计 IC" in html
+    assert "数据不足：累计 IC" not in html
+
+
 def test_report_group_col_missing_column():
     """group_col 指定但列不存在 → 静默跳过该节，不抛错。"""
     html = factor_report(_df(), "mom", "fwd_ret_1", group_col="not_a_col")

@@ -132,9 +132,12 @@ def quantile_summary(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
     ls_perf = perf_from_returns(ls["ret_long_short"].to_numpy(),
                                 periods_per_year=periods_per_year) if len(ls) else {}
 
-    means = [g["mean_ret"] for g in groups]
-    # 单调性：Spearman 相关（组序 vs 组平均收益），越接近 1 越单调
-    mono = _spearman(list(range(1, n_groups + 1)), means)
+    # 空分位组的 mean_ret 是 NaN —— 只用有效组算单调性与 spread，否则 NaN 毒化结果
+    pairs = [(g["q"], g["mean_ret"]) for g in groups
+             if isinstance(g["mean_ret"], float) and not math.isnan(g["mean_ret"])]
+    mono = _spearman([q for q, _ in pairs], [m for _, m in pairs]) if len(pairs) >= 2 \
+        else float("nan")
+    spread = pairs[-1][1] - pairs[0][1] if len(pairs) >= 2 else float("nan")
 
     return {
         "factor": factor,
@@ -145,7 +148,7 @@ def quantile_summary(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
                        ("total_return", "annual_return", "annual_vol", "sharpe",
                         "max_drawdown", "win_rate", "calmar")},
         "monotonicity": mono,
-        "top_bottom_spread": (means[-1] - means[0]) if means else float("nan"),
+        "top_bottom_spread": spread,
     }
 
 

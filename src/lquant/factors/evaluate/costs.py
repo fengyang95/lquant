@@ -5,8 +5,6 @@
 """
 from __future__ import annotations
 
-import math
-
 import polars as pl
 
 from lquant.backtest.metrics import perf_from_returns
@@ -55,11 +53,11 @@ def factor_turnover(df: pl.DataFrame, factor: str, n_groups: int = 10, *,
         if prev_long is None:      # 首日无可比持仓，不产生换手记录
             prev_long, prev_short = cur_long, cur_short
             continue
-        tl = 1.0 - len(cur_long & prev_long) / len(cur_long) if cur_long else float("nan")
-        ts = 1.0 - len(cur_short & prev_short) / len(cur_short) if cur_short else float("nan")
-        # 某端当日为空（如股票数 < n_groups）时按 NaN，avg 只对有效端取均值
-        vals = [v for v in (tl, ts) if not math.isnan(v)]
-        avg = sum(vals) / len(vals) if vals else float("nan")
+        # 某端当日为空（如股票数 < n_groups）时记 null（不用 NaN，避免毒化均值），avg 只对有效端取均值
+        tl = 1.0 - len(cur_long & prev_long) / len(cur_long) if cur_long else None
+        ts = 1.0 - len(cur_short & prev_short) / len(cur_short) if cur_short else None
+        vals = [v for v in (tl, ts) if v is not None]
+        avg = sum(vals) / len(vals) if vals else None
         rows.append({date_col: dt, "turnover_long": tl, "turnover_short": ts,
                      "turnover_avg": avg})
         prev_long, prev_short = cur_long, cur_short
@@ -104,10 +102,16 @@ def cost_matrix(df: pl.DataFrame, factor: str, ret_col: str, *,
     to = factor_turnover(df, factor, n_groups, date_col=date_col)
     gross = perf_from_returns(ls["ret_long_short"].to_numpy(),
                               periods_per_year=periods_per_year)["annual_return"]
-    ann_turnover = float(to["turnover_avg"].drop_nulls().mean()) * periods_per_year
+    mean_t = to["turnover_avg"].drop_nulls().mean() if len(to) else None
+    ann_turnover = float(mean_t) * periods_per_year if mean_t is not None else float("nan")
     rows = []
     for bps in bps_list:
-        cost_per_day = float(to["turnover_avg"].drop_nulls().mean()) * (bps / 1e4) * 2.0
+        # 换手未知（全部端组为空）→ 无法评估可用性，net 记 NaN、viable=False（保守）
+        cost_per_day = float(mean_t) * (bps / 1e4) * 2.0 if mean_t is not None else None
+        if cost_per_day is None:
+            rows.append({"bps": float(bps), "gross_annual": gross, "net_annual": float("nan"),
+                         "annual_turnover": float("nan"), "viable": False})
+            continue
         net = perf_from_returns(
             (ls["ret_long_short"] - cost_per_day).to_numpy(),
             periods_per_year=periods_per_year)["annual_return"]

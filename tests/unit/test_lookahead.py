@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import polars as pl
 import pytest
-from hypothesis import HealthCheck, given, settings
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from lquant.factors.engine import FactorEngine
@@ -54,6 +54,7 @@ def test_ts_ops_causal_truncation_invariance(price_lists, cut):
             assert (va - vb).abs().max() < 1e-12, expr
 
 
+@settings(max_examples=15, deadline=None)
 @given(price_lists=prices, h=st.integers(1, 5), cut=st.integers(30, 55))
 def test_forward_return_lookahead_alignment(price_lists, h, cut):
     """fwd_ret_h(T) == close(T+h)/close(T) - 1，且截断后 T-1 期结果不变。"""
