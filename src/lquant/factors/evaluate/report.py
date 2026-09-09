@@ -15,7 +15,9 @@ from pathlib import Path
 import polars as pl
 
 from lquant.factors.evaluate.attribution import attribution_summary
+from lquant.factors.evaluate.costs import cost_matrix, factor_turnover
 from lquant.factors.evaluate.decay import decay_profile, half_life, suggest_rebalance
+from lquant.factors.evaluate.group_ic import ic_by_group
 from lquant.factors.evaluate.ic import ic_by_year, ic_series, ic_summary
 from lquant.factors.evaluate.quantile import quantile_summary
 
@@ -122,8 +124,14 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
                   date_col: str = "trade_date", symbol_col: str = "symbol",
                   horizons: list[int] | None = None,
                   cat_col: str | None = None,
+                  group_col: str | None = None,
+                  bps_list: list[float] | None = None,
                   universe: str = "") -> str:
-    """生成因子研究报告 HTML。"""
+    """生成因子研究报告 HTML。
+
+    group_col 提供且列存在时输出「分组 IC」节（识破市值/行业暴露）；
+    bps_list 提供时输出「成本敏感性」表（net = gross 扣双边换手成本）。
+    """
     if factor not in df.columns:
         raise KeyError(f"因子列不存在: {factor}")
 
@@ -141,6 +149,26 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
             attr = attribution_summary(df, factor, ret_col, date_col=date_col, cat_col=cc)
         except Exception:
             attr = None
+
+    gi = None
+    if group_col and group_col in df.columns:
+        try:
+            gi = ic_by_group(df, factor, ret_col, group_col, date_col=date_col)
+        except Exception:
+            gi = None
+    to = None
+    if "symbol" in df.columns:
+        try:
+            to = factor_turnover(df, factor, n_groups, date_col=date_col)
+        except Exception:
+            to = None
+    cm = None
+    if bps_list:
+        try:
+            cm = cost_matrix(df, factor, ret_col, bps_list=bps_list,
+                             n_groups=n_groups, date_col=date_col)
+        except Exception:
+            cm = None
 
     icv = ic.get("ic", {})
     ric = ic.get("rank_ic", {})
@@ -168,6 +196,32 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
                      f'（越接近 0 说明中性化越干净）</p>'
                      + _table(attr["industry_exposure"], pct_cols=("weight_long",
                                                                     "weight_short", "exposure")))
+
+    gi_html = ""
+    if gi is not None and len(gi):
+        gi_html = (f'<h2>分组 IC · {_esc(group_col)}</h2>'
+                   f'<p class="hint">按组分别算 IC：若某组（如小市值）独占全部信号，'
+                   f'因子收益其实是该组暴露 —— 全样本 IC 会掩盖这一点</p>'
+                   + _table(gi))
+
+    to_html = ""
+    if to is not None and len(to):
+        to_mean = float(to["turnover_avg"].drop_nulls().mean())
+        to_html = (f'<h2>换手率</h2>'
+                   f'<div class="cards">'
+                   f'<div class="card"><div class="k">日均换手（两端均值）</div>'
+                   f'<div class="v">{_fmt(to_mean, pct=True)}</div></div>'
+                   f'<div class="card"><div class="k">年化换手</div>'
+                   f'<div class="v">{_fmt(to_mean * 252, nd=1)}x</div></div>'
+                   f'</div>'
+                   f'<div class="chart">{_svg_line(to["date"].to_list(), to["turnover_avg"].to_list(), zero=False, label="换手率")}</div>')
+
+    cm_html = ""
+    if cm is not None and len(cm):
+        cm_html = ('<h2>成本敏感性</h2>'
+                   '<p class="hint">净收益 = 毛收益扣换手 × 双边成本。'
+                   'viable=False 的行表示该成本下策略不可用 —— 很多高 IC 因子在这里现出原形</p>'
+                   + _table(cm))
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -233,6 +287,12 @@ footer{{margin-top:40px;color:#999;font-size:12px}}
 {_table(yearly, pct_cols=("ic_mean", "ic_std", "positive_rate"))}
 
 {attr_html}
+
+{gi_html}
+
+{to_html}
+
+{cm_html}
 
 <footer>lquant · 因子评价模块自动生成。本报告基于历史数据，不构成投资建议。</footer>
 </div></body></html>"""
