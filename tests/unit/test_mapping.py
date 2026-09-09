@@ -13,6 +13,7 @@ from lquant.data.mapping import (
     load_table_mapping,
     validate_table_config,
 )
+from lquant.data.schema import SCHEMAS
 
 CLEAN_YAML = """
 sources:
@@ -83,8 +84,6 @@ def test_apply_mapping_rename_derive_fill(tmp_path: Path) -> None:
     _write(tmp_path, CLEAN_YAML)
     tm = load_table_mapping("minute_bar", "baostock", config_dir=tmp_path)
     out = apply_mapping(_df(), tm)
-    from lquant.data.schema import SCHEMAS
-
     assert out.columns == list(SCHEMAS["minute_bar"])
     assert out["symbol"].to_list() == ["000001.SZ", "000002.SZ"]
     assert out["freq"].to_list() == ["1min", "1min"]
@@ -161,3 +160,30 @@ def test_validate_reports_forbidden_expr(tmp_path: Path) -> None:
 def test_validate_missing_file(tmp_path: Path) -> None:
     errs = validate_table_config("minute_bar", tmp_path / "schema" / "minute_bar.yaml")
     assert errs
+
+
+BAD_RENAME_LOAD_YAML = """
+sources:
+  baostock:
+    rename:
+      d: oops_not_a_col
+"""
+
+BAD_FILL_LOAD_YAML = """
+sources:
+  baostock:
+    fill:
+      not_a_fill_col: 1min
+"""
+
+
+def test_load_rejects_illegal_rename_target(tmp_path: Path) -> None:
+    _write(tmp_path, BAD_RENAME_LOAD_YAML)
+    with pytest.raises(MappingError, match="oops_not_a_col"):
+        load_table_mapping("minute_bar", "baostock", config_dir=tmp_path)
+
+
+def test_load_rejects_illegal_fill_key(tmp_path: Path) -> None:
+    _write(tmp_path, BAD_FILL_LOAD_YAML)
+    with pytest.raises(MappingError, match="not_a_fill_col"):
+        load_table_mapping("minute_bar", "baostock", config_dir=tmp_path)

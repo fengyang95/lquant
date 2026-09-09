@@ -65,6 +65,38 @@ def _coerce_rule(rule: DeriveRule | str) -> DeriveRule:
     return DeriveRule(expr=str(rule), from_cols=_extract_names(str(rule)))
 
 
+def _check_targets(
+    table: str,
+    source: str,
+    kind: str,
+    targets: Any,
+    schema_cols: set[str],
+) -> None:
+    """fail-fast：目标列不在 SCHEMAS[table] 中直接抛 MappingError。"""
+    for col in targets:
+        if col not in schema_cols:
+            raise MappingError(
+                f"{table}.yaml sources.{source}.{kind}: 目标列 {col!r}"
+                f" 不在 SCHEMAS[{table}] 中"
+            )
+
+
+def _check_targets(
+    table: str,
+    source: str,
+    kind: str,
+    targets: Any,
+    schema_cols: set[str],
+) -> None:
+    """fail-fast：目标列不在 SCHEMAS[table] 中直接抛 MappingError。"""
+    for col in targets:
+        if col not in schema_cols:
+            raise MappingError(
+                f"{table}.yaml sources.{source}.{kind}: 目标列 {col!r}"
+                f" 不在 SCHEMAS[{table}] 中"
+            )
+
+
 def load_table_mapping(
     table: str,
     source: str,
@@ -85,9 +117,18 @@ def load_table_mapping(
         raise MappingError(f"{path} 缺少 sources.{source} 节")
     sec = sources[source] or {}
 
+    schema_cols = set(SCHEMAS.get(table, {}))
+    if not schema_cols:
+        raise MappingError(f"未知表 {table!r}（不在 SCHEMAS 中）")
+
     rename = dict(sec.get("rename") or {})
     fill = dict(sec.get("fill") or {})
     required = tuple(sec.get("required") or ())
+
+    # fail-fast：映射目标列必须 ∈ SCHEMAS[table]，否则最终 select 会静默丢列
+    _check_targets(table, source, "rename", rename.values(), schema_cols)
+    _check_targets(table, source, "fill", fill.keys(), schema_cols)
+    _check_targets(table, source, "derive", (sec.get("derive") or {}).keys(), schema_cols)
 
     derive: dict[str, DeriveRule] = {}
     for target, raw in (sec.get("derive") or {}).items():
@@ -190,10 +231,13 @@ def apply_mapping(
     if schema is None:
         raise MappingError(f"未知表 {tm.table!r}（不在 SCHEMAS 中）")
 
+    _check_targets(tm.table, "(runtime)", "rename", tm.rename.values(), set(schema))
+    _check_targets(tm.table, "(runtime)", "derive", tm.derive.keys(), set(schema))
     out = df.rename(dict(tm.rename))
     out = _apply_derive(out, tm)
 
     fills = {**tm.fill, **(params or {})}
+    _check_targets(tm.table, "(runtime)", "fill", fills.keys(), set(schema))
     for col, value in fills.items():
         out = out.with_columns(pl.lit(value).alias(col))
 
