@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import math
+
 import polars as pl
 
 from lquant.backtest.metrics import perf_from_returns
@@ -45,7 +47,8 @@ def factor_turnover(df: pl.DataFrame, factor: str, n_groups: int = 10, *,
     prev_long: set | None = None
     prev_short: set | None = None
     rows = []
-    for dt, day_raw in d.group_by(date_col, maintain_order=True):
+    for dt_raw, day_raw in d.group_by(date_col, maintain_order=True):
+        dt = dt_raw[0] if isinstance(dt_raw, (list, tuple)) else dt_raw
         day = day_raw.sort("symbol")
         cur_long = _members(day, top)
         cur_short = _members(day, bottom)
@@ -54,8 +57,11 @@ def factor_turnover(df: pl.DataFrame, factor: str, n_groups: int = 10, *,
             continue
         tl = 1.0 - len(cur_long & prev_long) / len(cur_long) if cur_long else float("nan")
         ts = 1.0 - len(cur_short & prev_short) / len(cur_short) if cur_short else float("nan")
+        # 某端当日为空（如股票数 < n_groups）时按 NaN，avg 只对有效端取均值
+        vals = [v for v in (tl, ts) if not math.isnan(v)]
+        avg = sum(vals) / len(vals) if vals else float("nan")
         rows.append({date_col: dt, "turnover_long": tl, "turnover_short": ts,
-                     "turnover_avg": (tl + ts) / 2})
+                     "turnover_avg": avg})
         prev_long, prev_short = cur_long, cur_short
     out = pl.DataFrame(rows).rename({date_col: "date"}).sort("date")
     return out.select(["date", "turnover_long", "turnover_short", "turnover_avg"])

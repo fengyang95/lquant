@@ -115,14 +115,16 @@ def quantile_summary(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
     groups = []
     for q in range(1, n_groups + 1):
         sub = g.filter(pl.col("q") == q).sort(date_col)
-        r = sub["ret"].to_numpy()
-        p = perf_from_returns(r, periods_per_year=periods_per_year)
+        # 股票数 < n_groups 时部分分位组可能为空 —— mean 为 None，按 NaN 处理
+        m = sub["ret"].mean()
+        r = sub["ret"].to_numpy() if len(sub) else []
+        p = perf_from_returns(r, periods_per_year=periods_per_year) if len(sub) else {}
         groups.append({
             "q": q,
-            "mean_ret": float(sub["ret"].mean()),
-            "annual_return": p["annual_return"],
-            "sharpe": p["sharpe"],
-            "max_drawdown": p["max_drawdown"],
+            "mean_ret": float(m) if m is not None else float("nan"),
+            "annual_return": p.get("annual_return", float("nan")),
+            "sharpe": p.get("sharpe", float("nan")),
+            "max_drawdown": p.get("max_drawdown", float("nan")),
             "n_periods": len(sub),
         })
 
