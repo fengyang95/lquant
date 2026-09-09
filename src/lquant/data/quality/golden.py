@@ -12,8 +12,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import polars as pl
-
 from lquant.core.db import reader, writer
 from lquant.data.quality.issues import Issue
 from lquant.data.store.ddl import DDL_GOLDEN_EXPECTED as _DDL
@@ -85,5 +83,26 @@ def list_cases() -> list[GoldenCase]:
 
 
 def _run_one(con, c: GoldenCase) -> float | None:
+    _assert_readonly_sql(c.sql)
     r = con.execute(c.sql).fetchone()
     return float(r[0]) if r and r[0] is not None else None
+
+
+def _assert_readonly_sql(sql: str) -> None:
+    """golden SQL 只读防御：golden_expected 是普通表，行内容可被改写；
+    冻结时校验防误存，运行时再校验防篡改（纵深防御）。
+
+    拒绝：非 SELECT/WITH 开头、多语句（分号）、注释里藏分号的变体
+    （先剥注释再查分号）。
+    """
+    import re
+
+    s = re.sub(r"--[^\n]*", "", sql)
+    s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
+    s = s.strip().rstrip(";").strip()
+    if not s:
+        raise ValueError("golden SQL 为空")
+    if not re.match(r"(?is)^(select|with)\b", s):
+        raise ValueError(f"golden 只允许只读查询（SELECT/WITH），拒绝: {sql!r}")
+    if ";" in s:
+        raise ValueError(f"golden 不允许多语句 SQL，拒绝: {sql!r}")

@@ -1,4 +1,7 @@
-"""API 层集成测试 —— 拷贝真实 duckdb + parquet 湖到临时目录，全链路离线跑。
+"""API 层集成测试 —— generate_demo 生成自包含合成环境，全链路离线跑。
+
+不依赖任何本地真实数据（data/duckdb、data/parquet 均不需要）：
+tmp 目录 + generate_demo 地基 + demo 采集灌看板表，任何机器/CI 皆可跑。
 
 覆盖：health / data(coverage/securities/daily/indicators/quote) / watchlist CRUD /
 factors 注册-列表-详情-校验 / backtests run-list-detail-compare / market collect 健康度 /
@@ -7,13 +10,10 @@ strategies 枚举 / ws 任务推送。
 from __future__ import annotations
 
 import os
-import shutil
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-LQ_ROOT = Path(__file__).resolve().parents[2]
 # 测试环境不启动同步后台线程（避免测试期间触发真实采集）
 os.environ.setdefault("LQ_SYNC_WORKER", "0")
 
@@ -22,20 +22,27 @@ pytestmark = pytest.mark.usefixtures("api_env")
 
 @pytest.fixture(scope="module")
 def api_env(tmp_path_factory):
-    """每个测试模块拷一份隔离数据环境（duckdb 9.8M + parquet 0.5M）。"""
-    if not (LQ_ROOT / "data" / "duckdb" / "lquant.duckdb").exists():
-        pytest.skip("需要本地 data/duckdb/lquant.duckdb（不入库，CI 上跳过）",
-                    allow_module_level=True)
+    """chdir 到 tmp 目录，用 generate_demo 造一份自包含合成数据环境。"""
     base = tmp_path_factory.mktemp("api")
     os.chdir(base)
-    (base / "data" / "duckdb").mkdir(parents=True, exist_ok=True)
-    shutil.copy2(LQ_ROOT / "data" / "duckdb" / "lquant.duckdb",
-                 base / "data" / "duckdb" / "lquant.duckdb")
-    shutil.copytree(LQ_ROOT / "data" / "parquet", base / "data" / "parquet",
-                    dirs_exist_ok=True)
     from lquant.core.config import get_settings
 
     get_settings.cache_clear()
+
+    from lquant.core.db import writer
+    from lquant.data.ingest.demo import generate_demo
+    from lquant.market.scheduler import collect_and_save
+
+    from lquant.data.store.ddl import DDL_STATEMENTS
+    from lquant.market.schema import ensure_market_tables
+    with writer() as con:                # startup 前手动建库+看板表
+        for stmt in DDL_STATEMENTS:
+            con.execute(stmt)
+        ensure_market_tables(con)
+    generate_demo(start="2024-01-01", end="2026-06-30")
+    # 市场看板表灌一轮 demo 采集 —— breadth/snapshot/index 端点
+    # 不再依赖测试文件内的执行顺序（此前靠真实库里的存量数据）
+    collect_and_save(schedule=None, demo=True)
     yield base
     get_settings.cache_clear()
 
