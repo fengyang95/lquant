@@ -124,7 +124,7 @@ export default function StrategyEditorPage() {
   }
 
   async function save() {
-    if (!name.trim()) {
+    if (!selectedId && !name.trim()) {
       setErrors(['请填写策略名称']);
       return;
     }
@@ -132,19 +132,21 @@ export default function StrategyEditorPage() {
     setErrors([]);
     try {
       if (selectedId) {
-        await putData(`/strategies/${selectedId}`, { name, description, source: code });
+        // PUT 契约：StrategySourceIn 只有 source/description/config/benchmark，不可改名
+        await putData(`/strategies/${selectedId}`, { source: code, description });
         setNotice(`已更新「${name}」`);
       } else {
+        // POST 契约：source 字段即策略代码文本（min_length=10），非 builtin/user 标识
         const row = await post<StrategyMeta>('/strategies', {
           name,
-          source: 'user',
+          source: code,
           description,
         });
-        // source 字段在创建接口里是列表标识而非代码，保存代码走 PUT
-        if (row?.id) {
-          await putData(`/strategies/${row.id}`, { source: code });
-          setSelectedId(row.id);
+        if (!row?.id) {
+          setErrors(['保存接口未返回策略 id，请检查后端响应']);
+          return;
         }
+        setSelectedId(row.id);
         setNotice(`已创建「${name}」`);
       }
       mutateList();
@@ -253,8 +255,14 @@ export default function StrategyEditorPage() {
             <div className="flex flex-wrap items-end gap-3 border-b border-line px-4 py-3">
               <label className="text-sm">
                 <div className="mb-1 text-xs text-ink-faint">策略名称</div>
-                <input value={name} onChange={(e) => setName(e.target.value)}
-                       placeholder="如：双均线择时" className="input w-48" />
+                {selectedId ? (
+                  <div className="input w-48 cursor-default bg-white/60 text-ink-dim" title="改名需另存为新策略">
+                    {name}
+                  </div>
+                ) : (
+                  <input value={name} onChange={(e) => setName(e.target.value)}
+                         placeholder="如：双均线择时" className="input w-48" />
+                )}
               </label>
               <label className="text-sm">
                 <div className="mb-1 text-xs text-ink-faint">描述</div>
