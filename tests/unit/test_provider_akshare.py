@@ -139,7 +139,8 @@ def test_etf_daily_goes_through_daily_bar_with_sec_type(
 
     def fake_etf(**kw: Any) -> pd.DataFrame:
         captured.update(kw)
-        return _DAILY_PANDAS.assign(股票代码=["510300", "510300"])
+        # 还原 fund_etf_hist_em 真实形态：不带「股票代码」列
+        return _DAILY_PANDAS.drop(columns=["股票代码"])
 
     _install_fake_ak(monkeypatch, fund_etf_hist_em=fake_etf)
     out = provider.etf_daily_bars(["510300.SH"], date(2024, 1, 1), date(2024, 1, 3))
@@ -177,7 +178,28 @@ def test_adj_factors_two_pull_division(
     assert out["trade_date"].to_list() == [date(2024, 1, 2), date(2024, 1, 3)]
 
 
-def test_adj_factors_length_mismatch_skipped(
+def test_adj_factors_date_misalignment_no_wrong_factor(
+    provider: AkShareProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """行数相同但日期错开：按 trade_date join，只保留交集日期，因子不错位。"""
+    def fake_hist(**kw: Any) -> pd.DataFrame:
+        if kw["adjust"] == "qfq":
+            return pd.DataFrame({
+                "日期": ["2024-01-03", "2024-01-04"],
+                "收盘": [10.3, 10.4],
+            })
+        return pd.DataFrame({
+            "日期": ["2024-01-02", "2024-01-03"],
+            "收盘": [10.2, 10.3],
+        })
+
+    _install_fake_ak(monkeypatch, stock_zh_a_hist=fake_hist)
+    out = provider.adj_factors(["600000.SH"], date(2024, 1, 1), date(2024, 1, 4))
+    assert out["trade_date"].to_list() == [date(2024, 1, 3)]   # 仅交集
+    assert out["factor"].to_list() == pytest.approx([1.0])
+
+
+def test_adj_factors_partial_overlap_keeps_common_dates(
     provider: AkShareProvider, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def fake_hist(**kw: Any) -> pd.DataFrame:
@@ -186,7 +208,9 @@ def test_adj_factors_length_mismatch_skipped(
         return pd.DataFrame({"日期": ["2024-01-02", "2024-01-03"], "收盘": [10.2, 10.4]})
 
     _install_fake_ak(monkeypatch, stock_zh_a_hist=fake_hist)
-    assert provider.adj_factors(["600000.SH"], date(2024, 1, 1), date(2024, 1, 3)).height == 0
+    out = provider.adj_factors(["600000.SH"], date(2024, 1, 1), date(2024, 1, 3))
+    assert out["trade_date"].to_list() == [date(2024, 1, 2)]
+    assert out["factor"].to_list() == pytest.approx([0.5])
 
 
 def test_securities_mapping(

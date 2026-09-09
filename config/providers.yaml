@@ -16,8 +16,8 @@ providers:
     module: lquant.data.providers.akshare
     cls: AkShareProvider
     qps: 3            # 东财系极易封 IP
-    capability: [daily, minute_1, minute_5, etf_spot, etf_daily, etf_iopv,
-                 money_flow, limit_up, dragon_tiger, sector]
+    capability: [daily, minute_1, minute_5, minute_15, minute_30, minute_60,
+                 adj_factor, reference, etf_daily]
     note: 覆盖最广但易封；已接入声明式映射机制（daily/minute/adj_factor/securities/ETF 日线），保持关闭由用户开启
 
   - name: efinance
