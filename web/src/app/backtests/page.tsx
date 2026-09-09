@@ -68,13 +68,23 @@ export default function BacktestsPage() {
     setRunStrategyBusy(true);
     setErr('');
     try {
-      const detail = await get<{ source: string; benchmark?: string }>(`/strategies/${strategyId}`);
-      const r = await post<RunCodeResult>('/backtests/run-code', {
+      const detail = await get<{
+        source: string;
+        benchmark?: string;
+        config?: { factor_formulas?: unknown };
+      }>(`/strategies/${strategyId}`);
+      const rawFormulas = detail.config?.factor_formulas;
+      const factorFormulas = Array.isArray(rawFormulas)
+        ? rawFormulas.filter((f): f is string => typeof f === 'string')
+        : [];
+      const body: Record<string, unknown> = {
         code: detail.source,
         start: '2024-01-01',
         end: '2024-12-31',
         strategy_id: strategyId,
-      });
+      };
+      if (factorFormulas.length > 0) body.factor_formulas = factorFormulas;
+      const r = await post<RunCodeResult>('/backtests/run-code', body);
       router.push(`/backtests/${r.run_id}`);
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));

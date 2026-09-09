@@ -93,6 +93,8 @@ export default function StrategyEditorPage() {
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [code, setCode] = useState(DQ_TEMPLATE);
+  // 载入策略时保留其原 config，保存时合并 factor_formulas，不覆盖其他键
+  const [loadedConfig, setLoadedConfig] = useState<Record<string, unknown>>({});
   const [start, setStart] = useState(START_DEFAULT);
   const [end, setEnd] = useState(END_DEFAULT);
   const [formulas, setFormulas] = useState(FACTOR_DEFAULT);
@@ -109,6 +111,7 @@ export default function StrategyEditorPage() {
       setName(s.name);
       setDescription(s.description ?? '');
       setCode(s.source || '');
+      setLoadedConfig(s.config ?? {});
     } catch (e) {
       setErrors([e instanceof Error ? e.message : String(e)]);
     }
@@ -119,8 +122,16 @@ export default function StrategyEditorPage() {
     setName('');
     setDescription('');
     setCode(DQ_TEMPLATE);
+    setLoadedConfig({});
     setErrors([]);
     setNotice('');
+  }
+
+  function parseFormulas(): string[] {
+    return formulas
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
   }
 
   async function save() {
@@ -131,9 +142,10 @@ export default function StrategyEditorPage() {
     setBusy('save');
     setErrors([]);
     try {
+      const config = { ...loadedConfig, factor_formulas: parseFormulas() };
       if (selectedId) {
         // PUT 契约：StrategySourceIn 只有 source/description/config/benchmark，不可改名
-        await putData(`/strategies/${selectedId}`, { source: code, description });
+        await putData(`/strategies/${selectedId}`, { source: code, description, config });
         setNotice(`已更新「${name}」`);
       } else {
         // POST 契约：source 字段即策略代码文本（min_length=10），非 builtin/user 标识
@@ -141,6 +153,7 @@ export default function StrategyEditorPage() {
           name,
           source: code,
           description,
+          config,
         });
         if (!row?.id) {
           setErrors(['保存接口未返回策略 id，请检查后端响应']);
@@ -177,15 +190,11 @@ export default function StrategyEditorPage() {
     setErrors([]);
     setNotice('');
     try {
-      const factorFormulas = formulas
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean);
       const body: Record<string, unknown> = {
         code,
         start,
         end: end || undefined,
-        factor_formulas: factorFormulas,
+        factor_formulas: parseFormulas(),
       };
       if (selectedId) body.strategy_id = selectedId;
       const r = await post<RunCodeResult>('/backtests/run-code', body);
