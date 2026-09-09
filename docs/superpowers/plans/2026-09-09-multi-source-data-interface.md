@@ -95,7 +95,7 @@ sources:
 ```
 （注意：required 里 high/low/close 逐项列出，不缩写）
 
-**minute_bar.yaml `sources.baostock` 諭：**
+**minute_bar.yaml `sources.baostock` 节：**
 ```yaml
 table: minute_bar
 sources:
