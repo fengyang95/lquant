@@ -104,6 +104,14 @@ def verify_and_register(spec: dict) -> tuple[bool, dict]:
         else:
             grade = "C"
     payload["grade"] = grade
+    try:
+        from lquant.factors.replication import attribute
+
+        payload["attribution"] = attribute(
+            spec.get("claimed"), payload.get("recomputed", {}), grade,
+            spec.get("assumptions", []))
+    except Exception:  # noqa: BLE001
+        pass
     if t_val is not None and abs(t_val) < thr:
         payload.update({"ok": False, "reason_code": "LOW_TSTAT",
                         "hint": f"|t_val|={abs(t_val):.2f} < 校正门槛 {thr:.2f}"})

@@ -20,10 +20,20 @@ os.environ.setdefault("LQ_SYNC_WORKER", "0")
 pytestmark = pytest.mark.usefixtures("api_env")
 
 
+def _ensure_cwd():
+    """cwd 指向的目录被删（pytest tmp 清理）时，os.getcwd() 会炸 —— 先兜底恢复。"""
+    try:
+        os.getcwd()
+    except FileNotFoundError:
+        os.chdir(os.path.expanduser("~"))
+
+
 @pytest.fixture(scope="module")
 def api_env(tmp_path_factory):
     """chdir 到 tmp 目录，用 generate_demo 造一份自包含合成数据环境。"""
+    _ensure_cwd()
     base = tmp_path_factory.mktemp("api")
+    _old = os.getcwd()
     os.chdir(base)
     from lquant.core.config import get_settings
 
@@ -45,6 +55,7 @@ def api_env(tmp_path_factory):
     # 不再依赖测试文件内的执行顺序（此前靠真实库里的存量数据）
     collect_and_save(schedule=None, demo=True)
     yield base
+    os.chdir(_old)
     get_settings.cache_clear()
 
 

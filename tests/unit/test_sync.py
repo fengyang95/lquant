@@ -18,9 +18,18 @@ os.environ.setdefault("LQ_SYNC_WORKER", "0")   # 本模块直接调 manager，�
 pytestmark = pytest.mark.usefixtures("sync_env")
 
 
+def _ensure_cwd():
+    """cwd 指向的目录被删（pytest tmp 清理）时，os.getcwd() 会炸 —— 先兜底恢复。"""
+    try:
+        os.getcwd()
+    except FileNotFoundError:
+        os.chdir(os.path.expanduser("~"))
+
+
 @pytest.fixture(scope="module")
 def sync_env(tmp_path_factory):
     """每个模块一份隔离数据环境（拷真实 duckdb + parquet 湖）。"""
+    _ensure_cwd()
     if not (LQ_ROOT / "data" / "duckdb" / "lquant.duckdb").exists():
         pytest.skip("需要本地 data/duckdb/lquant.duckdb（不入库，CI 上跳过）",
                     allow_module_level=True)

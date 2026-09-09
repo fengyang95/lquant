@@ -1,6 +1,7 @@
 """质量模块加固测试：跨源对拍零值/空帧、门禁主键去重、golden 只读防御。"""
 from __future__ import annotations
 
+import os
 from datetime import date
 
 import polars as pl
@@ -30,9 +31,18 @@ def _good_bars(n_days: int = 5) -> pl.DataFrame:
 
 # ---------- 跨源对拍 ----------
 
-@pytest.fixture
+def _ensure_cwd():
+    """cwd 指向的目录被删（pytest tmp 清理）时，os.getcwd() 会炸 —— 先兜底恢复。"""
+    try:
+        os.getcwd()
+    except FileNotFoundError:
+        os.chdir(os.path.expanduser("~"))
+
+
+@pytest.fixture(scope="module")
 def q_env(tmp_path_factory):
     """与 test_quality.q_env 同款隔离 tmp duckdb（tests 不是包，就地复制）。"""
+    _ensure_cwd()
     import os
 
     base = tmp_path_factory.mktemp("quality_hardening")

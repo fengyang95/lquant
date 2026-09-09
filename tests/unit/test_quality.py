@@ -275,8 +275,17 @@ def test_adj_factor_checks():
 
 # ---------- 落库部分（隔离 tmp duckdb）----------
 
+def _ensure_cwd():
+    """cwd 指向的目录被删（pytest tmp 清理）时，os.getcwd() 会炸 —— 先兜底恢复。"""
+    try:
+        os.getcwd()
+    except FileNotFoundError:
+        os.chdir(os.path.expanduser("~"))
+
+
 @pytest.fixture(scope="module")
 def q_env(tmp_path_factory):
+    _ensure_cwd()
     base = tmp_path_factory.mktemp("quality")
     old_cwd = os.getcwd()
     os.chdir(base)
