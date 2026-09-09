@@ -10,8 +10,9 @@ requires-python = ">=3.12"
 license = { text = "MIT" }
 
 # 注意：polars / pyo3 / pyo3-polars 三者 ABI 强绑定，必须统一升级
+# polars-py 1.44 ↔ polars-rs 0.55（对照表见 crates/Cargo.toml），升级需两边同步
 dependencies = [
-  "polars>=1.30,<2",
+  "polars>=1.44,<1.45",
   "pyarrow>=18",
   "duckdb>=1.4",
   "pydantic>=2.9",

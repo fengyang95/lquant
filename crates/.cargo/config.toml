@@ -1,0 +1,8 @@
+# lq-ops 编译优化：针对本机 CPU（原写在 lq-ops/Cargo.toml 的 [build] 表是无效位置）
+# macOS pyo3 cdylib：Python 符号留待运行时由解释器解析
+[target.'cfg(target_os = "macos")']
+rustflags = [
+  "-C", "link-arg=-undefined",
+  "-C", "link-arg=dynamic_lookup",
+  "-C", "target-cpu=native",
+]

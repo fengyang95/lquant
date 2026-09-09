@@ -1,8 +1,8 @@
 [build-system]
-requires = ["maturin>=1.7,<2"]
+requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
 name = "lq-metrics"
 version = "0.1.0"
-requires-python = ">=3.9"
+requires-python = ">=3.12"

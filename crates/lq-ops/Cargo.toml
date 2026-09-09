@@ -9,11 +9,13 @@ crate-type = ["cdylib"]
 
 [dependencies]
 polars = { workspace = true }
+# 引入仅为开启 polars-ops/object、mem-engine/stream python feature，
+# 与 pyo3-polars derive 拉起的 polars-core/object 对齐（见 workspace Cargo.toml）
+polars-ops = { workspace = true }
+polars-mem-engine = { workspace = true }
+polars-stream = { workspace = true }
 pyo3 = { workspace = true }
 pyo3-polars = { workspace = true }
-polars-arrow = "0.49"
 serde = { workspace = true }
 
-# ⚠️ 版本必须与 Python 侧 polars 完全一致
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# ⚠️ 版本必须与 Python 侧 polars 完全一致（见 workspace Cargo.toml 对照表）

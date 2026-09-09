@@ -53,7 +53,7 @@ fn rank(v: &[f64]) -> Vec<f64> {
 #[pyfunction]
 fn max_drawdown(nav: Vec<f64>) -> f64 {
     let mut peak = f64::MIN;
-    let mut mdd: f64 = 0.0;
+    let mut mdd = 0.0f64;
     for v in nav {
         peak = peak.max(v);
         if peak > 0.0 {

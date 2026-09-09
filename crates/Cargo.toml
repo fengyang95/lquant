@@ -7,11 +7,19 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
-# ⚠️ pyo3 / pyo3-polars / polars 三者 ABI 强绑定，必须统一升级。
+# ⚠️ pyo3 / pyo3-polars / polars 三者 ABI 强绑定，必须统一升级，
+#    且与 Python 侧 polars 版本严格对应（pyproject.toml）：
+#    polars-rs 0.55 ↔ polars-py 1.44 ↔ pyo3-polars 0.28 ↔ pyo3 0.29
 # 版本错配要到运行时才炸，且报错看起来像编译器 bug。
 [workspace.dependencies]
-polars = { version = "0.49", features = ["lazy", "dtype-full"] }
-pyo3 = { version = "0.25", features = ["extension-module"] }
-pyo3-polars = { version = "0.22", features = ["derive"] }
+# 注意：pyo3-polars 的 derive feature 会强制 polars-plan/python → polars-core/object，
+# 但上游 0.55.2 的 feature 图不会同步给 polars-ops / polars-mem-engine / polars-stream，
+# 导致这三处对 Object / PythonScan / DeletionFilesList::Delta 的匹配编译失败。
+# 因此必须显式给整个 family 补齐 python / object feature，保持一致。
+polars = { version = "0.55", features = ["lazy"] }
+polars-ops = { version = "0.55", features = ["object"] }
+polars-mem-engine = { version = "0.55", features = ["python"] }
+polars-stream = { version = "0.55", features = ["python"] }
+pyo3 = { version = "0.29", features = ["extension-module"] }
+pyo3-polars = { version = "0.28", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-arrow = "54"
