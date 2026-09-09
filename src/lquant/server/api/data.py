@@ -13,20 +13,19 @@ from pydantic import BaseModel, Field
 
 from lquant.core.db import reader
 from lquant.data.ingest.tasks import (
+    TaskConflictError,
+    claim_retry,
     create_task,
     execute_task,
     get_task,
     list_tasks,
-    retry_task,
+    run_claimed_task,
 )
 from lquant.data.store.parquet import read_daily
 from lquant.server.deps import bare_code, resolve_symbol
 from lquant.server.jobs import enqueue
 
 router = APIRouter(prefix="/data", tags=["data"])
-
-# retry 可接受的状态（与 tasks._RETRIABLE 一致，避免引私有名）
-_RETRIABLE_STATUSES = ("partial", "failed", "interrupted")
 
 
 class TaskIn(BaseModel):
@@ -235,16 +234,16 @@ def create_data_task(req: TaskIn) -> dict:
     """
     try:
         task = create_task(req.kind, req.params)
+    except TaskConflictError as e:
+        raise HTTPException(409, str(e)) from e
     except ValueError as e:
-        if "运行中" in str(e) or "running" in str(e):
-            raise HTTPException(409, str(e)) from e
         raise HTTPException(422, str(e)) from e
     enqueue("lquant-ingest", execute_task, task["task_id"])
     return {"task_id": task["task_id"]}
 
 
 @router.get("/tasks")
-def list_data_tasks(limit: int = Query(default=50, le=500)) -> list[dict]:
+def list_data_tasks(limit: int = Query(default=50, ge=1, le=500)) -> list[dict]:
     """数据任务列表（最新在前）。"""
     return list_tasks(limit)
 
@@ -260,15 +259,24 @@ def get_data_task(task_id: str) -> dict:
 
 @router.post("/tasks/{task_id}/retry", status_code=202)
 def retry_data_task(task_id: str) -> dict:
-    """retry 补漏：unmark 失败标的 checkpoint 后重新执行 → 202 + task_id。"""
+    """retry 补漏：unmark 失败标的 checkpoint 后重新执行 → 202 + task_id。
+
+    端点同步原子认领（claim_retry，消除预检-入队的 TOCTOU）：
+    认领成功任务即置 running，再入队执行已认领任务。
+    409：pending/running 或竞争抢先；422：终态 ok 不可 retry；404：不存在。
+    """
     task = get_task(task_id)
     if task is None:
         raise HTTPException(404, f"任务不存在: {task_id}")
-    if task["status"] in ("pending", "running"):
-        raise HTTPException(409, f"任务 {task_id} 正在运行中，不可 retry")
-    if task["status"] not in _RETRIABLE_STATUSES:
-        raise HTTPException(422, f"任务 {task_id} 状态 {task['status']} 不可 retry")
-    enqueue("lquant-ingest", retry_task, task_id)
+    if task["status"] == "ok":
+        raise HTTPException(422, f"任务 {task_id} 状态 ok 不可 retry")
+    try:
+        claim_retry(task_id)
+    except TaskConflictError as e:
+        raise HTTPException(409, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    enqueue("lquant-ingest", run_claimed_task, task_id)
     return {"task_id": task_id}
 
 
@@ -288,7 +296,7 @@ def run_crosscheck_ep(req: CrosscheckIn) -> dict:
 
 @router.get("/crosscheck/issues")
 def crosscheck_issues(
-    limit: int = Query(default=200, le=1000),
+    limit: int = Query(default=200, ge=1, le=1000),
     resolved: bool = False,
 ) -> list[dict]:
     """质量问题检索（data_quality_issue，默认未解决）。"""
@@ -307,7 +315,10 @@ def resolve_crosscheck_issue(req: ResolveIn) -> dict:
             row = con.execute(
                 "SELECT issue_id FROM data_quality_issue WHERE issue_id = ?",
                 [req.issue_id]).fetchone()
-        except Exception:  # noqa: BLE001 - 表不存在等价于没有这条 issue
+        except Exception as e:  # noqa: BLE001 - 表不存在等价于没有这条 issue
+            from loguru import logger
+
+            logger.warning(f"quality issue 查询失败（按不存在处理）: {e}")
             row = None
     if row is None:
         raise HTTPException(404, f"issue 不存在: {req.issue_id}")

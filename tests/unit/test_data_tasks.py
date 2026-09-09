@@ -277,6 +277,31 @@ def test_retry_rejects_ok_task(seeded_db, monkeypatch):
     tasks_mod.execute_task(t["task_id"])
     with pytest.raises(ValueError, match="不可 retry"):
         tasks_mod.retry_task(t["task_id"])
+    # 专类型断言：TaskConflictError（ValueError 子类，旧捕获方不受影响）
+    with pytest.raises(tasks_mod.TaskConflictError):
+        tasks_mod.retry_task(t["task_id"])
+
+
+def test_retry_conflict_when_already_claimed(seeded_db, monkeypatch):
+    """原子认领：已被抢先（状态不再 retriable）→ TaskConflictError，不重复执行。"""
+    monkeypatch.setattr(tasks_mod, "backfill_pool", _mock_backfill([], rows=1))
+    t = _mk_task()
+    tasks_mod.execute_task(t["task_id"])          # → ok
+    from lquant.core.db import writer
+
+    with writer() as con:
+        con.execute("UPDATE data_task SET status='running' WHERE task_id=?",
+                    [t["task_id"]])
+    with pytest.raises(tasks_mod.TaskConflictError):
+        tasks_mod.retry_task(t["task_id"])
+    # claim_retry 直接认领 partial 任务 → running，二次认领失败
+    with writer() as con:
+        con.execute("UPDATE data_task SET status='partial' WHERE task_id=?",
+                    [t["task_id"]])
+    tasks_mod.claim_retry(t["task_id"])
+    with pytest.raises(tasks_mod.TaskConflictError):
+        tasks_mod.claim_retry(t["task_id"])
+    assert tasks_mod.get_task(t["task_id"])["status"] == "running"
 
 
 def test_mark_interrupted(seeded_db):

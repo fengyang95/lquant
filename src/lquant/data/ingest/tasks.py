@@ -52,6 +52,13 @@ _DAILY_DAYS_DEFAULT = 10
 _CP_PREFIX = "daily:"
 
 
+class TaskConflictError(ValueError):
+    """任务状态冲突（互斥 / 不可 retry / 正在运行）—— API 层映射 409。
+
+    继承 ValueError：旧调用方按 ValueError 捕获的行为不变。
+    """
+
+
 def _ensure_table(con) -> None:
     con.execute(_DDL)
 
@@ -141,7 +148,8 @@ def create_task(kind: str, params: dict | None = None) -> dict:
             "WHERE status = 'running' LIMIT 1"
         ).fetchone()
         if running:
-            raise ValueError(f"已有运行中的数据任务（{running[0]}），请等待完成后再创建")
+            raise TaskConflictError(
+                f"已有运行中的数据任务（{running[0]}），请等待完成后再创建")
         if kind == "full_backfill":
             n_delisted = con.execute(
                 "SELECT count(*) FROM security "
@@ -245,8 +253,14 @@ def execute_task(task_id: str) -> dict:
     if task is None:
         raise ValueError(f"任务不存在: {task_id}")
     if task["status"] == "running":
-        raise ValueError(f"任务 {task_id} 正在运行中")
+        raise TaskConflictError(f"任务 {task_id} 正在运行中")
     _reset_running(task_id)
+    return _run_task(task_id)
+
+
+def _run_task(task_id: str) -> dict:
+    """执行主体（状态已置 running）：跑池 → 收敛终态。"""
+    task = get_task(task_id)
     params = task["params"]
     start = _parse_date(params["start"], "起始日期")
     end = (_parse_date(params["end"], "结束日期") if params.get("end")
@@ -295,18 +309,52 @@ def execute_task(task_id: str) -> dict:
     return get_task(task_id)
 
 
-def retry_task(task_id: str) -> dict:
-    """unmark 失败标的的 checkpoint 后重新 execute（只补漏）。"""
+def claim_retry(task_id: str) -> dict:
+    """原子认领 retry：一条 UPDATE check-and-update 到 running（含计数清零），
+    并 unmark 失败标的 checkpoint。
+
+    消除端点「先预检再入队」的 TOCTOU：竞争失败（状态已不是 retriable，
+    或已被其他请求抢先）抛 TaskConflictError，不存在抛 ValueError。
+    返回认领后的 task。
+    """
     task = get_task(task_id)
     if task is None:
         raise ValueError(f"任务不存在: {task_id}")
-    if task["status"] not in _RETRIABLE:
-        raise ValueError(f"任务 {task_id} 状态不可 retry")
+    with writer() as con:
+        _ensure_table(con)
+        res = con.execute(
+            "UPDATE data_task SET status='running', phase=NULL, done_symbols=0, "
+            "failed_symbols='[]'::JSON, failed_detail='[]'::JSON, rows_written=0, "
+            "started_at=?, finished_at=NULL, message=NULL "
+            "WHERE task_id=? AND status IN ('partial', 'failed', 'interrupted')",
+            [datetime.now(), task_id],
+        ).fetchone()
+    if not res or not res[0]:
+        raise TaskConflictError(
+            f"任务 {task_id} 状态不可 retry（需 partial/failed/interrupted），"
+            "或已被其他操作抢先")
     failed = task["failed_symbols"] or []
-    cp = Checkpoint(_CP_PREFIX + task_id)
     if failed:
-        cp.unmark(failed)
-    return execute_task(task_id)
+        Checkpoint(_CP_PREFIX + task_id).unmark(failed)
+    return get_task(task_id)
+
+
+def retry_task(task_id: str) -> dict:
+    """unmark 失败标的的 checkpoint 后重新 execute（只补漏）。
+
+    先经 claim_retry 原子认领（不可 retry / 抢先失败 → TaskConflictError），
+    队列里重复认领也会安全失败而不是重复执行。
+    """
+    claim_retry(task_id)
+    return _run_task(task_id)
+
+
+def run_claimed_task(task_id: str) -> dict:
+    """执行已认领（running）的任务 —— 端点 claim_retry 成功后由队列调用。
+
+    与 execute_task 的区别：不做状态前置检查（认领即原子置 running）。
+    """
+    return _run_task(task_id)
 
 
 def mark_interrupted_on_startup() -> int:

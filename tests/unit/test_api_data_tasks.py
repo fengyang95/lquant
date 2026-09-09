@@ -60,7 +60,7 @@ def _stub_executor(monkeypatch):
     monkeypatch.setattr(tasks_mod, "retry_task", _noop)
     # data.py `from ... import execute_task` 持有引用，须一并打桩
     monkeypatch.setattr(data_mod, "execute_task", _noop)
-    monkeypatch.setattr(data_mod, "retry_task", _noop)
+    monkeypatch.setattr(data_mod, "run_claimed_task", _noop)
     yield
 
 
