@@ -5,7 +5,7 @@ from datetime import date
 
 import polars as pl
 
-from lquant.data.quality.flags import NEW_LISTING, ST_RISK, SUSPENDED
+from lquant.data.quality.flags import ADJ_ANOMALY, NEW_LISTING, ST_RISK, SUSPENDED, ZOMBIE
 from lquant.data.quality.tradability import flag_tradability
 
 
@@ -52,3 +52,40 @@ def test_no_columns_no_crash():
     assert (out["quality_flags"] & NEW_LISTING == 0).all()
     assert (out["quality_flags"] & ST_RISK == 0).all()
     assert (out["quality_flags"] & SUSPENDED != 0).any()
+
+
+def test_existing_flags_preserved_when_no_checks_apply():
+    # 无 volume/listing_date/is_st 且无 dict 时：已有 quality_flags 位必须原样保留
+    df = pl.DataFrame({
+        "symbol": ["A"] * 4,
+        "trade_date": [date(2020, 1, 2), date(2020, 1, 3),
+                       date(2020, 1, 4), date(2020, 1, 5)],
+        "close": [10.0] * 4,
+        "quality_flags": [ADJ_ANOMALY, 0, ADJ_ANOMALY | ZOMBIE, 0],
+    })
+    out = flag_tradability(df)
+    assert out["quality_flags"].to_list() == [ADJ_ANOMALY, 0,
+                                              ADJ_ANOMALY | ZOMBIE, 0]
+
+
+def test_listing_dates_dict_param():
+    # 缺 listing_date 列时用 listing_dates dict 驱动
+    df = _df()
+    out = flag_tradability(df, listing_dates={"A": date(2020, 1, 1)})
+    assert (out["quality_flags"] & NEW_LISTING != 0).all()
+    # 上市满 120 天 → 不打标
+    out2 = flag_tradability(df, listing_dates={"A": date(2019, 6, 1)})
+    assert (out2["quality_flags"] & NEW_LISTING == 0).all()
+
+
+def test_st_ranges_dict_param():
+    # 缺 is_st 列时用 st_ranges dict 驱动：区间内打标、区间外不打
+    df = _df()
+    out = flag_tradability(
+        df, st_ranges={"A": [(date(2020, 1, 3), date(2020, 1, 4))]})
+    got = out["quality_flags"].to_list()
+    assert got[1] & ST_RISK and got[2] & ST_RISK
+    assert not (got[0] & ST_RISK) and not (got[3] & ST_RISK)
+    # 区间与数据无交集 → 跳过检查
+    out2 = flag_tradability(df, st_ranges={"A": [(date(2021, 1, 1), date(2021, 2, 1))]})
+    assert (out2["quality_flags"] & ST_RISK == 0).all()
