@@ -97,6 +97,48 @@ def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
     raise HTTPException(422, f"暂不支持的因子公式: {formula}（内置因子见 GET /api/factors/builtin）")
 
 
+def _neutral_ladder(d: pl.DataFrame, col: str, ret_col: str) -> list[dict]:
+    """逐段叠加协变量看 IC 怎么掉：原始 → +市值 → +行业 → +换手率。"""
+    from lquant.factors.covariates import build_covariates
+    from lquant.factors.preprocess.pipeline import run as pipeline_run
+
+    levels = [
+        ("raw", []),
+        ("+market_cap", ["market_cap"]),
+        ("+industry", ["market_cap", "industry_sw1"]),
+        ("+turnover", ["market_cap", "industry_sw1", "turnover_1m"]),
+    ]
+    out = []
+    cov_names = sorted({c for _, covs in levels for c in covs})
+    try:
+        dd, report = build_covariates(d, cov_names)
+    except Exception:  # noqa: BLE001
+        return []
+    cov_report = {r["covariate"]: r["coverage"] for r in report}
+    for label, covs in levels:
+        steps = [{"op": "winsorize", "method": "mad", "n": 5},
+                 {"op": "standardize", "method": "zscore"}]
+        if covs:
+            cols = [f"cov_{c}" for c in covs if f"cov_{c}" in dd.columns]
+            if covs and not cols:
+                continue
+            steps.append({"op": "neutralize", "method": "ols", "factors": cols})
+        try:
+            r = pipeline_run(dd, col, steps)
+        except Exception:  # noqa: BLE001
+            continue
+        s = ic_series(r.drop_nulls([col]), col, ret_col)
+        if not len(s):
+            continue
+        out.append({
+            "label": label, "covs": covs,
+            "ic_mean": round(float(s["ic"].mean()), 4),
+            "rank_ic_mean": round(float(s["rank_ic"].mean()), 4),
+            "n_days": len(s),
+        })
+    return out
+
+
 def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
     """一次现算 + 评价，返回 (metrics, series)。
 
@@ -171,13 +213,16 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
                 "ir": _jf(r["ir"], 3), "positive_rate": _jf(r["positive_rate"], 4)}
                for r in icy.to_dicts()] if len(icy) else []
 
+    # ---- IC 归因阶梯（方案 5.3）：原始 → +市值 → +行业 → +换手率 ----
+    ladder = _neutral_ladder(d, "_factor", ret_col)
+
     series = {
         "factor": req.factor, "formula": req.formula,
         "n_groups": req.n_groups, "n_samples": len(d),
         "ic": {"dates": ic_dates, "ic": ic_vals, "rank_ic": ic_ranks, "cum_ic": cum_ic},
         "quantile": {"dates": qdates, "curves": curves, "groups": groups,
                      "monotonicity": _jf(qsum.get("monotonicity"), 3)},
-        "decay": decay, "ic_by_year": ic_year,
+        "decay": decay, "ic_by_year": ic_year, "neutral_ladder": ladder,
     }
     return metrics, series
 
