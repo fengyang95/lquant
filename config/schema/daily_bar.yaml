@@ -1,0 +1,16 @@
+# daily_bar 字段映射（唯一事实源：lquant.data.schema.SCHEMAS["daily_bar"]）
+# baostock 日线 amount 单位是千元 → 元（derive ×100）；
+# 停牌行过滤（tradestatus）与 isST 布尔转换在 provider 的 _fetch_raw 做
+# （trade_status / is_st 不是 schema 列，映射层 fail-fast 不允许 rename 到它们）。
+table: daily_bar
+sources:
+  baostock:
+    rename:
+      date: trade_date
+      code: symbol
+      preclose: pre_close
+      turn: turnover_rate
+    derive:
+      amount: {expr: "amount * 100", from: [amount]}   # 千元 → 元
+    fill: {sec_type: stock, source: baostock, quality_flags: 0, adj_factor: 1.0}
+    required: [symbol, trade_date, open, high, low, close, volume]

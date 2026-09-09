@@ -97,6 +97,20 @@ def _check_targets(
             )
 
 
+def _coerce_derive_rule(target: str, raw: Any) -> DeriveRule:
+    """derive 规则两种写法：字符串表达式 或 {expr, from} 显式形式。"""
+    if isinstance(raw, dict):
+        expr = raw.get("expr")
+        if not isinstance(expr, str) or not expr:
+            raise MappingError(f"derive {target!r}: dict 形式必须含非空 expr 字符串")
+        from_cols = raw.get("from") or []
+        if not isinstance(from_cols, list) or not all(isinstance(c, str) for c in from_cols):
+            raise MappingError(f"derive {target!r}: from 必须是字符串列表")
+        return DeriveRule(expr=expr, from_cols=tuple(from_cols))
+    expr = str(raw)
+    return DeriveRule(expr=expr, from_cols=_extract_names(expr))
+
+
 def load_table_mapping(
     table: str,
     source: str,
@@ -128,12 +142,13 @@ def load_table_mapping(
     # fail-fast：映射目标列必须 ∈ SCHEMAS[table]，否则最终 select 会静默丢列
     _check_targets(table, source, "rename", rename.values(), schema_cols)
     _check_targets(table, source, "fill", fill.keys(), schema_cols)
-    _check_targets(table, source, "derive", (sec.get("derive") or {}).keys(), schema_cols)
 
     derive: dict[str, DeriveRule] = {}
     for target, raw in (sec.get("derive") or {}).items():
-        expr = str(raw)
-        derive[target] = DeriveRule(expr=expr, from_cols=_extract_names(expr))
+        derive[target] = _coerce_derive_rule(target, raw)
+
+    # fail-fast：映射目标列必须 ∈ SCHEMAS[table]，否则最终 select 会静默丢列
+    _check_targets(table, source, "derive", derive.keys(), schema_cols)
 
     return TableMapping(
         table=table,
@@ -287,7 +302,9 @@ def _validate_source(
     for dst, raw in (sec.get("derive") or {}).items():
         if schema_cols and dst not in schema_cols:
             errors.append(f"{prefix}.derive: 目标列 {dst!r} 不在 SCHEMAS[{table}] 中")
-        expr = str(raw)
+        expr = (
+            str(raw.get("expr") or "") if isinstance(raw, dict) else str(raw)
+        )
         try:
             tree = _parse_expr(expr).body
         except MappingError as e:

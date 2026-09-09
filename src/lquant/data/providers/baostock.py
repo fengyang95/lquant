@@ -12,18 +12,15 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from typing import Any
 
 import polars as pl
 
 from lquant.core.types import SecType, parse_symbol
-from lquant.data.base import DataProvider
 from lquant.data.capability import Capability
-from lquant.data.normalize import (
-    assert_ohlc,
-    assert_plausible_prices,
-    normalize_symbols,
-)
+from lquant.data.normalize import normalize_symbols
 from lquant.data.providers import PROVIDERS
+from lquant.data.providers._engine import MappingProvider
 
 # baostock 代码格式：sh.600000 / sz.000001
 _FREQ_MAP = {
@@ -208,8 +205,9 @@ def _guess_track_index(name: str) -> str | None:
 
 
 @PROVIDERS.register("baostock", {"free": True, "need_token": False, "watchdog": True})
-class BaoStockProvider(DataProvider):
+class BaoStockProvider(MappingProvider):
     name = "baostock"
+    source = "baostock"
     capability = frozenset({
         Capability.DAILY, Capability.MINUTE_5, Capability.MINUTE_15,
         Capability.MINUTE_30, Capability.MINUTE_60, Capability.ETF_DAILY,
@@ -220,9 +218,25 @@ class BaoStockProvider(DataProvider):
 
     def __init__(self, qps: float = 0, capability: frozenset[Capability] | None = None) -> None:
         self.capability = capability or self.capability
+        # daily_bars 期间暂存的停牌过滤后 is_st 列 —— is_st 不是
+        # SCHEMAS[daily_bar] 列，映射层 select 会丢掉，_post_normalize 再挂回
+        self._pending_is_st: pl.Series | None = None
 
-    # ---------------------------------------------------------------- 日线
-    def daily_bars(self, symbols: list[str], start: date, end: date) -> pl.DataFrame:
+    # ------------------------------------------------- MappingProvider 引擎
+    def _fetch_raw(self, table: str, **params: Any) -> pl.DataFrame:
+        if table == "daily_bar":
+            return self._fetch_daily(**params)
+        if table == "minute_bar":
+            return self._fetch_minute(**params)
+        raise NotImplementedError(f"baostock 不支持表 {table!r}")
+
+    def _fetch_daily(
+        self, symbols: list[str], start: date, end: date
+    ) -> pl.DataFrame:
+        """watchdog 拉日线：产出**源列名** df，映射交给 engine。
+
+        行级逻辑留在 provider：停牌过滤 + isST 布尔转换。
+        """
         from lquant.data.watchdog import run_with_watchdog
 
         frames = []
@@ -234,44 +248,36 @@ class BaoStockProvider(DataProvider):
             )
             if not rows:
                 continue
-            df = pl.DataFrame(
+            frames.append(pl.DataFrame(
                 rows,
-                schema=["trade_date", "symbol", "open", "high", "low", "close",
-                        "pre_close", "volume", "amount", "turnover_rate",
-                        "trade_status", "is_st"],
+                schema=["date", "code", "open", "high", "low", "close",
+                        "preclose", "volume", "amount", "turn",
+                        "tradestatus", "isST"],
                 orient="row",
-            )
-            frames.append(df)
-
+            ))
         if not frames:
             return pl.DataFrame()
-        out = pl.concat(frames, how="diagonal")
-        out = out.with_columns(
-            pl.col("trade_date").str.to_date("%Y-%m-%d"),
-            pl.col(["open", "high", "low", "close", "pre_close", "volume", "amount"]).cast(pl.Float64),
-            pl.col("turnover_rate").cast(pl.Float64, strict=False),
-            pl.col("is_st").cast(pl.Utf8).str.strip_chars().is_in(["1"]),
+        df = pl.concat(frames, how="diagonal").with_columns(
+            pl.col("date").str.to_date("%Y-%m-%d"),   # 保持源列名 date，映射层 rename
+            pl.col(["open", "high", "low", "close", "preclose", "volume",
+                    "amount"]).cast(pl.Float64),
+            pl.col("turn").cast(pl.Float64, strict=False),
         )
         # 停牌日 volume=0 且 tradestatus=0 —— 不剔除会污染量价因子
-        out = out.filter(pl.col("trade_status").cast(pl.Utf8) != "0").drop("trade_status")
-        out = normalize_symbols(out)
-        assert_plausible_prices(out)
-        assert_ohlc(out)
-        return out.with_columns(
-            sec_type=pl.lit("stock"), source=pl.lit("baostock"),
-            quality_flags=pl.lit(0, dtype=pl.Int32),
-            adj_factor=pl.lit(1.0),
+        df = df.filter(pl.col("tradestatus").cast(pl.Utf8) != "0")
+        self._pending_is_st = (
+            df["isST"].cast(pl.Utf8).str.strip_chars().is_in(["1"])
         )
+        return df.drop(["tradestatus", "isST"])
 
-    # -------------------------------------------------------------- 分钟线
-    def minute_bars(self, symbols: list[str], start: date, end: date,
-                    freq: str = "60min") -> pl.DataFrame:
-        """分钟线。BaoStock 单次返回有上限，长区间按年切片。"""
+    def _fetch_minute(
+        self, symbols: list[str], start: date, end: date, freq: str = "60min"
+    ) -> pl.DataFrame:
+        """watchdog 拉分钟线：源列名 df，time → ts 解析留在 fetch 侧。"""
         from lquant.data.watchdog import run_with_watchdog
 
         if freq not in ("5min", "15min", "30min", "60min"):
             raise ValueError(f"baostock 分钟线不支持 {freq}")
-
         frames = []
         for sym in symbols:
             for y0, y1 in _year_slices(start, end):
@@ -283,26 +289,61 @@ class BaoStockProvider(DataProvider):
                     continue
                 frames.append(pl.DataFrame(
                     rows,
-                    schema=["trade_date", "time", "symbol", "open", "high", "low",
+                    schema=["date", "time", "code", "open", "high", "low",
                             "close", "volume", "amount", "adjustflag"],
                     orient="row",
                 ))
         if not frames:
             return pl.DataFrame()
-        out = pl.concat(frames, how="diagonal")
         # time 形如 20220930103500000（含毫秒），取前 14 位拼时间戳
-        out = out.with_columns(
+        return pl.concat(frames, how="diagonal").with_columns(
             pl.col(["open", "high", "low", "close", "volume", "amount"]).cast(pl.Float64),
             ts=pl.col("time").cast(pl.Utf8).str.slice(0, 14).str.to_datetime("%Y%m%d%H%M%S"),
-        ).drop(["time", "trade_date"])
-        out = normalize_symbols(out)
-        assert_plausible_prices(out)
-        assert_ohlc(out)
-        return out.with_columns(
-            freq=pl.lit(freq), source=pl.lit("baostock"),
-            ingested_at=pl.lit(datetime.now(), dtype=pl.Datetime),
-            adj_factor=pl.lit(1.0),
+        ).drop(["time", "date"])
+
+    def daily_bars(
+        self, symbols: list[str], start: date, end: date
+    ) -> pl.DataFrame:
+        return self.request("daily_bar", symbols=symbols, start=start, end=end)
+
+    def minute_bars(
+        self, symbols: list[str], start: date, end: date, freq: str = "60min"
+    ) -> pl.DataFrame:
+        """分钟线。BaoStock 单次返回有上限，长区间按年切片（_fetch_minute）。"""
+        return self.request(
+            "minute_bar", symbols=symbols, start=start, end=end, freq=freq
         )
+
+    def _post_normalize(self, df: pl.DataFrame, table: str) -> pl.DataFrame:
+        """引擎归一化后的 provider 侧钩子：符号归一、is_st 回挂、60min 边界。"""
+        df = normalize_symbols(df)
+        if table == "daily_bar":
+            if self._pending_is_st is not None:
+                df = df.with_columns(self._pending_is_st.alias("is_st"))
+                self._pending_is_st = None
+        elif table == "minute_bar":
+            df = self._normalize_60min_bounds(df)
+            df = df.with_columns(
+                ingested_at=pl.lit(datetime.now(), dtype=pl.Datetime),
+            )
+        return df
+
+    def _normalize_60min_bounds(self, df: pl.DataFrame) -> pl.DataFrame:
+        """60min 边界归一：baostock 把上午收盘那根标成 11:30 → 统一 11:00。
+
+        14:00 / 15:00 保持不变（baostock 原生即用 14:00 / 15:00）。
+        """
+        if df.is_empty() or df["freq"][0] != "60min":
+            return df
+        return df.with_columns(
+            pl.when(
+                (pl.col("ts").dt.hour() == 11) & (pl.col("ts").dt.minute() == 30)
+            )
+            .then(pl.col("ts") - pl.duration(minutes=30))
+            .otherwise(pl.col("ts"))
+            .alias("ts")
+        )
+
 
     # ---------------------------------------------------------------- 复权
     def adj_factors(self, symbols: list[str], start: date, end: date) -> pl.DataFrame:

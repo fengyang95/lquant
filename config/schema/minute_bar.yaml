@@ -1,0 +1,9 @@
+# minute_bar 字段映射（唯一事实源：lquant.data.schema.SCHEMAS["minute_bar"]）
+# baostock 分钟线 time 列解析（YYYYmmddHHMMSSmmm → ts）、60min 边界归一
+# 在 provider 的 _fetch_raw / _post_normalize 做；freq 由 request params 覆盖。
+table: minute_bar
+sources:
+  baostock:
+    rename: {code: symbol}
+    fill: {freq: "5min", source: baostock, adj_factor: 1.0}   # freq 由 params 覆盖
+    required: [symbol, ts, open, high, low, close, volume]
