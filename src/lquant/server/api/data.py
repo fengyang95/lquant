@@ -9,12 +9,40 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from lquant.core.db import reader
+from lquant.data.ingest.tasks import (
+    create_task,
+    execute_task,
+    get_task,
+    list_tasks,
+    retry_task,
+)
 from lquant.data.store.parquet import read_daily
 from lquant.server.deps import bare_code, resolve_symbol
+from lquant.server.jobs import enqueue
 
 router = APIRouter(prefix="/data", tags=["data"])
+
+# retry 可接受的状态（与 tasks._RETRIABLE 一致，避免引私有名）
+_RETRIABLE_STATUSES = ("partial", "failed", "interrupted")
+
+
+class TaskIn(BaseModel):
+    kind: str = Field(min_length=1, max_length=32)
+    params: dict = Field(default_factory=dict)
+
+
+class CrosscheckIn(BaseModel):
+    start: str | None = Field(default=None, max_length=10)
+    end: str | None = Field(default=None, max_length=10)
+    peers: list[str] | None = None
+    limit: int = Field(default=200, ge=1, le=1000)
+
+
+class ResolveIn(BaseModel):
+    issue_id: str = Field(min_length=1, max_length=64)
 
 # 覆盖度要看的表：名称 → (说明, 是否按 trade_date 取最新)
 _COVER_TABLES: list[tuple[str, str]] = [
@@ -194,3 +222,94 @@ def quote(symbol: str = Query(min_length=6, max_length=16)) -> dict:
         "turnover_rate": data.get("f50"),
         "market_cap": data.get("f116"),
     }
+
+
+# ---------- 数据任务（全量回填 / 每日增量，T4 执行器） ----------
+
+@router.post("/tasks", status_code=202)
+def create_data_task(req: TaskIn) -> dict:
+    """创建数据任务并入队执行 → 202 + task_id。
+
+    409：已有运行中任务（单任务互斥）；422：参数/前置校验失败（未知类型、
+    日期非法、full_backfill 无退市股等）。
+    """
+    try:
+        task = create_task(req.kind, req.params)
+    except ValueError as e:
+        if "运行中" in str(e) or "running" in str(e):
+            raise HTTPException(409, str(e)) from e
+        raise HTTPException(422, str(e)) from e
+    enqueue("lquant-ingest", execute_task, task["task_id"])
+    return {"task_id": task["task_id"]}
+
+
+@router.get("/tasks")
+def list_data_tasks(limit: int = Query(default=50, le=500)) -> list[dict]:
+    """数据任务列表（最新在前）。"""
+    return list_tasks(limit)
+
+
+@router.get("/tasks/{task_id}")
+def get_data_task(task_id: str) -> dict:
+    """任务详情：状态 / 进度 / 失败明细。WS 断开时前端轮询兜底。"""
+    task = get_task(task_id)
+    if task is None:
+        raise HTTPException(404, f"任务不存在: {task_id}")
+    return task
+
+
+@router.post("/tasks/{task_id}/retry", status_code=202)
+def retry_data_task(task_id: str) -> dict:
+    """retry 补漏：unmark 失败标的 checkpoint 后重新执行 → 202 + task_id。"""
+    task = get_task(task_id)
+    if task is None:
+        raise HTTPException(404, f"任务不存在: {task_id}")
+    if task["status"] in ("pending", "running"):
+        raise HTTPException(409, f"任务 {task_id} 正在运行中，不可 retry")
+    if task["status"] not in _RETRIABLE_STATUSES:
+        raise HTTPException(422, f"任务 {task_id} 状态 {task['status']} 不可 retry")
+    enqueue("lquant-ingest", retry_task, task_id)
+    return {"task_id": task_id}
+
+
+# ---------- 跨源对拍 ----------
+
+@router.post("/crosscheck")
+def run_crosscheck_ep(req: CrosscheckIn) -> dict:
+    """跨源对拍（同步端点：哨兵抽样小窗口，秒级）。返回 {summary, issues, flagged_rows}。"""
+    from lquant.data.ingest.crosscheck import run_crosscheck
+
+    try:
+        return run_crosscheck(peers=req.peers, start=req.start,
+                              end=req.end, limit=req.limit)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+
+
+@router.get("/crosscheck/issues")
+def crosscheck_issues(
+    limit: int = Query(default=200, le=1000),
+    resolved: bool = False,
+) -> list[dict]:
+    """质量问题检索（data_quality_issue，默认未解决）。"""
+    from lquant.data.quality.issues import latest_issues
+
+    return latest_issues(limit=limit, resolved=resolved)
+
+
+@router.post("/crosscheck/issues/resolve")
+def resolve_crosscheck_issue(req: ResolveIn) -> dict:
+    """标记问题已处理；不存在 → 404。"""
+    from lquant.data.quality.issues import resolve_issue
+
+    with reader() as con:
+        try:
+            row = con.execute(
+                "SELECT issue_id FROM data_quality_issue WHERE issue_id = ?",
+                [req.issue_id]).fetchone()
+        except Exception:  # noqa: BLE001 - 表不存在等价于没有这条 issue
+            row = None
+    if row is None:
+        raise HTTPException(404, f"issue 不存在: {req.issue_id}")
+    resolve_issue(req.issue_id)
+    return {"issue_id": req.issue_id, "resolved": True}

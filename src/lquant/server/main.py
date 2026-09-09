@@ -67,6 +67,17 @@ def _startup() -> None:
     except Exception as e:  # noqa: BLE001 - 库未初始化时不应阻断服务启动
         print(f"[startup] schema 迁移跳过: {e}")
 
+    # 数据任务中断标记：重启后 pending/running 残留标 interrupted（可 retry 续传），
+    # 只 log 不阻塞启动 —— 库未初始化时这里查不到表也无妨。
+    try:
+        from lquant.data.ingest.tasks import mark_interrupted_on_startup
+
+        n = mark_interrupted_on_startup()
+        if n:
+            print(f"[startup] {n} 个数据任务标记为 interrupted（可 retry 续传）")
+    except Exception as e:  # noqa: BLE001 - 同上，不阻断启动
+        print(f"[startup] 数据任务中断标记跳过: {e}")
+
     # 定时同步 worker（daemon 线程，每 30s 检查到期作业；测试用 LQ_SYNC_WORKER=0 关闭）
     import os
     import threading
