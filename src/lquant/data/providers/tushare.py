@@ -37,8 +37,8 @@ _PERMISSION_KEYWORDS = ("积分", "权限", "每天最多", "抱歉", "没有接
 # 财务三大表：item 前缀用接口名，防不同表同名列混淆
 _FINANCIAL_APIS = ("income", "balancesheet", "cashflow")
 
-# 报告期月份 → report_type
-_REPORT_TYPE = {3: "Q1", 6: "H1", 9: "Q3", 12: "ANNUAL"}
+# 报告期月份 → 季度序号（1~4；Q4 即年报）
+_REPORT_QUARTER = {3: 1, 6: 2, 9: 3, 12: 4}
 
 
 def _from_pandas(df: Any) -> pl.DataFrame:
@@ -58,7 +58,9 @@ def _to_date_col(df: pl.DataFrame, col: str) -> pl.DataFrame:
 
 
 def _report_type_of(stat_date: date) -> str:
-    return _REPORT_TYPE.get(stat_date.month, "Q1")
+    """报告期 → 带年季的 report_type（如 2024Q1），与 baostock 统一。"""
+    q = _REPORT_QUARTER.get(stat_date.month, 1)  # 非报告期末月按 Q1 fail-soft
+    return f"{stat_date.year}Q{q}"
 
 
 def _wide_to_long(df: pl.DataFrame, api: str) -> pl.DataFrame:

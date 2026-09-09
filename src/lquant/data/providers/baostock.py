@@ -19,7 +19,7 @@ import polars as pl
 from lquant.core.errors import DataQualityError
 from lquant.core.types import SecType, parse_symbol
 from lquant.data.capability import Capability
-from lquant.data.normalize import normalize_symbols
+from lquant.data.normalize import normalize_60min_bounds, normalize_symbols
 from lquant.data.providers import PROVIDERS
 from lquant.data.providers._engine import MappingProvider
 
@@ -335,27 +335,11 @@ class BaoStockProvider(MappingProvider):
         """引擎归一化后的 provider 侧钩子：符号归一、60min 边界、ingested_at。"""
         df = normalize_symbols(df)
         if table == "minute_bar":
-            df = self._normalize_60min_bounds(df)
+            df = normalize_60min_bounds(df)
             df = df.with_columns(
                 ingested_at=pl.lit(datetime.now(), dtype=pl.Datetime),
             )
         return df
-
-    def _normalize_60min_bounds(self, df: pl.DataFrame) -> pl.DataFrame:
-        """60min 边界归一：baostock 把上午收盘那根标成 11:30 → 统一 11:00。
-
-        14:00 / 15:00 保持不变（baostock 原生即用 14:00 / 15:00）。
-        """
-        if df.is_empty() or df["freq"][0] != "60min":
-            return df
-        return df.with_columns(
-            pl.when(
-                (pl.col("ts").dt.hour() == 11) & (pl.col("ts").dt.minute() == 30)
-            )
-            .then(pl.col("ts") - pl.duration(minutes=30))
-            .otherwise(pl.col("ts"))
-            .alias("ts")
-        )
 
 
     # ---------------------------------------------------------------- 复权

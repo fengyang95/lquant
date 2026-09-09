@@ -77,8 +77,7 @@ sources:
       close: close
       preclose: pre_close
       volume: volume          # baostock 已是股
-    derive:
-      amount: {expr: "amount * 100", from: [amount]}   # baostock 千元 → 元
+      amount: amount          # baostock 已是元，直接 rename（不换算）
     fill: {sec_type: stock}
     required: [symbol, trade_date, open, high, low, close, volume]
   akshare:

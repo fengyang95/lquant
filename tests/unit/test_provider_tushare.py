@@ -202,7 +202,7 @@ def test_financial_pit_wide_to_long(
     assert out["value"].to_list() == [100.0, 50.0]
     assert out["stat_date"].to_list() == [date(2023, 12, 31)] * 2
     assert out["pub_date"].to_list() == [date(2024, 4, 20)] * 2
-    assert out["report_type"].to_list() == ["ANNUAL", "ANNUAL"]
+    assert out["report_type"].to_list() == ["2023Q4", "2023Q4"]
     assert out["symbol"].to_list() == ["600000.SH", "600000.SH"]
     assert out["source"].to_list() == ["tushare", "tushare"]
 

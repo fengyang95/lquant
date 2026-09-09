@@ -132,6 +132,39 @@ def test_minute_bad_freq_raises_before_network(provider: AkShareProvider) -> Non
         provider.minute_bars(["600000.SH"], date(2024, 1, 1), date(2024, 1, 2), "7min")
 
 
+def test_minute_60min_boundary_normalized(
+    provider: AkShareProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """60min 边界归一与 baostock 一致：11:30 → 11:00；非 60min 不受影响。"""
+    def fake_min(**kw: Any) -> pd.DataFrame:
+        return pd.DataFrame({
+            "时间": ["2024-01-02 10:00:00", "2024-01-02 11:30:00",
+                     "2024-01-02 14:00:00"],
+            "股票代码": ["600000"] * 3,
+            "开盘": [10.0, 10.2, 10.4],
+            "收盘": [10.1, 10.3, 10.5],
+            "最高": [10.2, 10.4, 10.6],
+            "最低": [9.9, 10.1, 10.3],
+            "成交量": [100, 110, 120],
+            "成交额": [10000.0, 11000.0, 12000.0],
+        })
+
+    _install_fake_ak(monkeypatch, stock_zh_a_hist_min_em=fake_min)
+    out = provider.minute_bars(
+        ["600000.SH"], date(2024, 1, 1), date(2024, 1, 2), freq="60min"
+    )
+    # 11:30 → 11:00，10:00 / 14:00 保持
+    assert out["ts"].dt.hour().to_list() == [10, 11, 14]
+    assert out["ts"].dt.minute().to_list() == [0, 0, 0]
+
+    out5 = provider.minute_bars(
+        ["600000.SH"], date(2024, 1, 1), date(2024, 1, 2), freq="5min"
+    )
+    # 非 60min 不做边界归一
+    assert out5["ts"].dt.hour().to_list() == [10, 11, 14]
+    assert out5["ts"].dt.minute().to_list() == [0, 30, 0]
+
+
 def test_etf_daily_goes_through_daily_bar_with_sec_type(
     provider: AkShareProvider, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -159,10 +192,10 @@ def test_adj_factors_two_pull_division(
 
     def fake_hist(**kw: Any) -> pd.DataFrame:
         calls.append(kw["adjust"])
-        if kw["adjust"] == "qfq":
+        if kw["adjust"] == "hfq":
             return pd.DataFrame({
                 "日期": ["2024-01-02", "2024-01-03"],
-                "收盘": [5.1, 10.4],   # 前复权（首日除权减半）
+                "收盘": [20.4, 20.8],   # 后复权（首日除权翻倍）
             })
         return pd.DataFrame({
             "日期": ["2024-01-02", "2024-01-03"],
@@ -171,8 +204,8 @@ def test_adj_factors_two_pull_division(
 
     _install_fake_ak(monkeypatch, stock_zh_a_hist=fake_hist)
     out = provider.adj_factors(["600000.SH"], date(2024, 1, 1), date(2024, 1, 3))
-    assert calls == ["qfq", ""]
-    assert out["factor"].to_list() == pytest.approx([0.5, 1.0])
+    assert calls == ["hfq", ""]   # 后复权 / 不复权 两次拉取
+    assert out["factor"].to_list() == pytest.approx([2.0, 2.0])   # 后复权 factor ≥ 1
     assert out["symbol"].to_list() == ["600000.SH", "600000.SH"]
     assert out["source"].to_list() == ["akshare", "akshare"]
     assert out["trade_date"].to_list() == [date(2024, 1, 2), date(2024, 1, 3)]
@@ -183,7 +216,7 @@ def test_adj_factors_date_misalignment_no_wrong_factor(
 ) -> None:
     """行数相同但日期错开：按 trade_date join，只保留交集日期，因子不错位。"""
     def fake_hist(**kw: Any) -> pd.DataFrame:
-        if kw["adjust"] == "qfq":
+        if kw["adjust"] == "hfq":
             return pd.DataFrame({
                 "日期": ["2024-01-03", "2024-01-04"],
                 "收盘": [10.3, 10.4],
@@ -203,14 +236,14 @@ def test_adj_factors_partial_overlap_keeps_common_dates(
     provider: AkShareProvider, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def fake_hist(**kw: Any) -> pd.DataFrame:
-        if kw["adjust"] == "qfq":
-            return pd.DataFrame({"日期": ["2024-01-02"], "收盘": [5.1]})
+        if kw["adjust"] == "hfq":
+            return pd.DataFrame({"日期": ["2024-01-02"], "收盘": [20.4]})
         return pd.DataFrame({"日期": ["2024-01-02", "2024-01-03"], "收盘": [10.2, 10.4]})
 
     _install_fake_ak(monkeypatch, stock_zh_a_hist=fake_hist)
     out = provider.adj_factors(["600000.SH"], date(2024, 1, 1), date(2024, 1, 3))
     assert out["trade_date"].to_list() == [date(2024, 1, 2)]
-    assert out["factor"].to_list() == pytest.approx([0.5])
+    assert out["factor"].to_list() == pytest.approx([2.0])
 
 
 def test_securities_mapping(
