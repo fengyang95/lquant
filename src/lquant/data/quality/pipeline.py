@@ -22,12 +22,23 @@ _LIMIT_WINDOW_DAYS = 400
 
 def gate_daily(df: pl.DataFrame, *, data_version: str | None = None,
                raise_on_fatal: bool = True) -> tuple[pl.DataFrame, list[Issue]]:
-    """日线批次入湖前的门禁：八项断言（记录级）+ 打 quality_flags。
+    """日线批次入湖前的门禁：主键去重 + 八项断言（记录级）+ 打 quality_flags。
 
     fatal 失败抛 DataQualityError 阻断下游（§3.8.6）；
     warn 只打标 + 落 issue，批次照常落地。
     """
     out, found = asserts.run_record_checks(df, raise_on_fatal=False)
+    # 主键去重（fatal）：重复 (symbol, trade_date) 行静默入湖后，upsert 语义
+    # 下会互相覆盖且读取侧无法察觉 —— 必须在写湖前拦住
+    keys = [k for k in ("symbol", "trade_date") if k in out.columns]
+    if keys:
+        n_dup = len(out) - len(out.unique(subset=keys))
+        if n_dup:
+            found.append(Issue(
+                rule="DUP_KEY", severity="fatal",
+                dataset=found[0].dataset if found else "daily_bar",
+                detail=f"{keys} 有 {n_dup} 行重复键 —— upsert 会互相覆盖，读取侧不可见",
+                count=n_dup))
     try:
         save_issues(found, data_version=data_version)
     except Exception as e:  # noqa: BLE001  issue 落库失败不能阻断同步（打标已在 df 上）

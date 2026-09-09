@@ -26,7 +26,6 @@ from dataclasses import dataclass
 import polars as pl
 
 from lquant.data.quality.flags import CROSS_SOURCE_DIFF as CROSS_SRC_DIFF
-from lquant.data.quality.issues import Issue
 
 __all__ = ["L0", "L1", "L2", "L3", "CrossSourceResult", "classify_divergence",
            "flag_cross_source", "summarize"]
@@ -51,11 +50,6 @@ class CrossSourceResult:
     n_missing_peer: int              # primary 有 / peer 无 的字段数
     flag: bool                       # 是否该打 CROSS_SRC_DIFF
 
-
-def _rel_diff(a: float, b: float) -> float | None:
-    if a is None or b is None or a == 0:
-        return None
-    return abs(a - b) / abs(a)
 
 
 def _to_date(dtype, expr) -> pl.Expr:
@@ -82,6 +76,10 @@ def classify_divergence(primary: pl.DataFrame, peer: pl.DataFrame,
     # 只在两侧都有的列上比对 —— 缺失的列跳过，避免 select 报错
     fields = tuple(f for f in fields
                    if f in primary.columns and f in peer.columns)
+    if not fields:
+        # 两帧无共同可比字段 → 空结果（调用方按"无可比"处理）。
+        # 必须带 schema —— 下游 filter 需要 level 列，无 schema 空帧会 panic。
+        return _empty_issues()
     p = primary.select([*key, *fields])
     q = peer.select([*key, *fields])
     # 防御：join key dtype 必须一致。湖内 trade_date 是 Date，provider 可能回
@@ -118,14 +116,34 @@ def classify_divergence(primary: pl.DataFrame, peer: pl.DataFrame,
                              "primary": a, "peer": None, "rel_diff": None,
                              "missing": "peer", "level": lvl})
                 continue
-            d = _rel_diff(float(a), float(b))
-            lvl = L1 if (d is None or d <= tol) else L2
-            if a > 0 and b > 0 and (a / max(b, 1e-9) > 1.2 or b / max(a, 1e-9) > 1.2):
-                lvl = L3   # 数量级差 (>20%) → 离群候选
+            a_f, b_f = float(a), float(b)
+            if a_f == 0.0 and b_f == 0.0:
+                # 双零：确定一致（volume=0 停牌日常态），不能因为除零回 None 落 L1
+                d: float | None = 0.0
+            elif a_f == 0.0 or b_f == 0.0:
+                # 零 vs 非零：数量级分歧，直接离群候选 —— 旧逻辑除零回 None
+                # 被静默归入 L1 提示，零成交 vs 百万成交这种硬伤会被放行
+                d = None
+                lvl = L3
+            else:
+                d = abs(a_f - b_f) / abs(a_f)
+                lvl = L1 if d <= tol else L2
+                # 数量级差 (>20%) → 离群候选
+                if a_f / max(b_f, 1e-9) > 1.2 or b_f / max(a_f, 1e-9) > 1.2:
+                    lvl = L3
             rows.append({**{k: r[k] for k in key}, "field": f,
                          "primary": a, "peer": b, "rel_diff": d,
                          "missing": None, "level": lvl})
-    return pl.DataFrame(rows) if rows else pl.DataFrame()
+    return pl.DataFrame(rows) if rows else _empty_issues()
+
+
+def _empty_issues() -> pl.DataFrame:
+    """带完整 schema 的空结果帧 —— 下游 filter/summarize 不因缺列 panic。"""
+    return pl.DataFrame(schema={
+        "symbol": pl.String, "trade_date": pl.Date, "field": pl.String,
+        "primary": pl.Float64, "peer": pl.Float64, "rel_diff": pl.Float64,
+        "missing": pl.String, "level": pl.String,
+    })
 
 
 def flag_cross_source(primary: pl.DataFrame,
@@ -134,6 +152,11 @@ def flag_cross_source(primary: pl.DataFrame,
 
     primary 副本（immutable）。比对结果只用于标记降级，不改动任何数值。
     """
+    if not len(issues) or "level" not in issues.columns:
+        # 无可比结果（空帧/无 schema 帧）→ 原样返回（补 quality_flags 列）
+        return primary.with_columns(quality_flags=pl.col("quality_flags")
+                                    if "quality_flags" in primary.columns
+                                    else pl.lit(0, dtype=pl.Int32))
     bad = issues.filter(pl.col("level").is_in([L2, L3])).select(
         "symbol", "trade_date").unique()
     if not len(bad):
@@ -154,9 +177,10 @@ def flag_cross_source(primary: pl.DataFrame,
 
 
 def summarize(issues: pl.DataFrame) -> dict:
-    """等级计数汇总 → CLI 展示。"""
+    """等级计数汇总 → CLI 展示。空输入如实计 0（"无比对" 与 "全部一致" 是两回事，
+    健康哨兵 {"L0": 1} 由 ingest 层在无 peer 时显式给出）。"""
     if not len(issues):
-        return {"L0": 1, "L1": 0, "L2": 0, "L3": 0, "checked": 0}
+        return {"L0": 0, "L1": 0, "L2": 0, "L3": 0, "checked": 0}
     cnt = {lv: int(issues.filter(pl.col("level") == lv).height)
            for lv in (L1, L2, L3)}
     return {"L1": cnt[L1], "L2": cnt[L2], "L3": cnt[L3],
