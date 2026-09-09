@@ -114,3 +114,4 @@ def run_session(engine, panel, generator, *, agent="builtin", n_candidates=100,
     res.n_redundant = n_red
     res.n_size_proxy = n_proxy
     return res, survivors
+

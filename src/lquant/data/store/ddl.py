@@ -154,6 +154,18 @@ DDL_STATEMENTS: list[str] = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS factor_mining_run (
+        run_id VARCHAR PRIMARY KEY, agent VARCHAR, generator VARCHAR,
+        n_evaluated INTEGER, n_static_fail INTEGER, n_low_ic INTEGER,
+        n_redundant INTEGER, n_size_proxy INTEGER, n_survivors INTEGER,
+        corrections JSON, created_at TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS factor_replication (
+        name VARCHAR, expr VARCHAR, claimed_ic DOUBLE, recomputed_ic DOUBLE,
+        grade VARCHAR, agent VARCHAR, payload VARCHAR, created_at TIMESTAMP,
+        PRIMARY KEY (name, expr, created_at)
     CREATE TABLE IF NOT EXISTS factor_value (
         factor VARCHAR, symbol VARCHAR, trade_date DATE,
         raw DOUBLE, processed DOUBLE,

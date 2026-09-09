@@ -66,3 +66,14 @@ def _c(node: Node, parent: int) -> str:
     if isinstance(node, Call):
         return f"{node.name}(" + ",".join(_c(a, 0) for a in node.args) + ")"
     raise TypeError(f"unknown node {type(node)}")
+
+
+def canonical_id(expr: str) -> str:
+    """lquant DSL 串 -> canonical 串 sha1 前 16 位（入库 factor_id 统一口径）。"""
+    import hashlib
+
+    ast = parse(expr, "cid")
+    c = canonical(ast.root)
+    return hashlib.sha1(c.encode("utf-8")).hexdigest()[:16]
+
+from lquant.factors.dsl.parser import parse  # noqa: E402  (循环导入规避)
