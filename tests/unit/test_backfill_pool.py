@@ -212,6 +212,26 @@ def test_on_progress_frames(fake_settings, no_lake):
     assert frames[-1]["total"] == 4
 
 
+def test_on_progress_failed_frame_is_snapshot(fake_settings, no_lake):
+    """帧里的 failed 是快照：后续批次的失败不能追溯改写已发出的帧。"""
+    from lquant.data.ingest.daily import backfill_pool
+
+    frames = []
+    # 3 批各 1 只：第 1、3 批失败
+    p = FakeProvider(
+        [("raise", RuntimeError("x")), ("ok", 1), ("raise", RuntimeError("y"))]
+    )
+    pool = [(s, D) for s in ("a", "b", "c")]
+    backfill_pool(pool, date(2024, 1, 1), provider=p, batch_size=1, on_progress=frames.append)
+    assert [f["failed"] for f in frames] == [
+        [{"symbol": "a", "reason": "x"}],  # 第 1 帧：累计失败 [a]
+        [{"symbol": "a", "reason": "x"}],  # 第 2 帧：累计不变
+        [{"symbol": "a", "reason": "x"}, {"symbol": "c", "reason": "y"}],  # 第 3 帧
+    ]
+    # 关键：帧 1 的 failed 不被帧 3 追溯改写
+    assert frames[0]["failed"] == [{"symbol": "a", "reason": "x"}]
+
+
 def test_on_progress_early_stop_flag(fake_settings, no_lake):
     from lquant.data.ingest.daily import backfill_pool
 
@@ -240,6 +260,15 @@ def test_empty_pool(fake_settings, no_lake):
 
     res = backfill_pool([], date(2024, 1, 1), provider=FakeProvider([]))
     assert res == {"done": 0, "failed": [], "rows": 0, "early_stopped": False}
+
+
+def test_empty_pool_keeps_meta(fake_settings, no_lake):
+    """空跑不覆盖 checkpoint meta（避免 end=None 抹掉上次记录）。"""
+    from lquant.data.ingest.daily import backfill_pool
+
+    Checkpoint("daily").set_meta(start="2020-01-01", end="2020-12-31")
+    backfill_pool([], date(2024, 1, 1), provider=FakeProvider([]))
+    assert Checkpoint("daily").meta == {"start": "2020-01-01", "end": "2020-12-31"}
 
 
 def test_quality_gate_fatal_blocks_batch(fake_settings, no_lake, monkeypatch):

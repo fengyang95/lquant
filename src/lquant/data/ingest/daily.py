@@ -60,12 +60,13 @@ def backfill_pool(
     from loguru import logger
 
     cp = Checkpoint(_CP_NAME)
-    cp.set_meta(start=str(start), end=str(end) if end else None)
 
     todo = [(s, e) for s, e in pool if s not in cp.done]
     total = len(todo)
     if not todo:
         return {"done": 0, "failed": [], "rows": 0, "early_stopped": False}
+    # 空跑不覆盖 meta（end=None 时避免抹掉上次记录）
+    cp.set_meta(start=str(start), end=str(end) if end else None)
 
     if provider is None:
         from lquant.data.providers import get_provider
@@ -76,7 +77,6 @@ def backfill_pool(
     done = 0
     rows = 0
     failed: list[dict] = []
-    failed_syms: set[str] = set()
     consecutive_full_failures = 0
     stopped = False
 
@@ -100,13 +100,12 @@ def backfill_pool(
         cp.mark(ok)
         done += len(ok)
         rows += batch_rows
-        failed_syms |= set(batch_failed)
         failed.extend({"symbol": s, "reason": batch_failed[s]} for s in batch_failed)
         logger.info(f"  进度 {done}/{total}（本批失败 {len(batch_failed)}）")
         _notify(on_progress, {
             "done": done,
             "total": total,
-            "failed": failed,
+            "failed": list(failed),  # 快照：消费方存帧不被后续批次追溯改写
             "rows": rows,
             "early_stopped": False,
         })
@@ -126,7 +125,7 @@ def backfill_pool(
         _notify(on_progress, {
             "done": done,
             "total": total,
-            "failed": failed,
+            "failed": list(failed),  # 快照
             "rows": rows,
             "early_stopped": True,
         })
@@ -179,17 +178,16 @@ def _pull_group(
     return df, {}
 
 
-def _notify(cb: ProgressFn | None, frame: dict) -> bool:
-    """调用进度回调，异常吞掉不中断回填。返回 False 表示回调抛了异常。"""
+def _notify(cb: ProgressFn | None, frame: dict) -> None:
+    """调用进度回调，异常吞掉不中断回填。"""
     if cb is None:
-        return True
+        return
     try:
         cb(frame)
     except Exception as e:  # noqa: BLE001
         from loguru import logger
 
         logger.warning(f"on_progress 回调异常（忽略）: {e}")
-    return True
 
 
 def backfill_daily(
