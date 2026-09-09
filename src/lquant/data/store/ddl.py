@@ -214,6 +214,14 @@ DDL_STATEMENTS: list[str] = [
         rows INTEGER, status VARCHAR, detail JSON
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS app_setting (
+        setting_key VARCHAR PRIMARY KEY,
+        setting_value VARCHAR,
+        source      VARCHAR,          -- default / config / runtime（运行时 PUT 写这里）
+        updated_at  TIMESTAMP DEFAULT now()
+    )
+    """,
 ]
 
 VIEWS: list[str] = [

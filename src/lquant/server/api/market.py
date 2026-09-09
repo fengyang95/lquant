@@ -278,3 +278,96 @@ def batch(
     }
     return {"symbols": syms, "latest": latest, "summary": summary,
             "dates": dates, "series": series, "equal_weight_nav": eq}
+
+
+# ---------------- 快照 / 热榜 / 调度（看板补充） ----------------
+
+@router.get("/snapshot")
+def snapshot(
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=50, ge=1, le=300),
+    sort: str = Query(default="change_pct", pattern="^(change_pct|amount|turnover_rate)$"),
+) -> dict:
+    """全市场最新日度截面，分页。前端做涨跌排序表 / 快速筛选。"""
+    df = _daily_aggregate()
+    if not len(df):
+        return {"trade_date": None, "total": 0, "page": page, "size": size, "rows": []}
+    df = df.filter(pl.col("pre_close") > 0).with_columns(
+        (pl.col("close") / pl.col("pre_close") - 1).alias("change_pct"))
+    latest = df["trade_date"].max()
+    cur = df.filter(pl.col("trade_date") == latest).sort(sort, descending=True)
+    total = cur.height
+    rows = cur.slice((page - 1) * size, size).to_dicts()
+    for r in rows:
+        r["trade_date"] = str(latest)
+        # 最新日 close 可能为空 → change_pct None，round(None) 会炸这一页。
+        r["change_pct"] = round(r["change_pct"], 5) if r["change_pct"] is not None else None
+    return {"trade_date": str(latest), "total": total, "page": page, "size": size,
+            "rows": rows}
+
+
+@router.get("/heat")
+def heat(top: int = Query(default=15, ge=1, le=100)) -> dict:
+    """热榜：涨/跌 Top、放量 Top、龙虎榜（看板当日要点）。"""
+    df = _daily_aggregate()
+    base: dict = {"gainers": [], "losers": [], "volume": [], "dragon_tiger": []}
+    if len(df):
+        df = df.filter(pl.col("pre_close") > 0).with_columns(
+            (pl.col("close") / pl.col("pre_close") - 1).alias("change_pct"))
+        latest = df["trade_date"].max()
+        cur = df.filter(pl.col("trade_date") == latest)
+        base["gainers"] = heat_rows(cur.sort("change_pct", descending=True).head(top), latest)
+        base["losers"] = heat_rows(cur.sort("change_pct").head(top), latest)
+        base["volume"] = heat_rows(
+            cur.sort("amount", descending=True).head(top), latest)
+    try:
+        dt = _read("dragon_tiger", top)
+        if len(dt):
+            d = dt["trade_date"].max()
+            base["dragon_tiger"] = [
+                {"symbol": r["symbol"], "trade_date": str(d),
+                 "name": r.get("name"), "change_pct": r.get("change_pct"),
+                 "reason": r.get("reason")}
+                for r in dt.filter(pl.col("trade_date") == d).to_dicts()][:top]
+    except Exception:  # noqa: BLE001 - 表缺失按空态处理
+        pass
+    return base
+
+
+def _daily_aggregate() -> pl.DataFrame:
+    """数据湖日线聚合（含空湖/空 schema 兜底）：空湖读 read_daily 直接炸列）。"""
+    from lquant.data.store.parquet import read_daily
+
+    try:
+        df = (read_daily()
+              .select(["trade_date", "symbol", "close", "pre_close", "amount",
+                       "turnover_rate"])
+              .collect())
+        return df if len(df) else pl.DataFrame()
+    except Exception:  # noqa: BLE001 - 湖未初始化/空 schema，按空态处理
+        return pl.DataFrame()
+
+
+def heat_rows(cur: pl.DataFrame, latest) -> list[dict]:
+    out = []
+    for r in cur.to_dicts():
+        chg = r["change_pct"] if r["change_pct"] is not None else None
+        out.append({"symbol": r["symbol"], "trade_date": str(latest),
+                    "change_pct": round(chg, 5) if chg is not None else None,
+                    "amount": round(r["amount"], 0) if r["amount"] is not None else None,
+                    "turnover": r["turnover_rate"]})
+    return out
+
+
+@router.get("/schedules")
+def schedules() -> dict:
+    """采集时点 + 当前时刻应跑哪些（调度器状态，settings/看板用）。"""
+    from lquant.market.scheduler import SCHEDULES, due_schedules, status
+
+    now = __import__("datetime").datetime.now()
+    due = due_schedules(now)
+    items = [{"name": k, "time": v["time"], "desc": v["desc"], "due": k in due}
+             for k, v in SCHEDULES.items()]
+    cov = status()
+    return {"schedules": items, "now": now.isoformat(timespec="minutes"),
+            "coverage": cov.to_dicts() if len(cov) else []}

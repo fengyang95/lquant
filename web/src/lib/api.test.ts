@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ApiError, get, post } from './api';
+import { ApiError, get, getData, post } from './api';
 
 function mockFetch(status: number, body: unknown) {
   return vi.fn().mockResolvedValue(new Response(JSON.stringify(body), {
@@ -35,6 +35,34 @@ describe('api 请求封装', () => {
     const err = (await get('/factors').catch((e) => e)) as ApiError;
     expect(err).toBeInstanceOf(ApiError);
     expect(err.message).toBe('500 /factors');
+  });
+
+  describe('getData 封套取数（新老契约共存）', () => {
+    it('封套成功解出 data', async () => {
+      vi.stubGlobal('fetch', mockFetch(200, {
+        code: 0, data: { value: 'weekly' }, message: 'ok', trace_id: 'abc',
+      }));
+      await expect(getData('/settings/key')).resolves.toEqual({ value: 'weekly' });
+    });
+
+    it('old-style 裸返回原样透传', async () => {
+      vi.stubGlobal('fetch', mockFetch(200, { hello: 'world' }));
+      await expect(getData('/data/ping')).resolves.toEqual({ hello: 'world' });
+    });
+
+    it('封套业务失败（code!=0）抛 ApiError 带 message', async () => {
+      vi.stubGlobal('fetch', mockFetch(200, { code: 1, data: null, message: '取值越界' }));
+      const err = await getData('/settings/nope').catch((e) => e);
+      expect(err).toBeInstanceOf(ApiError);
+      expect(err.message).toBe('取值越界');
+    });
+
+    it('HTTP 错误优先取封套 message，其次 detail', async () => {
+      vi.stubGlobal('fetch', mockFetch(404, { code: 1, message: '无此 ETF' }));
+      const err = await getData('/etf/by-symbol/999999').catch((e) => e);
+      expect(err).toBeInstanceOf(ApiError);
+      expect(err.message).toBe('无此 ETF');
+    });
   });
 
   it('post 带方法与 JSON 头', async () => {

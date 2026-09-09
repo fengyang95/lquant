@@ -333,9 +333,191 @@ def test_market_batch_aggregate(client):
                       params={"symbols": ",".join(["600519"] * 21)}).status_code == 422
 
 
+# ---------- 封套 / settings ----------
+
+def test_settings_get_put_reset_enveloped(client):
+    """封套 {code,data,message,trace_id} + 配置读写生效。"""
+    r = client.get("/api/settings")
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"code", "data", "message", "trace_id"}
+    items = {i["key"]: i for i in body["data"]}
+    assert items["rebalance_default"]["value"] == "monthly"
+    assert items["rebalance_default"]["source"] in ("default", "runtime")
+    assert "providers_order" in items
+
+    r2 = client.put("/api/settings/rebalance_default", json={"key": "rebalance_default",
+                                                             "value": "weekly"})
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["code"] == 0 and r2.json()["data"]["value"] == "weekly"
+
+    # 覆盖后 source 变 runtime
+    after = {i["key"]: i["source"] for i in client.get("/api/settings").json()["data"]}
+    assert after["rebalance_default"] == "runtime"
+
+    # 非法枚举值 → 422 信封
+    bad = client.put("/api/settings/price_mode_default",
+                     json={"key": "price_mode_default", "value": "instant"})
+    assert bad.status_code == 422 and bad.json()["code"] == 1
+
+    # 未知 key → 422；key 不一致 → 422
+    assert client.put("/api/settings/nope", json={"key": "nope",
+                                                  "value": "x"}).status_code == 422
+    assert client.put("/api/settings/rebalance_default",
+                      json={"key": "other", "value": "x"}).status_code == 422
+
+    # 重置回默认
+    reset = client.delete("/api/settings/rebalance_default")
+    assert reset.status_code == 200 and reset.json()["data"]["reset"] is True
+    after2 = {i["key"]: i["value"] for i in client.get("/api/settings").json()["data"]}
+    assert after2["rebalance_default"] == "monthly"
+
+
+def test_settings_providers(client):
+    r = client.get("/api/settings/providers")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["code"] == 0
+    names = [p["name"] for p in body["data"]]
+    assert "baostock" in names and "mootdx" in names
+    assert any(p["enabled"] for p in body["data"])
+
+
+# ---------- ETF ----------
+
+def _seed_etf_meta():
+    """测试库写入 3 只 ETF 元数据（枚举竞价：互不相同、字段齐全）。"""
+    from lquant.core.db import writer
+
+    with writer() as con:
+        con.execute("DELETE FROM etf_meta")
+        rows = [
+            ("510300.SH", "沪深300ETF", "000300.SH", "equity", False, 1, 0.005, 0.001, 4.2e9, "baostock"),
+            ("510500.SH", "中证500ETF", "000905.SH", "equity", False, 1, 0.005, 0.001, 3.1e9, "baostock"),
+            ("513100.SH", "纳指ETF", None, "qdie", True, 2, 0.008, 0.002, 1.2e9, "baostock"),
+        ]
+        con.executemany(
+            "INSERT INTO etf_meta (symbol, name, track_index, fund_type, is_cross_border, "
+            "sellable_after_days, management_fee, custody_fee, fund_size, source) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT (symbol) DO UPDATE SET name = excluded.name",
+            rows)
+
+
+def test_etf_meta_enveloped(client):
+    _seed_etf_meta()
+    r = client.get("/api/etf/meta")
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"code", "data", "message", "trace_id"}
+    metas = {m["symbol"]: m for m in body["data"]}
+    assert "510300.SH" in metas
+    assert metas["510300.SH"]["track_index"] == "000300.SH"
+    assert metas["513100.SH"]["is_cross_border"] is True
+    # 搜索过滤
+    hit = client.get("/api/etf/meta", params={"q": "纳指"}).json()["data"]
+    assert len(hit) == 1 and hit[0]["symbol"] == "513100.SH"
+    # 单只 404
+    assert client.get("/api/etf/by-symbol/999999.SH").status_code == 404
+
+
+def test_etf_correlation_empty_graceful(client):
+    """湖无 ETF 行情 → 空 pairs + note，不 500（空态契约）。"""
+    r = client.get("/api/etf/correlation")
+    assert r.status_code == 200
+    body = r.json()["data"]
+    assert "pairs" in body and "note" in body
+
+
+def test_etf_correlation_computes_pairs(client, monkeypatch):
+    """有 ETF 日线时算得出 pairs 且 col 序/三角解开正确（回归：polars 无 DF.pct_change）。"""
+    import polars as pl
+
+    # correlation 内 `from lquant.data.store.parquet import read_daily` → 打在源模块上。
+    monkeypatch.setattr("lquant.data.store.parquet.read_daily", lambda: df_lake())
+
+    r = client.get("/api/etf/correlation", params={"horizon": 30})
+    assert r.status_code == 200
+    body = r.json()["data"]
+    assert body["note"] is None
+    syms = body["symbols"]
+    assert syms == ["510001.SH", "510002.SH", "510003.SH"]
+    # A 与 C 同构单调（1..6 / 10..60）→ 收益率近乎完美相关；pairs=3 且角标映射正确。
+    by = {(p["a"], p["b"]): p["corr"] for p in body["pairs"]}
+    assert by[(syms[0], syms[2])] >= 0.99
+    assert len(body["pairs"]) == 3
+
+
+def df_lake():
+    """合成 3 只沪 ETF 的 20 日日线湖（15+ 根有效收益率，触发真实计算路径）。"""
+    import polars as pl
+
+    b_close = [1, 40, 2, 43, 4, 41, 7, 44, 9, 47, 11, 50, 13, 53, 15, 56, 17, 59, 19, 62]
+    rows = []
+    for d, ci in enumerate(range(1, 21), start=1):
+        c = ci * 1.0
+        rows.append((d, "510001.SH", c, c))
+        rows.append((d, "510002.SH", float(b_close[ci - 1]), float(b_close[ci - 1])))
+        rows.append((d, "510003.SH", ci * 10.0, ci * 10.0))
+    # read_daily 契约返回 LazyFrame（.collect() 物化）—— stub 须保持一致。
+    return pl.DataFrame(rows, schema=["trade_date", "symbol", "close", "pre_close"]).lazy()
+
+
+# ---------- market 补充 ----------
+
+def test_market_snapshot(client):
+    client.post("/api/market/collect", json={"demo": True})
+    r = client.get("/api/market/snapshot", params={"page": 1, "size": 10})
+    assert r.status_code == 200
+    body = r.json()
+    assert {"trade_date", "total", "rows"} <= set(body)
+    if body["rows"]:
+        assert body["rows"][0]["change_pct"] >= body["rows"][-1]["change_pct"]
+    # 非法 sort → 422；合法 turnover_rate 通过
+    assert client.get("/api/market/snapshot",
+                      params={"sort": "bogus"}).status_code == 422
+    assert client.get("/api/market/snapshot",
+                      params={"sort": "turnover_rate"}).status_code == 200
+
+
+def test_market_heat_and_schedules(client):
+    h = client.get("/api/market/heat")
+    assert h.status_code == 200
+    hb = h.json()
+    assert {"gainers", "losers", "volume", "dragon_tiger"} <= set(hb)
+
+    s = client.get("/api/market/schedules")
+    assert s.status_code == 200
+    sb = s.json()
+    assert {"schedules", "coverage"} <= set(sb)
+    names = {x["name"] for x in sb["schedules"]}
+    assert {"close", "evening"} <= names
+
+
 # ---------- WebSocket ----------
 
 def test_ws_job_not_found(client):
     with client.websocket_connect("/ws/jobs/ghost-job") as ws:
         msg = ws.receive_json()
     assert msg["status"] == "not_found" and msg["done"] is True
+
+
+def test_ws_market_ticks_degrades_offline(client, monkeypatch):
+    """实时链路断时推送 available=false 帧后关连（可降级契约）。"""
+    from lquant.market import ticks
+    from lquant.market.ticks import TicksError
+
+    def _raise(symbols, **kw):
+        raise TicksError("no source")
+
+    monkeypatch.setattr(ticks, "fetch_quotes", _raise)
+    with client.websocket_connect("/ws/market/ticks?symbols=600519") as ws:
+        msg = ws.receive_json()
+    assert msg["available"] is False and msg["error"]
+
+
+def test_ws_market_ticks_empty_symbols(client):
+    """无标的直接降级关连，不挂空连接。"""
+    with client.websocket_connect("/ws/market/ticks") as ws:
+        msg = ws.receive_json()
+    assert msg["available"] is False and "symbols" in msg["error"]
