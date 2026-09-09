@@ -46,17 +46,21 @@ def list_factors(
 ) -> list[dict]:
     """已注册因子（factor_def 表）。offset/limit 分页 + source 筛选。"""
     suffix = f"OFFSET {offset}" + (f" LIMIT {limit}" if limit else "")
-    where = f"WHERE source = '{source}'" if source else ""
+    where = f"WHERE d.source = '{source}'" if source else ""
+    order = "icn DESC NULLS LAST" if not source else "created_at DESC"
     with reader() as con:
         try:
             rows = con.execute(
-                "SELECT name, expression, description, source, factor_id, created_at "
-                f"FROM factor_def {where} ORDER BY created_at DESC {suffix}"
+                "SELECT d.name, d.expression, d.description, d.source, d.factor_id, "
+                "i.ic_neutral AS icn, d.created_at FROM factor_def d "
+                "LEFT JOIN factor_ic i ON i.factor = d.name "
+                f"{where} ORDER BY {order} {suffix}"
             ).fetchall()
         except Exception:  # noqa: BLE001
             return []
     return [{"name": r[0], "expression": r[1], "description": r[2],
-             "source": r[3], "factor_id": r[4], "created_at": str(r[5])}
+             "source": r[3], "factor_id": r[4], "ic_neutral": r[5],
+             "created_at": str(r[6])}
             for r in rows]
 
 
@@ -95,6 +99,43 @@ def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
     if formula == "turnover":
         return df.with_columns((pl.col("amount") / 1e8).alias("_factor"))
     raise HTTPException(422, f"暂不支持的因子公式: {formula}（内置因子见 GET /api/factors/builtin）")
+
+
+def _neutral_views_for(d: pl.DataFrame, ret_col: str) -> dict:
+    """收益中性化对照 + 行业内分组标注（5.1 视图）。"""
+    from lquant.factors.evaluate.neutral_views import neutral_views as _nv
+
+    try:
+        cov_cols = [c for c in d.columns if c.startswith("cov_")]
+        if not cov_cols:
+            return {"view": "raw（未中性化 —— 协变量数据不可用）"}
+        return _nv(d, "_factor", ret_col, covariates=cov_cols,
+                   group_col="cov_industry_sw1" if "cov_industry_sw1" in d.columns else None)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _persist_ic(name: str, ladder: list[dict]) -> None:
+    """评价成功后把 IC(原始)/IC(中性化) 落 factor_ic 表 —— 列表页排序用。"""
+    if not ladder:
+        return
+    from datetime import datetime as _dt
+
+    from lquant.data.store.catalog import upsert
+
+    try:
+        upsert("factor_ic", pl.DataFrame([{
+            "factor": name,
+            "ic_raw": ladder[0]["ic_mean"],
+            "ic_neutral": ladder[-1]["ic_mean"],
+            "rank_ic_neutral": ladder[-1]["rank_ic_mean"],
+            "n_days": ladder[-1]["n_days"],
+            "updated_at": _dt.now(),
+        }]))
+    except Exception as e:  # noqa: BLE001
+        import loguru
+
+        loguru.logger.warning(f"factor_ic 写入失败: {e}")
 
 
 def _neutral_ladder(d: pl.DataFrame, col: str, ret_col: str) -> list[dict]:
@@ -136,6 +177,7 @@ def _neutral_ladder(d: pl.DataFrame, col: str, ret_col: str) -> list[dict]:
             "ic_mean": round(float(s["ic"].mean()), 4),
             "rank_ic_mean": round(float(s["rank_ic"].mean()), 4),
             "n_days": len(s),
+            "coverage": round(min((cov_report.get(c, 1.0) for c in covs), default=1.0), 4),
         })
     return out
 
@@ -215,8 +257,10 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
                 "ir": _jf(r["ir"], 3), "positive_rate": _jf(r["positive_rate"], 4)}
                for r in icy.to_dicts()] if len(icy) else []
 
-    # ---- IC 归因阶梯（方案 5.3）：原始 → +市值 → +行业 → +换手率 ----
+    # ---- IC 归因阶梯（方案 5.3）+ 三种中性化视图标注（方案 5.1） ----
     ladder = _neutral_ladder(d, "_factor", ret_col)
+    _persist_ic(req.factor, ladder)
+    views = _neutral_views_for(d, ret_col)
 
     series = {
         "factor": req.factor, "formula": req.formula,
@@ -225,6 +269,7 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
         "quantile": {"dates": qdates, "curves": curves, "groups": groups,
                      "monotonicity": _jf(qsum.get("monotonicity"), 3)},
         "decay": decay, "ic_by_year": ic_year, "neutral_ladder": ladder,
+        "neutral_views": views,
     }
     return metrics, series
 

@@ -34,13 +34,14 @@ tests/unit/test_factor_golden.py 与 test_ops_expanded.py 的手算断言。
 （test_f4_t_stat_identity）IC 序列 t 统计量必须等于 mean/std*sqrt(n)。
 **状态**：✅ 本轮
 
-## F5 交叉实现对照（P2）
+## F5 交叉实现对照
 
-与 qlib/alphalens 同公式对照因子值与 IC。**状态**：⏳ 后续里程碑
+MA20 / RSV10：qlib_alpha 内置实现 vs DSL 翻译版逐点对照（test_f5_cross_implementation_*）。
+**状态**：✅ 本轮
 
 ## F6 可复现性
 
-同输入两次计算逐位一致（缓存复现性）。**状态**：⏳ 后续里程碑
+同输入两次计算逐位一致（test_f6_reproducible_double_compute）。**状态**：✅ 本轮
 
 ## N1-N6 中性化专项（M2.5 落地，先占位编号）
 

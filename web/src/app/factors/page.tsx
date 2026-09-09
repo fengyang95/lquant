@@ -419,12 +419,16 @@ export default function FactorsPage() {
             {(evalSeries.neutral_ladder?.length ?? 0) > 0 ? (
               <div className="space-y-1.5 px-1 py-2 text-xs">
                 {evalSeries.neutral_ladder!.map((l) => {
+                  const cov = (l as { coverage?: number }).coverage ?? 1;
+                  const dim = cov < 0.8;
                   const first = evalSeries.neutral_ladder![0].ic_mean ?? 0;
                   const v = l.ic_mean ?? 0;
                   const drop = first !== 0 ? ((first - v) / Math.abs(first) * 100).toFixed(0) : '0';
                   const w = first !== 0 ? Math.min(Math.abs(v / first) * 100, 100) : 0;
                   return (
-                    <div key={l.label} className="flex items-center gap-2">
+                    <div key={l.label}
+                      className={`flex items-center gap-2 rounded-sm px-1 ${dim ? 'bg-ink-faint/10 opacity-60' : ''}`}
+                      title={dim ? `协变量覆盖率 ${(cov * 100).toFixed(0)}% < 80%` : ''}>
                       <span className="w-24 text-ink-dim">{l.label}</span>
                       <div className="h-3 flex-1 rounded-sm bg-ink-faint/10">
                         <div className="h-3 rounded-sm" style={{ width: `${w}%`, background: 'var(--c-indigo, #31589E)' }} />
@@ -611,12 +615,15 @@ export default function FactorsPage() {
                 <th className="text-left">名称</th>
                 <th className="text-left">表达式</th>
                 <th className="text-left">来源</th>
+                <th className="text-left">IC(中性化)</th>
                 <th className="text-left">注册时间</th>
               </tr>
             </thead>
             <tbody>
               {shownFactors.map((f) => {
                 const src = (f as unknown as { source?: string }).source;
+                const icn = (f as unknown as { ic_neutral?: number | null }).ic_neutral;
+                const icnDisplay = icn == null ? '—' : Number(icn).toFixed(4);
                 return (
                   <tr key={f.name} className="hover:bg-white">
                     <td className="font-medium">
@@ -624,6 +631,7 @@ export default function FactorsPage() {
                     </td>
                     <td className="font-mono text-xs text-ink-dim">{f.expression || '—'}</td>
                     <td className="text-ink-faint">{src ?? 'manual'}</td>
+                    <td className="font-mono">{icnDisplay}</td>
                     <td className="text-ink-faint">{f.created_at?.slice(0, 19)}</td>
                   </tr>
                 );

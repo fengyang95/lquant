@@ -26,6 +26,7 @@ def _panel(n_days: int = 120, n_sym: int = 8, seed: int = 7) -> pl.DataFrame:
             px *= 1 + rng.normal(0, 0.02)
             rows.append({"symbol": f"S{s:02d}", "trade_date": dt.date(2025, 1, 1) + dt.timedelta(days=i),
                          "close": px, "open": px * (1 + rng.normal(0, 0.001)),
+                         "high": px * 1.01, "low": px * 0.99,
                          "volume": float(1e5 + 1000 * i), "amount": px * 1e4})
     return pl.DataFrame(rows)
 
@@ -119,3 +120,38 @@ def test_f4_t_stat_identity():
     n = len(ser)
     expected = s["ic"]["mean"] / s["ic"]["std"] * np.sqrt(n)
     assert s["ic"]["t_stat"] == pytest.approx(expected, abs=1e-6)
+
+
+
+def test_f5_cross_implementation_ma20():
+    """F5 交叉实现对照：DSL 翻译版 MA20 vs qlib_alpha 内置实现，逐点一致。"""
+    from lquant.factors.qlib_alpha import compute as qlib_compute
+
+    panel = _panel(n_days=60, n_sym=5)
+    a = qlib_compute(panel, "MA20")
+    b = FactorEngine(panel.lazy()).compute("Ts_Mean($close, 20) / $close", "f")
+    j = a.join(b, on=["symbol", "trade_date"], suffix="_b").drop_nulls(["_factor", "f"])
+    diff = j.select((pl.col("_factor") - pl.col("f")).abs().max().alias("mx")).item()
+    assert diff < 1e-9, f"两套实现差异 {diff}"
+
+
+def test_f5_cross_implementation_rsv():
+    """F5b: RSV10 双实现对照。"""
+    from lquant.factors.qlib_alpha import compute as qlib_compute
+
+    panel = _panel(n_days=60, n_sym=5)
+    a = qlib_compute(panel, "RSV10")
+    b = FactorEngine(panel.lazy()).compute(
+        "($close-Ts_Min($low,10))/(Ts_Max($high,10)-Ts_Min($low,10)+1e-12)", "f")
+    j = a.join(b, on=["symbol", "trade_date"], suffix="_b").drop_nulls(["_factor", "f"])
+    diff = j.select((pl.col("_factor") - pl.col("f")).abs().max().alias("mx")).item()
+    assert diff < 1e-9
+
+
+def test_f6_reproducible_double_compute():
+    """F6 可复现性：同输入两次计算逐位一致；经缓存往返亦一致。"""
+    panel = _panel(n_days=40)
+    expr = "Rank(Ts_Mean($close,5)/$close-1)"
+    a = FactorEngine(panel.lazy()).compute(expr, "f")
+    b = FactorEngine(panel.lazy()).compute(expr, "f")
+    assert a.equals(b)

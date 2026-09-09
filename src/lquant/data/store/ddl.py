@@ -154,6 +154,18 @@ DDL_STATEMENTS: list[str] = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS agent_ledger (
+        agent VARCHAR PRIMARY KEY, eval_count INTEGER,
+        eval_last TIMESTAMP, updated_at TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS factor_ic (
+        factor VARCHAR PRIMARY KEY, ic_raw DOUBLE, ic_neutral DOUBLE,
+        rank_ic_neutral DOUBLE, n_days INTEGER, updated_at TIMESTAMP
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS factor_mining_run (
         run_id VARCHAR PRIMARY KEY, agent VARCHAR, generator VARCHAR,
         n_evaluated INTEGER, n_static_fail INTEGER, n_low_ic INTEGER,

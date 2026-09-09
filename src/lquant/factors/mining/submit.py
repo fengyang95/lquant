@@ -120,7 +120,7 @@ def verify_and_register(spec: dict) -> tuple[bool, dict]:
         try:
             upsert("factor_def", pl.DataFrame([{
             "name": name, "expression": expr,
-            "description": spec.get("rationale", ""),
+            "description": (spec.get("rationale", "") + " claimed=" + json.dumps(spec.get("claimed") or {})).strip(),
             "source": "mined" if spec.get("agent") else "manual",
             "source_ref": spec.get("agent", "manual"),
             "factor_id": canonical_id(expr),

@@ -59,3 +59,41 @@ def load_agents(directory: str = "config/agents") -> list[AgentProfile]:
 def find_agent(name: str) -> AgentProfile | None:
     agents = {a.name: a for a in load_agents()}
     return agents.get(name)
+
+
+def record_eval(agent: str, n: int = 1) -> int:
+    """eval 记账（方案 6.3 硬护栏 2）：按 Agent 累计，返回累计值。"""
+    import datetime as dt
+
+    from lquant.core.db import writer
+
+    try:
+        with writer() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO agent_ledger VALUES (?,?,?,?)",
+                [agent,
+                 eval_usage(agent) + n,
+                 dt.datetime.now(),
+                 dt.datetime.now()])
+    except Exception:  # noqa: BLE001
+        pass
+    return eval_usage(agent)
+
+
+def eval_usage(agent: str) -> int:
+    try:
+        from lquant.core.db import reader
+
+        with reader() as con:
+            row = con.execute("SELECT eval_count FROM agent_ledger WHERE agent = ?",
+                              [agent]).fetchone()
+        return int(row[0]) if row else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def quota_remaining(agent: str) -> int:
+    a = find_agent(agent)
+    if not a:
+        raise ValueError(f"Agent 未注册: {agent}")
+    return max(0, a.quota_eval - eval_usage(agent))

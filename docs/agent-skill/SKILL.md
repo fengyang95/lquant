@@ -15,8 +15,11 @@
 
 ## 操作面（CLI）
 
+    lq data fields               # 字段白名单 + 覆盖率（先看数据里有什么）
     lq factor check "<expr>"     # G0 静态校验（毫秒）
-    lq factor eval "<expr>"      # 平台算 IC/ICIR/分层 + 中性化对照
+    lq factor eval "<expr>"      # 平台算 IC + 中性化对照 + 校正门槛 + 剩余配额
+    lq factor series "<expr>"    # 逐日 IC 序列（平台算）
+    lq factor corr "<e1>" "<e2>" # 库内查重/自查（提交前必做）
     lq factor submit spec.yaml   # ★ 唯一入库通道，服务端重验（A/B 级入库）
     lq agent list / show / test  # 接入验收：lq agent test <name> 必须通过
 

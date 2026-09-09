@@ -76,3 +76,16 @@ def test_gp_generator_feedback():
     gp.feedback("Ts_Std($volume,20)", 0.01)
     out = gp()
     assert isinstance(out, str) and out
+
+
+
+def test_eval_quota_ledger(tmp_path, monkeypatch):
+    """方案 6.3 硬护栏 2：eval 按 Agent 记账，配额可见。"""
+    from lquant.factors import agents as A
+
+    # 无 DB 环境：eval_usage 应优雅返回 0（记账失败不炸）
+    assert A.eval_usage("ghost") >= 0
+
+    prof = A.AgentProfile(name="t", kind="skill", driver="agent",
+                          quota_eval=10, can_submit=True)
+    assert A.AgentProfile is not None

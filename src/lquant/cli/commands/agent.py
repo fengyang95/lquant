@@ -77,9 +77,16 @@ def freeze(name: str, enable: bool | None) -> None:
     a = find_agent(name)
     if not a:
         raise click.ClickException(f"Agent 未注册: {name}")
+    import hashlib
+
     fp = next(iter(Path("config/agents").glob(f"{name}.yaml")))
     raw = yaml.safe_load(fp.read_text()) or {}
     new_enabled = (not a.enabled) if enable is None else enable
     raw["enabled"] = new_enabled
+    # 冻结快照含 SKILL.md hash（方案 6.4）：Agent 手册被篡改即可发现
+    skill_fp = Path("docs/agent-skill/SKILL.md")
+    if skill_fp.exists():
+        raw["skill_sha256"] = hashlib.sha256(skill_fp.read_bytes()).hexdigest()[:16]
     fp.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False))
-    click.echo(f"{name}: enabled={new_enabled}")
+    click.echo(f"{name}: enabled={new_enabled} "
+               f"skill_sha256={raw.get('skill_sha256', '-')}")

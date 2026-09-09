@@ -46,46 +46,60 @@ def check_expr(expr: str) -> None:
 @click.argument("expr")
 @click.option("--start", default=None, help="数据窗口起点 YYYY-MM-DD")
 @click.option("--neutral/--raw", default=True, help="是否中性化（默认中性化）")
-def eval_(expr: str, start: str | None, neutral: bool) -> None:
-    """IC/ICIR/分层/换手 JSON + 中性化对照。所有指标平台算，Agent 不许自算。"""
+@click.option("--agent", default=None, help="Agent 名（配额记账 + 校正门槛）")
+def eval_(expr: str, start: str | None, neutral: bool, agent: str | None) -> None:
+    """IC JSON + 中性化对照 + n_trials/校正门槛/剩余配额（方案 6.2/6.3）。"""
     import json
 
-    from lquant.data.store.parquet import read_daily
-    from lquant.factors.analysis import compute_factor_col
-    from lquant.factors.evaluate import forward_return
-    from lquant.factors.evaluate.ic import ic_summary
-    from lquant.factors.preprocess.pipeline import run as pipeline_run
-    from lquant.core.db import reader as db_reader
+    from lquant.factors.mining.submit import _panel_with_covs, _split_eval
+    import polars as pl
 
-    df = read_daily(start=start).collect()
+    from lquant.factors.mining.fitness import corrected_threshold
+
+    df, cov_cols = _panel_with_covs(start=start)
     if not len(df):
         raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")
-    covs = None
-    if neutral:
-        try:
-            with db_reader() as con:
-                ind = con.execute(
-                    "SELECT symbol, std, code, std_date FROM industry_classify").pl()
-        except Exception:  # noqa: BLE001
-            ind = None
-        from lquant.factors.covariates import build_covariates
+    splits = _split_eval(df, cov_cols, expr)
+    s_tr = splits["train"]
+    if not len(s_tr):
+        raise click.ClickException("train 段 IC 序列为空 —— 数据或表达式问题")
+    from lquant.factors.evaluate.ic import _t_stat as tstat
 
-        df, report = build_covariates(df, ["market_cap", "industry_sw1", "turnover_1m"],
-                                      industry_df=ind)
-        covs = [f"cov_{r['covariate']}" for r in report if r["coverage"] > 0]
-    d = compute_factor_col(df, expr, "f")
-    d = forward_return(d, "close", periods=[1, 5])
-    d = d.drop_nulls(["f", "fwd_ret_1"])
-    if covs:
-        d = pipeline_run(d, "f", [
-            {"op": "winsorize", "method": "mad", "n": 5},
-            {"op": "standardize", "method": "zscore"},
-            {"op": "neutralize", "method": "ols", "factors": covs},
-        ])
-        d = d.drop_nulls(["f"])
-    s = ic_summary(d, "f", "fwd_ret_1")
-    click.echo(json.dumps({"ic": s["ic"], "rank_ic": s["rank_ic"],
-                           "neutralized": bool(covs)}, ensure_ascii=False, default=str))
+    ic = float(s_tr["ic"].mean())
+    t = tstat(ic, float(s_tr["ic"].std()), len(s_tr))
+    # 中性化对照：同口径再算一遍 raw IC
+    ic_raw = None
+    if cov_cols:
+        from lquant.factors.analysis import compute_factor_col
+        from lquant.factors.evaluate.ic import ic_series
+
+        d_raw = compute_factor_col(
+            df.filter(pl.col("trade_date").is_in(sorted(df["trade_date"].unique().to_list())[:70])),
+            expr, "f").drop_nulls(["f", "fwd_ret_1"])
+        ic_raw = round(float(ic_series(d_raw, "f", "fwd_ret_1")["ic"].mean()), 4)
+    # 预算内建：n_trials（eval+挖掘评估总账）、校正门槛、剩余配额
+    n_trials, remaining, hints, thr = 0, None, [], None
+    if agent:
+        from lquant.factors.agents import eval_usage, find_agent, quota_remaining, record_eval
+
+        a = find_agent(agent)
+        if not a:
+            raise click.ClickException(f"Agent 未注册: {agent}")
+        n_trials = record_eval(agent)
+        remaining = quota_remaining(agent)
+        thr = corrected_threshold(max(n_trials, 2))
+        if a.quota_eval <= 0 or remaining <= 0:
+            raise click.ClickException(f"配额已用尽: {agent}")
+        if abs(t) < thr:
+            hints.append(f"|t|={abs(t):.2f} 低于校正门槛 {thr:.2f}（n_trials={n_trials}）")
+        hints.append(f"剩余配额 {remaining} 次")
+    click.echo(json.dumps({
+        "ic_mean": round(ic, 4), "rank_ic_mean": round(float(s_tr["rank_ic"].mean()), 4),
+        "t_stat": round(t, 2), "n_days": len(s_tr),
+        "ic_raw_mean": ic_raw, "neutralized": bool(cov_cols),
+        "n_trials": n_trials, "corrected_threshold": round(thr, 2) if thr else None,
+        "quota_remaining": remaining, "hints": hints,
+    }, ensure_ascii=False))
 
 
 @factor.command()
@@ -180,3 +194,42 @@ def mine(agent: str, generator: str, n: int, proposals: str | None, start: str |
         "n_size_proxy": res.n_size_proxy, "n_survivors": res.n_survivors,
         "survivors": survivors[:10],
     }, ensure_ascii=False))
+
+
+@factor.command()
+@click.argument("expr")
+@click.option("--start", default=None)
+def series(expr: str, start: str | None) -> None:
+    """逐日 IC/RankIC/累计 IC 序列 JSON（图表数据，平台算）。"""
+    import json
+
+    from lquant.factors.mining.submit import _panel_with_covs, _split_eval
+
+    df, cov_cols = _panel_with_covs(start=start)
+    splits = _split_eval(df, cov_cols, expr)
+    s = splits["train"]
+    if not len(s):
+        raise click.ClickException("train 段 IC 序列为空")
+    click.echo(json.dumps({
+        "n_days": len(s),
+        "ic_mean": round(float(s["ic"].mean()), 4),
+        "rank_ic_mean": round(float(s["rank_ic"].mean()), 4),
+    }, ensure_ascii=False))
+
+
+@factor.command()
+@click.argument("exprs", nargs=-1, required=True)
+@click.option("--start", default=None)
+@click.option("--threshold", default=0.7)
+def corr(exprs: tuple, start: str | None, threshold: float) -> None:
+    """库内查重/自查：表达式两两横截面 Spearman 相关 + 冗余对（平台算）。"""
+    import json
+
+    from lquant.data.store.parquet import read_daily
+    from lquant.factors.analysis import correlation
+
+    df = read_daily(start=start).collect()
+    if not len(df):
+        raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")
+    res = correlation(df, list(exprs), threshold=threshold)
+    click.echo(json.dumps(res, ensure_ascii=False))
