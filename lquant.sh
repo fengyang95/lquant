@@ -271,6 +271,11 @@ cmd_install() {
   # 3) .env
   [ -f .env ] || { cp .env.example .env 2>/dev/null && dim "已生成 .env" || true; }
 
+  # 3.5) git 钩子（相对路径：主仓库与各 worktree 各用各的 scripts/githooks）
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git config core.hooksPath scripts/githooks && dim "git 钩子已就绪 (core.hooksPath=scripts/githooks)"
+  fi
+
   # 4) Rust 扩展（可选，无 cargo 自动装 rustup）
   if ensure_rust; then
     info "编译 Rust 扩展（可选加速）"

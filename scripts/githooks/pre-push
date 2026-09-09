@@ -1,18 +1,30 @@
 #!/usr/bin/env bash
 # 推送前检查：跑测试（比 pre-commit 严格）
+#
+# 注意：全量测试里有依赖数据的用例（API / sync），所以先做环境自愈 ——
+# 缺库建库、缺数据生成演示数据兜底，避免把"没跑过 bootstrap"误判成代码问题。
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 echo "==> pre-push: 测试"
 
-# 跳过开关（CI 上或临时放行）：git push --no-verify
+# 跳过开关（CI 上或临时放行）：LQ_SKIP_PUSH_CHECK=1 git push 或 git push --no-verify
 if [ "${LQ_SKIP_PUSH_CHECK:-0}" = "1" ]; then
   echo "    LQ_SKIP_PUSH_CHECK=1，跳过"; exit 0
 fi
 
 if [ -x .venv/bin/python ] && [ -d tests ]; then
+  mkdir -p data/duckdb data/parquet data/cache
+  if [ ! -f data/duckdb/lquant.duckdb ]; then
+    echo "    DuckDB 未建库，先 init_db"
+    .venv/bin/python scripts/init_db.py
+  fi
+  if ! find data/parquet -name '*.parquet' -print -quit 2>/dev/null | grep -q .; then
+    echo "    无任何 parquet 数据，生成演示数据兜底（换真数据: ./lquant.sh bootstrap）"
+    .venv/bin/lq data demo >/dev/null
+  fi
   .venv/bin/python -m pytest -x -q tests/ || {
-    echo "✗ 测试失败，修复后再 push（临时放行: LQ_SKIP_PUSH_CHECK=1 git push）"; exit 1; }
+    echo "✗ 测试失败，修复后再 push（临时放行: LQ_SKIP_PUSH_CHECK=1 git push 或 git push --no-verify）"; exit 1; }
 else
   echo "    无 .venv 或 tests/，跳过"
 fi
