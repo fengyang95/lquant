@@ -17,7 +17,7 @@ from lquant.data.providers.baostock import BaoStockProvider, _attach_is_st
 from lquant.data.schema import SCHEMAS
 
 DAILY_ROWS = [
-    # date, code, open, high, low, close, preclose, volume, amount(千元), turn, tradestatus, isST
+    # date, code, open, high, low, close, preclose, volume, amount(元), turn, tradestatus, isST
     ["2024-01-02", "sh.600000", "10.0", "10.5", "9.8", "10.2", "10.1",
      "1000", "3000", "1.5", "1", "0"],
     ["2024-01-03", "sh.600000", "10.2", "10.6", "10.0", "10.4", "10.2",
@@ -65,7 +65,7 @@ def test_daily_mapping_via_engine(provider: BaoStockProvider) -> None:
     assert out.columns[:16] == list(SCHEMAS["daily_bar"])
     assert out["symbol"].to_list() == ["600000.SH", "600000.SH"]
     assert out["trade_date"].dtype == pl.Date
-    assert out["amount"].to_list() == [300000.0, 330000.0]  # 千元 → 元
+    assert out["amount"].to_list() == [3000.0, 3300.0]  # 已是元，直接透传
     assert out["pre_close"].to_list() == [10.1, 10.2]
     assert out["turnover_rate"].to_list() == [1.5, 1.6]
     assert out["sec_type"].to_list() == ["stock", "stock"]
@@ -209,7 +209,7 @@ def test_daily_bars_end_to_end_no_network(
     p = BaoStockProvider()
     out = p.daily_bars(["600000.SH"], date(2024, 1, 1), date(2024, 1, 4))
     assert out["is_st"].to_list() == [False, True]
-    assert out["amount"].to_list() == [300000.0, 330000.0]
+    assert out["amount"].to_list() == [3000.0, 3300.0]   # 已是元，直接透传
     assert out["symbol"].to_list() == ["600000.SH", "600000.SH"]
 
 
@@ -218,7 +218,7 @@ def test_real_yaml_loads() -> None:
     dm = load_table_mapping("daily_bar", "baostock")
     assert dm.rename == {"date": "trade_date", "code": "symbol",
                          "preclose": "pre_close", "turn": "turnover_rate"}
-    assert "amount" in dm.derive
+    assert "amount" not in dm.derive   # baostock 日线 amount 单位是元，无换算
     assert dm.fill["source"] == "baostock"
     mm = load_table_mapping("minute_bar", "baostock")
     assert mm.fill == {"freq": "5min", "source": "baostock", "adj_factor": 1.0}

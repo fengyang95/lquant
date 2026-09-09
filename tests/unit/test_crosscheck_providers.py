@@ -30,14 +30,14 @@ _OPEN, _HIGH, _LOW, _CLOSE, _PRE_CLOSE = 10.0, 10.5, 9.8, 10.2, 10.1
 _VOLUME_SHARES = 120_000.0        # 股
 _AMOUNT_YUAN = 1_224_000.0        # 元
 
-# baostock：amount 千元（yaml derive ×100）、volume 股、code sh.600000
+# baostock：amount 已是元（直接透传，无 derive）、volume 股、code sh.600000
 _BAOSTOCK_RAW = pl.DataFrame({
     "date": ["2024-01-02"],
     "code": ["sh.600000"],
     "open": [10.0], "high": [10.5], "low": [9.8], "close": [10.2],
     "preclose": [10.1],
     "volume": [_VOLUME_SHARES],
-    "amount": [_AMOUNT_YUAN / 100],       # 千元（按 yaml 换算系数反推）
+    "amount": [_AMOUNT_YUAN],             # 元，直接透传
     "turn": [0.12],
     "is_st": ["0"],
 # 日期解析（_fetch_daily 产出即 pl.Date）与 baostock 源列保持一致
