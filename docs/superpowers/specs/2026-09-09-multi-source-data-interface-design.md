@@ -17,15 +17,20 @@ lquant 的数据层已有骨架：统一 schema（`src/lquant/data/schema.py`）
 **目标**：新源接入 ≈ 一份字段映射 YAML + 一个薄 fetch 类；schema 单点维护，
 启动时校验映射合法性。
 
-**范围**：机制优先。baostock 迁移到新机制，akshare 最小可用（daily +
-etf_daily + reference）；tushare / tickdb 只保证机制就绪（yaml 预留条目）。
+**范围**：baostock 迁移到新机制；akshare、tushare 完整接入（daily +
+minute_bar 全频率 + adj_factor + financial_pit + reference + trade_calendar，
+以各源实际能力为准）；tickdb 只保证机制就绪（yaml 预留条目）。
+
+tushare 为积分制 API，需要 token（env `TUSHARE_TOKEN`），部分接口有积分门槛
+与每分钟调用限制——token 缺失时该 provider 不加入链，而按 providers.yaml 的
+`env_key` 机制声明；限速通过现有 qps/ratelimit 机制配置。
 
 ## 非目标
 
 - 不替换 schema 载体（不 YAML 化、不引入 pydantic）——`schema.py` 的 dict 定义
   保持为唯一事实源
 - 不改动 Fallback / HealthTracker / 质量管线（quality/）
-- 本次不实现 tushare、tickdb 的 fetch 逻辑
+- 本次不实现 tickdb 的 fetch 逻辑
 
 ## 架构
 
@@ -40,7 +45,8 @@ src/lquant/data/
   providers/
     _engine.py                 # 新增：MappingProvider 通用基类
     baostock.py                # 迁移：只留取数 + 声明 source 名
-    akshare.py                 # 新写：同样模式，最小可用
+    akshare.py                 # 新写：同样模式，完整接入
+    tushare.py                 # 新写：同样模式，完整接入（token 走 env）
 ```
 
 ## 字段映射 YAML
@@ -182,8 +188,9 @@ class MappingProvider(DataProvider):
 | 源 | 动作 |
 |---|---|
 | baostock | 现有 479 行迁移：fetch 逻辑保留，列转换剥离到 yaml；映射文件覆盖其声明的全部 capability |
-| akshare | 新写最小可用（daily + etf_daily + reference），providers.yaml 中改为可配置启用 |
-| tushare / tickdb | 机制就绪：yaml 预留条目 + 映射文件中预留节（注释），接入只需 yaml + fetch 类 |
+| akshare | 完整接入：daily_bar、minute_bar（1/5/15/30/60min）、adj_factor、financial_pit、security、trade_calendar、etf_daily；providers.yaml 中改为可配置启用 |
+| tushare | 完整接入：daily_bar、minute_bar（1/5/15/30/60min，受积分门槛约束的频率在 fetch 层显式报错）、adj_factor（adj_factor 接口）、financial_pit（income/balancesheet/cashflow 长表拆分走 `_post_normalize`）、security（stock_basic）、trade_calendar（trade_cal）、etf_daily（fund_daily）；token 走 env `TUSHARE_TOKEN`，缺失则不加入链；qps 按积分档位配置 |
+| tickdb | 机制就绪：yaml 预留条目 + 映射文件中预留节（注释），接入只需 yaml + fetch 类 |
 
 ## 错误处理
 
@@ -198,7 +205,11 @@ class MappingProvider(DataProvider):
 - `tests/unit/test_engine.py`：假 SDK 返回脏数据 → 归一化后符合 schema；
   `_post_normalize` hook 生效
 - baostock 迁移：现有 golden 测试（`quality/golden.py`）回归对拍
-- akshare：mock akshare SDK 的单元测试
+- akshare / tushare：mock SDK 的单元测试（覆盖列名映射、单位换算、频率
+  翻译、token 缺失时不入链）
+- **对拍测试**：akshare / tushare / baostock 三源对同一标的同一交易日
+  （mock 数据）产出后按 quality/crosscheck 的 tolerance 互比，保证映射
+  换算正确
 
 ## 验收标准
 
@@ -206,4 +217,5 @@ class MappingProvider(DataProvider):
    修改
 2. 映射配置错误在启动时暴露，而非运行时
 3. baostock 迁移后现有测试全绿
-4. akshare 可配置启用并产出符合 `DAILY_BAR` schema 的数据
+4. akshare / tushare 可配置启用并产出符合统一 schema 的日线与分钟线数据
+5. tushare token 缺失时启动不报错、该源不出现在 Fallback 链中
