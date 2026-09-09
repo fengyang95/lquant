@@ -52,14 +52,14 @@ describe('api 请求封装', () => {
 
     it('封套业务失败（code!=0）抛 ApiError 带 message', async () => {
       vi.stubGlobal('fetch', mockFetch(200, { code: 1, data: null, message: '取值越界' }));
-      const err = await getData('/settings/nope').catch((e) => e);
+      const err = (await getData('/settings/nope').catch((e) => e)) as ApiError;
       expect(err).toBeInstanceOf(ApiError);
       expect(err.message).toBe('取值越界');
     });
 
     it('HTTP 错误优先取封套 message，其次 detail', async () => {
       vi.stubGlobal('fetch', mockFetch(404, { code: 1, message: '无此 ETF' }));
-      const err = await getData('/etf/by-symbol/999999').catch((e) => e);
+      const err = (await getData('/etf/by-symbol/999999').catch((e) => e)) as ApiError;
       expect(err).toBeInstanceOf(ApiError);
       expect(err.message).toBe('无此 ETF');
     });
