@@ -11,11 +11,10 @@ import polars as pl
 import pytest
 
 import lquant.data.watchdog as wd
+from lquant.core.errors import DataQualityError
 from lquant.data.mapping import load_table_mapping
-from lquant.data.providers.baostock import BaoStockProvider
+from lquant.data.providers.baostock import BaoStockProvider, _attach_is_st
 from lquant.data.schema import SCHEMAS
-
-P = BaoStockProvider()
 
 DAILY_ROWS = [
     # date, code, open, high, low, close, preclose, volume, amount(千元), turn, tradestatus, isST
@@ -28,6 +27,11 @@ DAILY_ROWS = [
 ]
 
 
+@pytest.fixture
+def provider() -> BaoStockProvider:
+    return BaoStockProvider()
+
+
 def _daily_raw() -> pl.DataFrame:
     return pl.DataFrame(
         DAILY_ROWS,
@@ -37,21 +41,27 @@ def _daily_raw() -> pl.DataFrame:
     )
 
 
-def test_daily_mapping_via_engine() -> None:
-    raw = (
+def _daily_raw_after_fetch() -> pl.DataFrame:
+    """模拟 _fetch_daily 输出：停牌过滤、cast、isST → is_st 布尔。"""
+    return (
         _daily_raw()
         .filter(pl.col("tradestatus") != "0")
-        .drop(["tradestatus", "isST"])
+        .drop("tradestatus")
         .with_columns(
             pl.col("date").str.to_date("%Y-%m-%d"),
             pl.col(["open", "high", "low", "close", "preclose", "volume",
                     "amount"]).cast(pl.Float64),
             pl.col("turn").cast(pl.Float64, strict=False),
+            is_st=pl.col("isST").cast(pl.Utf8).str.strip_chars().is_in(["1"]),
         )
+        .drop("isST")
     )
-    p = BaoStockProvider()
-    p._pending_is_st = pl.Series("is_st", [False, True])
-    out = p.request("daily_bar", _raw=raw)
+
+
+def test_daily_mapping_via_engine(provider: BaoStockProvider) -> None:
+    raw = _daily_raw_after_fetch()
+    out = provider.request("daily_bar", _raw=raw)
+    out = _attach_is_st(out, raw)
     assert out.columns[:16] == list(SCHEMAS["daily_bar"])
     assert out["symbol"].to_list() == ["600000.SH", "600000.SH"]
     assert out["trade_date"].dtype == pl.Date
@@ -65,6 +75,23 @@ def test_daily_mapping_via_engine() -> None:
     assert out["is_st"].to_list() == [False, True]
     assert out["ingested_at"].is_null().all()
     assert out["data_version"].is_null().all()
+
+
+def test_attach_is_st_without_column(provider: BaoStockProvider) -> None:
+    """raw 无 is_st（如 _raw 直传外部数据）→ 输出补全 null 列，不依赖实例状态。"""
+    raw = _daily_raw_after_fetch().drop("is_st")
+    out = provider.request("daily_bar", _raw=raw)
+    out = _attach_is_st(out, raw)
+    assert "is_st" in out.columns
+    assert out["is_st"].is_null().all()
+    assert out["is_st"].dtype == pl.Boolean
+
+
+def test_attach_is_st_length_mismatch_raises() -> None:
+    raw = _daily_raw_after_fetch()
+    out = pl.DataFrame({"x": [1.0]})  # 长度 1 != raw 长度 2
+    with pytest.raises(DataQualityError, match="is_st"):
+        _attach_is_st(out, raw)
 
 
 def test_daily_fetch_filters_suspended_and_converts_is_st(
@@ -82,11 +109,11 @@ def test_daily_fetch_filters_suspended_and_converts_is_st(
     raw = p._fetch_daily(["600000.SH"], date(2024, 1, 1), date(2024, 1, 4))
     assert captured["code"] == "sh.600000"
     assert len(raw) == 2  # 停牌行被过滤
-    assert p._pending_is_st.to_list() == [False, True]
+    assert raw["is_st"].to_list() == [False, True]
     assert "tradestatus" not in raw.columns and "isST" not in raw.columns
 
 
-def test_minute_mapping_via_engine() -> None:
+def test_minute_mapping_via_engine(provider: BaoStockProvider) -> None:
     raw = pl.DataFrame({
         "code": ["sh.600000", "sh.600000", "sh.600000"],
         "ts": [
@@ -101,7 +128,7 @@ def test_minute_mapping_via_engine() -> None:
         "volume": [1000.0, 1100.0, 1200.0],
         "amount": [10000.0, 11000.0, 12000.0],  # 已是元，不换算
     })
-    out = P.request("minute_bar", _raw=raw, freq="60min")
+    out = provider.request("minute_bar", _raw=raw, freq="60min")
     assert out.columns[:12] == list(SCHEMAS["minute_bar"])
     assert out["symbol"].to_list() == ["600000.SH"] * 3
     assert out["freq"].to_list() == ["60min"] * 3  # params 覆盖 yaml fill 的 5min
@@ -115,7 +142,7 @@ def test_minute_mapping_via_engine() -> None:
     assert out["ts"].dt.minute().to_list() == [30, 0, 0]
 
 
-def test_minute_5min_no_boundary_shift() -> None:
+def test_minute_5min_no_boundary_shift(provider: BaoStockProvider) -> None:
     """非 60min 的 freq 不做边界归一。"""
     raw = pl.DataFrame({
         "code": ["sh.600000"],
@@ -123,7 +150,7 @@ def test_minute_5min_no_boundary_shift() -> None:
         "open": [10.0], "high": [10.5], "low": [9.8], "close": [10.2],
         "volume": [1000.0], "amount": [10000.0],
     })
-    out = P.request("minute_bar", _raw=raw, freq="5min")
+    out = provider.request("minute_bar", _raw=raw, freq="5min")
     assert out["freq"].to_list() == ["5min"]
     assert out["ts"].dt.hour().to_list() == [11]
     assert out["ts"].dt.minute().to_list() == [30]
@@ -159,8 +186,31 @@ def test_minute_fetch_parses_time_and_slices_years(
 
 
 def test_minute_bad_freq_raises_before_network() -> None:
+    p = BaoStockProvider()
     with pytest.raises(ValueError, match="60min|不支持"):
-        P._fetch_minute(["600000.SH"], date(2024, 1, 1), date(2024, 1, 2), "7min")
+        p._fetch_minute(["600000.SH"], date(2024, 1, 1), date(2024, 1, 2), "7min")
+
+
+def test_empty_raw_short_circuits(provider: BaoStockProvider) -> None:
+    """零列/零行 raw → engine 短路返回 schema 形状空表（旧行为是空 df，不炸）。"""
+    for bad in (pl.DataFrame(), _daily_raw_after_fetch().clear()):
+        out = provider.request("daily_bar", _raw=bad)
+        assert out.columns == list(SCHEMAS["daily_bar"])
+        assert out.height == 0
+        out_m = provider.request("minute_bar", _raw=pl.DataFrame(), freq="60min")
+        assert out_m.columns == list(SCHEMAS["minute_bar"])
+
+
+def test_daily_bars_end_to_end_no_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """daily_bars 全链路（watchdog 打桩）：is_st 挂回、无实例状态。"""
+    monkeypatch.setattr(wd, "run_with_watchdog", lambda fn, *a, **k: DAILY_ROWS)
+    p = BaoStockProvider()
+    out = p.daily_bars(["600000.SH"], date(2024, 1, 1), date(2024, 1, 4))
+    assert out["is_st"].to_list() == [False, True]
+    assert out["amount"].to_list() == [300000.0, 330000.0]
+    assert out["symbol"].to_list() == ["600000.SH", "600000.SH"]
 
 
 def test_real_yaml_loads() -> None:

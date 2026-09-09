@@ -20,7 +20,7 @@ from lquant.core.errors import MappingError
 from lquant.data.base import DataProvider
 from lquant.data.mapping import apply_mapping, load_table_mapping
 from lquant.data.normalize import assert_ohlc, assert_plausible_prices
-from lquant.data.schema import SCHEMAS, coerce
+from lquant.data.schema import SCHEMAS, coerce, empty
 
 # 需要执行价格/OHLC 质量断言的表
 _ASSERT_TABLES = frozenset({"daily_bar", "minute_bar"})
@@ -93,6 +93,10 @@ class MappingProvider(DataProvider):
         raw = params.pop("_raw") if "_raw" in params else self._fetch_raw(
             table, *args, **params
         )
+        # 空结果短路：零列/零行 raw 进映射管线会在 rename 处炸
+        # （ColumnNotFoundError），统一短路成 schema 形状的空表
+        if raw.width == 0 or raw.height == 0:
+            return self._post_normalize(empty(table), table)
         tm = load_table_mapping(
             table, self.source or self.name, config_dir=config_dir
         )

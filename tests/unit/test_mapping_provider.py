@@ -15,6 +15,7 @@ import pytest
 from lquant.core.errors import DataQualityError, MappingError
 from lquant.data.capability import Capability
 from lquant.data.providers._engine import MappingProvider
+from lquant.data.schema import SCHEMAS
 
 FAKE_YAML = """
 sources:
@@ -180,3 +181,23 @@ def test_request_raw_passthrough(tmp_path: Path) -> None:
 
     out = NoFetch().request("daily_bar", _raw=raw, config_dir=_make_config(tmp_path))
     assert out["amount"].to_list() == [30000.0, 31000.0]
+
+
+def test_request_empty_raw_short_circuits(tmp_path: Path) -> None:
+    """零列/零行 raw → 短路返回 schema 形状空表，不进映射管线。"""
+    for bad in (pl.DataFrame(), pl.DataFrame({"d": [], "code": []})):
+        out = FakeProvider().request(
+            "daily_bar", _raw=bad, config_dir=_make_config(tmp_path)
+        )
+        assert out.columns == list(SCHEMAS["daily_bar"])
+        assert out.height == 0
+
+
+
+def test_request_empty_raw_short_circuits_minute(tmp_path: Path) -> None:
+    out = FakeProvider().request(
+        "minute_bar", _raw=pl.DataFrame(), freq="5min",
+        config_dir=_make_minute_config(tmp_path),
+    )
+    assert out.columns == list(SCHEMAS["minute_bar"])
+    assert out.height == 0

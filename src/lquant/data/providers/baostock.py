@@ -16,6 +16,7 @@ from typing import Any
 
 import polars as pl
 
+from lquant.core.errors import DataQualityError
 from lquant.core.types import SecType, parse_symbol
 from lquant.data.capability import Capability
 from lquant.data.normalize import normalize_symbols
@@ -185,6 +186,24 @@ def _year_slices(start: date, end: date):
     return out
 
 
+def _attach_is_st(out: pl.DataFrame, raw: pl.DataFrame) -> pl.DataFrame:
+    """把 fetch 侧的 is_st 布尔列挂回引擎输出（is_st 非日线路图列，映射层会丢）。
+
+    纯函数、无实例状态：长度不匹配 fail-fast；raw 无 is_st 时输出补全 null 列，
+    保持旧 daily_bars 输出恒有该列。
+    """
+    if "is_st" not in out.columns:
+        out = out.with_columns(pl.lit(None, dtype=pl.Boolean).alias("is_st"))
+    if raw.is_empty() or "is_st" not in raw.columns:
+        return out
+    if len(raw) != len(out):
+        raise DataQualityError(
+            "is_st_attach",
+            f"is_st 行数与映射输出不一致: raw={len(raw)} out={len(out)}",
+        )
+    return out.with_columns(raw["is_st"].cast(pl.Boolean).alias("is_st"))
+
+
 def _guess_sellable_days(name: str, track_index: str | None = None) -> int:
     """推断 T+N：股票 ETF = T+1，跨境/债/金/货币 ETF = T+0。"""
     text = f"{name}{track_index or ''}"
@@ -218,9 +237,6 @@ class BaoStockProvider(MappingProvider):
 
     def __init__(self, qps: float = 0, capability: frozenset[Capability] | None = None) -> None:
         self.capability = capability or self.capability
-        # daily_bars 期间暂存的停牌过滤后 is_st 列 —— is_st 不是
-        # SCHEMAS[daily_bar] 列，映射层 select 会丢掉，_post_normalize 再挂回
-        self._pending_is_st: pl.Series | None = None
 
     # ------------------------------------------------- MappingProvider 引擎
     def _fetch_raw(self, table: str, **params: Any) -> pl.DataFrame:
@@ -265,10 +281,9 @@ class BaoStockProvider(MappingProvider):
         )
         # 停牌日 volume=0 且 tradestatus=0 —— 不剔除会污染量价因子
         df = df.filter(pl.col("tradestatus").cast(pl.Utf8) != "0")
-        self._pending_is_st = (
-            df["isST"].cast(pl.Utf8).str.strip_chars().is_in(["1"])
-        )
-        return df.drop(["tradestatus", "isST"])
+        return df.drop("tradestatus").with_columns(
+            is_st=pl.col("isST").cast(pl.Utf8).str.strip_chars().is_in(["1"]),
+        ).drop("isST")
 
     def _fetch_minute(
         self, symbols: list[str], start: date, end: date, freq: str = "60min"
@@ -304,7 +319,9 @@ class BaoStockProvider(MappingProvider):
     def daily_bars(
         self, symbols: list[str], start: date, end: date
     ) -> pl.DataFrame:
-        return self.request("daily_bar", symbols=symbols, start=start, end=end)
+        raw = self._fetch_daily(symbols, start, end)
+        out = self.request("daily_bar", _raw=raw)
+        return _attach_is_st(out, raw)
 
     def minute_bars(
         self, symbols: list[str], start: date, end: date, freq: str = "60min"
@@ -315,13 +332,9 @@ class BaoStockProvider(MappingProvider):
         )
 
     def _post_normalize(self, df: pl.DataFrame, table: str) -> pl.DataFrame:
-        """引擎归一化后的 provider 侧钩子：符号归一、is_st 回挂、60min 边界。"""
+        """引擎归一化后的 provider 侧钩子：符号归一、60min 边界、ingested_at。"""
         df = normalize_symbols(df)
-        if table == "daily_bar":
-            if self._pending_is_st is not None:
-                df = df.with_columns(self._pending_is_st.alias("is_st"))
-                self._pending_is_st = None
-        elif table == "minute_bar":
+        if table == "minute_bar":
             df = self._normalize_60min_bounds(df)
             df = df.with_columns(
                 ingested_at=pl.lit(datetime.now(), dtype=pl.Datetime),
