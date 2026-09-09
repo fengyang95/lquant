@@ -70,6 +70,9 @@ function corrColor(v: number): string {
 
 export default function FactorsPage() {
   const { data: factors, mutate } = useSWR<FactorRow[]>('/factors', get);
+  const [srcFilter, setSrcFilter] = useState<string | null>(null);
+  const shownFactors = (factors ?? []).filter(
+    (f) => !srcFilter || (f as unknown as { source?: string }).source === srcFilter);
   const { data: builtin } = useSWR<BuiltinItem[]>('/factors/builtin', get);
   const [name, setName] = useState('mom20');
   const [expression, setExpression] = useState('Rank(Ts_Mean($close,5)/$close-1)');
@@ -536,7 +539,7 @@ export default function FactorsPage() {
 
       <Panel
         title="已注册因子"
-        meta={<>共 {factors?.length ?? 0} 个 · Qlib Alpha158 内置因子可一键入库</>}
+        meta={<>共 {shownFactors.length} 个 · Qlib Alpha158 内置因子可一键入库</>}
         actions={
           <button
             onClick={seedBuiltin}
@@ -547,6 +550,17 @@ export default function FactorsPage() {
           </button>
         }
       >
+        <div className="mb-3 flex flex-wrap items-center gap-1">
+          {['全部', 'qlib', 'yaml', 'manual'].map((src) => (
+            <button
+              key={src}
+              onClick={() => setSrcFilter(src === '全部' ? null : src)}
+              className={`tag ${(srcFilter ?? '全部') === src ? 'tag-on' : ''}`}
+            >
+              {src}
+            </button>
+          ))}
+        </div>
         <div className="mb-4 flex flex-wrap items-center gap-1">
           <input
             value={builtinQuery}
@@ -573,19 +587,24 @@ export default function FactorsPage() {
               <tr>
                 <th className="text-left">名称</th>
                 <th className="text-left">表达式</th>
+                <th className="text-left">来源</th>
                 <th className="text-left">注册时间</th>
               </tr>
             </thead>
             <tbody>
-              {factors.map((f) => (
-                <tr key={f.name} className="hover:bg-white">
-                  <td className="font-medium">
-                    <a href={`/factors/${f.name}`} className="hover:underline">{f.name}</a>
-                  </td>
-                  <td className="font-mono text-xs text-ink-dim">{f.expression || '—'}</td>
-                  <td className="text-ink-faint">{f.created_at?.slice(0, 19)}</td>
-                </tr>
-              ))}
+              {shownFactors.map((f) => {
+                const src = (f as unknown as { source?: string }).source;
+                return (
+                  <tr key={f.name} className="hover:bg-white">
+                    <td className="font-medium">
+                      <a href={`/factors/${f.name}`} className="hover:underline">{f.name}</a>
+                    </td>
+                    <td className="font-mono text-xs text-ink-dim">{f.expression || '—'}</td>
+                    <td className="text-ink-faint">{src ?? 'manual'}</td>
+                    <td className="text-ink-faint">{f.created_at?.slice(0, 19)}</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}

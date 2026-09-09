@@ -242,6 +242,21 @@ VIEWS: list[str] = [
 ]
 
 
+def ensure_factor_def_columns(con) -> int:
+    """factor_def 增列迁移：source / source_ref / factor_id（M2 来源接入）。
+
+    幂等：列已存在直接跳过。返回是否执行了迁移。
+    """
+    cols = {r[0] for r in con.execute("DESCRIBE factor_def").fetchall()}
+    n = 0
+    for col, typ in (("source", "VARCHAR DEFAULT 'manual'"), ("source_ref", "VARCHAR"),
+                     ("factor_id", "VARCHAR")):
+        if col not in cols:
+            con.execute(f"ALTER TABLE factor_def ADD COLUMN {col} {typ}")
+            n += 1
+    return n
+
+
 def ensure_factor_def(con) -> int:
     """factor_def 结构迁移：旧表（expr/category/universe 列）→ 新表（expression/description）。
 

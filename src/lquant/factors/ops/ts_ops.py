@@ -85,3 +85,43 @@ def ts_prod(x: pl.Expr, n: int) -> pl.Expr:
 @op("Ts_EMA", "TS", 1, "指数移动平均（span=n, adjust=False）")
 def ts_ema(x: pl.Expr, n: int) -> pl.Expr:
     return x.ewm_mean(span=n, adjust=False).over("symbol")
+
+
+@op("Ts_Quantile", "TS", 1, "时序分位数（q=0.8 时即 QTLU 口径）")
+def ts_quantile(x: pl.Expr, n: int, q: float = 0.8) -> pl.Expr:
+    return x.rolling_quantile(quantile=q, window_size=n).over("symbol")
+
+
+@op("Ts_Slope", "TS", 1, "时序回归斜率")
+def ts_slope(x: pl.Expr, n: int) -> pl.Expr:
+    return x.rolling_map(lambda s: float(np.polyfit(np.arange(len(s)), s, 1)[0]),
+                         window_size=n).over("symbol")
+
+
+@op("Ts_Rsquare", "TS", 1, "时序回归 R^2")
+def ts_rsquare(x: pl.Expr, n: int) -> pl.Expr:
+    def _r2(s):
+        if len(s) < 2 or np.std(s) < 1e-12:
+            return float("nan")
+        r = np.corrcoef(np.arange(len(s)), s)[0, 1]
+        return float(r * r)
+    return x.rolling_map(lambda s: _r2(s), window_size=n).over("symbol")
+
+
+@op("Ts_Resi", "TS", 1, "时序回归残差标准差")
+def ts_resi(x: pl.Expr, n: int) -> pl.Expr:
+    def _resi(s):
+        if len(s) < 2:
+            return float("nan")
+        coef = np.polyfit(np.arange(len(s)), s, 1)
+        fit = coef[0] * np.arange(len(s)) + coef[1]
+        return float(np.sqrt(np.mean((s - fit) ** 2)))
+    return x.rolling_map(lambda s: _resi(s), window_size=n).over("symbol")
+
+
+@op("Ts_WMA", "TS", 1, "加权移动平均（权重 1..n）")
+def ts_wma(x: pl.Expr, n: int) -> pl.Expr:
+    def _wma(s):
+        w = np.arange(1, len(s) + 1, dtype=float)
+        return float(np.dot(w, s) / w.sum())
+    return x.rolling_map(lambda s: _wma(s), window_size=n).over("symbol")

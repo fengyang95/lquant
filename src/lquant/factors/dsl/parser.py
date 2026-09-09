@@ -27,9 +27,21 @@ class Parser:
         if val != text:
             raise DSLParseError(f"期望 {text!r}，得到 {val!r}")
 
-    # expr := term (('+'|'-') term)*
+    # expr := cmp (('+'|'-') cmp)*
+    # cmp := term (('<'|'>') term)*  （比较产生 0/1，供 CNTP 族与 If 用）
     def parse_expr(self) -> Node:
+        node = self.parse_cmp()
+        while (t := self.peek()) and t[1] in ("+", "-"):
+            self.next()
+            node = BinaryOp(t[1], node, self.parse_cmp())
+        return node
+
+    def parse_cmp(self) -> Node:
         node = self.parse_term()
+        while (t := self.peek()) and t[1] in ("<", ">"):
+            self.next()
+            node = BinaryOp(t[1], node, self.parse_term())
+        return node
         while (t := self.peek()) and t[1] in ("+", "-"):
             self.next()
             node = BinaryOp(t[1], node, self.parse_term())

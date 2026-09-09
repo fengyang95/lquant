@@ -33,11 +33,12 @@ def api_env(tmp_path_factory):
     from lquant.data.ingest.demo import generate_demo
     from lquant.market.scheduler import collect_and_save
 
-    from lquant.data.store.ddl import DDL_STATEMENTS
+    from lquant.data.store.ddl import DDL_STATEMENTS, ensure_factor_def_columns
     from lquant.market.schema import ensure_market_tables
     with writer() as con:                # startup 前手动建库+看板表
         for stmt in DDL_STATEMENTS:
             con.execute(stmt)
+        ensure_factor_def_columns(con)
         ensure_market_tables(con)
     generate_demo(start="2024-01-01", end="2026-06-30")
     # 市场看板表灌一轮 demo 采集 —— breadth/snapshot/index 端点

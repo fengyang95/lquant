@@ -71,6 +71,7 @@ def compile_expr(node: Node) -> pl.Expr:
         l, r = compile_expr(node.left), compile_expr(node.right)
         return {
             "+": l + r, "-": l - r, "*": l * r, "/": l / r,
+            ">": (l > r).cast(pl.Float64), "<": (l < r).cast(pl.Float64),
         }[node.op]
     if isinstance(node, Call):
         fn = OPS.get(node.name)

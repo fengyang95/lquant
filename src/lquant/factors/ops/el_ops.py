@@ -39,3 +39,13 @@ def el_greater(a: pl.Expr, b: pl.Expr) -> pl.Expr:
 @op("Less", "EL", 0, "逐元素取小")
 def el_less(a: pl.Expr, b: pl.Expr) -> pl.Expr:
     return pl.min_horizontal(a, b)
+
+
+@op("SignedPower", "EL", 0, "带符号幂 sign(x)*|x|^p")
+def el_signed_power(x: pl.Expr, p: pl.Expr) -> pl.Expr:
+    return x.sign() * x.abs().pow(p)
+
+
+@op("If", "EL", 0, "逐元素条件 If(cond, a, b)")
+def el_if(c: pl.Expr, a: pl.Expr, b: pl.Expr) -> pl.Expr:
+    return pl.when(c > 0).then(a).otherwise(b)

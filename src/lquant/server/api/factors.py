@@ -42,18 +42,21 @@ class EvaluateIn(BaseModel):
 def list_factors(
     offset: int = Query(default=0, ge=0),
     limit: int | None = Query(default=None, ge=1, le=500),
+    source: str | None = Query(default=None, description="按来源筛选: qlib/yaml/manual"),
 ) -> list[dict]:
-    """已注册因子（factor_def 表）。offset/limit 分页，limit 缺省返回全量。"""
+    """已注册因子（factor_def 表）。offset/limit 分页 + source 筛选。"""
     suffix = f"OFFSET {offset}" + (f" LIMIT {limit}" if limit else "")
+    where = f"WHERE source = '{source}'" if source else ""
     with reader() as con:
         try:
             rows = con.execute(
-                "SELECT name, expression, description, created_at FROM factor_def "
-                f"ORDER BY created_at DESC {suffix}"
+                "SELECT name, expression, description, source, factor_id, created_at "
+                f"FROM factor_def {where} ORDER BY created_at DESC {suffix}"
             ).fetchall()
         except Exception:  # noqa: BLE001
             return []
-    return [{"name": r[0], "expression": r[1], "description": r[2], "created_at": str(r[3])}
+    return [{"name": r[0], "expression": r[1], "description": r[2],
+             "source": r[3], "factor_id": r[4], "created_at": str(r[5])}
             for r in rows]
 
 
@@ -218,6 +221,27 @@ def evaluate_series(req: EvaluateIn) -> dict:
     return s
 
 
+@router.post("/seed-yaml")
+def seed_yaml() -> dict:
+    """把 custom.yaml 因子入库（source=yaml，幂等覆盖）。"""
+    from lquant.factors.sources.yaml_source import load_custom
+
+    items = load_custom()
+    if not items:
+        raise HTTPException(422, "custom.yaml 无因子")
+    now = datetime.now()
+    n = upsert("factor_def", pl.DataFrame([{**it, "created_at": now} for it in items]))
+    return {"seeded": len(items), "rows_written": n}
+
+
+@router.get("/sources")
+def list_factor_sources() -> list[dict]:
+    """因子来源清单（M2 来源接入）。"""
+    from lquant.factors.sources import list_sources
+
+    return list_sources()
+
+
 @router.get("/builtin")
 def builtin_factors(
     family: str | None = Query(default=None, description="按族过滤：kbar/price/roc/ma/..."),
@@ -255,12 +279,24 @@ def seed_builtin(req: SeedBuiltinIn) -> dict:
     if not items:
         raise HTTPException(422, "没有匹配的内置因子")
     now = datetime.now()
-    n = upsert("factor_def", pl.DataFrame([{
-        "name": x["name"],
-        "expression": x["formula"],
-        "description": f"Qlib Alpha158 · {x['family']}",
-        "created_at": now,
-    } for x in items]))
+    from lquant.factors.sources.qlib_source import factor_id, translate
+
+    rows = []
+    for x in items:
+        try:
+            expr = translate(x["formula"])
+        except ValueError as e:
+            raise HTTPException(422, f"{x['name']} 翻译失败: {e}") from e
+        rows.append({
+            "name": x["name"],
+            "expression": expr,          # DSL 化：单一执行语义
+            "description": f"Qlib Alpha158 · {x['family']}",
+            "source": "qlib",
+            "source_ref": x["formula"],
+            "factor_id": factor_id(x["formula"]),
+            "created_at": now,
+        })
+    n = upsert("factor_def", pl.DataFrame(rows))
     return {"seeded": len(items), "rows_written": n,
             "sample": [x["name"] for x in items[:5]]}
 
