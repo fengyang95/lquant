@@ -38,6 +38,7 @@ type EvalSeries = {
   };
   decay: { horizons: number[]; ic: (number | null)[]; rank_ic: (number | null)[] };
   ic_by_year: { year: number; ic_mean: number | null; ir: number | null; positive_rate: number | null }[];
+  neutral_ladder?: { label: string; covs: string[]; ic_mean: number | null; rank_ic_mean: number | null; n_days: number }[];
 };
 type CorrResult = {
   factors: string[];
@@ -414,7 +415,29 @@ export default function FactorsPage() {
               : <Empty>样本不足</Empty>}
           </Panel>
           <div className="space-y-5">
-            <Panel title="IC 衰减" meta={`半衰期 ${evalRes?.half_life ?? '—'} 天 → 建议 ${evalRes?.suggested_rebalance ?? '—'}`}>
+            <Panel title="IC 归因阶梯" meta="原始 → +市值 → +行业 → +换手率（逐段叠加看 IC 掉多少）">
+            {(evalSeries.neutral_ladder?.length ?? 0) > 0 ? (
+              <div className="space-y-1.5 px-1 py-2 text-xs">
+                {evalSeries.neutral_ladder!.map((l) => {
+                  const first = evalSeries.neutral_ladder![0].ic_mean ?? 0;
+                  const v = l.ic_mean ?? 0;
+                  const drop = first !== 0 ? ((first - v) / Math.abs(first) * 100).toFixed(0) : '0';
+                  const w = first !== 0 ? Math.min(Math.abs(v / first) * 100, 100) : 0;
+                  return (
+                    <div key={l.label} className="flex items-center gap-2">
+                      <span className="w-24 text-ink-dim">{l.label}</span>
+                      <div className="h-3 flex-1 rounded-sm bg-ink-faint/10">
+                        <div className="h-3 rounded-sm" style={{ width: `${w}%`, background: 'var(--c-indigo, #31589E)' }} />
+                      </div>
+                      <span className="w-16 text-right font-mono">{v.toFixed(4)}</span>
+                      <span className="w-10 text-right text-ink-faint">↓{drop}%</span>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : <Empty>协变量数据不足</Empty>}
+          </Panel>
+          <Panel title="IC 衰减" meta={`半衰期 ${evalRes?.half_life ?? '—'} 天 → 建议 ${evalRes?.suggested_rebalance ?? '—'}`}>
               {decayOption
                 ? <Chart option={decayOption} height={180} />
                 : <Empty>样本不足</Empty>}
