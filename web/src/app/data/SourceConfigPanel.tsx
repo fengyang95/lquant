@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import useSWR from 'swr';
 import { Panel } from '@/components/Panel';
 import { Msg } from '@/components/States';
-import { getData, putData } from '@/lib/api';
+import { getData, putData, delData } from '@/lib/api';
 import type { Provider, Setting } from './types';
 
 /** 可作为对拍 peer 的源：capability 含 daily 或 etf_daily 且 enabled */
@@ -48,6 +48,7 @@ export default function SourceConfigPanel() {
     setBusy(true);
     setMsg('');
     try {
+      let saved: string[] = [];
       if (primary) {
         const orderSetting = settings?.find((s) => s.key === 'providers_order');
         const rest = Array.isArray(orderSetting?.value)
@@ -58,14 +59,25 @@ export default function SourceConfigPanel() {
           key: 'providers_order',
           value: newOrder.join(','),
         });
+        saved.push('主源');
+      } else if (dirty) {
+        // 选回占位项（清空主源）：不做 PUT，仅提示；peers 照常保存
+        saved.push('peers');
       }
+      // peers 无条件保存：清空全部也生效。后端 list 校验拒绝空串，
+      // 故「清空」走 DELETE /settings/crosscheck_peers 重置回默认空。
       if (peers.length) {
         await putData('/settings/crosscheck_peers', {
           key: 'crosscheck_peers',
           value: peers.join(','),
         });
+        if (!saved.includes('peers')) saved.push('peers');
+      } else if (dirty) {
+        await delData('/settings/crosscheck_peers');
+        if (!saved.includes('peers')) saved.push('peers');
       }
-      setMsg('✓ 已保存，下一次拉取即生效');
+      const hint = !primary && dirty ? '（未选主源，主源保持原样）' : '';
+      setMsg(saved.length ? `✓ 已保存（${saved.join(' + ')}），下一次拉取即生效${hint}` : '未改动任何配置');
       setDirty(false);
       void mutateSettings();
     } catch (e) {

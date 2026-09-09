@@ -11,7 +11,11 @@ export default function BackfillModal({
   onClose: () => void;
   onCreated: (taskId: string) => void;
 }) {
-  const today = new Date().toISOString().slice(0, 10);
+  // 本地日期（toISOString 是 UTC，北京 0-8 点会落到昨天）
+  const today = (() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  })();
   const [start, setStart] = useState('2016-01-01');
   const [end, setEnd] = useState(today);
   const [busy, setBusy] = useState(false);

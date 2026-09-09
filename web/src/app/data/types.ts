@@ -50,7 +50,8 @@ export type QualityIssue = {
   trade_date: string | null;
   rule_code: string;
   severity: string;
-  detail: string;
+  /** 后端存 JSON（如 {"message": "..."}），非纯字符串 */
+  detail: { message?: string } & Record<string, unknown>;
   count: number;
   resolved: boolean;
   created_at: string;

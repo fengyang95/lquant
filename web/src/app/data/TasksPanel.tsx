@@ -172,28 +172,30 @@ function FailedDetailTable({ task, onRetry, retrying }: {
       {!task.failed_detail.length ? (
         <div className="py-2 text-xs text-ink-faint">无失败明细</div>
       ) : (
-        <table className="table-dense">
-          <thead>
-            <tr>
-              <th className="w-24 text-left">标的</th>
-              <th className="text-left">原因</th>
-              <th className="w-16 text-right">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {task.failed_detail.map((f) => (
-              <tr key={f.symbol}>
-                <td className="font-mono text-xs">{f.symbol}</td>
-                <td className="text-xs text-ink-dim">{f.reason}</td>
-                <td className="text-right">
-                  <button className="btn btn-sm" onClick={onRetry} disabled={retrying}>
-                    {retrying ? '…' : '重试'}
-                  </button>
-                </td>
+        <>
+          <table className="table-dense">
+            <thead>
+              <tr>
+                <th className="w-24 text-left">标的</th>
+                <th className="text-left">原因</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {task.failed_detail.map((f) => (
+                <tr key={f.symbol}>
+                  <td className="font-mono text-xs">{f.symbol}</td>
+                  <td className="text-xs text-ink-dim">{f.reason}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {/* retry 是任务级（重跑全部失败标的），不做逐行操作 */}
+          <div className="mt-2">
+            <button className="btn btn-sm" onClick={onRetry} disabled={retrying}>
+              {retrying ? '补漏中…' : `重试全部失败标的（${task.failed_detail.length}）`}
+            </button>
+          </div>
+        </>
       )}
     </div>
   );

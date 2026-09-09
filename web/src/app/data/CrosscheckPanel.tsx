@@ -76,7 +76,11 @@ export default function CrosscheckPanel() {
       )}
 
       {!issues?.length ? (
-        <Empty>暂无分歧 issue —— 触发对拍后这里展示 L2/L3 分歧明细</Empty>
+        summary && !summary.checked ? (
+          <Empty>本次对拍 L0（未抽查任何行）—— 未配置可用的对拍 peer 源，请先在「数据源配置」勾选 peers</Empty>
+        ) : (
+          <Empty>暂无分歧 issue —— 触发对拍后这里展示 L2/L3 分歧明细</Empty>
+        )
       ) : (
         <div className="max-h-80 overflow-auto">
           <table className="table-dense">
@@ -99,7 +103,7 @@ export default function CrosscheckPanel() {
                   </td>
                   <td className="text-xs text-ink-dim">
                     {it.rule_code}
-                    {it.detail ? ` · ${it.detail}` : ''}
+                    {it.detail?.message ? ` · ${it.detail.message}` : ''}
                   </td>
                   <td className="text-right">
                     <button
