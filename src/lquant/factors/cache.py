@@ -46,9 +46,12 @@ class TwoTierCache:
         return p
 
     @staticmethod
-    def key(defs: list[dict], start: date, end: date, version: str) -> str:
-        """稳定 key：对 defs 排序后做签名，避免 dict 顺序抖动导致缓存翻车。"""
-        # defs 排序后再签名：同一组因子无论传序都共享缓存
+    def key(defs: list[dict], start: date, end: date, version: str,
+            steps: list[dict] | None = None) -> str:
+        """稳定 key：defs 排序签名 + steps 有序序列化（流水线顺序有语义）。
+
+        steps 是预处理配方，改配方必须换 key —— 否则「改了参数没反应」（缺陷 #12）。
+        """
         ordered = sorted(defs, key=lambda d: (d["name"],
                                               d.get("expression", d.get("formula", ""))))
         sig = json.dumps(
@@ -56,7 +59,9 @@ class TwoTierCache:
              for d in ordered],
             sort_keys=True, ensure_ascii=False,
         )
-        raw = f"{sig}|{_fmt(start)}|{_fmt(end)}|{version}"
+        steps_sig = (json.dumps(steps, sort_keys=True, ensure_ascii=False)
+                     if steps else "")
+        raw = f"{sig}|{steps_sig}|{_fmt(start)}|{_fmt(end)}|{version}"
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
     def get(self, key: str) -> pl.DataFrame | None:

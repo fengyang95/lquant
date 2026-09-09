@@ -65,7 +65,7 @@ class FactorEngine:
 
         version = data_version or lineage.latest("daily") or "unknown"
         cache = get_cache()
-        key = cache.key(defs, start, end, version)
+        key = cache.key(defs, start, end, version, steps=steps)
         hit = cache.get(key)
         if hit is not None:
             return hit
