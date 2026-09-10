@@ -130,6 +130,34 @@ def test_write_failure_keeps_ring(mdb, monkeypatch):
     get_settings.cache_clear()
 
 
+def test_write_failure_keeps_data_for_retry(mdb):
+    """写阶段失败：已 drain 的数据暂存 pending，下个周期成功重写。"""
+    api_ring.drain()
+    local_events.drain()
+    with fl._PENDING_LOCK:
+        fl._PENDING_API.clear()
+        fl._PENDING_TASK.clear()
+    api_ring.append(_pt(ts=time.time()))
+    real_write_api = fl._write_api
+    state = {"n": 0}
+
+    def flaky(con, pts):
+        if state["n"] == 0:
+            state["n"] += 1
+            raise RuntimeError("boom")
+        return real_write_api(con, pts)
+
+    with patch.object(fl, "_write_api", side_effect=flaky):
+        out = fl.flush_once()
+    assert out["api"] == 0
+    assert api_ring.snapshot() == ()  # 已 drain，由 pending 保留
+    out2 = fl.flush_once()
+    assert out2["api"] == 1  # 下个周期 pending 重写成功
+    n = duckdb.connect(mdb).execute(
+        "SELECT count(*) FROM metrics_api").fetchone()[0]
+    assert n == 1
+
+
 def test_retention_cleanup(mdb):
     con = duckdb.connect(mdb)
     fl.ensure_tables(con)
