@@ -70,10 +70,18 @@ class DemoProvider:
 
     fail_symbols：这些标的 daily_bars 抛 RuntimeError（脚本化首次失败，
     retry 后换 fail_once=False 即成功）。
+    dirty_symbols：这些标的产出脏数据（close<=0.1 触发 PRICE_RANGE fatal
+    断言）——质量门禁拦批路径用。
+    fill_valuation：给估值/市值/状态新列填非空值（dtype round-trip
+    断言用；全 null 列经 parquet round-trip 可能变 Null dtype）。
     """
 
-    def __init__(self, fail_symbols: set[str] | None = None) -> None:
+    def __init__(self, fail_symbols: set[str] | None = None,
+                 dirty_symbols: set[str] | None = None,
+                 fill_valuation: bool = False) -> None:
         self.fail_symbols = set(fail_symbols or [])
+        self.dirty_symbols = set(dirty_symbols or [])
+        self.fill_valuation = fill_valuation
         self.calls: list[tuple[list[str], date, date | None]] = []
 
     def daily_bars(self, symbols, start, end):
@@ -84,11 +92,14 @@ class DemoProvider:
         if bad:
             raise RuntimeError(f"源站拒绝: {bad}")
         for i, sym in enumerate(good):
-            frames.append(self._bars(sym, start, end, seed=100 + i))
+            frames.append(self._bars(sym, start, end, seed=100 + i,
+                                     dirty=sym in self.dirty_symbols,
+                                     fill=self.fill_valuation))
         return pl.concat(frames) if frames else pl.DataFrame()
 
     @staticmethod
-    def _bars(sym: str, start: date, end: date, seed: int) -> pl.DataFrame:
+    def _bars(sym: str, start: date, end: date, seed: int, *,
+              dirty: bool = False, fill: bool = False) -> pl.DataFrame:
         import pandas as pd
 
         days = pd.bdate_range(start, end).date
@@ -101,6 +112,21 @@ class DemoProvider:
         high = np.maximum(open_, close) * 1.01
         low = np.minimum(open_, close) * 0.99
         volume = rng.uniform(1e6, 5e6, n)
+        if dirty:
+            close = close * 0.001          # close <= 0.1 → PRICE_RANGE fatal
+        new_cols = {c: [None] * n for c in NEW_COLS}
+        if fill:
+            new_cols = {
+                "pct_chg": rng.normal(0, 2, n).round(2),
+                "is_st": [bool(i % 2 == 0) for i in range(n)],
+                "is_suspended": [False] * n,
+                "pe_ttm": rng.uniform(5, 60, n).round(2),
+                "pb_mrq": rng.uniform(0.5, 10, n).round(2),
+                "ps_ttm": rng.uniform(0.5, 15, n).round(2),
+                "pcf_ncf_ttm": rng.uniform(-20, 40, n).round(2),
+                "total_mv": (close * volume * 100).round(0),
+                "float_mv": (close * volume * 60).round(0),
+            }
         return pl.DataFrame({
             "trade_date": pl.Series(list(days), dtype=pl.Date),
             "symbol": [sym] * n,
@@ -112,7 +138,7 @@ class DemoProvider:
             "turnover_rate": rng.uniform(0.2, 5, n).round(2),
             "adj_factor": np.ones(n),
             "sec_type": ["stock"] * n,
-            **{c: [None] * n for c in NEW_COLS},
+            **new_cols,
         }).with_columns(pl.col("pe_ttm").cast(pl.Float64),
                         pl.col("is_st").cast(pl.Boolean))
 
@@ -225,3 +251,52 @@ def test_retry_e2e_only_refills_failed(seeded_db, monkeypatch):
     # 其余标的没有重复行（upsert 语义，不因 retry 翻倍）
     n_dup = len(lake2) - len(lake2.unique(subset=["symbol", "trade_date"]))
     assert n_dup == 0
+
+
+def test_quality_gate_rejects_dirty_batch(seeded_db, monkeypatch):
+    """负向：provider 产出 close<=0.1 的脏批 → PRICE_RANGE fatal 门禁拒批
+    → 任务终态 partial、failed_symbols/failed_detail 记录、湖里只有干净批次。
+
+    脏标的选 000001.SZ：000003.SZ 的窗口在退市后为空（不产数据）；
+    000001.SZ 与 ETF 不同 phase/组，拒批只影响它自己。
+    """
+    prov = DemoProvider(dirty_symbols={"000001.SZ"})
+    monkeypatch.setattr("lquant.data.providers.get_provider", lambda: prov)
+    monkeypatch.setattr(
+        "lquant.data.ingest.crosscheck.run_crosscheck",
+        lambda *a, **kw: {"summary": {"L0": 1}, "issues": [], "flagged_rows": 0},
+    )
+    t = tasks_mod.create_task("full_backfill", _task_range())
+    out = tasks_mod.execute_task(t["task_id"])
+    assert out["status"] == "partial", out
+    assert out["failed_symbols"] == ["000001.SZ"]
+    assert len(out["failed_detail"]) == 1
+    d = out["failed_detail"][0]
+    assert d["symbol"] == "000001.SZ"
+    assert d["reason"].startswith("quality:"), d
+
+    # 湖里只有干净批次的数据
+    lake = read_daily().collect()
+    assert "000001.SZ" not in set(lake["symbol"])
+    assert "510300.SH" in set(lake["symbol"])
+    assert len(lake) > 0
+
+
+def test_lake_schema_roundtrip_dtypes(seeded_db, monkeypatch):
+    """dtype：估值/市值列非空入湖 → parquet round-trip 后 Boolean/Float64 保持。"""
+    prov = DemoProvider(fill_valuation=True)
+    monkeypatch.setattr("lquant.data.providers.get_provider", lambda: prov)
+    monkeypatch.setattr(
+        "lquant.data.ingest.crosscheck.run_crosscheck",
+        lambda *a, **kw: {"summary": {"L0": 1}, "flagged_rows": 0},
+    )
+    t = tasks_mod.create_task("full_backfill", _task_range())
+    out = tasks_mod.execute_task(t["task_id"])
+    assert out["status"] == "ok", out
+
+    schema = read_daily().collect().schema
+    assert schema["is_st"] == pl.Boolean
+    assert schema["is_suspended"] == pl.Boolean
+    for c in ("pct_chg", "pe_ttm", "pb_mrq", "ps_ttm", "pcf_ncf_ttm",
+              "total_mv", "float_mv"):
+        assert schema[c] == pl.Float64, c
