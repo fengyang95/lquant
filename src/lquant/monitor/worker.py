@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
+import threading
 import time
 
 from rq import Worker
@@ -58,3 +60,91 @@ def current_job_fn():
     except Exception:  # noqa: BLE001
         return None
     return None
+
+
+GENERAL_QUEUES = ["lquant-default", "lquant-ingest"]
+BACKTEST_QUEUE = "lquant-backtest"
+
+# supervisor 优雅停机标志（_shutdown / stop_supervisor 置位）
+_supervisor_stop = threading.Event()
+
+
+def stop_supervisor() -> None:
+    """请求 supervisor watchdog 退出（优雅停机入口）。"""
+    _supervisor_stop.set()
+
+
+def _redis_ok() -> bool:
+    from lquant.server.jobs import _redis_available
+
+    return _redis_available()
+
+
+def spawn_worker(name: str, queues: list[str]) -> None:
+    """子进程入口（top-level，spawn 可 pickle）。Redis 失败 exit 1。"""
+    if not _redis_ok():
+        print("错误: Redis 不可用 —— 先启动 Redis（docker compose up -d redis）",
+              file=__import__("sys").stderr)
+        raise SystemExit(1)
+    from lquant.monitor import proc_sampler
+
+    w = MonitoringWorker(queues)
+    proc_sampler.start_sampler(name, current_job_fn=current_job_fn)
+    try:
+        w.run()
+    finally:
+        proc_sampler.stop_sampler()
+
+
+def _spawn_process(name: str, queues: list[str]):
+    """独立函数便于测试替身。"""
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("spawn")
+    p = ctx.Process(target=spawn_worker, args=(name, queues), name=name,
+                    daemon=True)
+    p.start()
+    return p
+
+
+def run_supervisor(general: int, backtest: int) -> None:
+    """拉起 worker 组 + watchdog respawn；Ctrl-C → 子进程 SIGINT → 5s grace → terminate。"""
+    if not _redis_ok():
+        print("错误: Redis 不可用 —— 先启动 Redis（docker compose up -d redis）",
+              file=__import__("sys").stderr)
+        raise SystemExit(1)
+    _supervisor_stop.clear()
+    children: list = []
+    for i in range(general):
+        children.append(_spawn_process(f"general-{i}", GENERAL_QUEUES))
+    for i in range(backtest):
+        children.append(_spawn_process(f"backtest-{i}", [BACKTEST_QUEUE]))
+    print(f"[worker] 已拉起 {len(children)} 个 worker 进程")
+
+    def _shutdown(signum, frame):
+        _supervisor_stop.set()
+        for p in children:
+            if p.is_alive():
+                import os as _os
+
+                _os.kill(p.pid, signal.SIGINT)  # RQ friendly shutdown
+        deadline = time.time() + 5
+        for p in children:
+            p.join(timeout=max(0.1, deadline - time.time()))
+        for p in children:
+            if p.is_alive():
+                p.terminate()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+    while not _supervisor_stop.is_set():
+        time.sleep(5)
+        for idx, p in enumerate(children):
+            if not p.is_alive():
+                _LOG.warning("worker %s 退出(code=%s)，respawn", p.name,
+                             p.exitcode)
+                name, queues = p.name, (
+                    GENERAL_QUEUES if p.name.startswith("general-")
+                    else [BACKTEST_QUEUE])
+                children[idx] = _spawn_process(name, queues)
