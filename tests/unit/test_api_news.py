@@ -210,6 +210,21 @@ def test_post_task_ok_then_conflict(client):
     assert client.post("/api/news/tasks", json={"kind": "manual"}).status_code == 409
 
 
+def test_post_task_default_all_sources(client):
+    """不传 sources → 默认全注册表，params 里可查到两个采集器。"""
+    from lquant.core.db import writer
+
+    # 清掉前面用例种下的 pending/running 残留，避免互斥 409
+    with writer() as con:
+        con.execute("DELETE FROM news_task WHERE task_id LIKE 'news_%_x'")
+    r = client.post("/api/news/tasks", json={"kind": "manual"})
+    assert r.status_code == 200, r.text
+    task_id = r.json()["data"]["task_id"]
+    rows = client.get("/api/news/tasks").json()["data"]
+    row = next(x for x in rows if x["task_id"] == task_id)
+    assert set(row["params"]["sources"]) >= {"cls_telegraph", "em_news"}
+
+
 def test_post_task_422_bad_params(client):
     assert client.post("/api/news/tasks",
                        json={"kind": "bogus"}).status_code == 422

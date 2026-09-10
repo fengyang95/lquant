@@ -80,6 +80,22 @@ def _startup() -> None:
     except Exception as e:  # noqa: BLE001 - 同上，不阻断启动
         print(f"[startup] 数据任务中断标记跳过: {e}")
 
+    # 资讯任务启动恢复：建 news_task 表后把 pending/running 残留标 interrupted
+    try:
+        from lquant.core.db import writer
+        from lquant.news.tasks import (
+            init_news_task_ddl,
+            mark_interrupted_on_startup,
+        )
+
+        with writer() as con:
+            init_news_task_ddl(con)
+            n = mark_interrupted_on_startup(con)
+        if n:
+            print(f"[startup] {n} 个资讯任务标记为 interrupted（可 retry 续传）")
+    except Exception as e:  # noqa: BLE001 - 同上，不阻断启动
+        print(f"[startup] 资讯任务中断标记跳过: {e}")
+
     # 定时同步 worker（daemon 线程，每 30s 检查到期作业；测试用 LQ_SYNC_WORKER=0 关闭）
     import os
     import threading

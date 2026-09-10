@@ -52,7 +52,7 @@ export function NewsFeedList({
             </span>
             <div className="min-w-0 flex-1">
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                <SourceBadge kind={n.source_tag} />
+                <SourceBadge kind={n.source} />
                 <span className="text-xs text-ink-faint">{n.source_name || n.source}</span>
                 {n.title ? (
                   n.url ? (

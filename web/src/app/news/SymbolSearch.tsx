@@ -18,7 +18,7 @@ export function SymbolSearch({ onSelect }: { onSelect: (symbol: string) => void 
 
   const { data: suggestions } = useSWR<SecRow[]>(
     debouncedQ.trim().length >= 2
-      ? `/data/securities?q=${encodeURIComponent(debouncedQ.trim())}&limit=8`
+      ? `/data/securities?q=${encodeURIComponent(debouncedQ.trim())}&limit=8&sec_type=stock`
       : null,
     fetcher,
   );

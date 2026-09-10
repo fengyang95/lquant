@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import date
+from pathlib import Path
 
 from fastapi import HTTPException, Query
 from pydantic import BaseModel
@@ -32,7 +33,7 @@ def _ensure_schema() -> None:
     """
     from lquant.core.config import get_settings
 
-    path_key = get_settings().duckdb_path
+    path_key = str(Path(get_settings().duckdb_path).resolve())
     if path_key in _schema_ready:
         return
     from lquant.news.store import init_news_ddl
@@ -192,19 +193,18 @@ class NewsTaskCreate(BaseModel):
 def create_news_task(body: NewsTaskCreate) -> dict:
     """创建并同步执行采集任务（M1 无后台线程）；冲突 409，参数非法 422。"""
     day = _parse_day_or_422(body.date)
-    if body.sources:
-        known = {r["source"] for r in _registry_rows()}
-        unknown = set(body.sources) - known
-        if unknown:
-            raise HTTPException(422, f"未知资讯来源: {sorted(unknown)}")
+    known = {r["source"] for r in _registry_rows()}
+    sources = sorted(body.sources) if body.sources else sorted(known)
+    unknown = set(sources) - known
+    if unknown:
+        raise HTTPException(422, f"未知资讯来源: {sorted(unknown)}")
 
     from lquant.news.tasks import TaskConflictError, create_task, execute_task
 
     params: dict = {}
     if day is not None:
         params["date"] = day
-    if body.sources:
-        params["sources"] = body.sources
+    params["sources"] = sources
     try:
         with writer() as con:
             _ensure_schema()

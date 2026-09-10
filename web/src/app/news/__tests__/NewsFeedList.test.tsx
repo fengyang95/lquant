@@ -65,4 +65,11 @@ describe('NewsFeedList', () => {
     );
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
   });
+
+  it('生产路径数据无 source_tag（空串）时徽章仍按 source 类别着色', () => {
+    // 采集器从不写 source_tag → 生产入库恒为 ""，契约字段是 source
+    const raw = item({ source: 'telegraph', source_tag: '' });
+    render(<NewsFeedList items={[raw]} total={1} limit={50} offset={0} />);
+    expect(screen.getByText('电报').className).toContain('bg-emerald-50');
+  });
 });
