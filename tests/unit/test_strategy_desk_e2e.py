@@ -8,7 +8,7 @@
 2. GET 回读 source → POST /api/backtests/run-code（带 factor_formulas + strategy_id）
    → run_id、metrics、logs 非空；
 3. GET /api/backtests/{run_id} → records 含 record 的 key 且有日期序列、
-   logs 非空、custom_analysis == []（自动执行在后续迭代接线，本期占位）；
+   logs 非空、custom_analysis 非空（run-code 自动执行已保存分析，chart spec 回读）；
 4. POST /api/analyses 保存一个从 result["metrics"] 产 chart spec 的分析 → 200 且冒烟通过；
 5. run_user_analysis 直接跑保存的分析源码（真实 metrics payload）→ 非空 chart spec；
 6. 反例：策略 source import os → 422（import 白名单拒绝）。
@@ -111,6 +111,11 @@ def run_metrics(client):
     assert saved["version"] == 1
     sid = saved["id"]
 
+    # 1.5 保存一个自定义分析（run-code 会自动执行它）
+    ra = client.post("/api/analyses", json={
+        "name": "e2e_metrics_chart", "source": ANALYSIS_SOURCE})
+    assert ra.status_code == 200, ra.text
+
     # 2. 回读 source 再跑回测（工作台前端同款路径）
     got = client.get(f"/api/strategies/{sid}")
     assert got.status_code == 200
@@ -148,7 +153,10 @@ def run_metrics(client):
     assert {"date", "value"} <= set(series[0])
     assert all(x["value"] > 0 for x in series)          # 组合总资产恒正
     assert d["logs"], "详情里 logs 不应为空"
-    assert d["custom_analysis"] == []                   # 本期占位空列表
+    ca = d["custom_analysis"]
+    assert ca, "run-code 应自动执行已保存分析，custom_analysis 不为空"
+    chart = next(s for s in ca if s.get("type") == "chart")
+    assert chart["type"] == "chart" and chart["data"], "chart spec 数据为空"
     return body["run_id"], d, body["metrics"]
 
 

@@ -197,6 +197,86 @@ def test_analysis_get_404(client):
 
 # ---------- run-code 因子联动 + record 落库 ----------
 
+RUN_CODE_SRC = '''
+def initialize(context):
+    set_order_cost(type="stock", open_tax=0, close_tax=0,
+                   open_commission=0, close_commission=0, min_commission=0)
+    run_monthly(rebal, monthday=1, time="open")
+
+def rebal(context):
+    order_target_value("600519.SH", context.portfolio.total_value * 0.5)
+    record(x=context.portfolio.total_value)
+    log.info("rebal done")
+'''
+
+
+def _save_chart_analysis(client, name: str) -> str:
+    """保存一个从 metrics 产 chart spec 的分析，返回 id。"""
+    src = ('def analyze(result):\n'
+           '    m = result.get("metrics", {})\n'
+           '    numeric = {k: v for k, v in m.items() if isinstance(v, (int, float))\n'
+           '               and not isinstance(v, bool)}\n'
+           '    return [{"type": "chart", "title": "指标一览",\n'
+           '              "data": [{"x": k, "value": float(v)}\n'
+           '                       for k, v in sorted(numeric.items())],\n'
+           '              "x": "x", "ys": ["value"]}]')
+    r = client.post("/api/analyses", json={"name": name, "source": src})
+    assert r.status_code == 200, r.text
+    return r.json()["id"]
+
+
+def _run_code(client) -> str:
+    """跑一次默认 run-code，返回 run_id。"""
+    r = client.post("/api/backtests/run-code", json={
+        "code": RUN_CODE_SRC, "start": "2026-01-01", "initial_cash": 1_000_000})
+    assert r.status_code == 200, r.text
+    return r.json()["run_id"]
+
+
+def test_run_code_auto_executes_saved_analysis(client):
+    """run_analysis=True（默认）：已保存分析自动执行，chart spec 落库并回读。"""
+    _save_chart_analysis(client, "autoexec_chart")
+    rid = _run_code(client)
+
+    body = client.get(f"/api/backtests/{rid}").json()
+    ca = body["custom_analysis"]
+    assert ca, "custom_analysis 不应为空"
+    chart = next(s for s in ca if s.get("type") == "chart")
+    assert chart["title"] == "指标一览"
+    assert chart["data"] and chart["x"] == "x" and chart["ys"] == ["value"]
+    assert any("annual_return" in str(d["x"]) for d in chart["data"]) or chart["data"]
+
+
+def test_run_code_broken_analysis_does_not_fail_backtest(client):
+    """坏分析只产生 error 条目，回测本身照常成功落库。"""
+    r = client.post("/api/analyses", json={
+        "name": "autoexec_broken",
+        # 空数据冒烟能过（返回 []），真实数据上输出非法 spec → 运行时失败
+        "source": 'def analyze(result):\n'
+                  '    if not result["nav"]:\n'
+                  '        return []\n'
+                  '    return [{"type": "pie"}]\n'})
+    assert r.status_code == 200, r.text
+    rid = _run_code(client)
+
+    assert client.get(f"/api/backtests/{rid}").status_code == 200
+    body = client.get(f"/api/backtests/{rid}").json()
+    err = [s for s in body["custom_analysis"] if "error" in s]
+    assert err, f"应包含 error 条目: {body['custom_analysis']}"
+    assert any("分析执行失败" in s["error"] for s in err)
+
+
+def test_run_code_without_analysis_flag(client):
+    """run_analysis=False：跳过分析执行，custom_analysis 为空列表。"""
+    _save_chart_analysis(client, "autoexec_skipped")
+    r = client.post("/api/backtests/run-code", json={
+        "code": RUN_CODE_SRC, "start": "2026-01-01", "initial_cash": 1_000_000,
+        "run_analysis": False})
+    assert r.status_code == 200, r.text
+    rid = r.json()["run_id"]
+    assert client.get(f"/api/backtests/{rid}").json()["custom_analysis"] == []
+
+
 def test_run_code_with_factor_and_records(client):
     factor = _builtin_factor()
     code = f'''
@@ -223,8 +303,7 @@ def rebal(context):
     assert body["records"] and "x" in body["records"]
     assert body["records"]["x"] and {"date", "value"} <= set(body["records"]["x"][0])
     assert body["logs"]
-    # custom_analysis 本期占位为空列表
-    assert body["custom_analysis"] == []
+    assert isinstance(body["custom_analysis"], list)
 
     # params 里应带 strategy_id / factor_formulas / logs
     assert body["params"]["factor_formulas"] == [factor]

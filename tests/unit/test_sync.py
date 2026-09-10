@@ -25,6 +25,7 @@ def sync_env(tmp_path_factory):
         pytest.skip("需要本地 data/duckdb/lquant.duckdb（不入库，CI 上跳过）",
                     allow_module_level=True)
     base = tmp_path_factory.mktemp("sync")
+    old_cwd = os.getcwd()
     os.chdir(base)
     (base / "data" / "duckdb").mkdir(parents=True, exist_ok=True)
     shutil.copy2(LQ_ROOT / "data" / "duckdb" / "lquant.duckdb",
@@ -42,6 +43,9 @@ def sync_env(tmp_path_factory):
 
     get_settings.cache_clear()
     yield base
+    # 恢复 cwd —— 泄漏的 cwd 会被 pytest tmp 保留策略回收掉，
+    # 之后所有模块 os.getcwd() 直接 FileNotFoundError（M9 教训同款）。
+    os.chdir(old_cwd)
     get_settings.cache_clear()
 
 
