@@ -453,6 +453,17 @@ sys.exit(0 if _redis_available() else 1)" 2>/dev/null; then
     fi
   fi
 
+  # 监控 worker 进程组（lq worker：1 通用 + K 回测，K=LQ_BACKTEST_WORKERS 或默认 2）
+  if ! pid_ok "$RUN_DIR/lqworker.pid"; then
+    mkdir -p logs
+    if command -v redis-cli >/dev/null 2>&1 && redis-cli -u "${LQ_REDIS_URL:-redis://localhost:6379/0}" ping >/dev/null 2>&1; then
+      info "启动监控 Worker 进程组 (lq worker)"
+      spawn lqworker logs/worker.log .venv/bin/lq worker
+    else
+      warn "Redis 不可用，跳过监控 Worker 启动（监控页将显示 offline）"
+    fi
+  fi
+
   if [ "$no_web" = 0 ]; then
     if pid_ok "$RUN_DIR/web.pid"; then warn "Web 已在运行 (pid $(cat "$RUN_DIR/web.pid"))"; else
       free_port "$WEB_PORT"
@@ -481,7 +492,7 @@ sys.exit(0 if _redis_available() else 1)" 2>/dev/null; then
 
 cmd_stop() {
   info "停止服务"
-  for name in web worker api; do
+  for name in web lqworker worker api; do
     if pid_ok "$RUN_DIR/$name.pid"; then
       local pid; pid="$(cat "$RUN_DIR/$name.pid")"
       kill "$pid" 2>/dev/null || true
@@ -494,13 +505,14 @@ cmd_stop() {
   # uvicorn/rq/next 可能有残留子进程
   pkill -f "uvicorn lquant.server.main" 2>/dev/null && dim "清理残留 uvicorn" || true
   pkill -f "rq worker lquant" 2>/dev/null || true
+  pkill -f "lq worker" 2>/dev/null || true
   info "done"
 }
 
 cmd_status() {
   echo "== lquant 服务状态 =="
   local name pid
-  for name in api worker web; do
+  for name in api lqworker worker web; do
     if pid_ok "$RUN_DIR/$name.pid"; then
       echo "  [运行中] $name  pid=$(cat "$RUN_DIR/$name.pid")"
     else
@@ -519,6 +531,7 @@ cmd_logs() {
   local name="${1:-api}"
   case "$name" in
     api|worker|web) tail -n 100 -f "$LOG_DIR/$name.log" ;;
+    lqworker) tail -n 100 -f logs/worker.log ;;
     *) fail "用法: ./lquant.sh logs [api|worker|web]" ;;
   esac
 }
