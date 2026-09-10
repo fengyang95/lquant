@@ -76,9 +76,8 @@ def api_env(tmp_path_factory):
 
         from lquant.core.db import writer
         from lquant.data.ingest.demo import generate_demo
-        from lquant.market.schema import ensure_market_tables
-
         from lquant.data.store.ddl import DDL_STATEMENTS
+        from lquant.market.schema import ensure_market_tables
         with writer() as con:                # startup 前手动建库 + 看板表
             for stmt in DDL_STATEMENTS:
                 con.execute(stmt)

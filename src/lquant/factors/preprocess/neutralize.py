@@ -35,7 +35,10 @@ def _resolve_market_cap(
     if source == "float_mv" and FLOAT_MV_COL not in df.columns:
         raise ValueError(
             f"market_cap_source='float_mv' 但 df 无 {FLOAT_MV_COL} 列")
-    if source == "auto" and FLOAT_MV_COL not in df.columns:
+    if source == "auto" and (FLOAT_MV_COL not in df.columns
+                             or CAP_COL not in df.columns):
+        # float_mv 或 market_cap 任一缺失都不 coalesce —— 缺列交给
+        # residual_by_day 的 N6 守卫报错，绝不静默退化（Polars 缺列会炸）
         return df, factors, None
     if source not in ("auto", "float_mv"):
         raise ValueError(f"未知 market_cap_source: {source}")

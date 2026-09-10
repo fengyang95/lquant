@@ -25,7 +25,6 @@ def fake_settings(tmp_path, monkeypatch):
     与 providers_order 的 config 派生都读它，内容即回退断言的依据。
     """
     import shutil
-
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[2]

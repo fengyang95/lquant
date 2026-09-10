@@ -2,8 +2,14 @@
 import pytest
 
 from lquant.backtest.strategy_store import (
-    delete_strategy, get_analysis, get_strategy, list_analyses,
-    list_strategies, list_versions, save_analysis, save_strategy,
+    delete_strategy,
+    get_analysis,
+    get_strategy,
+    list_analyses,
+    list_strategies,
+    list_versions,
+    save_analysis,
+    save_strategy,
 )
 
 
