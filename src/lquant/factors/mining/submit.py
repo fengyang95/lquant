@@ -37,7 +37,7 @@ def _split_eval(df, cov_cols, expr):
     from lquant.factors.evaluate import forward_return
     from lquant.factors.evaluate.ic import ic_series
     from lquant.factors.mining.runner import split_dates
-    from lquant.factors.preprocess.pipeline import run as pipeline_run
+    from lquant.factors.preprocess.pipeline import run as pipeline_run, drop_nonfinite
 
     dates = df["trade_date"].unique().to_list()
     train_d, val_d, _ = split_dates(dates)
@@ -51,7 +51,8 @@ def _split_eval(df, cov_cols, expr):
                 {"op": "winsorize", "method": "mad", "n": 5},
                 {"op": "standardize", "method": "zscore"},
                 {"op": "neutralize", "method": "ols", "factors": cov_cols},
-            ]).drop_nulls(["f"])
+            ])
+        d = drop_nonfinite(d, "f")
         s = ic_series(d, "f", "fwd_ret_1")
         out[label] = s
     return out

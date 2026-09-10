@@ -101,11 +101,18 @@ class TwoTierCache:
 
 
 _cache: TwoTierCache | None = None
+_cache_root: str | None = None
 
 
 def get_cache() -> TwoTierCache:
-    """进程级单例：不同模块共享同一内存层，省的反复重建。"""
-    global _cache
-    if _cache is None:
+    """进程级单例：不同模块共享同一内存层，省的反复重建。
+
+    LQUANT_CACHE_DIR 变更（测试隔离）时重建 —— 否则上个测试环境的内存
+    条目会串进下个测试（缓存命中断言随机翻车）。
+    """
+    global _cache, _cache_root
+    override = os.getenv("LQUANT_CACHE_DIR")
+    if _cache is None or override != _cache_root:
         _cache = TwoTierCache()
+        _cache_root = override
     return _cache

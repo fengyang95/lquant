@@ -32,9 +32,10 @@ def check_expr(expr: str) -> None:
     import json
     import sys
 
+    from lquant.factors.mining.submit import _daily_fields
     from lquant.factors.mining.gates import g0_static
 
-    r = g0_static(expr)
+    r = g0_static(expr, allowed_fields=_daily_fields())
     payload = {"passed": r.passed, "stage": r.stage,
                "reason_code": r.reason_code, "hint": r.hint}
     click.echo(json.dumps(payload, ensure_ascii=False))
@@ -42,7 +43,7 @@ def check_expr(expr: str) -> None:
         sys.exit(1)
 
 
-@factor.command()
+@factor.command("eval")
 @click.argument("expr")
 @click.option("--start", default=None, help="数据窗口起点 YYYY-MM-DD")
 @click.option("--neutral/--raw", default=True, help="是否中性化（默认中性化）")
@@ -71,11 +72,13 @@ def eval_(expr: str, start: str | None, neutral: bool, agent: str | None) -> Non
     ic_raw = None
     if cov_cols:
         from lquant.factors.analysis import compute_factor_col
+        from lquant.factors.evaluate import forward_return as _fr
         from lquant.factors.evaluate.ic import ic_series
 
-        d_raw = compute_factor_col(
-            df.filter(pl.col("trade_date").is_in(sorted(df["trade_date"].unique().to_list())[:70])),
-            expr, "f").drop_nulls(["f", "fwd_ret_1"])
+        raw_sub = df.filter(
+            pl.col("trade_date").is_in(sorted(df["trade_date"].unique().to_list())[:70]))
+        raw_sub = _fr(raw_sub.sort(["symbol", "trade_date"]), "close", periods=[1])
+        d_raw = compute_factor_col(raw_sub, expr, "f").drop_nulls(["f", "fwd_ret_1"])
         ic_raw = round(float(ic_series(d_raw, "f", "fwd_ret_1")["ic"].mean()), 4)
     # 预算内建：n_trials（eval+挖掘评估总账）、校正门槛、剩余配额
     n_trials, remaining, hints, thr = 0, None, [], None

@@ -51,7 +51,7 @@ def g1_fast_screen(train, expr, ret_col, engine, covs=None, min_abs_ic=0.02):
     from lquant.factors.analysis import compute_factor_col
     from lquant.factors.evaluate import forward_return
     from lquant.factors.evaluate.ic import ic_series
-    from lquant.factors.preprocess.pipeline import run as pipeline_run
+    from lquant.factors.preprocess.pipeline import run as pipeline_run, drop_nonfinite
 
     try:
         d = compute_factor_col(train, expr, "f")
@@ -61,7 +61,7 @@ def g1_fast_screen(train, expr, ret_col, engine, covs=None, min_abs_ic=0.02):
                 {"op": "standardize", "method": "zscore"},
                 {"op": "neutralize", "method": "ols", "factors": covs},
             ])
-        d = d.drop_nulls(["f"])
+        d = drop_nonfinite(d, "f")
         if "fwd_ret_1" not in d.columns:
             d = forward_return(d, "close", periods=[1])
             ret_col = "fwd_ret_1"
@@ -72,7 +72,7 @@ def g1_fast_screen(train, expr, ret_col, engine, covs=None, min_abs_ic=0.02):
         rank = float(s["rank_ic"].mean())
         raw_ic = ic
         if covs:
-            s_raw = ic_series(compute_factor_col(train, expr, "f").drop_nulls(["f"]),
+            s_raw = ic_series(drop_nonfinite(compute_factor_col(train, expr, "f"), "f"),
                               "f", ret_col)
             raw_ic = float(s_raw["ic"].mean())
         decay = 1 - abs(ic) / max(abs(raw_ic), 1e-12)

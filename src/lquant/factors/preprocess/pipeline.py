@@ -88,3 +88,15 @@ def run(df: pl.DataFrame, cols: str | list[str], steps: list[dict] | None = None
 def describe() -> list[dict]:
     """给前端枚举 UI：每个方法的名字、阶段、默认参数。"""
     return METHODS.describe()
+
+
+def drop_nonfinite(df: pl.DataFrame, col: str) -> pl.DataFrame:
+    """null 与 NaN/Inf 一并剔除（中性化残差中回归剔除行写回 NaN，drop_nulls 必拦不住）。"""
+    is_finite = None
+    try:
+        is_finite = pl.col(col).is_finite()
+    except Exception:  # noqa: BLE001
+        pass
+    if is_finite is None:
+        return df.filter(pl.col(col).is_not_null())
+    return df.filter(pl.col(col).is_not_null() & is_finite)

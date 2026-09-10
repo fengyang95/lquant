@@ -54,17 +54,18 @@ def run(factor_expr: str | None, spec_path: str | None, start: str | None,
     df, report = build_covariates(df, ["market_cap", "industry_sw1", "turnover_1m"],
                                   industry_df=ind)
     cov_cols = [f"cov_{r['covariate']}" for r in report if r["coverage"] > 0]
-    d = compute_factor_col(df, factor_expr, "f").drop_nulls(["f"])
+    d = drop_nonfinite(compute_factor_col(df, factor_expr, "f"), "f")
     d = forward_return(d, "close", periods=[1])
     ret_col = "fwd_ret_1"
     if cov_cols:
-        from lquant.factors.preprocess.pipeline import run as pipeline_run
+        from lquant.factors.preprocess.pipeline import run as pipeline_run, drop_nonfinite
 
         d = pipeline_run(d, "f", [
             {"op": "winsorize", "method": "mad", "n": 5},
             {"op": "standardize", "method": "zscore"},
             {"op": "neutralize", "method": "ols", "factors": cov_cols},
-        ]).drop_nulls(["f"])
+        ])
+        d = drop_nonfinite(d, "f")
     qsum = quantile_summary(d, "f", ret_col, n_groups)
     if not qsum.get("groups"):
         raise click.ClickException("分层结果为空 —— 样本不足")

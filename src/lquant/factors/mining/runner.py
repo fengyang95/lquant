@@ -97,7 +97,7 @@ def run_session(engine, panel, generator, *, agent="builtin", n_candidates=100,
             dv = engine.compute(expr, "f")
             val_j = dv.join(val_x, on=["symbol", "trade_date"], how="inner",
                             suffix="_r")
-            s = ic_series(val_j.drop_nulls(["f"]), "f", ret_col)
+            s = ic_series(drop_nonfinite(val_j, "f"), "f", ret_col)
             if not len(s):
                 raise ValueError("val IC 序列为空")
             ic_val = float(s["ic"].mean())

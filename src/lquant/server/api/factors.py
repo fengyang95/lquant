@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from lquant.core.db import reader
 from lquant.data.store.catalog import upsert
 from lquant.data.store.parquet import read_daily
+from lquant.factors.preprocess.pipeline import drop_nonfinite
 from lquant.factors.evaluate import evaluate, forward_return, save_report
 
 router = APIRouter(prefix="/factors", tags=["factors"])
@@ -146,7 +147,7 @@ def _neutral_ladder(d: pl.DataFrame, col: str, ret_col: str,
     dd/cov_report 可由调用方传入（协变量只构建一次，ladder 与 views 复用）。
     """
     from lquant.factors.evaluate.ic import ic_series
-    from lquant.factors.preprocess.pipeline import run as pipeline_run
+    from lquant.factors.preprocess.pipeline import run as pipeline_run, drop_nonfinite
 
     levels = [
         ("raw", []),
@@ -177,7 +178,8 @@ def _neutral_ladder(d: pl.DataFrame, col: str, ret_col: str,
             r = pipeline_run(dd, col, steps)
         except Exception:  # noqa: BLE001
             continue
-        s = ic_series(r.drop_nulls([col]), col, ret_col)
+        r = drop_nonfinite(r, col)
+        s = ic_series(r, col, ret_col)
         if not len(s):
             continue
         out.append({
@@ -199,7 +201,7 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
     df = read_daily(start=req.start).collect()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
-    d = _compute_factor(df, req.formula).drop_nulls(["_factor"])
+    d = drop_nonfinite(_compute_factor(df, req.formula), "_factor")
     d = forward_return(d, "close", periods=req.horizons)
     ret_col = f"fwd_ret_{min(req.horizons)}"
     if ret_col not in d.columns:
