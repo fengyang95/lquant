@@ -18,6 +18,7 @@ from lquant.core.db import reader
 from lquant.data.store.catalog import upsert
 from lquant.data.store.parquet import read_daily
 from lquant.factors.evaluate import evaluate, forward_return, save_report
+from lquant.factors.preprocess.pipeline import drop_nonfinite
 
 router = APIRouter(prefix="/factors", tags=["factors"])
 
@@ -42,18 +43,25 @@ class EvaluateIn(BaseModel):
 def list_factors(
     offset: int = Query(default=0, ge=0),
     limit: int | None = Query(default=None, ge=1, le=500),
+    source: str | None = Query(default=None, description="按来源筛选: qlib/yaml/manual"),
 ) -> list[dict]:
-    """已注册因子（factor_def 表）。offset/limit 分页，limit 缺省返回全量。"""
+    """已注册因子（factor_def 表）。offset/limit 分页 + source 筛选。"""
     suffix = f"OFFSET {offset}" + (f" LIMIT {limit}" if limit else "")
+    where = f"WHERE d.source = '{source}'" if source else ""
+    order = "icn DESC NULLS LAST" if not source else "created_at DESC"
     with reader() as con:
         try:
             rows = con.execute(
-                "SELECT name, expression, description, created_at FROM factor_def "
-                f"ORDER BY created_at DESC {suffix}"
+                "SELECT d.name, d.expression, d.description, d.source, d.factor_id, "
+                "i.ic_neutral AS icn, d.created_at FROM factor_def d "
+                "LEFT JOIN factor_ic i ON i.factor = d.name "
+                f"{where} ORDER BY {order} {suffix}"
             ).fetchall()
         except Exception:  # noqa: BLE001
             return []
-    return [{"name": r[0], "expression": r[1], "description": r[2], "created_at": str(r[3])}
+    return [{"name": r[0], "expression": r[1], "description": r[2],
+             "source": r[3], "factor_id": r[4], "ic_neutral": r[5],
+             "created_at": str(r[6])}
             for r in rows]
 
 
@@ -76,17 +84,20 @@ def register_factor(f: FactorIn) -> dict:
 
 
 def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
-    """现算因子。优先命中 Qlib Alpha158 内置因子（158 个），其次研究常用形态。"""
-    try:
-        from lquant.factors.qlib_alpha import compute as qlib_compute
+    """现算因子。优先命中 Qlib Alpha158 内置因子（白名单探测），其次研究常用形态。"""
+    from lquant.factors.qlib_alpha import compute as qlib_compute
+    from lquant.factors.qlib_alpha import has_factor
 
+    if has_factor(formula):
         return qlib_compute(df, formula)
-    except KeyError:
-        pass
-    if formula.startswith("pct_change_"):
+    if "$" in formula:                     # DSL 表达式 —— 统一走 FactorEngine
+        from lquant.factors.analysis import compute_factor_col
+
+        return compute_factor_col(df, formula, "_factor")
+    if formula.startswith("pct_change_") and formula.rsplit("_", 1)[1].isdigit():
         n = int(formula.rsplit("_", 1)[1])
         return df.with_columns(pl.col("close").pct_change(n).over("symbol").alias("_factor"))
-    if formula.startswith("rolling_std_"):
+    if formula.startswith("rolling_std_") and formula.rsplit("_", 1)[1].isdigit():
         n = int(formula.rsplit("_", 1)[1])
         return df.with_columns(pl.col("close").pct_change().over("symbol")
                                .rolling_std(n).alias("_factor"))
@@ -95,26 +106,120 @@ def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
     raise HTTPException(422, f"暂不支持的因子公式: {formula}（内置因子见 GET /api/factors/builtin）")
 
 
-@router.post("/evaluate")
-def run_evaluate(req: EvaluateIn) -> dict:
-    """现算因子 → 全套评价 → 存报告。返回关键指标。"""
+def _neutral_views_for(d: pl.DataFrame, ret_col: str) -> dict:
+    """收益中性化对照 + 行业内分组标注（5.1 视图）。"""
+    from lquant.factors.evaluate.neutral_views import neutral_views as _nv
+
+    try:
+        cov_cols = [c for c in d.columns if c.startswith("cov_")]
+        if not cov_cols:
+            return {"view": "raw（未中性化 —— 协变量数据不可用）"}
+        return _nv(d, "_factor", ret_col, covariates=cov_cols,
+                   group_col="cov_industry_sw1" if "cov_industry_sw1" in d.columns else None)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _persist_ic(name: str, ladder: list[dict]) -> None:
+    """评价成功后把 IC(原始)/IC(中性化) 落 factor_ic 表 —— 列表页排序用。"""
+    if not ladder:
+        return
+    from datetime import datetime as _dt
+
+    from lquant.data.store.catalog import upsert
+
+    try:
+        upsert("factor_ic", pl.DataFrame([{
+            "factor": name,
+            "ic_raw": ladder[0]["ic_mean"],
+            "ic_neutral": ladder[-1]["ic_mean"],
+            "rank_ic_neutral": ladder[-1]["rank_ic_mean"],
+            "n_days": ladder[-1]["n_days"],
+            "updated_at": _dt.now(),
+        }]))
+    except Exception as e:  # noqa: BLE001
+        import loguru
+
+        loguru.logger.warning(f"factor_ic 写入失败: {e}")
+
+
+def _neutral_ladder(d: pl.DataFrame, col: str, ret_col: str,
+                    dd: pl.DataFrame | None = None,
+                    cov_report: dict | None = None) -> list[dict]:
+    """逐段叠加协变量看 IC 怎么掉：原始 → +市值 → +行业 → +换手率。
+
+    dd/cov_report 可由调用方传入（协变量只构建一次，ladder 与 views 复用）。
+    """
+    from lquant.factors.evaluate.ic import ic_series
+    from lquant.factors.preprocess.pipeline import drop_nonfinite
+    from lquant.factors.preprocess.pipeline import run as pipeline_run
+
+    levels = [
+        ("raw", []),
+        ("+market_cap", ["market_cap"]),
+        ("+industry", ["market_cap", "industry_sw1"]),
+        ("+turnover", ["market_cap", "industry_sw1", "turnover_1m"]),
+    ]
+    out = []
+    if dd is None:
+        from lquant.factors.covariates import build_covariates
+
+        cov_names = sorted({c for _, covs in levels for c in covs})
+        try:
+            dd, report = build_covariates(d, cov_names)
+        except Exception:  # noqa: BLE001
+            return []
+        cov_report = {r["covariate"]: r["coverage"] for r in report}
+    cov_report = cov_report or {}
+    for label, covs in levels:
+        steps = [{"op": "winsorize", "method": "mad", "n": 5},
+                 {"op": "standardize", "method": "zscore"}]
+        if covs:
+            cols = [f"cov_{c}" for c in covs if f"cov_{c}" in dd.columns]
+            if covs and not cols:
+                continue
+            steps.append({"op": "neutralize", "method": "ols", "factors": cols})
+        try:
+            r = pipeline_run(dd, col, steps)
+        except Exception:  # noqa: BLE001
+            continue
+        r = drop_nonfinite(r, col)
+        s = ic_series(r, col, ret_col)
+        if not len(s):
+            continue
+        out.append({
+            "label": label, "covs": covs,
+            "ic_mean": round(float(s["ic"].mean()), 4),
+            "rank_ic_mean": round(float(s["rank_ic"].mean()), 4),
+            "n_days": len(s),
+            "coverage": round(min((cov_report.get(c, 1.0) for c in covs), default=1.0), 4),
+        })
+    return out
+
+
+def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
+    """一次现算 + 评价，返回 (metrics, series)。
+
+    /evaluate 与 /evaluate/series 共用同一份计算（缺陷 #2：原先两端点
+    各自全量重算，2 倍开销且两次结果可能不一致）。
+    """
     df = read_daily(start=req.start).collect()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
-    d = _compute_factor(df, req.formula).drop_nulls(["_factor"])
+    d = drop_nonfinite(_compute_factor(df, req.formula), "_factor")
     d = forward_return(d, "close", periods=req.horizons)
-
     ret_col = f"fwd_ret_{min(req.horizons)}"
     if ret_col not in d.columns:
         raise HTTPException(500, f"前瞻收益列缺失: {ret_col}")
 
+    # ---- metrics（原 run_evaluate 计算体） ----
     res = evaluate(d, "_factor", ret_col=ret_col, n_groups=req.n_groups,
                    horizons=req.horizons)
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     report_path = save_report(res["report"], REPORT_DIR / f"{req.factor}.html")
     ic = res["ic"]["ic"]
     ls = res["quantile"]["long_short"]
-    return {
+    metrics = {
         "factor": req.factor,
         "formula": req.formula,
         "n_samples": len(d),
@@ -130,35 +235,17 @@ def run_evaluate(req: EvaluateIn) -> dict:
         "report_url": f"/api/factors/reports/{report_path.stem}",
     }
 
-
-@router.post("/evaluate/series")
-def evaluate_series(req: EvaluateIn) -> dict:
-    """评价的图表数据包（JSON 序列，供前端 ECharts 渲染）：
-
-    - ic: 逐日 IC / RankIC / 累计 IC
-    - quantile: 分组净值曲线 + 各组年化柱
-    - decay: 各持有期 IC 衰减
-    - ic_by_year: 分年度 IC
-    """
+    # ---- series（原 evaluate_series 计算体） ----
     import math
 
     import numpy as np
+
     from lquant.factors.evaluate import ic_by_year, ic_series, quantile_nav, quantile_summary
     from lquant.factors.evaluate.decay import decay_profile
-
-    df = read_daily(start=req.start).collect()
-    if not len(df):
-        raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
-    d = _compute_factor(df, req.formula).drop_nulls(["_factor"])
-    d = forward_return(d, "close", periods=req.horizons)
-    ret_col = f"fwd_ret_{min(req.horizons)}"
-    if ret_col not in d.columns:
-        raise HTTPException(500, f"前瞻收益列缺失: {ret_col}")
 
     def _jf(v, nd=4) -> float | None:
         return round(float(v), nd) if v is not None and math.isfinite(v) else None
 
-    # 1) IC 序列 + 累计 IC
     s = ic_series(d, "_factor", ret_col)
     ic_dates = [str(x) for x in s["trade_date"].to_list()]
     ic_vals = [_jf(v) for v in s["ic"].to_list()]
@@ -166,19 +253,16 @@ def evaluate_series(req: EvaluateIn) -> dict:
     cum = np.nancumsum(np.array([v if v is not None else 0.0 for v in ic_vals])) if ic_vals else []
     cum_ic = [round(float(v), 4) for v in cum]
 
-    # 2) 分层净值曲线（各组累计净值 + 多空）
     qnav = quantile_nav(d, "_factor", ret_col, req.n_groups)
     qdates = [str(x) for x in qnav["trade_date"].to_list()] if len(qnav) else []
     curves = {c: [_jf(v, 4) for v in qnav[c].to_list()]
               for c in qnav.columns if c != "trade_date"}
 
-    # 3) 分组年化（柱状，看单调性）
     qsum = quantile_summary(d, "_factor", ret_col, req.n_groups)
     groups = [{"q": g["q"], "annual_return": _jf(g["annual_return"]),
                "sharpe": _jf(g["sharpe"], 2), "mean_ret": _jf(g["mean_ret"], 5)}
               for g in qsum.get("groups", [])]
 
-    # 4) IC 衰减 + 5) 分年度 IC
     prof = decay_profile(d, "_factor", req.horizons)
     decay = {"horizons": [int(h) for h in prof["horizon"].to_list()],
              "ic": [_jf(v) for v in prof["ic"].to_list()],
@@ -188,14 +272,70 @@ def evaluate_series(req: EvaluateIn) -> dict:
                 "ir": _jf(r["ir"], 3), "positive_rate": _jf(r["positive_rate"], 4)}
                for r in icy.to_dicts()] if len(icy) else []
 
-    return {
+    # ---- IC 归因阶梯（方案 5.3）+ 三种中性化视图标注（方案 5.1） ----
+    cov_names_all = ["market_cap", "industry_sw1", "turnover_1m"]
+    try:
+        with reader() as con:
+            ind = con.execute("SELECT symbol, std, code, std_date FROM industry_classify").pl()
+    except Exception:  # noqa: BLE001
+        ind = None
+    try:
+        from lquant.factors.covariates import build_covariates
+
+        d, cov_report = build_covariates(d, cov_names_all, industry_df=ind)
+        cov_map = {r["covariate"]: r["coverage"] for r in cov_report}
+    except Exception:  # noqa: BLE001
+        d, cov_map = d, {}
+    ladder = _neutral_ladder(d, "_factor", ret_col, dd=d, cov_report=cov_map)
+    _persist_ic(req.factor, ladder)
+    views = _neutral_views_for(d, ret_col)
+
+    series = {
         "factor": req.factor, "formula": req.formula,
         "n_groups": req.n_groups, "n_samples": len(d),
         "ic": {"dates": ic_dates, "ic": ic_vals, "rank_ic": ic_ranks, "cum_ic": cum_ic},
         "quantile": {"dates": qdates, "curves": curves, "groups": groups,
                      "monotonicity": _jf(qsum.get("monotonicity"), 3)},
-        "decay": decay, "ic_by_year": ic_year,
+        "decay": decay, "ic_by_year": ic_year, "neutral_ladder": ladder,
+        "neutral_views": views,
     }
+    return metrics, series
+
+
+@router.post("/evaluate")
+def run_evaluate(req: EvaluateIn) -> dict:
+    """现算因子 → 全套评价 → 存报告。一次计算同时返回指标与图表序列。"""
+    m, s = _evaluate_full(req)
+    m["series"] = s
+    return m
+
+
+@router.post("/evaluate/series")
+def evaluate_series(req: EvaluateIn) -> dict:
+    """图表数据包端点（兼容别名）：内部走同一 helper，一次计算两处复用。"""
+    _, s = _evaluate_full(req)
+    return s
+
+
+@router.post("/seed-yaml")
+def seed_yaml() -> dict:
+    """把 custom.yaml 因子入库（source=yaml，幂等覆盖）。"""
+    from lquant.factors.sources.yaml_source import load_custom
+
+    items = load_custom()
+    if not items:
+        raise HTTPException(422, "custom.yaml 无因子")
+    now = datetime.now()
+    n = upsert("factor_def", pl.DataFrame([{**it, "created_at": now} for it in items]))
+    return {"seeded": len(items), "rows_written": n}
+
+
+@router.get("/sources")
+def list_factor_sources() -> list[dict]:
+    """因子来源清单（M2 来源接入）。"""
+    from lquant.factors.sources import list_sources
+
+    return list_sources()
 
 
 @router.get("/builtin")
@@ -235,17 +375,132 @@ def seed_builtin(req: SeedBuiltinIn) -> dict:
     if not items:
         raise HTTPException(422, "没有匹配的内置因子")
     now = datetime.now()
-    n = upsert("factor_def", pl.DataFrame([{
-        "name": x["name"],
-        "expression": x["formula"],
-        "description": f"Qlib Alpha158 · {x['family']}",
-        "created_at": now,
-    } for x in items]))
+    from lquant.factors.sources.qlib_source import factor_id, translate
+
+    rows = []
+    for x in items:
+        try:
+            expr = translate(x["formula"])
+        except ValueError as e:
+            raise HTTPException(422, f"{x['name']} 翻译失败: {e}") from e
+        rows.append({
+            "name": x["name"],
+            "expression": expr,          # DSL 化：单一执行语义
+            "description": f"Qlib Alpha158 · {x['family']}",
+            "source": "qlib",
+            "source_ref": x["formula"],
+            "factor_id": factor_id(x["formula"]),
+            "created_at": now,
+        })
+    n = upsert("factor_def", pl.DataFrame(rows))
     return {"seeded": len(items), "rows_written": n,
             "sample": [x["name"] for x in items[:5]]}
 
 
-@router.get("/reports")
+@router.get("/agents")
+def list_agents() -> list[dict]:
+    """Agent 注册表（config/agents/*.yaml，fail-fast）。"""
+    from lquant.factors.agents import load_agents
+
+    return [a.__dict__ for a in load_agents()]
+
+
+@router.get("/agents/{name}/guide")
+def agent_guide(name: str) -> dict:
+    """一次性接入指引（方案 6.4）：装 SKILL.md 走 CLI，lq agent test 验收。"""
+    from lquant.factors.agents import find_agent
+
+    a = find_agent(name)
+    if not a:
+        raise HTTPException(404, f"Agent 未注册: {name}")
+    return {
+        "agent": a.name, "kind": a.kind, "driver": a.driver,
+        "quota_eval": a.quota_eval, "can_submit": a.can_submit,
+        "steps": [
+            "1. 阅读 docs/agent-skill/SKILL.md（操作手册 + 纪律）",
+            "2. lq data fields —— 先看字段白名单与覆盖率",
+            "3. lq factor check \"<expr>\" —— G0 静态校验，永远第一步",
+            "4. lq factor eval \"<expr>\" --agent " + a.name + " —— 平台算指标",
+            "5. lq factor corr \"<e1>\" \"<e2>\" —— 提交前自查相关性",
+            "6. lq factor submit spec.yaml —— 唯一入库通道（服务端重验）",
+        ],
+        "acceptance": f"lq agent test {a.name} 必须通过",
+    }
+
+
+@router.get("/mine/runs")
+def list_mining_runs(limit: int = Query(default=50, ge=1, le=500)) -> list[dict]:
+    """挖掘会话台账（factor_mining_run）。"""
+    with reader() as con:
+        try:
+            rows = con.execute(
+                "SELECT run_id, agent, generator, n_evaluated, n_static_fail, n_low_ic, "
+                "n_redundant, n_size_proxy, n_survivors, created_at "
+                "FROM factor_mining_run ORDER BY created_at DESC LIMIT ?",
+                [limit]).fetchall()
+        except Exception:  # noqa: BLE001
+            return []
+    return [{"run_id": r[0], "agent": r[1], "generator": r[2],
+             "n_evaluated": r[3], "n_static_fail": r[4], "n_low_ic": r[5],
+             "n_redundant": r[6], "n_size_proxy": r[7], "n_survivors": r[8],
+             "created_at": str(r[9])} for r in rows]
+
+
+@router.post("/mine/run")
+def mine_run(req: dict) -> dict:
+    """平台驱动挖掘会话（同步，有界预算）。请求: {agent, generator, n}。"""
+    import datetime as dt
+    import json
+    import uuid
+
+    from lquant.core.db import writer
+    from lquant.factors.agents import find_agent
+    from lquant.factors.engine import FactorEngine
+    from lquant.factors.mining.runner import run_session
+
+    agent_name = (req or {}).get("agent", "gp-internal")
+    generator = (req or {}).get("generator", "gp")
+    n = int((req or {}).get("n", 100))
+    a = find_agent(agent_name)
+    if not a:
+        raise HTTPException(404, f"Agent 未注册: {agent_name}")
+    if not a.enabled:
+        raise HTTPException(423, f"Agent 已冻结: {agent_name}")
+    if n > a.quota_eval:
+        raise HTTPException(422, f"超出配额: n={n} > quota={a.quota_eval}")
+    from lquant.factors.mining.submit import _panel_with_covs
+
+    df, cov_cols = _panel_with_covs()
+    if not len(df):
+        raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
+    eng = FactorEngine(df.lazy())
+    if generator == "gp":
+        from lquant.factors.mining.gp import GPGenerator
+        gen = GPGenerator()
+    elif generator == "random":
+        from lquant.factors.mining.random_gen import make_generator
+        gen = make_generator()
+    else:
+        raise HTTPException(422, f"未知生成器: {generator}（可选 gp/random）")
+    res, survivors = run_session(eng, df, gen, agent=agent_name, n_candidates=n,
+                                 covs=cov_cols)
+    run_id = uuid.uuid4().hex[:12]
+    try:
+        with writer() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO factor_mining_run VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                [run_id, agent_name, generator, res.n_evaluated, res.n_static_fail,
+                 res.n_redundant, res.n_size_proxy, res.n_survivors,
+                 json.dumps(res.corrections, ensure_ascii=False)[:10000], dt.datetime.now()])
+    except Exception:  # noqa: BLE001
+        pass  # 记账失败不阻断结果
+    return {"run_id": run_id, "agent": agent_name, "generator": generator,
+            "n_evaluated": res.n_evaluated, "n_static_fail": res.n_static_fail,
+            "n_low_ic": res.n_low_ic, "n_redundant": res.n_redundant,
+            "n_size_proxy": res.n_size_proxy, "n_survivors": res.n_survivors,
+            "survivors": survivors[:10]}
+
+
 def list_reports() -> list[dict]:
     if not REPORT_DIR.exists():
         return []
@@ -334,7 +589,7 @@ def synthesize(req: SynthesizeIn) -> dict:
     tag = "icw" if req.method == "ic_weighted" else "eq"
     name = f"syn_{len(req.formulas)}f_{tag}"
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = save_report(res["report"], REPORT_DIR / f"{name}.html")
+    save_report(res["report"], REPORT_DIR / f"{name}.html")
     ic = res["ic"]["ic"]
     ls = res["quantile"]["long_short"]
     return {

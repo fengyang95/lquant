@@ -16,9 +16,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from datetime import date, datetime, timedelta
-
-import polars as pl
+from datetime import datetime, timedelta
 
 from lquant.core.db import reader, writer
 

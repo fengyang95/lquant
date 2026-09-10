@@ -1,0 +1,11 @@
+# 远程专用挖掘器（external + platform）
+name: remote-miner
+kind: external
+driver: platform
+transport: http        # http | subprocess | mcp
+endpoint: http://localhost:9100
+permissions:
+  quota_eval: 500
+  can_submit: false
+  can_export_data: true
+enabled: false

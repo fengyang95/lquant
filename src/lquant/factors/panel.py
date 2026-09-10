@@ -30,10 +30,7 @@ def compute_factor_columns(
             resolve_name(f)  # 内置名合法才走 qlib_alpha
         except (KeyError, ValueError):
             shortcut = _shortcut_compute(out, f, col)
-            if shortcut is not None:
-                out = shortcut
-            else:
-                out = _dsl_compute(out, f, col)
+            out = shortcut if shortcut is not None else _dsl_compute(out, f, col)
             colmap[f] = col
             continue
         try:

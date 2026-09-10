@@ -11,8 +11,6 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from lquant.core.config import get_settings
-from lquant.server import api as api_pkg
 from lquant.server.main import create_app
 
 _GRID = [

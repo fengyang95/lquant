@@ -16,7 +16,6 @@ from datetime import date
 
 import polars as pl
 
-from lquant.core.types import now_cn
 from lquant.data.store.catalog import EtfMetaRepo, SecurityRepo
 
 

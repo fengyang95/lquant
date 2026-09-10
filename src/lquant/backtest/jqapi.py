@@ -37,17 +37,17 @@ from __future__ import annotations
 import math
 import traceback
 from dataclasses import dataclass, field
-from datetime import date, datetime, time as dtime
+from datetime import date, datetime
+from datetime import time as dtime
 
 import polars as pl
 
 from lquant.backtest.account import Account
 from lquant.backtest.broker import Broker
-from lquant.backtest.engine import Engine, EngineConfig, build_rules
+from lquant.backtest.engine import Engine, build_rules
 from lquant.backtest.events import Bar, Fill, Order, Side
 from lquant.backtest.metrics import perf_from_returns, turnover_from_trades
-from lquant.backtest.rules.model import Commission, TaxSchedule
-from lquant.backtest.slippage import PctSlippage, TickSlippage
+from lquant.backtest.slippage import PctSlippage
 from lquant.core.types import parse_symbol
 from lquant.factors.panel import compute_factor_columns
 
@@ -124,7 +124,7 @@ class _SecData:
 
 
 class _CurrentData:
-    def __init__(self, runner: "JQRunner") -> None:
+    def __init__(self, runner: JQRunner) -> None:
         self._r = runner
 
     def __getitem__(self, security: str) -> _SecData:
@@ -153,7 +153,7 @@ class _BarProxy:
 class _DataProxy:
     """handle_data(context, data) 的 data。"""
 
-    def __init__(self, runner: "JQRunner") -> None:
+    def __init__(self, runner: JQRunner) -> None:
         self._r = runner
 
     def __getitem__(self, security: str) -> _BarProxy:
@@ -169,7 +169,7 @@ class _DataProxy:
 class _JQPosition:
     """context.portfolio.positions[sym]。"""
 
-    def __init__(self, runner: "JQRunner", symbol: str) -> None:
+    def __init__(self, runner: JQRunner, symbol: str) -> None:
         self._r = runner
         self._s = symbol
 
@@ -203,18 +203,18 @@ class _JQPosition:
 class _PositionsMap(dict):
     """聚宽语义：positions[未持有股票] 返回空持仓对象，不抛 KeyError。"""
 
-    def __init__(self, runner: "JQRunner") -> None:
+    def __init__(self, runner: JQRunner) -> None:
         super().__init__()
         self._r = runner
 
-    def __missing__(self, key: str) -> "_JQPosition":
+    def __missing__(self, key: str) -> _JQPosition:
         v = _JQPosition(self._r, key)
         self[key] = v
         return v
 
 
 class _JQPortfolio:
-    def __init__(self, runner: "JQRunner") -> None:
+    def __init__(self, runner: JQRunner) -> None:
         self._r = runner
         self._pmap = _PositionsMap(runner)
 
@@ -254,7 +254,7 @@ class _JQPortfolio:
 
 
 class _JQContext:
-    def __init__(self, runner: "JQRunner") -> None:
+    def __init__(self, runner: JQRunner) -> None:
         self.portfolio = _JQPortfolio(runner)
         self._r = runner
         self.current_dt: datetime = datetime.combine(date.today(), dtime(9, 30))

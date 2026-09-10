@@ -154,6 +154,33 @@ DDL_STATEMENTS: list[str] = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS agent_ledger (
+        agent VARCHAR PRIMARY KEY, eval_count INTEGER,
+        eval_last TIMESTAMP, updated_at TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS factor_ic (
+        factor VARCHAR PRIMARY KEY, ic_raw DOUBLE, ic_neutral DOUBLE,
+        rank_ic_neutral DOUBLE, n_days INTEGER, updated_at TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS factor_mining_run (
+        run_id VARCHAR PRIMARY KEY, agent VARCHAR, generator VARCHAR,
+        n_evaluated INTEGER, n_static_fail INTEGER, n_low_ic INTEGER,
+        n_redundant INTEGER, n_size_proxy INTEGER, n_survivors INTEGER,
+        corrections JSON, created_at TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS factor_replication (
+        name VARCHAR, expr VARCHAR, claimed_ic DOUBLE, recomputed_ic DOUBLE,
+        grade VARCHAR, agent VARCHAR, payload VARCHAR, created_at TIMESTAMP,
+        PRIMARY KEY (name, expr, created_at)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS factor_value (
         factor VARCHAR, symbol VARCHAR, trade_date DATE,
         raw DOUBLE, processed DOUBLE,
@@ -240,6 +267,21 @@ VIEWS: list[str] = [
     SELECT * FROM read_parquet('data/parquet/daily/**/*.parquet')
     """
 ]
+
+
+def ensure_factor_def_columns(con) -> int:
+    """factor_def 增列迁移：source / source_ref / factor_id（M2 来源接入）。
+
+    幂等：列已存在直接跳过。返回是否执行了迁移。
+    """
+    cols = {r[0] for r in con.execute("DESCRIBE factor_def").fetchall()}
+    n = 0
+    for col, typ in (("source", "VARCHAR DEFAULT 'manual'"), ("source_ref", "VARCHAR"),
+                     ("factor_id", "VARCHAR")):
+        if col not in cols:
+            con.execute(f"ALTER TABLE factor_def ADD COLUMN {col} {typ}")
+            n += 1
+    return n
 
 
 def ensure_factor_def(con) -> int:

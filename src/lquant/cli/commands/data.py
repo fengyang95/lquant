@@ -162,3 +162,20 @@ def crosscheck(peers: str, start: str, end: str | None, limit: int) -> None:
         if out["summary"].get(lv):
             click.echo(f"  [{lv}] {len([i for i in out['issues'] if i.rule.endswith(lv)])} 条 issue 待查看")
     click.echo(f"primary 打 CROSS_SRC_DIFF 标记: {out['flagged_rows']} 行")
+
+
+@data.command("fields")
+@click.option("--start", default=None, help="覆盖率统计窗口起点")
+def fields(start: str | None) -> None:
+    """字段白名单 + 覆盖率（方案 6.2：Agent 接入第一步）。"""
+    import json
+
+    from lquant.data.store.parquet import read_daily
+
+    df = read_daily(start=start).collect()
+    if not len(df):
+        raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")
+    n = len(df)
+    out = [{"field": c, "coverage": round(1 - df[c].null_count() / n, 4), "rows": n}
+           for c in df.columns]
+    click.echo(json.dumps(out, ensure_ascii=False, indent=1))

@@ -3,11 +3,14 @@ from __future__ import annotations
 
 from datetime import date
 
-import polars as pl
 import pytest
 
-from lquant.backtest.attribution import (brinson_by_group, group_of_symbol,
-                                         risk_vs_benchmark, stock_contribution)
+from lquant.backtest.attribution import (
+    brinson_by_group,
+    group_of_symbol,
+    risk_vs_benchmark,
+    stock_contribution,
+)
 
 
 def _scenario():

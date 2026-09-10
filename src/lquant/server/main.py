@@ -4,7 +4,6 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from lquant.core.config import get_settings
 from lquant.server import ws
 from lquant.server.api import (
     analyses,
@@ -23,7 +22,6 @@ from lquant.server.api import (
 
 
 def create_app() -> FastAPI:
-    s = get_settings()
     app = FastAPI(title="lquant", version="0.1.0",
                   description="A股量化研究平台 API")
     app.add_middleware(
@@ -54,6 +52,7 @@ def _startup() -> None:
             ensure_classify_snapshots,
             ensure_collect_log,
             ensure_factor_def,
+            ensure_factor_def_columns,
         )
 
         with writer() as con:
@@ -65,6 +64,8 @@ def _startup() -> None:
                 print("[migrate] collect_log → 补主键")
             if ensure_classify_snapshots(con):
                 print("[migrate] industry_classify → 补 (symbol, std_date) 主键")
+            if ensure_factor_def_columns(con):
+                print("[migrate] factor_def → 补 source/source_ref/factor_id 列")
     except Exception as e:  # noqa: BLE001 - 库未初始化时不应阻断服务启动
         print(f"[startup] schema 迁移跳过: {e}")
 

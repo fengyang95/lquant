@@ -92,6 +92,29 @@ def test_key_changes_with_window_and_version(cache_dir):
     assert k4 == k5
 
 
+def test_cache_key_changes_with_steps():
+    """缺陷 #12：预处理配方必须进缓存签名 —— 换配方不命中旧缓存。"""
+    defs = [{"name": "a", "expression": "Ts_Mean($close, 5)"}]
+    k1 = TwoTierCache.key(defs, dt.date(2026, 3, 2), dt.date(2026, 3, 9), "v1")
+    k2 = TwoTierCache.key(defs, dt.date(2026, 3, 2), dt.date(2026, 3, 9), "v1",
+                          steps=[{"op": "winsorize", "method": "mad"}])
+    k3 = TwoTierCache.key(defs, dt.date(2026, 3, 2), dt.date(2026, 3, 9), "v1",
+                          steps=[{"op": "winsorize", "method": "mad", "n": 5}])
+    assert k1 != k2, "加 steps 必须换 key"
+    assert k2 != k3, "steps 参数不同必须换 key"
+    assert k1 == TwoTierCache.key(defs, dt.date(2026, 3, 2), dt.date(2026, 3, 9), "v1", steps=[])
+
+
+def test_cache_key_steps_order_preserved():
+    """steps 是有序流水线：顺序不同 = 语义不同 = key 不同。"""
+    defs = [{"name": "a", "expression": "Ts_Mean($close, 5)"}]
+    k1 = TwoTierCache.key(defs, dt.date(2026, 3, 2), dt.date(2026, 3, 9), "v1",
+                          steps=[{"op": "winsorize"}, {"op": "standardize"}])
+    k2 = TwoTierCache.key(defs, dt.date(2026, 3, 2), dt.date(2026, 3, 9), "v1",
+                          steps=[{"op": "standardize"}, {"op": "winsorize"}])
+    assert k1 != k2
+
+
 def test_cache_set_with_preprocess(cache_dir):
     eng = FactorEngine(_panel())
     df = eng.compute_many(

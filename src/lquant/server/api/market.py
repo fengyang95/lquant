@@ -13,9 +13,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from lquant.core.db import reader
-from lquant.market.collectors import run_all, list_collectors
-from lquant.market.schema import TABLE_COLUMNS
-from lquant.data.store.catalog import upsert
+from lquant.market.collectors import list_collectors
 from lquant.server.deps import resolve_symbol
 
 router = APIRouter(prefix="/market", tags=["market"])
@@ -108,7 +106,7 @@ def index_quotes(days: int = Query(default=20, le=250)) -> list[dict]:
                 "  SELECT *, ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY trade_date DESC) AS rk "
                 "  FROM index_daily) WHERE rk = 1").pl()
             hist = con.execute(
-                f"SELECT trade_date, symbol, close FROM ("
+                "SELECT trade_date, symbol, close FROM ("
                 "  SELECT * FROM index_daily ORDER BY trade_date DESC LIMIT ?)"
                 " ORDER BY trade_date", [days * 8]).pl()
         except Exception:  # noqa: BLE001
@@ -185,8 +183,8 @@ def breadth(days: int = Query(default=60, le=250)) -> dict:
         up=(pl.col("chg") > 0).sum(),
         down=(pl.col("chg") < 0).sum(),
         flat=(pl.col("chg") == 0).sum(),
-        limit_up=((pl.col("chg") >= pl.col("_lim") - 0.005)).sum(),
-        limit_down=((pl.col("chg") <= -(pl.col("_lim") - 0.005))).sum(),
+        limit_up=(pl.col("chg") >= pl.col("_lim") - 0.005).sum(),
+        limit_down=(pl.col("chg") <= -(pl.col("_lim") - 0.005)).sum(),
         med_chg=pl.col("chg").median(),
         total_amount=pl.col("amount").sum(),
     ).sort("trade_date")

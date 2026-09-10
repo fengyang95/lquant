@@ -8,7 +8,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from lquant.factors.qlib_alpha import WINDOWS, compute, list_builtin, resolve_name
+from lquant.factors.qlib_alpha import compute, list_builtin, resolve_name
 
 
 def make_ohlcv(n_days: int = 120, n_syms: int = 3, seed: int = 5) -> pl.DataFrame:

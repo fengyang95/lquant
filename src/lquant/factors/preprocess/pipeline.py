@@ -60,7 +60,7 @@ def run(df: pl.DataFrame, cols: str | list[str], steps: list[dict] | None = None
                                 for c in names])
         targets = [f"{c}_clean" for c in names]
         out = out.with_columns([pl.col(c).cast(pl.Float64, strict=False).alias(t)
-                                for c, t in zip(names, targets)])
+                                for c, t in zip(names, targets, strict=False)])
     else:
         targets = names
         out = out.with_columns([pl.col(c).cast(pl.Float64, strict=False) for c in names])
@@ -88,3 +88,8 @@ def run(df: pl.DataFrame, cols: str | list[str], steps: list[dict] | None = None
 def describe() -> list[dict]:
     """给前端枚举 UI：每个方法的名字、阶段、默认参数。"""
     return METHODS.describe()
+
+
+def drop_nonfinite(df: pl.DataFrame, col: str) -> pl.DataFrame:
+    """null 与 NaN/Inf 一并剔除（中性化残差中回归剔除行写回 NaN，drop_nulls 必拦不住）。"""
+    return df.filter(pl.col(col).is_not_null() & pl.col(col).is_finite())

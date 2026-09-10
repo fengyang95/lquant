@@ -77,7 +77,12 @@ def update_analysis(aid: str, req: AnalysisSourceIn) -> dict:
     存活校验按 name 口径：id 已被软删但同名仍有存活条 → 等效更新仍可用；
     整个 name 已软删 → 404，PUT 不复活。
     """
-    from lquant.backtest.strategy_store import delete_analysis, get_analysis, list_analyses, save_analysis
+    from lquant.backtest.strategy_store import (
+        delete_analysis,
+        get_analysis,
+        list_analyses,
+        save_analysis,
+    )
 
     try:
         cur = get_analysis(aid)

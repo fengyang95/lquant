@@ -57,7 +57,7 @@ def test_golden_fwd_ret_1_pointwise():
     for sym, expected in golden.items():
         got = out.filter(pl.col("symbol") == sym).sort("trade_date")["fwd_ret_1"].to_list()
         assert len(got) == 10
-        for g, e in zip(got[:-1], expected[:-1]):
+        for g, e in zip(got[:-1], expected[:-1], strict=False):
             assert g == pytest.approx(e, rel=1e-9)
         assert got[-1] is None  # 尾行无未来 → null
     # 方向性：D 锯齿 ±0.222/±0.182 交替，E 缓涨 ≈ 0.0095

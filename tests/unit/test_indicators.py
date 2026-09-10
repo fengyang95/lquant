@@ -5,7 +5,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from lquant.factors.indicators import add_all, add_boll, add_macd, add_ma, add_rsi
+from lquant.factors.indicators import add_all, add_boll, add_ma, add_macd, add_rsi
 
 
 def make_series(n: int = 60, seed: int = 11) -> pl.DataFrame:

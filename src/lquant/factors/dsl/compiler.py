@@ -18,14 +18,32 @@ def _category(node: Node) -> str:
     return OPS.meta(node.name).get("category", "EL") if isinstance(node, Call) else "EL"
 
 
+def _has_kind(node: Node, kind: str) -> bool:
+    """子树中是否含某类窗口算子（跨过四则运算包装也要查到）。"""
+    if isinstance(node, Call):
+        if _category(node) == kind:
+            return True
+        return any(_has_kind(a, kind) for a in node.args)
+    if isinstance(node, UnaryOp):
+        return _has_kind(node.arg, kind)
+    if isinstance(node, BinaryOp):
+        return _has_kind(node.left, kind) or _has_kind(node.right, kind)
+    return False
+
+
 def has_nested_ts_cs(node: Node) -> bool:
-    """检测 TS/CS 嵌套 —— 有则需要分步物化。"""
+    """检测 TS/CS 嵌套 —— 有则需要分步物化。
+
+    判据：Call 的参数子树内含异类窗口算子（TS/CS 任意深度混排）。
+    原判据只看参数是否直接是异类 Call，四则运算包裹的混合子树漏检 →
+    单表达式双 over 静默产出全 null（Polars #25691 坑）。
+    """
     if isinstance(node, Call):
         cat = _category(node)
         for a in node.args:
-            if isinstance(a, Call) and _category(a) != cat and _category(a) != "EL":
-                if {cat, _category(a)} == {"TS", "CS"}:
-                    return True
+            other = "CS" if cat == "TS" else "TS"
+            if _has_kind(a, other):
+                return True
             if has_nested_ts_cs(a):
                 return True
     elif isinstance(node, (UnaryOp, BinaryOp)):
@@ -35,25 +53,39 @@ def has_nested_ts_cs(node: Node) -> bool:
 
 
 def plan(node: Node) -> list[Node]:
-    """把 TS/CS 嵌套拆成有序步骤，每步物化后再进入下一步。"""
+    """把 TS/CS 嵌套拆成有序步骤，每步物化后再进入下一步。
+
+    通用后序拆步：Call 的任意参数（含四则运算包裹的 TS/CS 混合子树）
+    只要含 TS/CS 嵌套，就整体物化为一步、原位替换成 __step{i} 引用；
+    根节点永远作为最后一步。
+    """
     if not has_nested_ts_cs(node):
         return [node]
     steps: list[Node] = []
-    _split(node, steps)
+    root = _split(node, steps)
+    steps.append(root)
     return steps
 
 
 def _split(node: Node, steps: list[Node]) -> Node:
-    if isinstance(node, Call) and any(isinstance(a, Call) and _category(a) == "CS" for a in node.args):
-        inner = node.args[0]
-        if isinstance(inner, Call):
-            steps.append(inner)
-            node.args[0] = Field(f"__step{len(steps)}")
-            steps.append(node)
-            return node
+    """后序拆步：先把参数子树拆净，再在当前节点处把含异类算子的参数整体物化。"""
+    if isinstance(node, BinaryOp):
+        return BinaryOp(node.op, _split(node.left, steps), _split(node.right, steps))
+    if isinstance(node, UnaryOp):
+        return UnaryOp(node.op, _split(node.arg, steps))
+    if isinstance(node, Call):
+        cat = _category(node)
+        other = "CS" if cat == "TS" else "TS"
+        rebuilt = []
+        for a in node.args:
+            rebuilt.append(_split(a, steps))
+        node = Call(node.name, rebuilt)
+        for i, a in enumerate(node.args):
+            if _has_kind(a, other) or has_nested_ts_cs(a):
+                steps.append(a)
+                node.args[i] = Field(f"__step{len(steps)}")
+        return node
     return node
-
-
 def _int_window(v: float) -> int | float:
     """整值数字 → int（rolling 窗口要 int）；真小数保持原样。"""
     return int(v) if float(v).is_integer() else v
@@ -71,6 +103,7 @@ def compile_expr(node: Node) -> pl.Expr:
         l, r = compile_expr(node.left), compile_expr(node.right)
         return {
             "+": l + r, "-": l - r, "*": l * r, "/": l / r,
+            ">": (l > r).cast(pl.Float64), "<": (l < r).cast(pl.Float64),
         }[node.op]
     if isinstance(node, Call):
         fn = OPS.get(node.name)

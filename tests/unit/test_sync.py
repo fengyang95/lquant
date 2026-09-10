@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 import shutil
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -18,9 +18,18 @@ os.environ.setdefault("LQ_SYNC_WORKER", "0")   # 本模块直接调 manager，�
 pytestmark = pytest.mark.usefixtures("sync_env")
 
 
+def _ensure_cwd():
+    """cwd 指向的目录被删（pytest tmp 清理）时，os.getcwd() 会炸 —— 先兜底恢复。"""
+    try:
+        os.getcwd()
+    except FileNotFoundError:
+        os.chdir(os.path.expanduser("~"))
+
+
 @pytest.fixture(scope="module")
 def sync_env(tmp_path_factory):
     """每个模块一份隔离数据环境（拷真实 duckdb + parquet 湖）。"""
+    _ensure_cwd()
     if not (LQ_ROOT / "data" / "duckdb" / "lquant.duckdb").exists():
         pytest.skip("需要本地 data/duckdb/lquant.duckdb（不入库，CI 上跳过）",
                     allow_module_level=True)
@@ -137,10 +146,10 @@ def test_run_collect_demo_persists_and_logs():
 
 
 def test_index_daily_demo_schema_and_persist():
+    from lquant.core.db import reader
+    from lquant.data.store.catalog import upsert
     from lquant.market.collectors import run
     from lquant.market.schema import ensure_market_tables
-    from lquant.data.store.catalog import upsert
-    from lquant.core.db import reader
 
     df = run("index_daily", demo=True)
     assert {"000001.SH", "000300.SH"} <= set(df["symbol"].unique().to_list())
@@ -170,6 +179,7 @@ def test_dragon_tiger_demo_schema():
 
 def test_refresh_adj_factors_merges_into_lake():
     import polars as pl
+
     from lquant.data.ingest.adj import refresh_adj_factors
     from lquant.data.store.parquet import read_daily
 

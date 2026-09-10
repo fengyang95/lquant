@@ -84,6 +84,19 @@ _PRICE: dict[str, str] = {
 _NAME_RE = re.compile(r"^(?P<fam>[A-Z]+)(?P<d>\d+)$")
 
 
+def has_factor(name: str) -> bool:
+    """formula 是否命中内置因子目录（大小写不敏感）；不抛错。
+
+    供 API 探测用：先查白名单再调用 compute，避免 except KeyError 把
+    数据缺列错误一并吞掉（缺陷 #1）。
+    """
+    try:
+        resolve_name(name)
+        return True
+    except KeyError:
+        return False
+
+
 def list_builtin() -> list[dict]:
     """全部内置因子清单（158 个）。"""
     out = [{"name": n, "family": "kbar", "window": None, "formula": f}
@@ -133,7 +146,7 @@ def _prep(df: pl.DataFrame) -> pl.DataFrame:
 
 def _expr(fam: str, d: int) -> pl.Expr:
     """单族单窗口的 Polars 表达式（均按 symbol 分组）。"""
-    c, h, l, o, v = pl.col("close"), pl.col("high"), pl.col("low"), pl.col("open"), pl.col("volume")
+    c, h, l, _o, v = pl.col("close"), pl.col("high"), pl.col("low"), pl.col("open"), pl.col("volume")
     pc, pv, ret = pl.col("_pc"), pl.col("_pv"), pl.col("_ret")
     g = lambda e: e.clip(0.0)  # noqa: E731  Greater(x,0)
 
@@ -209,8 +222,8 @@ def _numpy_block(gdf: pl.DataFrame, windows: tuple[int, ...]) -> dict[str, np.nd
         var_t = (tc**2).sum()
         std_t = np.sqrt(var_t / d)
 
-        def roll(a: np.ndarray) -> np.ndarray:  # noqa: ANN001
-            return np.lib.stride_tricks.sliding_window_view(a, d)
+        def roll(a: np.ndarray, _d: int = d) -> np.ndarray:  # noqa: ANN001  绑定循环变量（B023）
+            return np.lib.stride_tricks.sliding_window_view(a, _d)
 
         sw_c = roll(close)
         ybar = sw_c.mean(axis=1, keepdims=True)
@@ -229,9 +242,9 @@ def _numpy_block(gdf: pl.DataFrame, windows: tuple[int, ...]) -> dict[str, np.nd
         # Rank：窗口内 <= 当前值的比例（qlib Rank 语义）
         rank = (sw_c <= close[d - 1:, None]).sum(axis=1) / d
 
-        def pad(x: np.ndarray) -> np.ndarray:
+        def pad(x: np.ndarray, _d: int = d) -> np.ndarray:
             full = np.full(n, np.nan)
-            full[d - 1:] = x
+            full[_d - 1:] = x
             return full
 
         out[f"BETA{d}"] = pad(slope / close[d - 1:])

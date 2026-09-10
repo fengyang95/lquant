@@ -14,6 +14,7 @@ key 由「因子 defs 集 + 窗口 + data_version」哈希而成。data_version 
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -46,9 +47,12 @@ class TwoTierCache:
         return p
 
     @staticmethod
-    def key(defs: list[dict], start: date, end: date, version: str) -> str:
-        """稳定 key：对 defs 排序后做签名，避免 dict 顺序抖动导致缓存翻车。"""
-        # defs 排序后再签名：同一组因子无论传序都共享缓存
+    def key(defs: list[dict], start: date, end: date, version: str,
+            steps: list[dict] | None = None) -> str:
+        """稳定 key：defs 排序签名 + steps 有序序列化（流水线顺序有语义）。
+
+        steps 是预处理配方，改配方必须换 key —— 否则「改了参数没反应」（缺陷 #12）。
+        """
         ordered = sorted(defs, key=lambda d: (d["name"],
                                               d.get("expression", d.get("formula", ""))))
         sig = json.dumps(
@@ -56,7 +60,9 @@ class TwoTierCache:
              for d in ordered],
             sort_keys=True, ensure_ascii=False,
         )
-        raw = f"{sig}|{_fmt(start)}|{_fmt(end)}|{version}"
+        steps_sig = (json.dumps(steps, sort_keys=True, ensure_ascii=False)
+                     if steps else "")
+        raw = f"{sig}|{steps_sig}|{_fmt(start)}|{_fmt(end)}|{version}"
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
     def get(self, key: str) -> pl.DataFrame | None:
@@ -72,10 +78,8 @@ class TwoTierCache:
                 return df
             except Exception as e:  # noqa: BLE001  缓存坏了当 miss，重算覆盖
                 logger.warning(f"factor cache disk read failed {p}: {e}")
-                try:
+                with contextlib.suppress(OSError):
                     p.unlink(missing_ok=True)
-                except OSError:
-                    pass
         return None
 
     def set(self, key: str, df: pl.DataFrame) -> None:
@@ -96,11 +100,18 @@ class TwoTierCache:
 
 
 _cache: TwoTierCache | None = None
+_cache_root: str | None = None
 
 
 def get_cache() -> TwoTierCache:
-    """进程级单例：不同模块共享同一内存层，省的反复重建。"""
-    global _cache
-    if _cache is None:
+    """进程级单例：不同模块共享同一内存层，省的反复重建。
+
+    LQUANT_CACHE_DIR 变更（测试隔离）时重建 —— 否则上个测试环境的内存
+    条目会串进下个测试（缓存命中断言随机翻车）。
+    """
+    global _cache, _cache_root
+    override = os.getenv("LQUANT_CACHE_DIR")
+    if _cache is None or override != _cache_root:
         _cache = TwoTierCache()
+        _cache_root = override
     return _cache

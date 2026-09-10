@@ -159,7 +159,7 @@ def _spearman(a: list[float], b: list[float]) -> float:
     ra = _ranks(a)
     rb = _ranks(b)
     ma, mb = sum(ra) / n, sum(rb) / n
-    num = sum((x - ma) * (y - mb) for x, y in zip(ra, rb))
+    num = sum((x - ma) * (y - mb) for x, y in zip(ra, rb, strict=False))
     da = math.sqrt(sum((x - ma) ** 2 for x in ra))
     db = math.sqrt(sum((y - mb) ** 2 for y in rb))
     return num / (da * db) if da > 0 and db > 0 else float("nan")

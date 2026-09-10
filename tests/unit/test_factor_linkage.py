@@ -105,9 +105,10 @@ def test_factor_panels_drop_nan():
     r = JQRunner("def handle_data(c, d):\n    pass\n",
                  factor_formulas=["pct_change_5"])
     panels = r._build_factor_panels(dirty)
-    assert panels and all(
-        v == v for vals in panels.values() for v in vals.values()  # NaN == NaN 为 False
-    )
+    assert panels
+    for vals in panels.values():
+        for v in vals.values():     # NaN == NaN 为 False —— NaN 会自己暴露
+            assert v == v  # noqa: PLR0124  故意自比以捕获 NaN
 
 
 def test_record_skips_non_finite():

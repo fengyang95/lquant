@@ -1,7 +1,7 @@
 """运行时配置：settings_store 纯函数（类型白名单/coerce/合并）。"""
 from __future__ import annotations
 
-from lquant.core.settings_store import SETTING_DEFS, coerce_setting, _parse
+from lquant.core.settings_store import SETTING_DEFS, _parse, coerce_setting
 
 
 def test_defs_are_registered():

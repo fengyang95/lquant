@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+
 # key -> 定义。type: str|bool|enum|list
 @dataclass(frozen=True)
 class SettingDef:

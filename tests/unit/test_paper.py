@@ -2,7 +2,6 @@
 from datetime import date
 
 import polars as pl
-import pytest
 
 from lquant.paper import PaperConfig, PaperEngine, compare_nav
 

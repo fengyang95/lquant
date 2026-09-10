@@ -10,6 +10,8 @@ from __future__ import annotations
 import numpy as np
 import polars as pl
 
+from lquant.core.errors import FactorError
+
 MISSING_CAT = "__NA__"
 
 
@@ -58,7 +60,7 @@ def design_matrix(sub: pl.DataFrame, num_cols: list[str],
         v = sub[c].cast(pl.Float64, strict=False).to_numpy()
         v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
         blocks.append(v.reshape(n, 1))
-    for c, enc in zip(cat_levels.keys(), enc_cols):
+    for c, enc in zip(cat_levels.keys(), enc_cols, strict=False):
         k = len(cat_levels[c])
         if k == 0:
             continue
@@ -95,12 +97,22 @@ def residual_by_day(
     solve : (X, y) -> (beta, resid_on_valid)
         回归求解器，只处理有效行。
     """
+    # N6 硬约束：协变量全缺失必须报错，绝不静默退化为去均值（缺陷 1.1 的根源）
+    present = [c for c in factor_cols if c in df.columns]
+    if not present:
+        raise FactorError(
+            f"中性化协变量全部缺失: {factor_cols} —— 拒绝静默去均值；"
+            f"可用列: {df.columns[:15]}...")
+    factor_cols = present
     num_cols, cat_cols = split_levels(df, factor_cols)
     enc_df, levels, enc_cols = encode_cats(df, cat_cols)
     need = len(num_cols) + sum(len(v) for v in levels.values()) + 2
     min_obs = min_obs or need
 
     out = enc_df.with_columns(pl.col(col).cast(pl.Float64, strict=False).alias(col))
+    # 分组块必须与行序一致，否则 values[cursor:cursor+n] 会把残差写回错位
+    # （symbol-major 数据上 partition_by 的组不连续）。先按 by 排序，结束后还原。
+    out = out.with_row_index("__row").sort(by)
     values = out[col].to_numpy().astype(float)
     cursor = 0
     for sub in out.partition_by(by, as_dict=False, maintain_order=True):
@@ -120,7 +132,8 @@ def residual_by_day(
         values[cursor : cursor + n] = resid
         cursor += n
 
-    return enc_df.drop(enc_cols).with_columns(pl.Series(col, values))
+    out = out.drop(enc_cols).with_columns(pl.Series(col, values))
+    return out.sort("__row").drop("__row")
 
 
 def ols_resid(X: np.ndarray, y: np.ndarray) -> np.ndarray:

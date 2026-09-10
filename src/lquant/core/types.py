@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date, datetime
-from enum import Enum
+from enum import StrEnum
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -24,7 +24,7 @@ _SUFFIX_RULES = [
 _SYMBOL_RE = re.compile(r"^(\d{6})\.(SH|SZ|BJ)$")
 
 
-class SecType(str, Enum):
+class SecType(StrEnum):
     STOCK = "stock"
     ETF = "etf"
     INDEX = "index"
@@ -32,7 +32,7 @@ class SecType(str, Enum):
     BOND = "bond"
 
 
-class Board(str, Enum):
+class Board(StrEnum):
     MAIN = "main"
     GEM = "gem"        # 创业板 300/301
     STAR = "star"      # 科创板 688
@@ -58,9 +58,8 @@ class Symbol:
                 return SecType.ETF
             if c.startswith("5"):
                 return SecType.LOF
-        if self.exchange == "SZ":
-            if c.startswith(("15", "16", "159")):
-                return SecType.ETF
+        if self.exchange == "SZ" and c.startswith(("15", "16", "159")):
+            return SecType.ETF
         if c in ("000001", "000300", "000905", "000852") and self.exchange == "SH":
             return SecType.INDEX
         if c.startswith("399") and self.exchange == "SZ":

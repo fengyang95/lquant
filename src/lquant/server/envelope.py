@@ -16,7 +16,7 @@ import json
 import logging
 import uuid
 
-from fastapi import HTTPException
+from fastapi import APIRouter, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
@@ -55,8 +55,6 @@ def err(message: str, *, code: int = CODE_ERR, data=None, trace_id: str | None =
 
 def make_router(*, prefix: str = "", tags: list[str] | None = None) -> APIRouter:
     """建一个自带封套的 APIRouter（route_class=EnvRoute）。"""
-    from fastapi import APIRouter
-
     return APIRouter(prefix=prefix, tags=tags, route_class=EnvRoute)
 
 
@@ -78,7 +76,7 @@ class EnvRoute(APIRoute):
                 # 422 保留状态码，body 走信封（不给客户端吐 pydantic 原始错误堆）
                 msg = _first_validation_error(e)
                 return _enveloped_error(422, msg)
-            except Exception as e:  # noqa: BLE001 - 兜底成信封，避免前端拿到非 JSON 500
+            except Exception:  # noqa: BLE001 - 兜底成信封，避免前端拿到非 JSON 500
                 _LOG.exception("enveloped route 未捕获异常 %s %s", request.method,
                                request.url.path)
                 return _enveloped_error(500, "服务内部错误，请稍后重试")

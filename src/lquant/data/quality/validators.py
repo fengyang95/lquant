@@ -156,7 +156,7 @@ def check_coverage(df: pl.DataFrame, *, min_ratio: float = 0.90,
     if median is None or median <= 0:
         return []
     issues: list[Issue] = []
-    for d, n in zip(per_day["trade_date"], counts):
+    for d, n in zip(per_day["trade_date"], counts, strict=False):
         ratio = n / median
         if ratio < min_ratio:
             issues.append(Issue(
@@ -184,7 +184,7 @@ def check_zombie(df: pl.DataFrame, *, warn_ratio: float = 0.08,
         zero_ret, on="trade_date", how="inner").with_columns(
         (pl.col("n_zero") / pl.col("n")).alias("ratio"))
     issues: list[Issue] = []
-    for d, ratio in zip(per_day["trade_date"], per_day["ratio"]):
+    for d, ratio in zip(per_day["trade_date"], per_day["ratio"], strict=False):
         if ratio >= error_ratio:
             issues.append(Issue(
                 rule="ZOMBIE_DAY", severity="error", dataset=dataset, trade_date=d,

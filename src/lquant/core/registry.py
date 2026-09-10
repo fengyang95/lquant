@@ -5,12 +5,13 @@
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Generic, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 T = TypeVar("T")
 
 
-class Registry(Generic[T]):
+class Registry[T]:
     def __init__(self, name: str) -> None:
         self.name = name
         self._items: dict[str, T] = {}
@@ -46,6 +47,10 @@ class Registry(Generic[T]):
             {"name": k, **self._meta.get(k, {})}
             for k in sorted(self._items)
         ]
+
+    def __iter__(self):
+        """按序迭代注册键（与 keys() 一致，sorted）。"""
+        return iter(sorted(self._items))
 
     def __contains__(self, key: str) -> bool:
         return key in self._items

@@ -102,7 +102,7 @@ class MootdxProvider(DataProvider):
             # frequency=FREQUENCY.index('1m')=8；9 是 day（get_frequency 按下标查）。
             # offset=窗口条数，0 → count0 返回空；用最近 800 根 1 分钟线。
             df = self._client().bars(
-                symbol=_tdx_code(sym), frequency=int(8), start=0, offset=800).iloc[::-1]
+                symbol=_tdx_code(sym), frequency=8, start=0, offset=800).iloc[::-1]
             if df is None or df.empty:
                 continue
             df = df.reset_index().rename(columns={

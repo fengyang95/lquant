@@ -275,8 +275,17 @@ def test_adj_factor_checks():
 
 # ---------- 落库部分（隔离 tmp duckdb）----------
 
+def _ensure_cwd():
+    """cwd 指向的目录被删（pytest tmp 清理）时，os.getcwd() 会炸 —— 先兜底恢复。"""
+    try:
+        os.getcwd()
+    except FileNotFoundError:
+        os.chdir(os.path.expanduser("~"))
+
+
 @pytest.fixture(scope="module")
 def q_env(tmp_path_factory):
+    _ensure_cwd()
     base = tmp_path_factory.mktemp("quality")
     old_cwd = os.getcwd()
     os.chdir(base)
@@ -332,9 +341,8 @@ def test_lineage(q_env):
 
 
 def test_golden_freeze_and_run(q_env):
-    from lquant.data.quality.golden import GoldenCase, freeze, list_cases, run_all
-
     from lquant.core.db import writer
+    from lquant.data.quality.golden import GoldenCase, freeze, list_cases, run_all
     with writer() as w:
         w.register("_gb", _good_bars())
         w.execute("CREATE TABLE golden_src AS SELECT * FROM _gb")
@@ -359,12 +367,12 @@ def test_golden_freeze_and_run(q_env):
 
 def test_gate_daily_saves_issues_before_raise(q_env):
     """fatal 时 issue 也要先落库 —— 留证据，不是抛完就没了。"""
-    from lquant.core.db import reader
+    from lquant.core.errors import DataQualityError
     from lquant.data.quality.issues import latest_issues
     from lquant.data.quality.pipeline import gate_daily
 
     bad = _good_bars().with_columns(close=0.05)
-    with pytest.raises(Exception):
+    with pytest.raises(DataQualityError):
         gate_daily(bad, data_version="20260109.1")
     rows = latest_issues()
     assert any(r["rule_code"] == "PRICE_RANGE" and r["severity"] == "fatal"

@@ -147,7 +147,7 @@ def _benchmark_nav_aligned(run_dates: set, run_nav: dict) -> tuple[list[dict], s
                      .group_by("trade_date").agg(pl.col("r").mean().alias("r"))
                      .sort("trade_date"))
                 cur = 1.0
-                for d, rr in zip(b["trade_date"].to_list(), b["r"].to_list()):
+                for d, rr in zip(b["trade_date"].to_list(), b["r"].to_list(), strict=False):
                     if d in run_dates:
                         if rr is not None and math.isfinite(rr):
                             cur *= 1 + float(rr)
@@ -354,9 +354,13 @@ def get_attribution(run_id: str, top: int = Query(default=15, ge=3, le=50)) -> d
     持仓数据来自 backtest_position（run-code / run 端点都会写）；
     老运行没有持仓数据时返回 404 提示重跑。
     """
-    from lquant.backtest.attribution import (brinson_by_group, group_of_symbol,
-                                             industry_map_from_db,
-                                             risk_vs_benchmark, stock_contribution)
+    from lquant.backtest.attribution import (
+        brinson_by_group,
+        group_of_symbol,
+        industry_map_from_db,
+        risk_vs_benchmark,
+        stock_contribution,
+    )
 
     with reader() as con:
         nav = con.execute(
@@ -372,7 +376,6 @@ def get_attribution(run_id: str, top: int = Query(default=15, ge=3, le=50)) -> d
     if not pos_rows:
         raise HTTPException(404, "该运行没有每日持仓数据（老版本生成），重跑一次即可")
 
-    import numpy as np
     nav_map = {r[0]: float(r[1]) for r in nav}
     dates = [r[0] for r in nav]
     positions: dict = {}

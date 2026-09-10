@@ -22,8 +22,8 @@ from lquant.portfolio.screener import (
     FilterConfig,
     apply_filters,
     filter_report,
-    screen,
     score,
+    screen,
 )
 from lquant.portfolio.weighting import (
     METHODS,

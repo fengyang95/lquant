@@ -1,0 +1,9 @@
+name: claude-code
+kind: skill
+driver: agent
+permissions:
+  quota_eval: 2000
+  can_submit: true
+  can_export_data: false
+enabled: true
+skill_sha256: ed0d4bfebf164af9

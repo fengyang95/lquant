@@ -38,6 +38,7 @@ type EvalSeries = {
   };
   decay: { horizons: number[]; ic: (number | null)[]; rank_ic: (number | null)[] };
   ic_by_year: { year: number; ic_mean: number | null; ir: number | null; positive_rate: number | null }[];
+  neutral_ladder?: { label: string; covs: string[]; ic_mean: number | null; rank_ic_mean: number | null; n_days: number }[];
 };
 type CorrResult = {
   factors: string[];
@@ -70,12 +71,16 @@ function corrColor(v: number): string {
 
 export default function FactorsPage() {
   const { data: factors, mutate } = useSWR<FactorRow[]>('/factors', get);
+  const [srcFilter, setSrcFilter] = useState<string | null>(null);
+  const shownFactors = (factors ?? []).filter(
+    (f) => !srcFilter || (f as unknown as { source?: string }).source === srcFilter);
   const { data: builtin } = useSWR<BuiltinItem[]>('/factors/builtin', get);
   const [name, setName] = useState('mom20');
   const [expression, setExpression] = useState('Rank(Ts_Mean($close,5)/$close-1)');
   const [formula, setFormula] = useState('pct_change_20');
   const [evalRes, setEvalRes] = useState<EvalResult | null>(null);
   const [evalSeries, setEvalSeries] = useState<EvalSeries | null>(null);
+  const [seriesError, setSeriesError] = useState<string | null>(null);
   const [busy, setBusy] = useState<'' | 'reg' | 'eval' | 'corr' | 'syn' | 'seed'>('');
   const [msg, setMsg] = useState('');
   // 相关性 / 合成
@@ -216,12 +221,11 @@ export default function FactorsPage() {
     setMsg('');
     try {
       const params = { factor: name || 'tmp', formula, n_groups: 5 };
-      const r = await post<EvalResult>('/factors/evaluate', params);
+      const r = await post<EvalResult & { series?: EvalSeries }>('/factors/evaluate', params);
       setEvalRes(r);
-      // 图表数据包（失败不阻塞主评价结果）
-      try {
-        setEvalSeries(await post<EvalSeries>('/factors/evaluate/series', params));
-      } catch { setEvalSeries(null); }
+      // 图表数据包随主评价一次返回（后端已合并计算）
+      setEvalSeries(r.series ?? null);
+      setSeriesError(r.series ? null : '图表数据缺失：评价响应未包含 series 字段');
     } catch (e) {
       setMsg(`✗ ${e instanceof Error ? e.message : e}`);
     } finally {
@@ -385,6 +389,13 @@ export default function FactorsPage() {
         </Panel>
       )}
 
+      {/* 图表加载失败显式提示（缺陷 #4：不再伪装成「样本不足」） */}
+      {seriesError && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {seriesError}
+        </div>
+      )}
+
       {/* 评价图表：IC / 分层 / 衰减 */}
       {evalSeries && (
         <div className="grid gap-5 lg:grid-cols-2">
@@ -404,7 +415,36 @@ export default function FactorsPage() {
               : <Empty>样本不足</Empty>}
           </Panel>
           <div className="space-y-5">
-            <Panel title="IC 衰减" meta={`半衰期 ${evalRes?.half_life ?? '—'} 天 → 建议 ${evalRes?.suggested_rebalance ?? '—'}`}>
+            <Panel title="IC 归因阶梯"
+            meta={(evalSeries.neutral_views as { return_neutral_ic?: number } | undefined)?.return_neutral_ic != null
+              ? `收益中性化 IC 对照 = ${(evalSeries.neutral_views as { return_neutral_ic: number }).return_neutral_ic.toFixed(4)}（口径：因子~协变量取残差）`
+              : '原始 → +市值 → +行业 → +换手率（逐段叠加看 IC 掉多少）'}>
+            {(evalSeries.neutral_ladder?.length ?? 0) > 0 ? (
+              <div className="space-y-1.5 px-1 py-2 text-xs">
+                {evalSeries.neutral_ladder!.map((l) => {
+                  const cov = (l as { coverage?: number }).coverage ?? 1;
+                  const dim = cov < 0.8;
+                  const first = evalSeries.neutral_ladder![0].ic_mean ?? 0;
+                  const v = l.ic_mean ?? 0;
+                  const drop = first !== 0 ? ((first - v) / Math.abs(first) * 100).toFixed(0) : '0';
+                  const w = first !== 0 ? Math.min(Math.abs(v / first) * 100, 100) : 0;
+                  return (
+                    <div key={l.label}
+                      className={`flex items-center gap-2 rounded-sm px-1 ${dim ? 'bg-ink-faint/10 opacity-60' : ''}`}
+                      title={dim ? `协变量覆盖率 ${(cov * 100).toFixed(0)}% < 80%` : ''}>
+                      <span className="w-24 text-ink-dim">{l.label}</span>
+                      <div className="h-3 flex-1 rounded-sm bg-ink-faint/10">
+                        <div className="h-3 rounded-sm" style={{ width: `${w}%`, background: 'var(--c-indigo, #31589E)' }} />
+                      </div>
+                      <span className="w-16 text-right font-mono">{v.toFixed(4)}</span>
+                      <span className="w-10 text-right text-ink-faint">↓{drop}%</span>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : <Empty>协变量数据不足</Empty>}
+          </Panel>
+          <Panel title="IC 衰减" meta={`半衰期 ${evalRes?.half_life ?? '—'} 天 → 建议 ${evalRes?.suggested_rebalance ?? '—'}`}>
               {decayOption
                 ? <Chart option={decayOption} height={180} />
                 : <Empty>样本不足</Empty>}
@@ -529,7 +569,7 @@ export default function FactorsPage() {
 
       <Panel
         title="已注册因子"
-        meta={<>共 {factors?.length ?? 0} 个 · Qlib Alpha158 内置因子可一键入库</>}
+        meta={<>共 {shownFactors.length} 个 · Qlib Alpha158 内置因子可一键入库</>}
         actions={
           <button
             onClick={seedBuiltin}
@@ -540,6 +580,17 @@ export default function FactorsPage() {
           </button>
         }
       >
+        <div className="mb-3 flex flex-wrap items-center gap-1">
+          {['全部', 'qlib', 'yaml', 'manual'].map((src) => (
+            <button
+              key={src}
+              onClick={() => setSrcFilter(src === '全部' ? null : src)}
+              className={`tag ${(srcFilter ?? '全部') === src ? 'tag-on' : ''}`}
+            >
+              {src}
+            </button>
+          ))}
+        </div>
         <div className="mb-4 flex flex-wrap items-center gap-1">
           <input
             value={builtinQuery}
@@ -566,19 +617,28 @@ export default function FactorsPage() {
               <tr>
                 <th className="text-left">名称</th>
                 <th className="text-left">表达式</th>
+                <th className="text-left">来源</th>
+                <th className="text-left">IC(中性化)</th>
                 <th className="text-left">注册时间</th>
               </tr>
             </thead>
             <tbody>
-              {factors.map((f) => (
-                <tr key={f.name} className="hover:bg-white">
-                  <td className="font-medium">
-                    <a href={`/factors/${f.name}`} className="hover:underline">{f.name}</a>
-                  </td>
-                  <td className="font-mono text-xs text-ink-dim">{f.expression || '—'}</td>
-                  <td className="text-ink-faint">{f.created_at?.slice(0, 19)}</td>
-                </tr>
-              ))}
+              {shownFactors.map((f) => {
+                const src = (f as unknown as { source?: string }).source;
+                const icn = (f as unknown as { ic_neutral?: number | null }).ic_neutral;
+                const icnDisplay = icn == null ? '—' : Number(icn).toFixed(4);
+                return (
+                  <tr key={f.name} className="hover:bg-white">
+                    <td className="font-medium">
+                      <a href={`/factors/${f.name}`} className="hover:underline">{f.name}</a>
+                    </td>
+                    <td className="font-mono text-xs text-ink-dim">{f.expression || '—'}</td>
+                    <td className="text-ink-faint">{src ?? 'manual'}</td>
+                    <td className="font-mono">{icnDisplay}</td>
+                    <td className="text-ink-faint">{f.created_at?.slice(0, 19)}</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}

@@ -20,10 +20,20 @@ os.environ.setdefault("LQ_SYNC_WORKER", "0")
 pytestmark = pytest.mark.usefixtures("api_env")
 
 
+def _ensure_cwd():
+    """cwd 指向的目录被删（pytest tmp 清理）时，os.getcwd() 会炸 —— 先兜底恢复。"""
+    try:
+        os.getcwd()
+    except FileNotFoundError:
+        os.chdir(os.path.expanduser("~"))
+
+
 @pytest.fixture(scope="module")
 def api_env(tmp_path_factory):
     """chdir 到 tmp 目录，用 generate_demo 造一份自包含合成数据环境。"""
+    _ensure_cwd()
     base = tmp_path_factory.mktemp("api")
+    _old = os.getcwd()
     os.chdir(base)
     from lquant.core.config import get_settings
 
@@ -31,19 +41,20 @@ def api_env(tmp_path_factory):
 
     from lquant.core.db import writer
     from lquant.data.ingest.demo import generate_demo
+    from lquant.data.store.ddl import DDL_STATEMENTS, ensure_factor_def_columns
     from lquant.market.scheduler import collect_and_save
-
-    from lquant.data.store.ddl import DDL_STATEMENTS
     from lquant.market.schema import ensure_market_tables
     with writer() as con:                # startup 前手动建库+看板表
         for stmt in DDL_STATEMENTS:
             con.execute(stmt)
+        ensure_factor_def_columns(con)
         ensure_market_tables(con)
     generate_demo(start="2024-01-01", end="2026-06-30")
     # 市场看板表灌一轮 demo 采集 —— breadth/snapshot/index 端点
     # 不再依赖测试文件内的执行顺序（此前靠真实库里的存量数据）
     collect_and_save(schedule=None, demo=True)
     yield base
+    os.chdir(_old)
     get_settings.cache_clear()
 
 
@@ -438,7 +449,6 @@ def test_etf_correlation_empty_graceful(client):
 
 def test_etf_correlation_computes_pairs(client, monkeypatch):
     """有 ETF 日线时算得出 pairs 且 col 序/三角解开正确（回归：polars 无 DF.pct_change）。"""
-    import polars as pl
 
     # correlation 内 `from lquant.data.store.parquet import read_daily` → 打在源模块上。
     monkeypatch.setattr("lquant.data.store.parquet.read_daily", lambda: df_lake())

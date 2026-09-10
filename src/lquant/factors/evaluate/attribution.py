@@ -33,7 +33,7 @@ def exposure(df: pl.DataFrame, factor: str, by: str = "industry_sw1",
     def dist(part: pl.DataFrame) -> dict[str, float]:
         g = part.group_by(by).agg(pl.len().alias("n")).with_columns(
             w=pl.col("n") / pl.col("n").sum())
-        return dict(zip(g[by].cast(pl.Utf8).to_list(), g["w"].to_list()))
+        return dict(zip(g[by].cast(pl.Utf8).to_list(), g["w"].to_list(), strict=False))
 
     dh, dl = dist(hi), dist(lo)
     keys = sorted(set(dh) | set(dl))

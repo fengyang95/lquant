@@ -172,7 +172,7 @@ def monthly_returns(dates, returns) -> dict[tuple[int, int], float]:
     if dates is None or len(dates) != len(r):
         return out
     acc: dict[tuple[int, int], float] = {}
-    for d, v in zip(dates, r):
+    for d, v in zip(dates, r, strict=False):
         key = (getattr(d, "year", 0), getattr(d, "month", 0))
         acc[key] = acc.get(key, 1.0) * (1.0 + v)
     return {k: v - 1.0 for k, v in acc.items()}

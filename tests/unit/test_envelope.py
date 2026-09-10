@@ -5,9 +5,6 @@
 """
 from __future__ import annotations
 
-import json
-
-import pytest
 from fastapi import APIRouter, FastAPI, HTTPException, Query
 from fastapi.testclient import TestClient
 
