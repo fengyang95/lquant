@@ -208,4 +208,30 @@ describe('connectAskEvents', () => {
     expect(FakeWebSocket.instances).toHaveLength(3);
     expect(last().closed).toBe(true);
   });
+
+  it('onDone 仅在收到 done 事件时触发，并停止重连意图', () => {
+    setup();
+    const cancel = connectAskEvents('s1', onEvent, onDone);
+
+    last().onmessage?.({ data: JSON.stringify({ type: 'assistant_delta', text: 'hi' }) });
+    expect(onDone).not.toHaveBeenCalled();
+
+    last().onmessage?.({ data: JSON.stringify({ type: 'done' }) });
+    expect(onDone).toHaveBeenCalledTimes(1);
+
+    // done 后连接关闭不再重连
+    last().onclose?.();
+    vi.advanceTimersByTime(10_000);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    cancel();
+    expect(onDone).toHaveBeenCalledTimes(1); // cancel 不重复触发
+  });
+
+  it('cancel/清理不再调用 onDone', () => {
+    setup();
+    const cancel = connectAskEvents('s1', onEvent, onDone);
+    last().onmessage?.({ data: JSON.stringify({ type: 'assistant_delta', text: 'hi' }) });
+    cancel();
+    expect(onDone).not.toHaveBeenCalled();
+  });
 });

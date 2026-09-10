@@ -31,6 +31,8 @@ SETTING_DEFS: dict[str, SettingDef] = {
         label="回测默认撮合模式"),
     "timezone": SettingDef(default="Asia/Shanghai", ty="str", label="时区"),
     "crosscheck_peers": SettingDef(default=(), ty="list", label="对拍 peer 源（跨源印证）"),
+    "agent.provider": SettingDef(
+        default="mock", ty="str", label="问 AI 后端 provider（mock / claude_code 等）"),
 }
 
 
@@ -93,6 +95,16 @@ def _config_default_providers() -> tuple[str, ...]:
         return ()
 
 
+def _config_default_agent_provider() -> str:
+    """从 config/app.yaml 取 agent.provider 默认值（读不到回退 mock）。"""
+    try:
+        from lquant.core.config import get_settings  # noqa: PLC0415
+
+        return get_settings().agent.provider or "mock"
+    except Exception:  # noqa: BLE001
+        return "mock"
+
+
 def defaults() -> dict[str, tuple[object, str]]:
     """key -> (value, source)。providers_order 从 config 派生（config/默认）。"""
     out: dict[str, tuple[object, str]] = {}
@@ -100,6 +112,9 @@ def defaults() -> dict[str, tuple[object, str]]:
         if k == "providers_order":
             cfg = _config_default_providers()
             out[k] = (cfg, "config" if cfg else "default")
+        elif k == "agent.provider":
+            cfg = _config_default_agent_provider()
+            out[k] = (cfg, "config" if cfg != "mock" else "default")
         else:
             out[k] = (d.default, "default")
     return out

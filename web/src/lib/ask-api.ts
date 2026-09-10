@@ -144,7 +144,8 @@ function findLastAssistant(msgs: AskMessage[]): number {
 
 
 /** 连接会话事件流：ws(s)://host/ws/ask/{sid}，断线指数退避重连（1s 起上限 10s）。
- *  返回取消函数：停止重连并关闭当前连接。 */
+ *  收到 done 事件时触发 onDone 并停止重连意图；cancel 只负责停止重连并关闭连接，不触发 onDone。
+ *  返回取消函数。 */
 export function connectAskEvents(
   sid: string,
   onEvent: (ev: AgentEventMsg) => void,
@@ -156,6 +157,7 @@ export function connectAskEvents(
 
   let ws: WebSocket | null = null;
   let cancelled = false;
+  let finished = false;
   let retry = 0;
 
   const connect = (): void => {
@@ -167,10 +169,14 @@ export function connectAskEvents(
       } catch {
         return; // 非 JSON 消息静默忽略
       }
+      if (ev.type === 'done' && !finished) {
+        finished = true;
+        onDone?.();
+      }
       onEvent(ev);
     };
     ws.onclose = () => {
-      if (cancelled) return;
+      if (cancelled || finished) return; // done 后不再重连
       const delay = Math.min(1000 * 2 ** retry, 10000);
       retry += 1;
       setTimeout(connect, delay);
@@ -182,6 +188,5 @@ export function connectAskEvents(
   return () => {
     cancelled = true;
     ws?.close();
-    if (onDone) onDone();
   };
 }
