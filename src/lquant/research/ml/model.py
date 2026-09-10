@@ -28,7 +28,7 @@ class Model:
         self.model = None
         self.feature_names: list[str] = []
 
-    def fit(self, X: np.ndarray, y: np.ndarray, **kw) -> "Model":
+    def fit(self, X: np.ndarray, y: np.ndarray, **kw) -> Model:
         raise NotImplementedError
 
     def _check_ready(self) -> None:
@@ -40,7 +40,7 @@ class Model:
         self._check_ready()
         raise NotImplementedError
 
-    def finetune(self, X: np.ndarray, y: np.ndarray, **kw) -> "Model":
+    def finetune(self, X: np.ndarray, y: np.ndarray, **kw) -> Model:
         """增量训练。默认退化为全量重训。"""
         return self.fit(X, y, **kw)
 
@@ -53,7 +53,7 @@ class Model:
         return p
 
     @classmethod
-    def load(cls, path: str | Path) -> "Model":
+    def load(cls, path: str | Path) -> Model:
         with open(path, "rb") as f:
             blob = pickle.load(f)
         obj = cls(**blob.get("params", {}))
@@ -74,7 +74,7 @@ class LGBMModel(Model):
         default.update(params)
         super().__init__(**default)
 
-    def fit(self, X, y, **kw) -> "LGBMModel":
+    def fit(self, X, y, **kw) -> LGBMModel:
         import lightgbm as lgb
         self.model = lgb.LGBMRegressor(**self.params)
         self.model.fit(X, y, **kw)
@@ -96,7 +96,7 @@ class SklearnModel(Model):
         default.update(params)
         super().__init__(**default)
 
-    def fit(self, X, y, **kw) -> "SklearnModel":
+    def fit(self, X, y, **kw) -> SklearnModel:
         # 用 GradientBoostingRegressor 而不是 HistGradientBoostingRegressor：
         # 后者在 sklearn 1.9 里不接受 n_estimators / subsample，参数名跨版本不稳定
         from sklearn.ensemble import GradientBoostingRegressor
@@ -119,7 +119,7 @@ class RidgeModel(Model):
         default.update(params)
         super().__init__(**default)
 
-    def fit(self, X, y, **kw) -> "RidgeModel":
+    def fit(self, X, y, **kw) -> RidgeModel:
         from sklearn.linear_model import Ridge
         self.model = Ridge(**self.params)
         self.model.fit(X, y)

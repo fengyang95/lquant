@@ -13,6 +13,7 @@ from lquant.factors.evaluate.ic import _t_stat as tstat
 from lquant.factors.evaluate.ic import ic_series
 from lquant.factors.mining.fitness import corrected_threshold
 from lquant.factors.mining.gates import GateResult, g0_static, g1_fast_screen, g2_dedup
+from lquant.factors.preprocess.pipeline import drop_nonfinite
 
 
 @dataclass

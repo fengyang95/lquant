@@ -4,7 +4,6 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from lquant.core.config import get_settings
 from lquant.server import ws
 from lquant.server.api import (
     analyses,
@@ -23,7 +22,6 @@ from lquant.server.api import (
 
 
 def create_app() -> FastAPI:
-    s = get_settings()
     app = FastAPI(title="lquant", version="0.1.0",
                   description="A股量化研究平台 API")
     app.add_middleware(

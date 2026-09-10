@@ -17,8 +17,8 @@ from pydantic import BaseModel, Field
 from lquant.core.db import reader
 from lquant.data.store.catalog import upsert
 from lquant.data.store.parquet import read_daily
-from lquant.factors.preprocess.pipeline import drop_nonfinite
 from lquant.factors.evaluate import evaluate, forward_return, save_report
+from lquant.factors.preprocess.pipeline import drop_nonfinite
 
 router = APIRouter(prefix="/factors", tags=["factors"])
 
@@ -147,7 +147,8 @@ def _neutral_ladder(d: pl.DataFrame, col: str, ret_col: str,
     dd/cov_report 可由调用方传入（协变量只构建一次，ladder 与 views 复用）。
     """
     from lquant.factors.evaluate.ic import ic_series
-    from lquant.factors.preprocess.pipeline import run as pipeline_run, drop_nonfinite
+    from lquant.factors.preprocess.pipeline import drop_nonfinite
+    from lquant.factors.preprocess.pipeline import run as pipeline_run
 
     levels = [
         ("raw", []),
@@ -303,30 +304,6 @@ def run_evaluate(req: EvaluateIn) -> dict:
     m, s = _evaluate_full(req)
     m["series"] = s
     return m
-    if ret_col not in d.columns:
-        raise HTTPException(500, f"前瞻收益列缺失: {ret_col}")
-
-    res = evaluate(d, "_factor", ret_col=ret_col, n_groups=req.n_groups,
-                   horizons=req.horizons)
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = save_report(res["report"], REPORT_DIR / f"{req.factor}.html")
-    ic = res["ic"]["ic"]
-    ls = res["quantile"]["long_short"]
-    return {
-        "factor": req.factor,
-        "formula": req.formula,
-        "n_samples": len(d),
-        "ic": {"mean": round(ic["mean"], 4), "ir": round(ic["ir"], 3),
-               "t_stat": round(ic["t_stat"], 2), "positive_rate": round(ic["positive_rate"], 4)},
-        "rank_ic_mean": round(res["ic"]["rank_ic"]["mean"], 4),
-        "long_short": {"annual_return": round(ls["annual_return"], 4),
-                       "sharpe": round(ls["sharpe"], 2),
-                       "max_drawdown": round(ls["max_drawdown"], 4)},
-        "monotonicity": round(res["quantile"]["monotonicity"], 3),
-        "half_life": res["decay"]["half_life"],
-        "suggested_rebalance": res["decay"]["suggested_rebalance"],
-        "report_url": f"/api/factors/reports/{report_path.stem}",
-    }
 
 
 @router.post("/evaluate/series")
@@ -451,10 +428,10 @@ def agent_guide(name: str) -> dict:
 def mine_run(req: dict) -> dict:
     """平台驱动挖掘会话（同步，有界预算）。请求: {agent, generator, n}。"""
     import datetime as dt
+    import json
     import uuid
 
     from lquant.core.db import writer
-    from lquant.data.store.parquet import read_daily
     from lquant.factors.agents import find_agent
     from lquant.factors.engine import FactorEngine
     from lquant.factors.mining.runner import run_session
@@ -606,7 +583,7 @@ def synthesize(req: SynthesizeIn) -> dict:
     tag = "icw" if req.method == "ic_weighted" else "eq"
     name = f"syn_{len(req.formulas)}f_{tag}"
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = save_report(res["report"], REPORT_DIR / f"{name}.html")
+    save_report(res["report"], REPORT_DIR / f"{name}.html")
     ic = res["ic"]["ic"]
     ls = res["quantile"]["long_short"]
     return {

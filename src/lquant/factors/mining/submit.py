@@ -5,6 +5,8 @@ A/B 级入库，C/D 级落 factor_replication 表归档正确数字（D = 研报
 """
 from __future__ import annotations
 
+import json
+
 import polars as pl
 
 from lquant.factors.mining.fitness import corrected_threshold
@@ -37,7 +39,8 @@ def _split_eval(df, cov_cols, expr):
     from lquant.factors.evaluate import forward_return
     from lquant.factors.evaluate.ic import ic_series
     from lquant.factors.mining.runner import split_dates
-    from lquant.factors.preprocess.pipeline import run as pipeline_run, drop_nonfinite
+    from lquant.factors.preprocess.pipeline import drop_nonfinite
+    from lquant.factors.preprocess.pipeline import run as pipeline_run
 
     dates = df["trade_date"].unique().to_list()
     train_d, val_d, _ = split_dates(dates)

@@ -21,14 +21,13 @@ def run(factor_expr: str | None, spec_path: str | None, start: str | None,
     """因子多空分层回测（复现工作流的验证终点；平台算，Agent 不许自算）。"""
     import json
 
-    import polars as pl
-
     from lquant.data.store.parquet import read_daily
     from lquant.factors.analysis import compute_factor_col
-    from lquant.factors.preprocess.pipeline import drop_nonfinite, run as pipeline_run
     from lquant.factors.covariates import build_covariates
     from lquant.factors.evaluate import forward_return
     from lquant.factors.evaluate.quantile import quantile_summary
+    from lquant.factors.preprocess.pipeline import drop_nonfinite
+    from lquant.factors.preprocess.pipeline import run as pipeline_run
 
     if spec_path:
         from lquant.factors.replication import load_spec

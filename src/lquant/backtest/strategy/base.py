@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from lquant.backtest.events import Bar
 from lquant.backtest.account import Account
+from lquant.backtest.events import Bar
 
 
 @dataclass

@@ -81,7 +81,26 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "PL"]
-ignore = ["PLR0913", "PLR2004", "B008"]
+ignore = [
+  "PLR0913", "PLR2004", "B008",
+  # 与仓库既有模式冲突的 PL 规则（新版 ruff preview 行为），见 lint 债务清理
+  "PLC0415",   # 函数级 import 是有意的惰性加载模式（CLI/服务启动提速）
+  "PLR0912",   # 复杂度：存量分支数
+  "PLR0915",   # 复杂度：存量语句数
+  "PLR0911",   # 复杂度：return 数
+  "PLR0917",   # 复杂度：位置参数数
+  "PLW0603",   # 模块级单例（cache/get_settings 等有意为之）
+  "PLW2901",   # 循环变量重绑定（解析器惯用）
+  "PLC0207",   # maxsplit 风格
+  "PLW1510",   # subprocess check 默认
+  "PLR1714",   # 链式比较合并
+  "PLW3301",   # 相似分支
+  "PLW0127",   # 自赋值诊断（DSL 解析器边界用法）
+  "PLW0108",   # lambda 包一层 def
+  "E741",      # l/I 变量名（数学语境）
+  "E701",      # 单行多语句（存量风格）
+  "E501",      # 行长交给 ruff format 与人审，不作为硬门禁
+]
 
 [tool.mypy]
 python_version = "3.12"

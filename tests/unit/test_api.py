@@ -41,9 +41,8 @@ def api_env(tmp_path_factory):
 
     from lquant.core.db import writer
     from lquant.data.ingest.demo import generate_demo
-    from lquant.market.scheduler import collect_and_save
-
     from lquant.data.store.ddl import DDL_STATEMENTS, ensure_factor_def_columns
+    from lquant.market.scheduler import collect_and_save
     from lquant.market.schema import ensure_market_tables
     with writer() as con:                # startup 前手动建库+看板表
         for stmt in DDL_STATEMENTS:
@@ -450,7 +449,6 @@ def test_etf_correlation_empty_graceful(client):
 
 def test_etf_correlation_computes_pairs(client, monkeypatch):
     """有 ETF 日线时算得出 pairs 且 col 序/三角解开正确（回归：polars 无 DF.pct_change）。"""
-    import polars as pl
 
     # correlation 内 `from lquant.data.store.parquet import read_daily` → 打在源模块上。
     monkeypatch.setattr("lquant.data.store.parquet.read_daily", lambda: df_lake())

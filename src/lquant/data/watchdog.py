@@ -7,7 +7,8 @@ BaoStock 批量连续请求会静默挂起 —— 实测 20 只串行跑 12 分�
 from __future__ import annotations
 
 import multiprocessing as mp
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from lquant.core.config import get_settings
 

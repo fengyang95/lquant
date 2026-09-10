@@ -5,12 +5,13 @@
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Generic, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 T = TypeVar("T")
 
 
-class Registry(Generic[T]):
+class Registry[T]:
     def __init__(self, name: str) -> None:
         self.name = name
         self._items: dict[str, T] = {}

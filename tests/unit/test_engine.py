@@ -16,7 +16,6 @@ from lquant.backtest.slippage import NoSlippage, make_slippage
 from lquant.backtest.strategy import get_strategy
 from lquant.backtest.strategy.base import Context, Strategy
 
-
 # ---------- 合成数据 ----------
 
 def make_single(rows) -> pl.DataFrame:
@@ -240,7 +239,7 @@ def test_perf_from_nav_keys():
                          dates=[d for d, _ in res.nav])
     for k in ("total_return", "annual_return", "sharpe", "max_drawdown"):
         assert k in perf
-    assert -1.0 < perf["total_return"]                     # 不会归零以下
+    assert perf["total_return"] > -1.0                     # 不会归零以下
 
 
 def test_perf_zero_vol_sharpe_safe():

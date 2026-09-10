@@ -10,12 +10,12 @@
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime
 
 import polars as pl
 
 from lquant.data.store.catalog import upsert
-from lquant.market.collectors import COLLECTORS, list_collectors
+from lquant.market.collectors import COLLECTORS
 from lquant.market.schema import TABLE_COLUMNS, ensure_market_tables
 
 __all__ = ["SCHEDULES", "collect", "persist", "collect_and_save",
@@ -102,7 +102,7 @@ def collect_and_save(schedule: str | None = "close", trade_date=None, *,
     d = trade_date or started.date()
     frames: dict[str, pl.DataFrame] = {}
     errors: dict[str, str] = {}
-    for k in COLLECTORS.keys():
+    for k in COLLECTORS:
         meta = COLLECTORS.meta(k)
         if schedule and meta.get("schedule") != schedule:
             continue

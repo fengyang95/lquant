@@ -88,7 +88,7 @@ def test_eval_quota_ledger(tmp_path, monkeypatch):
 
     prof = A.AgentProfile(name="t", kind="skill", driver="agent",
                           quota_eval=10, can_submit=True)
-    assert A.AgentProfile is not None
+    assert prof.quota_eval == 10
 
 
 

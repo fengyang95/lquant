@@ -10,9 +10,7 @@ import polars as pl
 
 from lquant.factors.evaluate.ic import ic_series
 from lquant.factors.preprocess._regress import (
-    encode_cats,
     residual_by_day,
-    split_levels,
 )
 
 
@@ -55,6 +53,6 @@ def neutral_views(df: pl.DataFrame, factor: str, ret_col: str,
         if len(s):
             out["return_neutral_ic"] = round(float(s["ic"].mean()), 4)
     if group_col:
-        gq = industry_group_quantile(df, factor, ret_col, group_col, n_groups)
+        industry_group_quantile(df, factor, ret_col, group_col, n_groups)
         out["industry_group_quantile"] = True
     return out

@@ -135,7 +135,6 @@ def walk_forward_splits(dates: list[date], train_months: int = 24,
     这是唯一能反映实盘的验证方式：每一期只用当时可得的数据训练，
     预测随后的一段时间，再整体前移。
     """
-    from datetime import timedelta
 
     if not dates:
         return []
@@ -154,7 +153,6 @@ def walk_forward_splits(dates: list[date], train_months: int = 24,
 
 
 def _add_months(d: date, months: int) -> date:
-    from datetime import timedelta
     y = d.year + (d.month - 1 + months) // 12
     m = (d.month - 1 + months) % 12 + 1
     import calendar

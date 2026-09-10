@@ -1,6 +1,5 @@
 from datetime import date
 
-from lquant.backtest.account import Account
 from lquant.backtest.broker import Broker
 from lquant.backtest.events import Bar, Order, Side
 from lquant.backtest.rules.model import Commission, InstrumentRules, PriceLimit, TaxSchedule

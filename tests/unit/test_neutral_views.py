@@ -15,7 +15,6 @@ from lquant.factors.evaluate.neutral_views import (
     neutral_views,
     return_neutral_ic,
 )
-from lquant.factors.preprocess.pipeline import run as pipeline_run
 
 
 def _panel(n_days=80, n_sym=10):

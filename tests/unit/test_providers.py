@@ -21,12 +21,19 @@ class TestTencentParse:
         from lquant.data.providers.tencent import parse_quotes
 
         f = [str(i) for i in range(50)]       # 占位，仅保长度
-        f[1] = "贵州茅台"; f[3] = "1700.00"
-        f[4] = "1690.00"; f[5] = "1695.00"
-        f[6] = "12345"; f[30] = "20240909150003"
-        f[32] = "-1.20"; f[33] = "1720.00"; f[34] = "1680.00"
-        f[37] = "586134.00"; f[38] = "0.05"
-        f[47] = "1747.00"; f[48] = "1650.00"
+        f[1] = "贵州茅台"
+        f[3] = "1700.00"
+        f[4] = "1690.00"
+        f[5] = "1695.00"
+        f[6] = "12345"
+        f[30] = "20240909150003"
+        f[32] = "-1.20"
+        f[33] = "1720.00"
+        f[34] = "1680.00"
+        f[37] = "586134.00"
+        f[38] = "0.05"
+        f[47] = "1747.00"
+        f[48] = "1650.00"
         df = parse_quotes(_gtimg_payload(f))
         assert len(df) == 1
         r = df.row(0, named=True)
@@ -277,9 +284,9 @@ class TestCrosscheck:
 
     def test_date_dtype_normalized_before_join(self):
         """湖 Date 与 provider String/Datetime 混用不该抛 SchemaError。"""
-        from lquant.data.quality.crosscheck import classify_divergence
-
         import datetime as dt
+
+        from lquant.data.quality.crosscheck import classify_divergence
         p = pl.DataFrame({
             "symbol": ["600519.SH"], "trade_date": [dt.date(2024, 9, 9)],
             "open": [1700.0]})

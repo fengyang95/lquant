@@ -383,7 +383,7 @@ class BaoStockProvider(MappingProvider):
             if not raw or not hfq or len(raw) != len(hfq):
                 continue
             out.append(pl.DataFrame(
-                [[r[0], r[1], float(r[2]), float(h[2])] for r, h in zip(raw, hfq)],
+                [[r[0], r[1], float(r[2]), float(h[2])] for r, h in zip(raw, hfq, strict=False)],
                 schema=["trade_date", "symbol", "close", "hfq_close"], orient="row",
             ))
         if not out:
@@ -523,7 +523,7 @@ class BaoStockProvider(MappingProvider):
                         if stat_d is None or pub_d is None:
                             continue  # 无公告日 → 无法防未来函数 → 丢弃
                         code = r[ci] if ci is not None else sym
-                        for col, val in zip(head, r):
+                        for col, val in zip(head, r, strict=False):
                             if col in ("code", "statDate", "pubDate") or val in ("", None):
                                 continue
                             try:

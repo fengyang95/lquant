@@ -1,5 +1,4 @@
 """端到端冒烟：解析因子 → 计算 → （可选）评价。"""
-import polars as pl
 
 from lquant.factors.engine import FactorEngine
 from lquant.factors.ops import cs_ops, ts_ops  # noqa: F401

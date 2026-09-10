@@ -112,7 +112,7 @@ def fetch_northbound(trade_date=None, *, demo: bool = False) -> pl.DataFrame:
                   "&fields2=f51,f52,f54,f56&ut=b2884a393a59ad64002292a3e90d46a5")
     data = resp.json().get("data") or {}
     sh = sz = 0.0
-    for it in (data.get("hk2sh") or [], data.get("hk2sz") or []):
+    for _it in (data.get("hk2sh") or [], data.get("hk2sz") or []):
         pass
     # 该接口返回结构随版本变化，稳妥做法：取 kamt.rtmin 的最后一条
     try:

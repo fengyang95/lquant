@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 import shutil
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -146,10 +146,10 @@ def test_run_collect_demo_persists_and_logs():
 
 
 def test_index_daily_demo_schema_and_persist():
+    from lquant.core.db import reader
+    from lquant.data.store.catalog import upsert
     from lquant.market.collectors import run
     from lquant.market.schema import ensure_market_tables
-    from lquant.data.store.catalog import upsert
-    from lquant.core.db import reader
 
     df = run("index_daily", demo=True)
     assert {"000001.SH", "000300.SH"} <= set(df["symbol"].unique().to_list())
@@ -179,6 +179,7 @@ def test_dragon_tiger_demo_schema():
 
 def test_refresh_adj_factors_merges_into_lake():
     import polars as pl
+
     from lquant.data.ingest.adj import refresh_adj_factors
     from lquant.data.store.parquet import read_daily
 

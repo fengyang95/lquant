@@ -7,6 +7,7 @@ BaoStock 长任务（5000 只标的 / 逐季财务）动辄跑几小时，
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -30,10 +31,9 @@ class Checkpoint:
         self.path = _dir() / f"{name}.json"
         self._data: dict = {"done": [], "updated_at": None, "meta": {}}
         if self.path.exists():
-            try:
+            # 坏文件直接当空，不阻塞任务
+            with contextlib.suppress(json.JSONDecodeError):
                 self._data = json.loads(self.path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                pass  # 坏文件直接当空，不阻塞任务
 
     @property
     def done(self) -> set[str]:

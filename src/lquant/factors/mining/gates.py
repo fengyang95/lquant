@@ -51,7 +51,8 @@ def g1_fast_screen(train, expr, ret_col, engine, covs=None, min_abs_ic=0.02):
     from lquant.factors.analysis import compute_factor_col
     from lquant.factors.evaluate import forward_return
     from lquant.factors.evaluate.ic import ic_series
-    from lquant.factors.preprocess.pipeline import run as pipeline_run, drop_nonfinite
+    from lquant.factors.preprocess.pipeline import drop_nonfinite
+    from lquant.factors.preprocess.pipeline import run as pipeline_run
 
     try:
         d = compute_factor_col(train, expr, "f")

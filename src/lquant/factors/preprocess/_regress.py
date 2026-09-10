@@ -60,7 +60,7 @@ def design_matrix(sub: pl.DataFrame, num_cols: list[str],
         v = sub[c].cast(pl.Float64, strict=False).to_numpy()
         v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
         blocks.append(v.reshape(n, 1))
-    for c, enc in zip(cat_levels.keys(), enc_cols):
+    for c, enc in zip(cat_levels.keys(), enc_cols, strict=False):
         k = len(cat_levels[c])
         if k == 0:
             continue

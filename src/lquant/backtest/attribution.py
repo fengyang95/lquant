@@ -127,7 +127,6 @@ def brinson_by_group(
     nav_map = {d: v for d, v in nav}
     dates = [d for d, _ in nav]
     uni = set(universe)
-    dates_set = set(dates)
 
     # 预取基准个股日收益（坏点经 _clean_ret 护栏过滤）
     bench_ret: dict[date, dict[str, float]] = {}

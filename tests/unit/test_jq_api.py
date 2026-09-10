@@ -15,10 +15,10 @@ def make_df(days=6, start=date(2026, 1, 5)):
     px = {"600000.SH": 100.0, "000001.SZ": 50.0}
     for i in range(days):
         d = date.fromordinal(start.toordinal() + i)
-        for s in px:
-            p = px[s] * (1.02 ** i) if s.startswith("6") else px[s] * (0.99 ** i)
+        for s, base in px.items():
+            p = base * (1.02 ** i) if s.startswith("6") else base * (0.99 ** i)
             pre = p if i == 0 else (
-                px[s] * (1.02 ** (i - 1)) if s.startswith("6") else px[s] * (0.99 ** (i - 1)))
+                base * (1.02 ** (i - 1)) if s.startswith("6") else base * (0.99 ** (i - 1)))
             rows.append(dict(trade_date=d, symbol=s, open=p, high=p * 1.005, low=p * 0.995,
                              close=p, pre_close=pre, volume=1e8, amount=p * 1e8))
     return pl.DataFrame(rows)
@@ -45,7 +45,7 @@ def buy(context):
     assert len(res.trades) == 1
     assert res.trades[0].qty == 5000.0                       # 500000/100，整百
     cash = 1_000_000 - 5000 * 100.05 * (1 + 1e-5)            # 滑点价 + 过户费
-    for k, (d, v) in enumerate(res.nav):
+    for k, (_d, v) in enumerate(res.nav):
         px = 100.0 * (1.02 ** k)
         expect = cash + 5000 * px
         assert v == pytest.approx(expect, rel=1e-6), f"day {k}"

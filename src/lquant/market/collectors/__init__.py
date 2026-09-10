@@ -5,8 +5,8 @@
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import date
-from typing import Callable
 
 import polars as pl
 
@@ -35,7 +35,7 @@ def run_all(schedule: str | None = None, trade_date: date | str | None = None,
             **kw) -> dict[str, pl.DataFrame]:
     """按调度时点批量执行。单个采集器失败不影响其他。"""
     out: dict[str, pl.DataFrame] = {}
-    for k in COLLECTORS.keys():
+    for k in COLLECTORS:
         meta = COLLECTORS.meta(k)
         if schedule and meta.get("schedule") != schedule:
             continue

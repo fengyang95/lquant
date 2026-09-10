@@ -5,7 +5,7 @@ from datetime import date
 
 import polars as pl
 
-from lquant.core.errors import FactorError, LookaheadError
+from lquant.core.errors import FactorError
 from lquant.factors.dsl.analyzer import check
 from lquant.factors.dsl.compiler import compile_expr, plan
 from lquant.factors.dsl.parser import parse

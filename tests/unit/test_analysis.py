@@ -41,9 +41,10 @@ def test_corr_high_for_same_factor_shifted():
 
 
 def test_corr_too_few_factors_rejected():
+    from lquant.core.errors import FactorError
     from lquant.factors.analysis import correlation
 
-    with pytest.raises(Exception):
+    with pytest.raises((ValueError, FactorError)):
         correlation(_demo_daily(), ["pct_change_5"])
 
 

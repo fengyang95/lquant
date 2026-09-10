@@ -16,7 +16,7 @@ EL_OPS = {"Abs", "Log", "Sign", "Sqrt", "Power", "Greater", "Less"}
 
 def test_ops_registered():
     for n in TS_OPS | EL_OPS:
-        assert n in OPS.keys(), f"算子未注册: {n}"
+        assert n in OPS, f"算子未注册: {n}"
 
 
 def _panel(n_days: int = 30, n_sym: int = 3) -> pl.DataFrame:

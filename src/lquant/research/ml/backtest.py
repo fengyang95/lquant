@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import numpy as np
 import polars as pl
 
 from lquant.backtest.engine import Engine, EngineConfig

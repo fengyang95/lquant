@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from fastapi import HTTPException, Query
+from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
 from lquant.core.settings_store import SettingsStore

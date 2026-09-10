@@ -146,7 +146,7 @@ def synthesize(df: pl.DataFrame, formulas: list[str], *,
         raise ValueError("weights 数量与因子数不一致")
 
     out = wide
-    for c, w in zip(names, weights):
+    for c, w in zip(names, weights, strict=False):
         r = pl.col(c).rank().over("trade_date")
         z = (r - r.mean().over("trade_date")) / (r.std().over("trade_date") + 1e-12)
         out = out.with_columns((z * w).alias(f"_z_{c}"))

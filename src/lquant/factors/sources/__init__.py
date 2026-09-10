@@ -15,4 +15,4 @@ def register_source(name: str, label: str):
 
 
 def list_sources() -> list[dict]:
-    return [{"name": k, **SOURCES.meta(k)} for k in SOURCES.keys()]
+    return [{"name": k, **SOURCES.meta(k)} for k in SOURCES]

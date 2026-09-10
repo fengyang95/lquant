@@ -42,7 +42,7 @@ def equal_weight(returns, symbols: list[str] | None = None, **kw) -> dict[str, f
     """1/N。样本外最稳健的基准，所有优化结果都该先和它比。"""
     _, syms = _returns_matrix(returns, symbols)
     n = len(syms)
-    return dict(zip(syms, [1.0 / n] * n))
+    return dict(zip(syms, [1.0 / n] * n, strict=False))
 
 
 def score_weight(df: pl.DataFrame, score_col: str = "score", *,
@@ -77,7 +77,7 @@ def inverse_vol_weight(returns, symbols: list[str] | None = None,
     M, syms = _returns_matrix(returns, symbols)
     vol = M.std(axis=0, ddof=1)
     vol[vol < 1e-9] = 1e-9
-    return dict(zip(syms, _clean(1.0 / vol)))
+    return dict(zip(syms, _clean(1.0 / vol), strict=False))
 
 
 def risk_parity_weight(returns, symbols: list[str] | None = None, *,
@@ -114,7 +114,7 @@ def risk_parity_weight(returns, symbols: list[str] | None = None, *,
                        options={"maxiter": max_iter, "ftol": tol})
         if not res.success or not np.all(np.isfinite(res.x)):
             raise RuntimeError("risk parity 未收敛")
-        return dict(zip(syms, _clean(res.x)))
+        return dict(zip(syms, _clean(res.x), strict=False))
     except Exception:
         return inverse_vol_weight(M, syms)
 
@@ -136,7 +136,7 @@ def min_variance_weight(returns, symbols: list[str] | None = None, *,
                        options={"maxiter": 300, "ftol": 1e-12})
         if not res.success:
             raise RuntimeError("min variance 未收敛")
-        return dict(zip(syms, _clean(res.x)))
+        return dict(zip(syms, _clean(res.x), strict=False))
     except Exception:
         return inverse_vol_weight(M, syms)
 
@@ -153,7 +153,7 @@ def hrp_weight(returns, symbols: list[str] | None = None, *,
         return inverse_vol_weight(M, syms)
 
     try:
-        from scipy.cluster.hierarchy import linkage, leaves_list
+        from scipy.cluster.hierarchy import leaves_list, linkage
         from scipy.spatial.distance import squareform
     except ImportError:
         return inverse_vol_weight(M, syms)
@@ -202,7 +202,7 @@ def hrp_weight(returns, symbols: list[str] | None = None, *,
             nxt.extend([left, right])
         clusters = nxt
 
-    return dict(zip(syms, _clean(w)))
+    return dict(zip(syms, _clean(w), strict=False))
 
 
 METHODS = {

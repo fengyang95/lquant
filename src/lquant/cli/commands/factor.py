@@ -32,8 +32,8 @@ def check_expr(expr: str) -> None:
     import json
     import sys
 
-    from lquant.factors.mining.submit import _daily_fields
     from lquant.factors.mining.gates import g0_static
+    from lquant.factors.mining.submit import _daily_fields
 
     r = g0_static(expr, allowed_fields=_daily_fields())
     payload = {"passed": r.passed, "stage": r.stage,
@@ -52,10 +52,10 @@ def eval_(expr: str, start: str | None, neutral: bool, agent: str | None) -> Non
     """IC JSON + 中性化对照 + n_trials/校正门槛/剩余配额（方案 6.2/6.3）。"""
     import json
 
-    from lquant.factors.mining.submit import _panel_with_covs, _split_eval
     import polars as pl
 
     from lquant.factors.mining.fitness import corrected_threshold
+    from lquant.factors.mining.submit import _panel_with_covs, _split_eval
 
     df, cov_cols = _panel_with_covs(start=start)
     if not len(df):
@@ -74,7 +74,6 @@ def eval_(expr: str, start: str | None, neutral: bool, agent: str | None) -> Non
         from lquant.factors.analysis import compute_factor_col
         from lquant.factors.evaluate import forward_return as _fr
         from lquant.factors.evaluate.ic import ic_series
-
         from lquant.factors.mining.runner import split_dates
 
         tr_d, _v, _t = split_dates(df["trade_date"].unique().to_list())
@@ -85,7 +84,7 @@ def eval_(expr: str, start: str | None, neutral: bool, agent: str | None) -> Non
     # 预算内建：n_trials（eval+挖掘评估总账）、校正门槛、剩余配额
     n_trials, remaining, hints, thr = 0, None, [], None
     if agent:
-        from lquant.factors.agents import eval_usage, find_agent, quota_remaining, record_eval
+        from lquant.factors.agents import find_agent, quota_remaining, record_eval
 
         a = find_agent(agent)
         if not a:
@@ -146,7 +145,6 @@ def mine(agent: str, generator: str, n: int, proposals: str | None, start: str |
     from lquant.data.store.parquet import read_daily
     from lquant.factors.agents import find_agent
     from lquant.factors.engine import FactorEngine
-    from lquant.factors.evaluate import forward_return
     from lquant.factors.mining.runner import run_session
 
     a = find_agent(agent)
@@ -182,7 +180,8 @@ def mine(agent: str, generator: str, n: int, proposals: str | None, start: str |
 
         gen = make_generator()
     else:
-        from lquant.factors.mining.llm import load_proposals, make_generator as mg
+        from lquant.factors.mining.llm import load_proposals
+        from lquant.factors.mining.llm import make_generator as mg
 
         gen = mg(load_proposals(proposals))
 
@@ -193,7 +192,6 @@ def mine(agent: str, generator: str, n: int, proposals: str | None, start: str |
     run_id = uuid.uuid4().hex[:12]
     import datetime as dt
 
-    import polars as pl
 
     try:
         with writer() as con:

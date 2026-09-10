@@ -18,7 +18,6 @@ from lquant.backtest.metrics import max_drawdown
 from lquant.backtest.rules.model import RuleSet
 from lquant.backtest.strategy.base import Context, Strategy
 
-
 # ---------- 基建：零费率规则集 + 确定性数据 ----------
 
 def zero_fee_ruleset() -> RuleSet:

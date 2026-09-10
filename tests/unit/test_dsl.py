@@ -1,6 +1,6 @@
 import pytest
 
-from lquant.core.errors import FactorError, LookaheadError
+from lquant.core.errors import FactorError
 from lquant.factors.dsl.analyzer import check
 from lquant.factors.dsl.compiler import has_nested_ts_cs
 from lquant.factors.dsl.parser import parse
@@ -15,8 +15,8 @@ def test_parse_and_analyze():
 
 
 def test_unknown_op():
-    from lquant.factors.dsl.parser import parse
     from lquant.factors.dsl.analyzer import check
+    from lquant.factors.dsl.parser import parse
 
     with pytest.raises(FactorError):
         check(parse("NoSuchOp($close)", "bad"))
@@ -73,7 +73,6 @@ def test_nested_cs_ts_materialization():
     assert "f" in out.columns
     # 手算对照：S0 第 5 天的截面秩
     s0 = out.filter(pl.col("symbol") == "S0").sort("trade_date")
-    expect = None
     vals = {}
     for sym in [f"S{i}" for i in range(4)]:
         sub = out.filter(pl.col("symbol") == sym).sort("trade_date")

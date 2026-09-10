@@ -33,8 +33,6 @@ def test_verify_grades_claimed(monkeypatch, tmp_path):
     """claimed 与重算值的分级逻辑：A/B 入库，C/D 归档。"""
     import lquant.factors.mining.submit as sub
 
-    calls = {}
-
     def fake_split(df, covs, expr):
         import polars as pl
 

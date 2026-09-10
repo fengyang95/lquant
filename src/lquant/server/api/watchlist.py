@@ -7,7 +7,6 @@
 """
 from __future__ import annotations
 
-import polars as pl
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 

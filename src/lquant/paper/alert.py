@@ -54,10 +54,7 @@ def compare_nav(backtest_nav: pl.DataFrame, paper_nav: pl.DataFrame,
     max_dev, mean_dev = float(rel.max()), float(rel.mean())
     bad = int((rel > tol_daily).sum())
 
-    if len(j) > 2:
-        corr = float(np.corrcoef(j["bt"], j["pp"])[0, 1])
-    else:
-        corr = float("nan")
+    corr = float(np.corrcoef(j["bt"], j["pp"])[0, 1]) if len(j) > 2 else float("nan")
 
     if max_dev <= tol_daily:
         verdict, detail = "ok", f"最大偏差 {max_dev:.2%} 在容忍度内"

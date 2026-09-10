@@ -32,7 +32,8 @@ def load_spec(path: str):
     """yaml -> FactorSpec（语法 fail-fast）。"""
     import yaml
 
-    raw = yaml.safe_load(open(path))
+    with open(path) as fh:
+        raw = yaml.safe_load(fh)
     from lquant.factors.dsl.parser import parse
 
     parse(raw["expr"], raw.get("name", "spec"))

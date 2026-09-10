@@ -14,6 +14,7 @@ key 由「因子 defs 集 + 窗口 + data_version」哈希而成。data_version 
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -77,10 +78,8 @@ class TwoTierCache:
                 return df
             except Exception as e:  # noqa: BLE001  缓存坏了当 miss，重算覆盖
                 logger.warning(f"factor cache disk read failed {p}: {e}")
-                try:
+                with contextlib.suppress(OSError):
                     p.unlink(missing_ok=True)
-                except OSError:
-                    pass
         return None
 
     def set(self, key: str, df: pl.DataFrame) -> None:

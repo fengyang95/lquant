@@ -48,7 +48,7 @@ def analyze(node: Node) -> tuple[int, set[str], set[str]]:
     raise TypeError(f"未知节点 {type(node)}")
 
 
-def check(expr_ast: "object", allowed_fields: set[str] | None = None) -> None:
+def check(expr_ast: object, allowed_fields: set[str] | None = None) -> None:
     """入口：对 FactorExpr 做静态检查，失败直接抛。
 
     allowed_fields 非 None 时额外做字段白名单校验 —— 拼错字段（$closs）

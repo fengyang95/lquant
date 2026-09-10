@@ -5,10 +5,10 @@ Fallback 链解决不了「某源根本没有 1 分钟线」——
 """
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
 
-class Capability(str, Enum):
+class Capability(StrEnum):
     DAILY = "daily"
     MINUTE_1 = "minute_1"
     MINUTE_5 = "minute_5"
@@ -35,7 +35,7 @@ class Capability(str, Enum):
     SECTOR = "sector"
 
     @classmethod
-    def parse(cls, s: str) -> "Capability":
+    def parse(cls, s: str) -> Capability:
         try:
             return cls(s)
         except ValueError:

@@ -86,8 +86,8 @@ def parse_quotes(payload: str) -> pl.DataFrame:
         except ValueError:
             ts = None
 
-        def g(i: int) -> float | None:
-            return _to_float(f[i]) if len(f) > i else None
+        def g(i: int, _f=f) -> float | None:  # 默认参数绑定循环变量（B023）
+            return _to_float(_f[i]) if len(_f) > i else None
 
         rows.append({
             "symbol": f"{code}.{mkt.upper()}",

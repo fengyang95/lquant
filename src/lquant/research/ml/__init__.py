@@ -11,7 +11,12 @@
 """
 from __future__ import annotations
 
-from lquant.research.ml.backtest import MLResult, run_ml_pipeline, signal_backtest, train_and_predict
+from lquant.research.ml.backtest import (
+    MLResult,
+    run_ml_pipeline,
+    signal_backtest,
+    train_and_predict,
+)
 from lquant.research.ml.dataset import (
     Dataset,
     DatasetConfig,

@@ -23,10 +23,10 @@ def test_load_spec_fail_fast():
 name: t_spec
 expr: "Rank(Ts_Mean($close,5))"
 """
-    fp = tempfile.NamedTemporaryFile('w', suffix='.yaml', delete=False)
-    fp.write(content)
-    fp.close()
-    spec = load_spec(fp.name)
+    with tempfile.NamedTemporaryFile('w', suffix='.yaml', delete=False) as fp:
+        fp.write(content)
+        path = fp.name
+    spec = load_spec(path)
     assert spec.name == "t_spec"
     os.unlink(fp.name)
 
@@ -43,8 +43,6 @@ def test_attribute_codes():
 def tmp_jsonl() -> str:
     import tempfile
 
-    fp = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
-    f = fp
-    f.write(json.dumps({"expr": "Rank(Ts_Mean($close,5))"}))
-    f.close()
-    return fp.name
+    with tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False) as fp:
+        fp.write(json.dumps({'expr': 'Rank(Ts_Mean($close,5))'}))
+        return fp.name

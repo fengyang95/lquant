@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
@@ -61,13 +62,9 @@ async def job_progress(ws: WebSocket, job_id: str) -> None:
             await asyncio.sleep(_POLL_SECONDS)
     except WebSocketDisconnect:
         return
-    except Exception:  # noqa: BLE001 - 客户端断开等，静默收尾
-        pass
     finally:
-        try:
+        with contextlib.suppress(Exception):  # 客户端断开等，静默收尾
             await ws.close()
-        except Exception:  # noqa: BLE001
-            pass
 
 
 @router.websocket("/ws/market/ticks")
@@ -105,17 +102,15 @@ async def market_ticks(ws: WebSocket, symbols: str = Query(default="", max_lengt
             await asyncio.sleep(_TICK_INTERVAL)
     except WebSocketDisconnect:
         return
-    except Exception:  # noqa: BLE001 - 客户端断开等，静默收尾
-        pass
     finally:
+        with contextlib.suppress(Exception):
+            await ws.close()
         await _close(ws)
 
 
 async def _close(ws: WebSocket) -> None:
-    try:
+    with contextlib.suppress(Exception):
         await ws.close()
-    except Exception:  # noqa: BLE001
-        pass
 
 
 def _safe_result(job) -> object:

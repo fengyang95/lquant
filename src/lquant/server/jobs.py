@@ -63,7 +63,7 @@ class LocalJob:
 
 # 本地任务的进程内注册表：/ws/jobs/{id} 靠它查状态。
 # Redis 模式下 RQ Job 自带状态查询，不需要这里。
-_LOCAL_JOBS: dict[str, "LocalJob"] = {}
+_LOCAL_JOBS: dict[str, LocalJob] = {}
 
 
 def get_job(job_id: str):
