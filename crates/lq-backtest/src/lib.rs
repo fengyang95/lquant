@@ -44,6 +44,20 @@ pub struct Fill {
 /// 最低佣金按订单累计（分多次成交只收一次）。
 /// `max_qty`：单次撮合的最大成交量（None = 剩余全部成交），用于分批成交。
 pub fn match_order(order: &mut Order, price: f64, r: &InstrumentRules, max_qty: Option<f64>) -> Option<Fill> {
+    // 入口校验：脏价格/数量（负数、0、NaN/Inf）会算出负成交额→负费用，
+    // 静默污染账目，直接拒绝成交。
+    if !price.is_finite() || price <= 0.0 {
+        return None;
+    }
+    if !order.qty.is_finite()
+        || !order.filled_qty.is_finite()
+        || order.qty < 0.0
+        || order.filled_qty < 0.0
+        || !r.lot_size.is_finite()
+        || r.lot_size <= 0.0
+    {
+        return None;
+    }
     let remain = order.qty - order.filled_qty;
     let fillable = max_qty.unwrap_or(remain).min(remain);
     let qty = (fillable / r.lot_size).floor() * r.lot_size;
@@ -131,5 +145,25 @@ mod tests {
         assert_eq!(f2.qty, 200.0);
         assert!((f1.fee - 5.0).abs() < 1e-9);   // 第一笔补足到 5 元
         assert!(f2.fee.abs() < 1e-9);           // 第二笔已被覆盖
+    }
+
+    #[test]
+    fn dirty_inputs_are_rejected() {
+        let mut o = Order { symbol: "510300.SH".into(), side: Side::Buy,
+                            qty: 1000.0, filled_qty: 0.0, cum_amount: 0.0, paid_comm: 0.0 };
+        let r = InstrumentRules { commission_rate: 0.00025, commission_min: 5.0,
+                                  commission_per_order: true, transfer_fee_rate: 0.0,
+                                  tax_rate: 0.0, lot_size: 100.0, sellable_after_days: 0 };
+        // 负价格 / 0 价格 / NaN 价格：拒绝成交而非算出负费用
+        assert!(match_order(&mut o, -4.0, &r, None).is_none());
+        assert!(match_order(&mut o, 0.0, &r, None).is_none());
+        assert!(match_order(&mut o, f64::NAN, &r, None).is_none());
+        // 脏订单 / 脏规则
+        let mut bad = Order { qty: f64::NAN, ..o };
+        assert!(match_order(&mut bad, 4.0, &r, None).is_none());
+        let bad_rules = InstrumentRules { lot_size: 0.0, ..r };
+        let mut o2 = Order { symbol: "510300.SH".into(), side: Side::Buy,
+                             qty: 1000.0, filled_qty: 0.0, cum_amount: 0.0, paid_comm: 0.0 };
+        assert!(match_order(&mut o2, 4.0, &bad_rules, None).is_none());
     }
 }
