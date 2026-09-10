@@ -79,9 +79,18 @@ function FeedView({
 
 export default function NewsPage() {
   const [tab, setTab] = useState<TabKey>('feed');
-  // 来源/关键词过滤跨 tab 保留；symbol 只在个股 tab 使用
-  const [filters, setFilters] = useState<PageFilters>({ source: '', keyword: '' });
+  // 来源/关键词过滤跨 tab 保留；keyword 防抖 300ms 再进查询（仿 SymbolSearch）
+  const [source, setSource] = useState('');
+  const [keyword, setKeyword] = useState('');
+  const [debouncedKeyword, setDebouncedKeyword] = useState('');
   const [symbol, setSymbol] = useState('');
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedKeyword(keyword), 300);
+    return () => clearTimeout(t);
+  }, [keyword]);
+
+  const filters: PageFilters = { source, keyword: debouncedKeyword };
 
   return (
     <div className="space-y-4">
@@ -104,15 +113,12 @@ export default function NewsPage() {
         </div>
         <div className="ml-auto flex items-center gap-2">
           <input
-            value={filters.keyword}
-            onChange={(e) => setFilters((f) => ({ ...f, keyword: e.target.value }))}
+            value={keyword}
+            onChange={(e) => setKeyword(e.target.value)}
             placeholder="关键词过滤"
             className="input w-44"
           />
-          <SourceFilter
-            value={filters.source}
-            onChange={(v) => setFilters((f) => ({ ...f, source: v }))}
-          />
+          <SourceFilter value={source} onChange={setSource} />
         </div>
       </div>
 

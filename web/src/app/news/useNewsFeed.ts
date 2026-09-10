@@ -35,15 +35,18 @@ export function useNewsFeed(params: ItemFilter) {
   }, [rest, limit]);
 
   const loadMore = useCallback(() => {
+    const id = seq.current; // 落地前比对：过滤条件已变（seq 前进）则丢弃本次追加
     setLoading(true);
     fetchItems({ ...JSON.parse(rest), limit, offset: items.length })
       .then((page) => {
+        if (seq.current !== id) return;
         setItems((prev) => [...prev, ...page.items]); // 追加去重由 news_id key 兜底
         setOffset(items.length);
         setTotal(page.total);
         setLoading(false);
       })
       .catch((e: unknown) => {
+        if (seq.current !== id) return;
         setError(e instanceof Error ? e.message : String(e));
         setLoading(false);
       });

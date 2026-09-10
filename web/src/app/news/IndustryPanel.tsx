@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import useSWR from 'swr';
 import { Empty, ErrorNote, Loading } from '@/components/States';
 import { fetcherData } from '@/lib/api';
@@ -17,6 +17,7 @@ export function IndustryPanel({ filters = {} }: { filters?: ItemFilter }) {
   );
 
   const [selected, setSelected] = useState<string | null>(null);
+  const gen = useRef(0); // 查询代际：selected/filters 变化 +1，使在途 loadMore 落地时自弃
   const [page, setPage] = useState<{
     items: NewsItemDTO[];
     total: number;
@@ -28,6 +29,7 @@ export function IndustryPanel({ filters = {} }: { filters?: ItemFilter }) {
   // 选中行业或共享过滤条件变化 → 重查第一页
   useEffect(() => {
     if (!selected) return;
+    gen.current += 1;
     let alive = true;
     setPage((p) => ({ ...p, loading: true, error: '' }));
     fetchItems({ ...filters, industry: selected, limit: 50, offset: 0 })
@@ -46,12 +48,15 @@ export function IndustryPanel({ filters = {} }: { filters?: ItemFilter }) {
 
   const loadMore = () => {
     if (!selected) return;
+    const id = gen.current; // 落地前比对代际：期间已切换行业/过滤则丢弃本次追加
     setPage((p) => ({ ...p, loading: true }));
     fetchItems({ ...filters, industry: selected, limit: 50, offset: page.items.length })
       .then((res) => {
+        if (gen.current !== id) return;
         setPage((p) => ({ ...p, items: [...p.items, ...res.items], total: res.total, offset: p.items.length, loading: false }));
       })
       .catch((e: unknown) => {
+        if (gen.current !== id) return;
         setPage((p) => ({ ...p, loading: false, error: e instanceof Error ? e.message : String(e) }));
       });
   };
