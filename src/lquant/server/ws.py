@@ -13,6 +13,7 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
 from lquant.data.ingest.tasks import get_task
 from lquant.market import ticks as ticks_mod
+from lquant.server.api.ask import get_event_bus
 from lquant.server.jobs import get_job
 
 router = APIRouter()
@@ -65,6 +66,24 @@ async def job_progress(ws: WebSocket, job_id: str) -> None:
     finally:
         with contextlib.suppress(Exception):  # 客户端断开等，静默收尾
             await ws.close()
+
+
+@router.websocket("/ws/ask/{session_id}")
+async def ask_stream(ws: WebSocket, session_id: str) -> None:
+    """问 AI 事件流：订阅事件总线，逐条转发 AgentEvent；done/error 后不关连接，可继续提问。"""
+    await ws.accept()
+    bus = get_event_bus()
+    q = await bus.subscribe(session_id)
+    try:
+        while True:
+            event = await q.get()
+            await ws.send_json(event.model_dump())
+    except (WebSocketDisconnect, RuntimeError):
+        # 客户端断开：starlette 抛 WebSocketDisconnect 或 RuntimeError，均静默收尾
+        pass
+    finally:
+        await bus.unsubscribe(session_id, q)
+        await _close(ws)
 
 
 @router.websocket("/ws/market/ticks")
