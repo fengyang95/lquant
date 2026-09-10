@@ -48,5 +48,9 @@ class Registry[T]:
             for k in sorted(self._items)
         ]
 
+    def __iter__(self):
+        """按序迭代注册键（与 keys() 一致，sorted）。"""
+        return iter(sorted(self._items))
+
     def __contains__(self, key: str) -> bool:
         return key in self._items
