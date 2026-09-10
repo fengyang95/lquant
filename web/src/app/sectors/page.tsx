@@ -25,7 +25,7 @@ export default function SectorsPage() {
   if (!data?.length)
     return (
       <div className="space-y-5">
-        <PageHeader title="板块" sub={data?.[0]?.trade_date ?? ''} />
+        <PageHeader title="板块" sub={data?.[0]?.trade_date ?? '暂无数据'} />
         <Empty>
           暂无板块数据 —— 先 <code className="bg-paper px-1">POST /api/market/collect</code> 触发采集
         </Empty>

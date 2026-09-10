@@ -81,17 +81,23 @@ export default function SyncPage() {
 
   async function toggle(j: SyncJob) {
     setBusy(j.sync_id);
+    setMsg('');
     try {
       await post(`/sync/jobs/${j.sync_id}/toggle`, { enabled: !j.enabled });
       mutateJobs();
+    } catch (e) {
+      setMsg(`✗ ${e instanceof Error ? e.message : e}`);
     } finally { setBusy(''); }
   }
 
   async function remove(id: string) {
     setBusy(id);
+    setMsg('');
     try {
       await del(`/sync/jobs/${id}`);
       mutateJobs();
+    } catch (e) {
+      setMsg(`✗ ${e instanceof Error ? e.message : e}`);
     } finally { setBusy(''); }
   }
 

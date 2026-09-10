@@ -78,16 +78,16 @@ export default function BacktestDetailPage() {
     runId ? `/backtests/${runId}/code` : null, get);
   const { data: holdIdx } = useSWR<HoldingsIdx>(
     runId && tab === 'holdings' ? `/backtests/${runId}/holdings` : null, get);
-  const { data: holdDayData } = useSWR<HoldingsDay>(
+  const { data: holdDayData, isLoading: holdDayLoading, error: holdDayError } = useSWR<HoldingsDay>(
     runId && tab === 'holdings' && holdDay ? `/backtests/${runId}/holdings?day=${holdDay}` : null, get);
 
   const m = d?.metrics ?? {};
   const risk = d?.risk_vs_benchmark;
 
-  // 超额净值 = 策略 / 基准（逐日对齐）
+  // 超额净值 = 策略 / 基准（逐日对齐）；benchmark 缺失时仅画策略净值
   const benchOption = useMemo(() => {
-    if (!d) return null;
-    const bench = new Map(d.benchmark.map((b) => [b.date, b.nav]));
+    if (!d?.nav?.length) return null;
+    const bench = new Map((d.benchmark ?? []).map((b) => [b.date, b.nav]));
     const dates: string[] = [];
     const strat: number[] = [];
     const benchY: (number | null)[] = [];
@@ -229,7 +229,7 @@ export default function BacktestDetailPage() {
     { label: '策略年化', value: pct(m.annual_return), tone: retCls(m.annual_return) },
     { label: '超额收益', value: pct(risk?.excess_return), tone: retCls(risk?.excess_return),
       hint: `基准 ${risk?.benchmark ?? d.benchmark_label}` },
-    { label: '基准收益', value: d.benchmark.length > 1
+    { label: '基准收益', value: (d.benchmark?.length ?? 0) > 1
       ? pct(d.benchmark[d.benchmark.length - 1].nav / d.benchmark[0].nav - 1) : '--' },
     { label: '阿尔法 α', value: num(risk?.alpha_annual, 3), tone: retCls(risk?.alpha_annual) },
     { label: '贝塔 β', value: num(risk?.beta) },
@@ -250,7 +250,7 @@ export default function BacktestDetailPage() {
         title={isJq ? '自定义策略' : String(d.params?.formula ?? d.strategy)}
         sub={
           <>
-            {String(d.params?.start ?? d.nav[0]?.date)} 至 {String(d.params?.end ?? d.nav[d.nav.length - 1]?.date)}
+            {String(d.params?.start ?? d.nav[0]?.date ?? '—')} 至 {String(d.params?.end ?? d.nav[d.nav.length - 1]?.date ?? '—')}
             {' · '}¥{num(Number(d.params?.initial_cash ?? m.initial_cash ?? 1_000_000), 0)}
             {' · '}状态 <span className={d.status === 'done' ? 'text-down' : ''}>{d.status === 'done' ? '回测完成' : d.status}</span>
             {' · '}{d.strategy}
@@ -444,6 +444,12 @@ export default function BacktestDetailPage() {
               </table>
             </div>
           )}
+          {holdDay && holdDayError && (
+            <div className="py-8 text-center text-sm text-ink-faint">
+              加载失败：{String(holdDayError)} <button className="btn btn-sm ml-2" onClick={() => setHoldDay('')}>返回列表</button>
+            </div>
+          )}
+          {holdDay && holdDayLoading && <Loading>持仓明细加载中…</Loading>}
           {holdDay && holdDayData && (
             <div>
               <div className="mb-3 text-xs text-ink-dim">

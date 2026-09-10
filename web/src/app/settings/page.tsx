@@ -37,7 +37,13 @@ export default function SettingsPage() {
     try {
       const r = await putData<{ key: string; value: unknown }>(`/settings/${key}`, { key, value });
       setMsg(`✓ ${key} = ${String(r.value)}`);
-      mutate();
+      // 落库成功后用返回值同步（清除）该 key 的草稿，避免输入框显示与实际不一致
+      setDraft((d) => {
+        if (!(key in d)) return d;
+        const { [key]: _removed, ...rest } = d;
+        return rest;
+      });
+      await mutate();
     } catch (e) {
       setMsg(`✗ ${e instanceof Error ? e.message : e}`);
     } finally {
