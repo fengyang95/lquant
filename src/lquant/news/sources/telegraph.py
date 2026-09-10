@@ -53,10 +53,18 @@ def _iter_rows(df: pd.DataFrame, cols: list[str]) -> list[dict[str, Any]]:
     return rows
 
 
+def _clean_str(value: Any) -> str:
+    """去空白;NaN/NaT/None 归为空串。"""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() in {"nan", "nat", "none"} else text
+
+
 def _cls_published_at(row: dict[str, Any]) -> datetime | None:
     """发布日期 + 发布时间 拼接解析;任一失败返回 None。"""
-    date_part = str(row.get("发布日期") or "").strip()
-    time_part = str(row.get("发布时间") or "").strip()
+    date_part = _clean_str(row.get("发布日期"))
+    time_part = _clean_str(row.get("发布时间"))
     if not date_part or not time_part:
         return None
     return _parse_time(f"{date_part} {time_part}")
@@ -87,11 +95,13 @@ class _TelegraphMixin:
             title_raw = row.get("标题")
             title = str(title_raw).strip() if title_raw is not None else ""
             if is_cls:
-                # 日期+时间拼接,缺时间时用内容 hash 兜底
-                date_part = str(row.get("发布日期") or "").strip()
-                time_part = str(row.get("发布时间") or "").strip()
-                external_id = f"{date_part}{time_part}"
-                if not external_id:
+                # 日期+时间拼接;时间缺失时退化为 sha1(content)[:16],
+                # 避免同日多条快讯 external_id 碰撞被去重误删
+                date_part = _clean_str(row.get("发布日期"))
+                time_part = _clean_str(row.get("发布时间"))
+                if date_part and time_part:
+                    external_id = f"{date_part}{time_part}"
+                else:
                     external_id = hashlib.sha1(content.encode()).hexdigest()[:16]
             else:
                 # sina: sha1(content)[:16]
@@ -123,10 +133,12 @@ class ClsTelegraphSource(_TelegraphMixin):
     def fetch(self, day: date) -> list[NewsItem]:
         del day  # akshare 只给最近数据,忽略 day
         try:
+            # 仅对 akshare 调用本身(网络/接口错误)做 fallback;
+            # 映射阶段的缺列 ValueError 不在此 except 范围内,向上传播
             df = ak.stock_info_global_cls()
-            return self._map_df(df, _CLS_SOURCE, is_cls=True)
         except Exception:  # noqa: BLE001 - 上游任何异常都走 fallback
             return self._fetch_sina()
+        return self._map_df(df, _CLS_SOURCE, is_cls=True)
 
 
 @register
