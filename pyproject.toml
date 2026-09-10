@@ -25,6 +25,7 @@ dependencies = [
   "tenacity>=8.1",
   "baostock>=0.8.8",
   "pandas>=2.2",
+  "aiosqlite>=0.22.1",
 ]
 
 [project.optional-dependencies]
@@ -55,6 +56,7 @@ server = [
 dev = [
   "pytest>=8.3",
   "pytest-cov>=6.0",
+  "pytest-asyncio>=1.4.0",
   "ruff>=0.8",
   "mypy>=1.13",
   "pre-commit>=4.0",
