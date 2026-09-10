@@ -1,0 +1,13 @@
+# config/schema/news.yaml — 资讯模块配置(用户可编辑)
+industry_keywords:
+  锂矿: BK101010
+  光伏: BK102010
+  半导体: BK103010
+
+industry_names:
+  BK101010: 锂电
+  BK102010: 光伏
+  BK103010: 半导体
+
+em_news:
+  pool_limit: 200

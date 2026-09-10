@@ -53,6 +53,14 @@ export function getData<T>(path: string): Promise<T> {
   return requestData<T>(path);
 }
 
+export function postData<T>(path: string, body: unknown): Promise<T> {
+  return requestData<T>(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
 export function putData<T>(path: string, body: unknown): Promise<T> {
   return requestData<T>(path, {
     method: 'PUT',
