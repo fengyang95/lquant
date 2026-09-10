@@ -128,7 +128,9 @@ def test_fetch_ignores_day():
 
 
 def test_all_sources_have_protocol_attrs():
-    for src in get_sources():
+    # 只断言本模块的两个电报来源;注册表是全局的,后续任务会注册其他 category 的来源
+    for cls in (ClsTelegraphSource, SinaTelegraphSource):
+        src = cls()
         assert isinstance(src.name, str) and src.name
         assert src.category == "telegraph"
         assert callable(src.fetch)
