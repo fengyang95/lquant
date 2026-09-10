@@ -1,6 +1,7 @@
 """监控全链路集成：http + RQ worker 子进程 → 事件落盘 → API 断言。
 
-需要本机 Redis（docker compose up -d redis）；不可用则 skip。
+test_full_chain 走降级路径（无需 Redis，强制 _redis_available=False）；
+test_rq_worker_chain 需要本机 Redis（docker compose up -d redis），不可用则 skip。
 """
 from __future__ import annotations
 
@@ -10,12 +11,25 @@ import uuid
 
 import pytest
 
-from lquant.server.jobs import _redis_available
+pytestmark = pytest.mark.integration
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not _redis_available(), reason="需要 Redis"),
-]
+
+def _redis_up() -> bool:
+    from lquant.server.jobs import _redis_available
+
+    return _redis_available()
+
+
+_REDIS_MARK = pytest.mark.skipif(not _redis_up(), reason="需要 Redis")
+
+
+def _enqueue_test_task() -> str:
+    from lquant.server.jobs import enqueue
+
+    def _echo():
+        return 42
+
+    return enqueue("lquant-default", _echo).id
 
 
 @pytest.fixture()
@@ -32,23 +46,21 @@ def env(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
-def _enqueue_test_task() -> str:
-    from lquant.server.jobs import enqueue
+def test_full_chain(env, monkeypatch):
+    """降级模式任务事件 → 内存队列 → flusher → metrics_task → API。
 
-    def _echo():
-        return 42
-
-    job = enqueue("lquant-default", _echo)
-    return job.id
-
-
-def test_full_chain(env):
-    """降级模式任务事件 → 内存队列 → flusher → metrics_task → API。"""
+    强制 _redis_available=False：本测试意图是验证降级链路，若 Redis 可用则
+    jobs.enqueue 会进 RQ 队列无人消费，断言必失败，与降级前提矛盾。
+    """
     from fastapi.testclient import TestClient
 
+    import lquant.server.jobs as jobs_mod
     from lquant.monitor import flusher
     from lquant.server.main import create_app
 
+    monkeypatch.setattr(jobs_mod, "_redis_available", lambda: False)
+    monkeypatch.setattr("lquant.monitor.flusher._redis_available",
+                        lambda: False)
     _enqueue_test_task()
     time.sleep(1)  # 等本地线程任务跑完发事件
     flusher.flush_once()
@@ -59,6 +71,7 @@ def test_full_chain(env):
         assert "procs" in s and "queues" in s
 
 
+@_REDIS_MARK
 def test_rq_worker_chain(env):
     """RQ worker（burst 模式）执行任务 → 事件经 Redis → flusher 落盘。"""
     from lquant.monitor import flusher

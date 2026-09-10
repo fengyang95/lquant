@@ -16,13 +16,13 @@ from lquant.server.api import (
     factors,
     health,
     market,
+    monitor,
     news,
     paper,
     settings,
     strategies,
     sync,
     watchlist,
-    monitor,
 )
 
 
@@ -35,7 +35,8 @@ def create_app() -> FastAPI:
         allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
     )
     for r in (health, data, factors, backtests, market, paper, watchlist,
-              strategies, analyses, sync, etf, news, settings, ask, monitor):        app.include_router(r.router, prefix="/api")
+              strategies, analyses, sync, etf, news, settings, ask, monitor):
+        app.include_router(r.router, prefix="/api")
     app.include_router(ws.router)  # /ws/jobs/{id}，无 /api 前缀（与前端代理一致）
 
     @app.on_event("startup")

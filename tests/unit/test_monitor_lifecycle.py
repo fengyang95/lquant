@@ -56,3 +56,66 @@ def test_app_wraps_middleware_and_lifecycle_hooks():
     with TestClient(app) as client:  # __enter__/__exit__ 触发 startup/shutdown
         r = client.get("/api/health")
         assert r.status_code == 200
+
+
+def _clear_ring() -> None:
+    from lquant.monitor.ring import api_ring
+
+    api_ring.drain()
+
+
+def test_disabled_no_ring_capture(monkeypatch, tmp_path):
+    """enabled=False：请求不进环缓冲，stop_flusher 不做 final flush。"""
+    import asyncio
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LQ_MONITOR_ENABLED", "0")
+    monkeypatch.setenv("LQ_MONITOR_DB", str(tmp_path / "off.duckdb"))
+    from lquant.core.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        _clear_ring()
+        from lquant.monitor.api_mw import MonitorMiddleware
+
+        async def app(scope, receive, send):  # noqa: ANN001
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        async def receive():  # noqa: ANN001
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        mw = MonitorMiddleware(app)
+        scope = {"type": "http", "path": "/api/factors", "method": "GET"}
+        asyncio.run(mw(scope, receive, lambda m: asyncio.sleep(0)))
+
+        from lquant.monitor.ring import api_ring
+
+        assert len(api_ring.drain()) == 0  # 未采集
+
+        # stop_flusher 未启动过：不做 final flush，不创建 duckdb 文件
+        from lquant.monitor import flusher
+
+        flusher.stop_flusher()
+        assert not (tmp_path / "off.duckdb").exists()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_disabled_flush_once_no_db(monkeypatch, tmp_path):
+    """enabled=False 时 flush_once 直接落盘也可能建库——验证开关下不写库。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LQ_MONITOR_ENABLED", "0")
+    monkeypatch.setenv("LQ_MONITOR_DB", str(tmp_path / "off2.duckdb"))
+    from lquant.core.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        _clear_ring()
+        from lquant.monitor import flusher
+
+        flusher.flush_once()
+        assert not (tmp_path / "off2.duckdb").exists()
+    finally:
+        get_settings.cache_clear()

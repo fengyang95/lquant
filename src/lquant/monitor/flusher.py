@@ -19,6 +19,7 @@ _JOIN_TIMEOUT = 15.0  # stop_flusher join 线程上限秒数
 _CLEANUP_STATE = {"last": None}
 _STOP = threading.Event()
 _thread: threading.Thread | None = None
+_started = False  # 是否以启用状态启动过（决定 stop 时是否 final flush）
 
 # 写失败时暂存待重试的数据（下个周期优先重写，成功后清空）
 _PENDING_LOCK = threading.Lock()
@@ -192,6 +193,10 @@ def _take_pending() -> tuple[list, list]:
 def flush_once(now: float | None = None) -> dict:
     """单周期：返回各表写入行数；失败时数据暂存/回队，待重试不丢弃。"""
     out = {"api": 0, "task": 0, "sys": 0}
+    from lquant.core.config import get_settings
+
+    if not get_settings().monitor_enabled:
+        return out  # 关闭监控：不建库不写库
     r = None
     if _redis_available():
         try:
@@ -245,24 +250,30 @@ def _cycle(interval: float) -> None:
 
 
 def start_flusher() -> threading.Thread | None:
-    global _thread
-    if _thread is not None and _thread.is_alive():
-        return _thread
+    global _thread, _started
     from lquant.core.config import get_settings
 
+    if not get_settings().monitor_enabled:
+        return None
+    if _thread is not None and _thread.is_alive():
+        return _thread
     _STOP.clear()
     _thread = threading.Thread(target=_cycle,
                                args=(get_settings().monitor_flush_interval_sec,),
                                name="monitor-flusher", daemon=True)
     _thread.start()
+    _started = True
     return _thread
 
 
 def stop_flusher() -> None:
-    global _thread
+    global _thread, _started
     _STOP.set()
     t = _thread
     if t is not None and t.is_alive() and t is not threading.current_thread():
         t.join(timeout=_JOIN_TIMEOUT)
     _thread = None
+    if not _started:
+        return  # 未启动或 enabled=False：不 final flush（避免创建/写 monitor.duckdb）
+    _started = False
     flush_once()  # final flush：环缓冲剩余 + Redis 样本剩余（join 后无并发写）

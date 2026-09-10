@@ -93,7 +93,10 @@ def get_settings() -> Settings:
         ingest_concurrency=int(ingest.get("concurrency", 4)),
         ingest_watchdog_sec=int(ingest.get("watchdog_sec", 120)),
         redis_url=os.getenv("LQ_REDIS_URL", "redis://localhost:6379/0"),
-        monitor_enabled=os.getenv("LQ_MONITOR_ENABLED", "1") != "0",
+        monitor_enabled=(
+            os.getenv("LQ_MONITOR_ENABLED") != "0"
+            if os.getenv("LQ_MONITOR_ENABLED") is not None
+            else bool((raw.get("monitor", {}) or {}).get("enabled", True))),
         monitor_flush_interval_sec=int(
             (raw.get("monitor", {}) or {}).get("flush_interval_sec", 10)),
         monitor_sample_interval_sec=int(

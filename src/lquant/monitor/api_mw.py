@@ -39,6 +39,16 @@ def _route_template(scope: Scope) -> str:
     return getattr(route, "path", None) or "unmatched"
 
 
+def _monitor_enabled() -> bool:
+    """读缓存 settings 的开关（get_settings 有 lru_cache，仅首次解析 yaml/env）。"""
+    try:
+        from lquant.core.config import get_settings  # 动态 import 避免循环依赖
+
+        return get_settings().monitor_enabled
+    except Exception:  # noqa: BLE001 - 配置读取失败不阻断请求
+        return True
+
+
 class MonitorMiddleware:
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -46,7 +56,8 @@ class MonitorMiddleware:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         from lquant.monitor import ring as ring_mod  # 动态取单例，测试可替换
 
-        if scope["type"] != "http" or _should_skip(scope.get("path", "")):
+        if scope["type"] != "http" or _should_skip(scope.get("path", "")) \
+                or not _monitor_enabled():
             await self.app(scope, receive, send)
         else:
             start = time.perf_counter()
