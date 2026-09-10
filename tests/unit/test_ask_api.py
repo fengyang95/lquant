@@ -63,6 +63,13 @@ async def test_cancel_returns_200(client):
     await client.delete(f"/api/ask/sessions/{sid}")
 
 
+async def test_dragon_tiger_endpoint(client):
+    r = await client.get("/api/market/dragon-tiger")
+    # 空湖也必须 200 + 列表（与现有 market 端点风格一致：空数据不报错）
+    assert r.status_code == 200
+    assert isinstance(r.json(), list)
+
+
 async def test_unknown_session_404(client):
     r = await client.get("/api/ask/sessions/nope/messages")
     assert r.status_code == 404
