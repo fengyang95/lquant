@@ -16,13 +16,15 @@ import PageHeader from '@/components/PageHeader';
 import { Loading } from '@/components/States';
 import { get } from '@/lib/api';
 import { C, axes, legend, tooltip } from '@/lib/chart';
-import { customChartOption, recordChartOption } from '@/lib/backtestDetail';
+import {
+  customChartOption,
+  partitionCustomAnalysis,
+  recordChartOption,
+  type CustomRawItem,
+} from '@/lib/backtestDetail';
 
 type NavPt = { date: string; nav: number; drawdown: number | null };
 type RecordPt = { date: string; value: number };
-type CustomAnalysisItem =
-  | { type: 'chart'; title?: string; data: Record<string, unknown>[]; x: string; ys: string[] }
-  | { type: 'table'; title?: string; columns: string[]; rows: unknown[][] };
 type Detail = {
   run_id: string; strategy: string; params: Record<string, unknown>; status: string;
   metrics: Record<string, number>;
@@ -39,7 +41,7 @@ type Detail = {
   };
   records?: { [key: string]: RecordPt[] };
   logs?: string[];
-  custom_analysis?: CustomAnalysisItem[];
+  custom_analysis?: CustomRawItem[];
 };
 type Attribution = {
   stock_contribution: { top: { symbol: string; contribution: number }[]; bottom: { symbol: string; contribution: number }[]; n_stocks: number };
@@ -286,41 +288,53 @@ export default function BacktestDetailPage() {
               </Panel>
             ) : null;
           })}
-          {(d.custom_analysis?.length ?? 0) > 0 && (
-            <Panel title="自定义分析">
-              <div className="space-y-5">
-                {d.custom_analysis!.map((item, i) =>
-                  item.type === 'chart' ? (
-                    (() => {
-                      const opt = customChartOption(item);
-                      return opt ? (
-                        <div key={i}>
-                          {item.title && <div className="mb-1 text-xs text-ink-dim">{item.title}</div>}
-                          <Chart option={opt} height={240} />
-                        </div>
-                      ) : null;
-                    })()
-                  ) : item.columns?.length ? (
-                    <div key={i}>
-                      {item.title && <div className="mb-1 text-xs text-ink-dim">{item.title}</div>}
-                      <table className="table-dense text-xs">
-                        <thead>
-                          <tr>{item.columns.map((c) => <th key={c} className="text-left">{c}</th>)}</tr>
-                        </thead>
-                        <tbody>
-                          {item.rows.map((row, ri) => (
-                            <tr key={ri} className="hover:bg-white">
-                              {row.map((cell, ci) => <td key={ci}>{String(cell ?? '--')}</td>)}
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
+          {(d.custom_analysis?.length ?? 0) > 0 && (() => {
+            const { valid, errors } = partitionCustomAnalysis(d.custom_analysis);
+            return (
+              <Panel title="自定义分析">
+                <div className="space-y-5">
+                  {valid.map((item, i) =>
+                    item.type === 'chart' ? (
+                      (() => {
+                        const opt = customChartOption(item);
+                        return opt ? (
+                          <div key={i}>
+                            {item.title && <div className="mb-1 text-xs text-ink-dim">{item.title}</div>}
+                            <Chart option={opt} height={240} />
+                          </div>
+                        ) : null;
+                      })()
+                    ) : item.columns?.length ? (
+                      <div key={i}>
+                        {item.title && <div className="mb-1 text-xs text-ink-dim">{item.title}</div>}
+                        <table className="table-dense text-xs">
+                          <thead>
+                            <tr>{item.columns.map((c) => <th key={c} className="text-left">{c}</th>)}</tr>
+                          </thead>
+                          <tbody>
+                            {item.rows.map((row, ri) => (
+                              <tr key={ri} className="hover:bg-white">
+                                {row.map((cell, ci) => <td key={ci}>{String(cell ?? '--')}</td>)}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : null,
+                  )}
+                  {errors.map((e, i) => (
+                    <div
+                      key={`err-${i}`}
+                      className="rounded-[2px] border border-line bg-panel px-3 py-2 text-xs text-gold"
+                    >
+                      <span className="font-medium">⚠ {e.name ?? '自定义分析'}</span>
+                      <span className="ml-2 text-ink-dim">{e.error}</span>
                     </div>
-                  ) : null,
-                )}
-              </div>
-            </Panel>
-          )}
+                  ))}
+                </div>
+              </Panel>
+            );
+          })()}
           {(d.logs?.length ?? 0) > 0 && (
             <details className="rounded-[2px] border border-line bg-panel px-4 py-3">
               <summary className="cursor-pointer text-sm font-medium text-ink-dim">

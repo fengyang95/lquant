@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   customChartOption,
+  partitionCustomAnalysis,
   recordChartOption,
   type CustomChartItem,
   type RecordPt,
@@ -68,5 +69,38 @@ describe('customChartOption', () => {
     expect(customChartOption({ type: 'chart', data: [], x: 'd', ys: ['a'] })).toBeNull();
     expect(customChartOption({ type: 'chart', data: [{ d: 'x' }], x: '', ys: ['a'] })).toBeNull();
     expect(customChartOption({ type: 'chart', data: [{ d: 'x' }], x: 'd', ys: [] })).toBeNull();
+  });
+});
+
+describe('partitionCustomAnalysis', () => {
+  it('chart/table 进 valid，error 条目进 errors，未知形态丢弃', () => {
+    const chart = { type: 'chart', title: 'A', data: [{ d: '1' }], x: 'd', ys: ['v'] };
+    const table = { type: 'table', title: 'B', columns: ['c'], rows: [[1]] };
+    const err = { name: 'alpha', error: '自定义分析执行失败: boom' };
+    const unknown = { foo: 'bar' };
+    const { valid, errors } = partitionCustomAnalysis([chart, table, err, unknown, null]);
+    expect(valid).toEqual([chart, table]);
+    expect(errors).toEqual([{ name: 'alpha', error: '自定义分析执行失败: boom' }]);
+  });
+
+  it('空/undefined 输入返回空分区', () => {
+    expect(partitionCustomAnalysis([])).toEqual({ valid: [], errors: [] });
+    expect(partitionCustomAnalysis(undefined)).toEqual({ valid: [], errors: [] });
+    expect(partitionCustomAnalysis(null)).toEqual({ valid: [], errors: [] });
+  });
+
+  it('error 非字符串或空字符串不进 errors', () => {
+    const { valid, errors } = partitionCustomAnalysis([
+      { name: 'x', error: '' },
+      { name: 'y', error: 42 },
+      'plain-string',
+    ]);
+    expect(valid).toEqual([]);
+    expect(errors).toEqual([]);
+  });
+
+  it('error 条目 name 非字符串时置为 undefined', () => {
+    const { errors } = partitionCustomAnalysis([{ name: 123, error: 'bad' }]);
+    expect(errors).toEqual([{ name: undefined, error: 'bad' }]);
   });
 });

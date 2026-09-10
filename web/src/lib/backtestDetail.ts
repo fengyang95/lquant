@@ -22,6 +22,39 @@ export type CustomTableItem = {
   rows: unknown[][];
 };
 export type CustomAnalysisItem = CustomChartItem | CustomTableItem;
+/** 后端自定义分析失败时的 error 标记条目（无 type，仅 name + error） */
+export type CustomErrorItem = { name?: string; error: string };
+export type CustomRawItem = CustomAnalysisItem | CustomErrorItem | { [k: string]: unknown };
+
+export type PartitionedCustomAnalysis = {
+  /** type 为 chart/table 的正常条目 */
+  valid: CustomAnalysisItem[];
+  /** 携带 error 字符串的失败条目 */
+  errors: CustomErrorItem[];
+};
+
+/**
+ * 将后端返回的 custom_analysis 原始条目分区：
+ * - type === 'chart' | 'table' → valid
+ * - 含 error 字符串（无 type）→ errors
+ * - 其余（无识别 type）→ 丢弃
+ */
+export function partitionCustomAnalysis(items: unknown[] | undefined | null): PartitionedCustomAnalysis {
+  const valid: CustomAnalysisItem[] = [];
+  const errors: CustomErrorItem[] = [];
+  for (const raw of items ?? []) {
+    if (!raw || typeof raw !== 'object') continue;
+    const rec = raw as Record<string, unknown>;
+    const type = rec.type;
+    if (type === 'chart' || type === 'table') {
+      valid.push(raw as CustomAnalysisItem);
+    } else if (typeof rec.error === 'string' && rec.error.length > 0) {
+      errors.push({ name: typeof rec.name === 'string' ? rec.name : undefined, error: rec.error });
+    }
+    // 其他未知形态：跳过
+  }
+  return { valid, errors };
+}
 
 /** record() 单条曲线 → ECharts 折线 option（空数据返回 null） */
 export function recordChartOption(key: string, pts: RecordPt[] | undefined) {
