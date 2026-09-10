@@ -39,6 +39,8 @@ def bench(generator_name: str, n: int, seed: int, df, cov_cols):
         "n_size_proxy": res.n_size_proxy,
         "n_survivors": res.n_survivors,
         "mean_abs_ic_survivors": round(mean_ic, 4),
+        "n_g1_pass": res.n_g1_pass,
+        "mean_g1_abs_ic": round(res.g1_ic_sum / res.n_g1_pass, 4) if res.n_g1_pass else 0.0,
     }
 
 
@@ -66,9 +68,9 @@ def main() -> None:
         df = df.with_columns(pl.col("close") * (1 + pl.col("_sig").fill_null(0) * 0.01))
     gp = bench("gp", args.n, args.seed, df, cov_cols)
     rnd = bench("random", args.n, args.seed, df, cov_cols)
-    win = gp["n_survivors"] > rnd["n_survivors"] or (
-        gp["n_survivors"] == rnd["n_survivors"] and
-        gp["mean_abs_ic_survivors"] > rnd["mean_abs_ic_survivors"])
+    # 搜索效率判据（幸存数被 G3 校正门槛噪声主导，不作为主要依据）：
+    # 1) G1 通过者平均 |IC| 更高  2) 同 |IC| 下 G1 通过率更高
+    win = (gp["mean_g1_abs_ic"], gp["n_g1_pass"]) > (rnd["mean_g1_abs_ic"], rnd["n_g1_pass"])
     print(json.dumps({"gp": gp, "random": rnd, "gp_wins": win}, ensure_ascii=False, indent=1))
     raise SystemExit(0 if win else 1)
 

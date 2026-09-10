@@ -66,6 +66,7 @@ def g1_fast_screen(train, expr, ret_col, engine, covs=None, min_abs_ic=0.02):
         if "fwd_ret_1" not in d.columns:
             d = forward_return(d, "close", periods=[1])
             ret_col = "fwd_ret_1"
+        d = drop_nonfinite(d, ret_col)
         s = ic_series(d, "f", ret_col)
         if not len(s):
             return GateResult(False, "G1", "COMPUTE_FAIL", "IC 序列为空")

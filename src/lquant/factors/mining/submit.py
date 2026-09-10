@@ -48,7 +48,8 @@ def _split_eval(df, cov_cols, expr):
     for label, dd in (("train", train_d), ("val", val_d)):
         sub = df.filter(pl.col("trade_date").is_in(dd))
         sub = forward_return(sub.sort(["symbol", "trade_date"]), "close", periods=[1, 5])
-        d = compute_factor_col(sub, expr, "f").drop_nulls(["f", "fwd_ret_1"])
+        d = drop_nonfinite(compute_factor_col(sub, expr, "f"), "f")
+        d = drop_nonfinite(d, "fwd_ret_1")
         if cov_cols:
             d = pipeline_run(d, "f", [
                 {"op": "winsorize", "method": "mad", "n": 5},

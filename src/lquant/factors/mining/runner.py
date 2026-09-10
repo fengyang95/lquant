@@ -37,6 +37,8 @@ class SessionResult:
     n_redundant: int = 0
     n_size_proxy: int = 0
     n_survivors: int = 0
+    n_g1_pass: int = 0              # 搜索效率指标：G1 通过数（幸存数被门槛噪声主导）
+    g1_ic_sum: float = 0.0          # G1 通过者 |IC| 累计
     corrections: list[dict] = field(default_factory=list)
 
 
@@ -76,6 +78,10 @@ def run_session(engine, panel, generator, *, agent="builtin", n_candidates=100,
             res.corrections.append({"expr": expr, "stage": "G0", "reason": g0.reason_code, "hint": g0.hint})
             continue
         g1 = g1_fast_screen(train, expr, ret_col, engine, covs=covs)
+        if g1.passed:
+            res.n_g1_pass += 1
+            _ic = g1.ic if (g1.ic is not None and math.isfinite(g1.ic)) else 0.0
+            res.g1_ic_sum += abs(_ic)
         if hasattr(generator, "feedback") and g1.ic is not None:
             from lquant.factors.mining.fitness import fitness
 
