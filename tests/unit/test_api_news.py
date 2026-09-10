@@ -46,9 +46,22 @@ def client(api_env):
 
 @pytest.fixture(autouse=True)
 def _stub_runner(monkeypatch):
-    """采集 runner 与 link 词表 no-op：不触网，只测 HTTP 契约。"""
+    """采集 runner 与 link 词表 no-op：不触网，只测 HTTP 契约。
+
+    _load_link_inputs 在函数内 import AkShareProvider —— patch 必须落在源模块
+    属性上（打桩 lquant.news.tasks.build_name_to_code 挡不住它），否则有网环境
+    会真实请求 akshare。securities() 假数据返回空 DataFrame，link 管线全降级。
+    """
+    import polars as pl
+
+    class _FakeProvider:
+        def securities(self):
+            return pl.DataFrame({"name": [], "symbol": []})
+
     monkeypatch.setattr("lquant.news.tasks._default_runner", lambda day, src: [])
     monkeypatch.setattr("lquant.news.tasks.build_name_to_code", lambda rows: {})
+    monkeypatch.setattr(
+        "lquant.data.providers.akshare.AkShareProvider", _FakeProvider)
 
 
 def _seed_news(n: int = 1, **overrides) -> None:
