@@ -81,13 +81,6 @@ const PARAMS_DEFAULT: EditorParams = {
   formulas: FACTOR_DEFAULT,
 };
 
-const EMPTY_SNAPSHOT: Snapshot = {
-  name: '',
-  description: '',
-  code: '',
-  params: { start: '', end: '', formulas: '' },
-};
-
 type TabId = 'workspace' | 'quick' | 'history';
 
 const TABS: { id: TabId; label: string }[] = [
@@ -351,7 +344,15 @@ function BacktestWorkspace() {
       )}
 
       {tab === 'quick' && <QuickRunPanel />}
-      {tab === 'history' && <HistoryPanel onLoadRun={(row) => void loadRunCode(row.run_id)} />}
+      {tab === 'history' && (
+        <HistoryPanel
+          onLoadRun={(row) =>
+            void (row.params?.strategy_id
+              ? loadStrategy(row.params.strategy_id)
+              : loadRunCode(row.run_id))
+          }
+        />
+      )}
     </div>
   );
 }

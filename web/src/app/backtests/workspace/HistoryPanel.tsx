@@ -14,7 +14,7 @@ import { SERIES_COLORS, axes, legend, tooltip } from '@/lib/chart';
 export type RunRow = {
   run_id: string;
   strategy: string;
-  params: { factor?: string; top_n?: number; rebalance?: string };
+  params: { factor?: string; top_n?: number; rebalance?: string; strategy_id?: string };
   start_date: string;
   end_date: string;
   status: string;

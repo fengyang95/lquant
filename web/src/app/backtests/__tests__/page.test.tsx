@@ -62,6 +62,27 @@ vi.mock('next/dynamic', () => ({
   },
 }));
 
+// ---- HistoryPanel stub：提供「载入」按钮，把 row 交给 onLoadRun 验证路由逻辑 ----
+vi.mock('../workspace/HistoryPanel', () => ({
+  __esModule: true,
+  default: ({ onLoadRun }: { onLoadRun: (row: unknown) => void }) => (
+    <>
+      <div>回测记录</div>
+      <button
+        onClick={() =>
+          onLoadRun({
+            run_id: 'r9',
+            strategy: 'factor_rotation',
+            params: { strategy_id: 's9' },
+          })
+        }
+      >
+        载入
+      </button>
+    </>
+  ),
+}));
+
 import { del, get } from '@/lib/api';
 const getMock = vi.mocked(get);
 const delMock = vi.mocked(del);
@@ -105,6 +126,20 @@ describe('回测工作台 page', () => {
     render(<Page />);
     await userEvent.click(screen.getByRole('button', { name: '历史与对比' }));
     expect(await screen.findByText('回测记录')).toBeInTheDocument();
+  });
+
+  it('历史「载入」row.params.strategy_id 存在 → 走 /strategies/{id} 而非 /code', async () => {
+    getMock.mockImplementation((path: string) => {
+      if (path === '/strategies/s9') {
+        return Promise.resolve({ id: 's9', name: '乙策略', source: 'print(9)', config: {} });
+      }
+      return Promise.resolve(undefined);
+    });
+    render(<Page />);
+    await userEvent.click(screen.getByRole('button', { name: '历史与对比' }));
+    await userEvent.click(await screen.findByRole('button', { name: '载入' }));
+    expect(getMock).toHaveBeenCalledWith('/strategies/s9');
+    expect(getMock).not.toHaveBeenCalledWith('/backtests/r9/code');
   });
 
   it('?run= 参数触发拉取该 run 的代码回填编辑器', async () => {

@@ -11,9 +11,9 @@ import Link from 'next/link';
 import useSWR from 'swr';
 import Chart from '@/components/Chart';
 import { Stat } from '@/components/Panel';
-import { Empty, Loading } from '@/components/States';
+import { Empty, ErrorNote, Loading } from '@/components/States';
 import { get } from '@/lib/api';
-import { C, axes, legend, tooltip } from '@/lib/chart';
+import { C, legend, tooltip } from '@/lib/chart';
 
 type NavPt = { date: string; nav: number; drawdown: number | null };
 
@@ -120,7 +120,7 @@ function useNavOption(d: Detail | undefined) {
 }
 
 export default function ResultPane({ runId }: { runId: string | null }) {
-  const { data: d } = useSWR<Detail>(
+  const { data: d, isLoading, error } = useSWR<Detail>(
     runId ? `/backtests/${runId}` : null,
     get,
   );
@@ -130,8 +130,12 @@ export default function ResultPane({ runId }: { runId: string | null }) {
     return <Empty>点「编译运行 ▶」开始第一次回测</Empty>;
   }
 
-  if (!d) {
-    return <Loading>加载中…（run 不存在时会一直为空）</Loading>;
+  if (error) {
+    return <ErrorNote>加载失败：{error instanceof Error ? error.message : String(error)}</ErrorNote>;
+  }
+
+  if (isLoading || !d) {
+    return <Loading>加载中…</Loading>;
   }
 
   const m = d.metrics ?? {};
