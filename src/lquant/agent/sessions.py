@@ -41,10 +41,18 @@ class SessionStore:
 
     async def _conn(self) -> aiosqlite.Connection:
         if self._db is None:
-            self._db = await aiosqlite.connect(self._path)
-            await self._db.execute("PRAGMA foreign_keys = ON")
-            await self._db.executescript(_DDL)
-            await self._db.commit()
+            db: aiosqlite.Connection | None = None
+            try:
+                db = await aiosqlite.connect(self._path)
+                await db.execute("PRAGMA foreign_keys = ON")
+                await db.executescript(_DDL)
+                await db.commit()
+            except BaseException:
+                if db is not None:
+                    await db.close()
+                self._db = None
+                raise
+            self._db = db
         return self._db
 
     async def close(self) -> None:
@@ -110,7 +118,9 @@ class SessionStore:
 
     async def append_assistant_delta(self, sid: str, mid: str, text: str) -> None:
         con = await self._conn()
-        await con.execute("UPDATE ask_messages SET content = content || ? WHERE id=?", (text, mid))
+        await con.execute(
+            "UPDATE ask_messages SET content = content || ? WHERE id=? AND session_id=?",
+            (text, mid, sid))
         await con.commit()
 
     async def finish_assistant(self, sid: str, mid: str) -> None:

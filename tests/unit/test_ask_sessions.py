@@ -50,3 +50,13 @@ async def test_streaming_update(store):
     got = await store.messages(ses.id)
     assert got[0].content == "你好，世界"
     await store.finish_assistant(ses.id, m.id)
+
+
+async def test_append_delta_rejects_wrong_session(store):
+    """session_id 不匹配时不修改任何行（防跨会话写穿）。"""
+    ses = await store.create(None)
+    other = await store.create(None)
+    m = await store.add_message(ses.id, "assistant", "原内容")
+    await store.append_assistant_delta(other.id, m.id, "恶意追加")
+    got = await store.messages(ses.id)
+    assert got[0].content == "原内容"
