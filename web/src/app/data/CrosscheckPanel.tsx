@@ -105,9 +105,7 @@ export default function CrosscheckPanel() {
                   ? `${d.deviation_pct.toFixed(2)}%`
                   : '—';
                 const fmtVal = (v: unknown) =>
-                  v == null ? '—'
-                    : typeof v === 'number' ? String(v)
-                      : String(v);
+                  v == null ? '—' : String(v);
                 return (
                   <tr key={it.issue_id}>
                     <td className="font-mono text-xs">{it.symbol ?? '—'}</td>

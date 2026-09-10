@@ -122,3 +122,32 @@ def test_neutralize_mixed_uses_float_mv_per_row():
     c_wo = out_wo.select(pl.corr("factor_clean", "eff")).item()
     assert abs(c_with) < 0.05
     assert abs(c_wo) > 0.5
+
+
+# ------------------------------------------------------ 量纲比率告警（复审补充）
+
+def test_neutralize_unit_ratio_warns_and_stays_quiet(monkeypatch):
+    """float_mv/market_cap 中位数比率越界 [0.05, 1.2] -> warning 一次；
+    比率正常（同一量纲）-> 不触发。只告警，不改数据。"""
+    import lquant.factors.preprocess.neutralize as nz
+
+    calls: list[str] = []
+    monkeypatch.setattr(nz.logger, "warning",
+                        lambda msg, *a, **kw: calls.append(str(msg)))
+
+    def _mk(fmv_scale: float) -> pl.DataFrame:
+        n = 10
+        return pl.DataFrame({
+            "trade_date": ["2026-01-05"] * n,
+            "symbol": [f"S{i:03d}" for i in range(n)],
+            "factor": [float(i) for i in range(n)],
+            "market_cap": [(i + 1) * 1e10 for i in range(n)],
+            "float_mv": [(i + 1) * 1e10 * fmv_scale for i in range(n)],
+        })
+
+    # 比率 1.0（一致）-> 静默；比率 0.001（float_mv 少 3 个零）-> 告警
+    nz._resolve_market_cap(_mk(1.0), ["market_cap"], "auto")
+    assert calls == []
+    nz._resolve_market_cap(_mk(0.001), ["market_cap"], "auto")
+    assert len(calls) == 1
+    assert "0.00" in calls[0]

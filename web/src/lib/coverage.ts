@@ -87,6 +87,7 @@ export function monthlyCoverageOption(rows: FlaggedMonthlyRow[]): object {
 
 /** 默认统计窗口：近 N 个月（含当月），返回 [start, end]（YYYY-MM-DD，UTC 口径避免时区跨月漂移） */
 export function lastNMonthsRange(n: number, today: Date = new Date()): [string, string] {
+  // UTC 口径：北京时间 0-8 点时 end 为昨天，可接受（覆盖率查询不需要日内精度）
   const end = today.toISOString().slice(0, 10);
   const start = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth() - n, 1));
   return [start.toISOString().slice(0, 10), end];

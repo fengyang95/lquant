@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import numpy as np
 import polars as pl
+from loguru import logger
 
 from lquant.factors.preprocess._regress import ols_resid, residual_by_day, ridge_resid
 from lquant.factors.preprocess.registry import method
@@ -38,10 +39,32 @@ def _resolve_market_cap(
         return df, factors, None
     if source not in ("auto", "float_mv"):
         raise ValueError(f"未知 market_cap_source: {source}")
+    _warn_unit_mismatch(df)
     out = df.with_columns(
         pl.coalesce(pl.col(FLOAT_MV_COL), pl.col(CAP_COL)).alias(_CAP_EFF)
     )
     return out, [_CAP_EFF if f == CAP_COL else f for f in factors], _CAP_EFF
+
+
+# float_mv/market_cap 比率合理区间：两列都应代表流通/总市值（同一量纲，元），
+# 比率显著越界说明某一列单位错了（如手写成了亿/万元），coalesce 会污染暴露。
+_UNIT_RATIO_LO, _UNIT_RATIO_HI = 0.05, 1.2
+
+
+def _warn_unit_mismatch(df: pl.DataFrame) -> None:
+    """两列均有非空值时，按中位数比率检查量纲一致性；只告警不改数据。"""
+    if FLOAT_MV_COL not in df.columns or CAP_COL not in df.columns:
+        return
+    sub = df.select(FLOAT_MV_COL, CAP_COL).drop_nulls()
+    if sub.height == 0:
+        return
+    ratio = (sub[FLOAT_MV_COL] / sub[CAP_COL]).median()
+    if ratio is None:
+        return
+    if not (_UNIT_RATIO_LO <= ratio <= _UNIT_RATIO_HI):
+        logger.warning(
+            "float_mv 与 market_cap 量纲疑似不一致"
+            f"（比率 {ratio:.2f}），市值暴露可能被污染")
 
 
 def _neutralize_residuals(df, col, by, factors, *, source, solve):
