@@ -263,7 +263,7 @@ def test_run_code_broken_analysis_does_not_fail_backtest(client):
     body = client.get(f"/api/backtests/{rid}").json()
     err = [s for s in body["custom_analysis"] if "error" in s]
     assert err, f"应包含 error 条目: {body['custom_analysis']}"
-    assert any("分析执行失败" in s["error"] for s in err)
+    assert any("type 必须是" in s["error"] for s in err)
 
 
 def test_run_code_without_analysis_flag(client):
@@ -275,6 +275,27 @@ def test_run_code_without_analysis_flag(client):
     assert r.status_code == 200, r.text
     rid = r.json()["run_id"]
     assert client.get(f"/api/backtests/{rid}").json()["custom_analysis"] == []
+
+
+def test_run_code_payload_dates_returns_aligned(client):
+    """payload 契约：returns 与 dates 对齐 —— len(returns) == len(dates) - 1。
+
+    用一个把长度写进 table spec 的分析来断言（零净值点位也不得跳过丢位）。
+    """
+    r = client.post("/api/analyses", json={
+        "name": "autoexec_lencheck",
+        "source": 'def analyze(result):\n'
+                  '    d = result["dates"]\n'
+                  '    r = result["returns"]\n'
+                  '    return [{"type": "table", "title": "len",\n'
+                  '              "columns": ["key", "n"],\n'
+                  '              "rows": [["dates", len(d)], ["returns", len(r)]]}]'})
+    assert r.status_code == 200, r.text
+    rid = _run_code(client)
+    body = client.get(f"/api/backtests/{rid}").json()
+    tbl = next(s for s in body["custom_analysis"] if s.get("type") == "table")
+    rows = {row[0]: row[1] for row in tbl["rows"]}
+    assert rows["returns"] == rows["dates"] - 1
 
 
 def test_run_code_with_factor_and_records(client):

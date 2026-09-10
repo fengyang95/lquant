@@ -91,8 +91,8 @@ def _run_saved_analyses(res) -> list[dict]:
     payload = {
         "dates": dates,
         "nav": navs,
-        "returns": [0.0] + [navs[i] / navs[i - 1] - 1
-                            for i in range(1, len(navs)) if navs[i - 1]],
+        "returns": [navs[i] / navs[i - 1] - 1 if navs[i - 1] > 0 else 0.0
+                    for i in range(1, len(navs))],
         "trades": res.trades_frame(),
         "positions": res.positions,
         "records": res.records,
@@ -107,7 +107,7 @@ def _run_saved_analyses(res) -> list[dict]:
         try:
             out.extend(run_user_analysis(get_analysis(a["id"])["source"], payload))
         except Exception as e:                 # noqa: BLE001  单个分析失败不炸回测
-            out.append({"name": a["name"], "error": f"分析执行失败: {e}"[:200]})
+            out.append({"name": a["name"], "error": str(e)[:200]})
     return out
 
 
