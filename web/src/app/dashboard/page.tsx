@@ -7,6 +7,7 @@
  */
 
 import { useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import useSWR from 'swr';
 import Chart from '@/components/Chart';
 import { Panel, Stat } from '@/components/Panel';
@@ -79,6 +80,7 @@ function TempScale({ temp }: { temp: number }) {
 }
 
 export default function DashboardPage() {
+  const router = useRouter();
   const { data: overview } = useSWR<Overview>('/market/overview', get, { refreshInterval: 30_000 });
   const { data: breadth } = useSWR<{ latest: BreadthRow | null; history: BreadthRow[] }>(
     '/market/breadth?days=90', get, { refreshInterval: 60_000 });
@@ -154,6 +156,11 @@ export default function DashboardPage() {
       <PageHeader
         title="大盘"
         sub={<>数据湖日线截面{b?.trade_date ? ` · ${b.trade_date}` : ''}{s?.trade_date && s.trade_date !== b?.trade_date ? ` / ${s.trade_date}` : ''}</>}
+        actions={
+          <button className="btn" onClick={() => router.push('/ask')}>
+            问 AI
+          </button>
+        }
       />
 
       {/* 指数条：一根发丝线面板，竖线分栏 */}

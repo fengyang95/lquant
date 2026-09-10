@@ -88,6 +88,17 @@ def limit_up(limit: int = Query(default=50, le=500)) -> list[dict]:
               .sort("first_limit_time").head(limit).to_dicts())
 
 
+@router.get("/dragon-tiger")
+def dragon_tiger(limit: int = Query(default=50, le=500)) -> list[dict]:
+    """龙虎榜：最新交易日上榜个股及原因（空湖返回空列表）。"""
+    df = _read("dragon_tiger", 1000)
+    if not len(df):
+        return []
+    latest_date = df["trade_date"].max()
+    return (df.filter(pl.col("trade_date") == latest_date)
+              .head(limit).to_dicts())
+
+
 @router.get("/collectors")
 def collectors_status() -> list[dict]:
     return list_collectors()

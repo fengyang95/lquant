@@ -1,13 +1,15 @@
-"""运行时配置：settings_store 纯函数（类型白名单/coerce/合并）。"""
+"""运行时配置：settings_store 纯函数 + Settings.agent 派生。"""
 from __future__ import annotations
 
-from lquant.core.settings_store import SETTING_DEFS, _parse, coerce_setting
+from lquant.core.config import get_settings
+from lquant.core.settings_store import SETTING_DEFS, _parse, coerce_setting, defaults
 
 
 def test_defs_are_registered():
     assert "providers_order" in SETTING_DEFS
     assert "rebalance_default" in SETTING_DEFS
     assert "price_mode_default" in SETTING_DEFS
+    assert "agent.provider" in SETTING_DEFS
 
 
 def test_coerce_bool():
@@ -38,3 +40,30 @@ def test_parse_roundtrip():
     assert _parse(SETTING_DEFS["factor_cache_enabled"], "true") is True
     assert _parse(SETTING_DEFS["price_mode_default"], "same_close") == "same_close"
     assert _parse(SETTING_DEFS["providers_order"], "a,b") == ["a", "b"]
+
+
+def test_agent_provider_setting_default_derives_from_config(tmp_path, monkeypatch):
+    """agent.provider 默认值从 config/app.yaml 派生（source=config），可被 PUT 覆盖。"""
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "app.yaml").write_text(
+        "agent:\n  provider: claude_code\n", encoding="utf-8")
+    monkeypatch.setenv("LQ_ROOT", str(tmp_path))
+    get_settings.cache_clear()
+    try:
+        d = defaults()
+        assert d["agent.provider"] == ("claude_code", "config")
+    finally:
+        get_settings.cache_clear()
+
+
+def test_agent_provider_from_raw(tmp_path, monkeypatch):
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "app.yaml").write_text(
+        "agent:\n  provider: x\n", encoding="utf-8")
+    monkeypatch.setenv("LQ_ROOT", str(tmp_path))
+    get_settings.cache_clear()
+    try:
+        s = get_settings()
+        assert s.agent.provider == "x"
+    finally:
+        get_settings.cache_clear()

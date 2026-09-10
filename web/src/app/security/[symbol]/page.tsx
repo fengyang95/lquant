@@ -2,7 +2,7 @@
 
 import { useMemo } from 'react';
 import Link from 'next/link';
-import { useParams } from 'next/navigation';
+import { useParams, useRouter } from 'next/navigation';
 import useSWR from 'swr';
 import KChart, { type Overlay } from '@/components/KChart';
 import PageHeader from '@/components/PageHeader';
@@ -64,6 +64,7 @@ const MA_COLORS: Record<string, string> = {
 
 export default function SecurityPage() {
   const { symbol = '' } = useParams<{ symbol: string }>();
+  const router = useRouter();
 
   // 实时行情 5s 轮询；不可用时用日线末根兜底
   const { data: quote } = useSWR<Quote>(
@@ -112,6 +113,11 @@ export default function SecurityPage() {
                 ? ` · 实时行情不可用，显示 ${last.trade_date} 收盘价`
                 : ' · 暂无行情'}
           </>
+        }
+        actions={
+          <button className="btn" onClick={() => router.push(`/ask?symbol=${symbol}`)}>
+            问 AI
+          </button>
         }
       />
 
