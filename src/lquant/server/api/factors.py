@@ -489,7 +489,7 @@ def mine_run(req: dict) -> dict:
                 "INSERT OR REPLACE INTO factor_mining_run VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 [run_id, agent_name, generator, res.n_evaluated, res.n_static_fail,
                  res.n_redundant, res.n_size_proxy, res.n_survivors,
-                 str(res.corrections)[:10000], dt.datetime.now()])
+                 json.dumps(res.corrections, ensure_ascii=False)[:10000], dt.datetime.now()])
     except Exception:  # noqa: BLE001
         pass  # 记账失败不阻断结果
     return {"run_id": run_id, "agent": agent_name, "generator": generator,

@@ -25,6 +25,7 @@ def run(factor_expr: str | None, spec_path: str | None, start: str | None,
 
     from lquant.data.store.parquet import read_daily
     from lquant.factors.analysis import compute_factor_col
+    from lquant.factors.preprocess.pipeline import drop_nonfinite, run as pipeline_run
     from lquant.factors.covariates import build_covariates
     from lquant.factors.evaluate import forward_return
     from lquant.factors.evaluate.quantile import quantile_summary
@@ -58,7 +59,7 @@ def run(factor_expr: str | None, spec_path: str | None, start: str | None,
     d = forward_return(d, "close", periods=[1])
     ret_col = "fwd_ret_1"
     if cov_cols:
-        from lquant.factors.preprocess.pipeline import run as pipeline_run, drop_nonfinite
+    
 
         d = pipeline_run(d, "f", [
             {"op": "winsorize", "method": "mad", "n": 5},

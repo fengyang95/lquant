@@ -5,7 +5,7 @@ from datetime import date
 
 import polars as pl
 
-from lquant.core.errors import LookaheadError
+from lquant.core.errors import FactorError, LookaheadError
 from lquant.factors.dsl.analyzer import check
 from lquant.factors.dsl.compiler import compile_expr, plan
 from lquant.factors.dsl.parser import parse
@@ -26,6 +26,8 @@ class FactorEngine:
         check(ast, allowed_fields=set(df.columns))   # 静态分析：未来函数 + 未注册算子 + 字段白名单
 
         steps = plan(ast.root)
+        if not steps:
+            raise FactorError(f"表达式编译出空执行计划: {expr}")
         pref = f"{name}__s" if len(steps) > 1 else name
         out = df
         for i, step in enumerate(steps):
@@ -33,11 +35,14 @@ class FactorEngine:
             col = f"{pref}{i + 1}" if len(steps) > 1 else name
             out = out.with_columns(e.alias(col))
             if len(steps) > 1:
-                # 物化：打断 Polars 的嵌套 over 优化（必须）
+                # 物化：打断 Polars 的嵌套 over 优化（必须）；
+                # 同时 alias 成 plan 的引用名 __step{i+1}，供后续步骤读取
                 out = out.with_columns(pl.col(col).alias(col))
+                out = out.with_columns(pl.col(col).alias(f"__step{i + 1}"))
         if len(steps) > 1:
-            out = out.rename({f"{pref}{len(steps)}": name}).drop(
-                [f"{pref}{i + 1}" for i in range(len(steps) - 1)])
+            inter = ([f"{pref}{i + 1}" for i in range(len(steps) - 1)]
+                     + [f"__step{i + 1}" for i in range(len(steps))])
+            out = out.rename({f"{pref}{len(steps)}": name}).drop(inter)
         return out
 
     def compute(self, expr: str, name: str = "f") -> pl.DataFrame:

@@ -192,7 +192,7 @@ def mine(agent: str, generator: str, n: int, proposals: str | None, start: str |
                 "INSERT OR REPLACE INTO factor_mining_run VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 [run_id, agent, generator, res.n_evaluated, res.n_static_fail,
                  res.n_low_ic, res.n_redundant, res.n_size_proxy, res.n_survivors,
-                 str(res.corrections)[:10000], dt.datetime.now()])
+                 json.dumps(res.corrections, ensure_ascii=False)[:10000], dt.datetime.now()])
     except Exception as e:  # noqa: BLE001
         click.echo(f"[warn] 记账落库失败（结果仍有效）: {e}")
     click.echo(json.dumps({
