@@ -415,7 +415,10 @@ export default function FactorsPage() {
               : <Empty>样本不足</Empty>}
           </Panel>
           <div className="space-y-5">
-            <Panel title="IC 归因阶梯" meta="原始 → +市值 → +行业 → +换手率（逐段叠加看 IC 掉多少）">
+            <Panel title="IC 归因阶梯"
+            meta={(evalSeries.neutral_views as { return_neutral_ic?: number } | undefined)?.return_neutral_ic != null
+              ? `收益中性化 IC 对照 = ${(evalSeries.neutral_views as { return_neutral_ic: number }).return_neutral_ic.toFixed(4)}（口径：因子~协变量取残差）`
+              : '原始 → +市值 → +行业 → +换手率（逐段叠加看 IC 掉多少）'}>
             {(evalSeries.neutral_ladder?.length ?? 0) > 0 ? (
               <div className="space-y-1.5 px-1 py-2 text-xs">
                 {evalSeries.neutral_ladder!.map((l) => {

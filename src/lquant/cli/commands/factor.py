@@ -75,8 +75,10 @@ def eval_(expr: str, start: str | None, neutral: bool, agent: str | None) -> Non
         from lquant.factors.evaluate import forward_return as _fr
         from lquant.factors.evaluate.ic import ic_series
 
-        raw_sub = df.filter(
-            pl.col("trade_date").is_in(sorted(df["trade_date"].unique().to_list())[:70]))
+        from lquant.factors.mining.runner import split_dates
+
+        tr_d, _v, _t = split_dates(df["trade_date"].unique().to_list())
+        raw_sub = df.filter(pl.col("trade_date").is_in(tr_d))
         raw_sub = _fr(raw_sub.sort(["symbol", "trade_date"]), "close", periods=[1])
         d_raw = compute_factor_col(raw_sub, expr, "f").drop_nulls(["f", "fwd_ret_1"])
         ic_raw = round(float(ic_series(d_raw, "f", "fwd_ret_1")["ic"].mean()), 4)
