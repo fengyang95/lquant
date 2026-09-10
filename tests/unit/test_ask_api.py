@@ -6,6 +6,8 @@ import asyncio
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from lquant.agent.service import get_agent_service
+from lquant.server.api import ask as ask_api
 from lquant.server.main import app
 
 
@@ -73,3 +75,25 @@ async def test_dragon_tiger_endpoint(client):
 async def test_unknown_session_404(client):
     r = await client.get("/api/ask/sessions/nope/messages")
     assert r.status_code == 404
+
+
+async def test_send_message_500_cancels_background_task(client, monkeypatch):
+    """202 轮询超时返回 500 时，后台 agent 任务必须被收敛，不留孤儿任务。"""
+    svc = await get_agent_service()
+    r = await client.post("/api/ask/sessions", json=None)
+    sid = r.json()["data"]["id"]
+
+    # 轮询永远看不到 user 消息 → 强制走 500 分支
+    async def _no_messages(_sid):
+        return []
+
+    monkeypatch.setattr(svc, "get_messages", _no_messages)
+
+    r = await client.post(f"/api/ask/sessions/{sid}/messages", json={"content": "大盘怎么样"})
+    assert r.status_code == 500
+
+    # 后台任务已被取消：service 内不再登记，全局任务集也已收敛
+    assert sid not in svc._tasks
+    assert not ask_api._tasks, "500 返回后不应残留后台任务"
+
+    await client.delete(f"/api/ask/sessions/{sid}")

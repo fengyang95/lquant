@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 
 from fastapi import HTTPException
@@ -105,6 +106,10 @@ async def send_message(sid: str, body: dict):
             break
         await asyncio.sleep(_POLL_INTERVAL)
     if user is None:
+        # 收敛后台任务：返回 500 时不能留孤儿 agent 任务继续跑
+        await svc.cancel(sid)
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
         raise HTTPException(500, "消息落库失败")
     return JSONResponse(
         status_code=202,

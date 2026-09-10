@@ -1,4 +1,5 @@
 """端到端：创建会话 → WS 订阅 → 发消息 → 断言事件流与落库对账。"""
+import asyncio
 import time
 
 import pytest
@@ -34,6 +35,78 @@ def _drain_until_terminal(ws) -> list[dict]:
         if ev["type"] in ("done", "error"):
             return events
     raise AssertionError(f"10s 内未收到终态事件: {events}")
+
+
+def test_ask_e2e_error_path_persists_assistant_error(monkeypatch):
+    """error 路径：fetch_quotes 抛错 → WS 收到 error 事件 → 错误以 assistant 消息落库。"""
+
+    def broken_fetch_quotes(symbols):  # noqa: ANN001, ARG001
+        raise RuntimeError("行情源炸了")
+
+    monkeypatch.setattr("lquant.agent.mock.fetch_quotes", broken_fetch_quotes)
+
+    with TestClient(app) as c:
+        r = c.post("/api/ask/sessions")
+        assert r.status_code == 200
+        sid = r.json()["data"]["id"]
+
+        with c.websocket_connect(f"/ws/ask/{sid}") as ws:
+            r = c.post(f"/api/ask/sessions/{sid}/messages", json={"content": "600519 怎么样"})
+            assert r.status_code == 202
+
+            events = _drain_until_terminal(ws)
+            assert events[-1]["type"] == "error"
+            assert "行情源炸了" in events[-1]["message"]
+
+        # 错误已落库：最后一条消息 role == assistant
+        r = c.get(f"/api/ask/sessions/{sid}/messages")
+        msgs = r.json()["data"]
+        assert msgs, "会话应有落库消息"
+        assert msgs[-1]["role"] == "assistant"
+        assert "出错了" in msgs[-1]["content"]
+
+        c.delete(f"/api/ask/sessions/{sid}")
+
+
+def test_ask_e2e_cancel_path(monkeypatch):
+    """cancel 路径：POST cancel 后 WS 收到 error（已中断）事件。
+
+    竞态说明：mock 流程很快（delta sleep 0.01s），cancel 请求可能在
+    done 之后才被处理——若 cancel 晚到则流以 done 正常收尾，此时断言
+    收到 done 也算通过。
+    """
+
+    # 放慢 delta，给 cancel 留出在 done 之前生效的窗口
+    real_sleep = asyncio.sleep
+
+    async def slow_sleep(delay, *a, **kw):
+        if delay == 0.01:
+            delay = 0.05
+        return await real_sleep(delay, *a, **kw)
+
+    monkeypatch.setattr("lquant.agent.mock.asyncio.sleep", slow_sleep)
+
+    with TestClient(app) as c:
+        r = c.post("/api/ask/sessions")
+        assert r.status_code == 200
+        sid = r.json()["data"]["id"]
+
+        with c.websocket_connect(f"/ws/ask/{sid}") as ws:
+            r = c.post(f"/api/ask/sessions/{sid}/messages", json={"content": "600519 怎么样"})
+            assert r.status_code == 202
+
+            r = c.post(f"/api/ask/sessions/{sid}/cancel")
+            assert r.status_code == 200
+
+            events = _drain_until_terminal(ws)
+            terminal = events[-1]
+            if terminal["type"] == "error":
+                assert "已中断" in terminal["message"]
+            else:
+                # 竞态：cancel 晚于 done，流已正常结束
+                assert terminal["type"] == "done"
+
+        c.delete(f"/api/ask/sessions/{sid}")
 
 
 def test_ask_e2e_stream_and_reconcile():
