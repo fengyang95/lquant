@@ -37,9 +37,14 @@ def find_root() -> Path:
     return Path.cwd()
 
 
+class AgentConfig(BaseModel):
+    provider: str = "mock"
+
+
 class Settings(BaseModel):
     root: Path = Field(default_factory=find_root)
     env: str = "dev"
+    agent: AgentConfig = Field(default_factory=AgentConfig)
     timezone: str = "Asia/Shanghai"
     duckdb_path: str = "./data/duckdb/lquant.duckdb"
     parquet_dir: str = "./data/parquet"
@@ -67,6 +72,7 @@ def get_settings() -> Settings:
     return Settings(
         root=root,
         env=raw.get("env", "dev"),
+        agent=AgentConfig(provider=raw.get("agent", {}).get("provider", "mock")),
         timezone=raw.get("timezone", "Asia/Shanghai"),
         duckdb_path=str(paths.get("duckdb", "./data/duckdb/lquant.duckdb")),
         parquet_dir=str(paths.get("parquet", "./data/parquet")),
