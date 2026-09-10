@@ -18,6 +18,9 @@ router = make_router(prefix="/ask", tags=["ask"])
 
 _bus = AskEventBus()
 
+# 持有后台任务引用，防止协程被 GC（done 后自动移除）
+_tasks: set[asyncio.Task] = set()
+
 # 等 user 消息落库的轮询参数：40 × 50ms = 2s 上限
 _POLL_TIMES = 40
 _POLL_INTERVAL = 0.05
@@ -44,6 +47,15 @@ async def list_sessions():
 async def delete_session(sid: str):
     svc = await get_agent_service()
     await svc.delete_session(sid)  # 内部先 cancel 后台任务
+    return {"ok": True}
+
+
+@router.post("/sessions/{sid}/cancel")
+async def cancel_session(sid: str):
+    svc = await get_agent_service()
+    if await svc.store.get(sid) is None:
+        raise HTTPException(404, "会话不存在")
+    await svc.cancel(sid)
     return {"ok": True}
 
 
@@ -80,7 +92,9 @@ async def send_message(sid: str, body: dict):
             _LOG.exception("agent 后台任务失败 sid=%s", sid)
             await on_event(AgentEvent(type="error", message=str(e)))
 
-    asyncio.create_task(run())
+    task = asyncio.create_task(run())
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
 
     # 等 user 消息落库后再返回（上限 2s），保证前端拿到完整 user_message
     user = None

@@ -53,6 +53,16 @@ async def test_empty_message_400(client):
     await client.delete(f"/api/ask/sessions/{sid}")
 
 
+async def test_cancel_returns_200(client):
+    r = await client.post("/api/ask/sessions", json=None)
+    sid = r.json()["data"]["id"]
+    r = await client.post(f"/api/ask/sessions/{sid}/messages", json={"content": "600519 怎么样"})
+    assert r.status_code == 202
+    r = await client.post(f"/api/ask/sessions/{sid}/cancel")
+    assert r.status_code == 200
+    await client.delete(f"/api/ask/sessions/{sid}")
+
+
 async def test_unknown_session_404(client):
     r = await client.get("/api/ask/sessions/nope/messages")
     assert r.status_code == 404
