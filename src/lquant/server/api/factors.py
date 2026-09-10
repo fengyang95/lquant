@@ -138,9 +138,13 @@ def _persist_ic(name: str, ladder: list[dict]) -> None:
         loguru.logger.warning(f"factor_ic 写入失败: {e}")
 
 
-def _neutral_ladder(d: pl.DataFrame, col: str, ret_col: str) -> list[dict]:
-    """逐段叠加协变量看 IC 怎么掉：原始 → +市值 → +行业 → +换手率。"""
-    from lquant.factors.covariates import build_covariates
+def _neutral_ladder(d: pl.DataFrame, col: str, ret_col: str,
+                    dd: pl.DataFrame | None = None,
+                    cov_report: dict | None = None) -> list[dict]:
+    """逐段叠加协变量看 IC 怎么掉：原始 → +市值 → +行业 → +换手率。
+
+    dd/cov_report 可由调用方传入（协变量只构建一次，ladder 与 views 复用）。
+    """
     from lquant.factors.evaluate.ic import ic_series
     from lquant.factors.preprocess.pipeline import run as pipeline_run
 
@@ -151,12 +155,16 @@ def _neutral_ladder(d: pl.DataFrame, col: str, ret_col: str) -> list[dict]:
         ("+turnover", ["market_cap", "industry_sw1", "turnover_1m"]),
     ]
     out = []
-    cov_names = sorted({c for _, covs in levels for c in covs})
-    try:
-        dd, report = build_covariates(d, cov_names)
-    except Exception:  # noqa: BLE001
-        return []
-    cov_report = {r["covariate"]: r["coverage"] for r in report}
+    if dd is None:
+        from lquant.factors.covariates import build_covariates
+
+        cov_names = sorted({c for _, covs in levels for c in covs})
+        try:
+            dd, report = build_covariates(d, cov_names)
+        except Exception:  # noqa: BLE001
+            return []
+        cov_report = {r["covariate"]: r["coverage"] for r in report}
+    cov_report = cov_report or {}
     for label, covs in levels:
         steps = [{"op": "winsorize", "method": "mad", "n": 5},
                  {"op": "standardize", "method": "zscore"}]
@@ -258,7 +266,20 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
                for r in icy.to_dicts()] if len(icy) else []
 
     # ---- IC 归因阶梯（方案 5.3）+ 三种中性化视图标注（方案 5.1） ----
-    ladder = _neutral_ladder(d, "_factor", ret_col)
+    cov_names_all = ["market_cap", "industry_sw1", "turnover_1m"]
+    try:
+        with reader() as con:
+            ind = con.execute("SELECT symbol, std, code, std_date FROM industry_classify").pl()
+    except Exception:  # noqa: BLE001
+        ind = None
+    try:
+        from lquant.factors.covariates import build_covariates
+
+        d, cov_report = build_covariates(d, cov_names_all, industry_df=ind)
+        cov_map = {r["covariate"]: r["coverage"] for r in cov_report}
+    except Exception:  # noqa: BLE001
+        d, cov_map = d, {}
+    ladder = _neutral_ladder(d, "_factor", ret_col, dd=d, cov_report=cov_map)
     _persist_ic(req.factor, ladder)
     views = _neutral_views_for(d, ret_col)
 

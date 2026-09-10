@@ -28,6 +28,8 @@ class GateResult:
     stage: str
     reason_code: str | None = None
     hint: str = ""
+    ic: float | None = None        # G1 通过时回传，供 fitness/GP feedback 用
+    ic_raw: float | None = None
 
 
 def g0_static(expr, allowed_fields=None):
@@ -41,13 +43,18 @@ def g0_static(expr, allowed_fields=None):
 
 
 def g1_fast_screen(train, expr, ret_col, engine, covs=None, min_abs_ic=0.02):
-    """G1 快筛：训练段 + 中性化 IC（方案 3.2/5.4：快筛一律用中性化后 IC）。"""
+    """G1 快筛：训练段 + 中性化 IC（方案 3.2/5.4：快筛一律用中性化后 IC）。
+
+    数据范围硬约束：只在传入的 train 子集上计算（engine 可能持有全量 panel，
+    直接 engine.compute 会把 val/test 泄漏进快筛 —— 静默破坏 70/15/15）。
+    """
+    from lquant.factors.analysis import compute_factor_col
     from lquant.factors.evaluate import forward_return
     from lquant.factors.evaluate.ic import ic_series
     from lquant.factors.preprocess.pipeline import run as pipeline_run
 
     try:
-        d = engine.compute(expr, "f")
+        d = compute_factor_col(train, expr, "f")
         if covs:
             d = pipeline_run(d, "f", [
                 {"op": "winsorize", "method": "mad", "n": 5},
@@ -65,7 +72,8 @@ def g1_fast_screen(train, expr, ret_col, engine, covs=None, min_abs_ic=0.02):
         rank = float(s["rank_ic"].mean())
         raw_ic = ic
         if covs:
-            s_raw = ic_series(engine.compute(expr, "f").drop_nulls(["f"]), "f", ret_col)
+            s_raw = ic_series(compute_factor_col(train, expr, "f").drop_nulls(["f"]),
+                              "f", ret_col)
             raw_ic = float(s_raw["ic"].mean())
         decay = 1 - abs(ic) / max(abs(raw_ic), 1e-12)
         size_proxy = covs is not None and decay > 0.8
@@ -76,7 +84,8 @@ def g1_fast_screen(train, expr, ret_col, engine, covs=None, min_abs_ic=0.02):
             return GateResult(False, "G1", "LOW_IC",
                               f"中性化 IC={ic:.4f} < {min_abs_ic}；"
                               f"建议换字段族或加截面变换（Rank/ZScore）")
-        return GateResult(True, "G1", hint=f"IC={ic:.4f} rank={rank:.4f} decay={decay:.0%}")
+        return GateResult(True, "G1", hint=f"IC={ic:.4f} rank={rank:.4f} decay={decay:.0%}",
+                          ic=ic, ic_raw=raw_ic)
     except Exception as e:  # noqa: BLE001
         return GateResult(False, "G1", "COMPUTE_FAIL", f"{type(e).__name__}: {e}")
 

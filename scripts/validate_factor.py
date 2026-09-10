@@ -20,6 +20,8 @@ LAYERS = [
     ("F2", [TEST_FILE, "-k", "f2"]),
     ("F3", [TEST_FILE, "-k", "f3"]),
     ("F4", [TEST_FILE, "-k", "f4"]),
+    ("F5", [TEST_FILE, "-k", "f5"]),
+    ("F6", [TEST_FILE, "-k", "f6"]),
 ]
 
 if __name__ == "__main__":

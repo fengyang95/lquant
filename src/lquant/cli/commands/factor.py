@@ -149,6 +149,11 @@ def mine(agent: str, generator: str, n: int, proposals: str | None, start: str |
         raise click.ClickException(f"Agent 未注册: {agent}（见 lq agent list）")
     if not a.enabled:
         raise click.ClickException(f"Agent 已冻结: {agent}")
+    from lquant.factors.agents import quota_remaining
+
+    remaining = quota_remaining(agent)
+    if n > remaining:
+        raise click.ClickException(f"超出剩余配额: n={n} > remaining={remaining}")
     if n > a.quota_eval:
         raise click.ClickException(f"超出配额: n={n} > quota={a.quota_eval}")
 

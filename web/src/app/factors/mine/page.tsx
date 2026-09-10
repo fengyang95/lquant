@@ -35,7 +35,7 @@ function StatRow({ label, value }: { label: string; value: number }) {
 }
 
 export default function FactorsMinePage() {
-  const { data: runs } = useSWR<MineRun[]>('/factors/mine/runs', get);
+  const { data: runs, mutate: mutateRuns } = useSWR<MineRun[]>('/factors/mine/runs', get);
   const { data: agents } = useSWR<AgentRow[]>('/factors/agents', get);
   const [busy, setBusy] = useState('');
   const [msg, setMsg] = useState('');
@@ -49,7 +49,7 @@ export default function FactorsMinePage() {
         '/factors/mine/run',
         { agent: 'gp-internal', generator, n: n });
       setMsg(`run ${r.run_id}: 评估 ${r.n_evaluated} / 幸存 ${r.n_survivors}`);
-      await get('/factors/mine/runs');
+      mutateRuns();
     } catch (e) {
       setMsg(`失败: ${e instanceof Error ? e.message : String(e)}`);
     } finally {

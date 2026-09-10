@@ -71,7 +71,7 @@ def run(factor_expr: str | None, spec_path: str | None, start: str | None,
     ls = qsum.get("long_short", {})
     click.echo(json.dumps({
         "factor": factor_expr, "n_groups": n_groups,
-        "n_days": qsum.get("n_dates"),
+        "n_days": d["trade_date"].n_unique(),
         "monotonicity": qsum.get("monotonicity"),
         "long_short": ls,
         "note": "多空分层回测（日频、等权、next-day 收益口径）",

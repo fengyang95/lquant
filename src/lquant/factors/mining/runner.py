@@ -74,6 +74,10 @@ def run_session(engine, panel, generator, *, agent="builtin", n_candidates=100,
             res.corrections.append({"expr": expr, "stage": "G0", "reason": g0.reason_code, "hint": g0.hint})
             continue
         g1 = g1_fast_screen(train, expr, ret_col, engine, covs=cov_build)
+        if hasattr(generator, "feedback") and g1.ic is not None:
+            from lquant.factors.mining.fitness import fitness
+
+            generator.feedback(expr, fitness(g1.ic, g1.ic_raw or g1.ic))
         if not g1.passed:
             if g1.reason_code == "SIZE_PROXY":
                 n_proxy += 1

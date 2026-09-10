@@ -8,7 +8,7 @@ import polars as pl
 import pytest
 
 from lquant.factors.mining.fitness import corrected_threshold, fitness
-from lquant.factors.mining.gates import g0_static
+from lquant.factors.mining.gates import g0_static, g1_fast_screen
 from lquant.factors.mining.random_gen import make_generator
 from lquant.factors.mining.runner import run_session, split_dates
 from lquant.factors.ops import cs_ops, el_ops, ts_ops  # noqa: F401
@@ -89,3 +89,26 @@ def test_eval_quota_ledger(tmp_path, monkeypatch):
     prof = A.AgentProfile(name="t", kind="skill", driver="agent",
                           quota_eval=10, can_submit=True)
     assert A.AgentProfile is not None
+
+
+
+def test_g1_uses_train_subset_only():
+    """G1 数据范围硬约束：IC 必须算在传入的 train 子集上，不许碰全量 panel。"""
+    import polars as pl
+
+    from lquant.factors.analysis import compute_factor_col
+    from lquant.factors.evaluate import forward_return
+    from lquant.factors.evaluate.ic import ic_series
+
+    panel = _panel()
+    train_dates = sorted(panel["trade_date"].unique().to_list())[:70]
+    train = panel.filter(pl.col("trade_date").is_in(train_dates))
+    train = forward_return(train.sort(["symbol", "trade_date"]), "close", periods=[1])
+    train = train.drop_nulls(["fwd_ret_1"])
+    expr = "Ts_Return($close, 5)"
+    r = g1_fast_screen(train, expr, "fwd_ret_1", engine=None)
+    assert r.passed and r.ic is not None
+    # 手工在 train 上重算同口径 IC
+    d = compute_factor_col(train, expr, "f").drop_nulls(["f", "fwd_ret_1"])
+    expect = float(ic_series(d, "f", "fwd_ret_1")["ic"].mean())
+    assert abs(r.ic - expect) < 1e-9
