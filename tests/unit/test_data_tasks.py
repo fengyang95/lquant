@@ -110,7 +110,7 @@ def test_create_full_backfill_requires_delisted(seeded_db):
 
 def test_create_rejects_running_task(seeded_db):
     _mk_running_row()
-    with pytest.raises(ValueError, match="运行中"):
+    with pytest.raises(ValueError, match="未完成"):
         tasks_mod.create_task("daily_update", {"days": 10})
 
 
@@ -315,6 +315,14 @@ def test_mark_interrupted(seeded_db):
 
 def test_get_and_list_tasks(seeded_db):
     t1 = _mk_task()
+    # pending 也纳入互斥：活动任务存在时不能再创建
+    with pytest.raises(tasks_mod.TaskConflictError):
+        tasks_mod.create_task("daily_update", {"days": 10})
+    from lquant.core.db import writer
+
+    with writer() as con:
+        con.execute("UPDATE data_task SET status='ok' WHERE task_id=?",
+                    [t1["task_id"]])
     tasks_mod.create_task("daily_update", {"days": 10})
     assert tasks_mod.get_task(t1["task_id"])["task_id"] == t1["task_id"]
     assert tasks_mod.get_task("nope") is None

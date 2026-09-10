@@ -155,9 +155,17 @@ def collect_status() -> dict:
 # ---------------- 市场宽度 / 批量聚合（看板丰富化） ----------------
 
 def _limit_threshold(sym: str) -> float:
-    """涨跌停判定阈值（近似）：创业板/科创板 20%，其余主板 10%。"""
+    """涨跌停判定阈值（近似）：创业板/科创板 20%，北交所 30%，其余主板 10%。
+
+    北交所代码规则：43 开头（老三板转来）、83/87 开头（新三板精选层/北交所）、
+    92 开头（北交所新代码段）。
+    """
     bare = sym.split(".", 1)[0]
-    return 0.195 if bare.startswith(("300", "301", "688", "689")) else 0.095
+    if bare.startswith(("43", "83", "87", "92")):
+        return 0.295
+    if bare.startswith(("300", "301", "688", "689")):
+        return 0.195
+    return 0.095
 
 
 @router.get("/breadth")

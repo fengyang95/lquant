@@ -64,6 +64,20 @@ class LocalJob:
 # 本地任务的进程内注册表：/ws/jobs/{id} 靠它查状态。
 # Redis 模式下 RQ Job 自带状态查询，不需要这里。
 _LOCAL_JOBS: dict[str, LocalJob] = {}
+_LOCAL_JOBS_MAX = 200  # 降级模式的兜底容量：超过就淘汰已结束的最旧任务
+_JOBS_LOCK = threading.Lock()
+
+
+def _register_job(job: LocalJob) -> None:
+    """注册本地任务并淘汰最旧的已结束任务（防降级模式内存泄漏）。"""
+    with _JOBS_LOCK:
+        if len(_LOCAL_JOBS) >= _LOCAL_JOBS_MAX:
+            for jid, j in list(_LOCAL_JOBS.items()):
+                if j.get_status() != "started":
+                    del _LOCAL_JOBS[jid]
+                    if len(_LOCAL_JOBS) < _LOCAL_JOBS_MAX:
+                        break
+        _LOCAL_JOBS[job.id] = job
 
 
 def get_job(job_id: str):
@@ -90,7 +104,7 @@ def enqueue(queue: str, fn, *args, **kwargs):
 
     # 本地降级：后台线程执行，异常留在 job 上而不是炸请求方
     job = LocalJob()
-    _LOCAL_JOBS[job.id] = job
+    _register_job(job)
 
     def _run():
         try:

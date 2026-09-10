@@ -167,7 +167,7 @@ class BacktestIn(BaseModel):
     top_n: int = Field(default=5, ge=1, le=100)
     rebalance: str = Field(default="monthly", pattern="^(daily|weekly|monthly|none)$")
     initial_cash: float = Field(default=1_000_000, gt=0)
-    start: str = "2026-01-01"
+    start: str = Field(default="2026-01-01", pattern=r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:

@@ -5,11 +5,40 @@
 """
 from __future__ import annotations
 
+import os
+import threading
 from pathlib import Path
 
 import polars as pl
 
 from lquant.core.config import get_settings
+
+# 读-改-写按 (路径) 加锁：不同 year / (freq, ym) 文件互不阻塞。
+# 锁保护同进程并发（sync-worker 线程与本地任务线程同进程），
+# 并保证「读旧 → 合并 → 写临时文件 → os.replace」对读侧原子可见。
+_FILE_LOCKS: dict[str, threading.Lock] = {}
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+def _file_lock(path: Path) -> threading.Lock:
+    key = str(path)
+    with _FILE_LOCKS_GUARD:
+        lock = _FILE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _FILE_LOCKS[key] = lock
+        return lock
+
+
+def _atomic_write_parquet(df: pl.DataFrame, p: Path) -> None:
+    """先写同目录临时文件再 os.replace：读侧不会看到半截文件。"""
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        df.write_parquet(tmp, compression="zstd")
+        os.replace(tmp, p)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _root() -> Path:
@@ -30,17 +59,18 @@ def write_daily(df: pl.DataFrame) -> list[Path]:
         y = year[0]
         p = _daily_path(y)
         p.parent.mkdir(parents=True, exist_ok=True)
-        # 同key覆盖：读旧 → 去旧 → 合并 → 写
-        if p.exists():
-            old = pl.read_parquet(p)
-            old = old.filter(
-                ~pl.struct(["symbol", "trade_date"]).is_in(
-                    g.select(pl.struct(["symbol", "trade_date"])).to_series()
+        # 同key覆盖：读旧 → 去旧 → 合并 → 原子写（锁按文件粒度，不串行全年份）
+        with _file_lock(p):
+            if p.exists():
+                old = pl.read_parquet(p)
+                old = old.filter(
+                    ~pl.struct(["symbol", "trade_date"]).is_in(
+                        g.select(pl.struct(["symbol", "trade_date"])).to_series()
+                    )
                 )
-            )
-            g = pl.concat([old, g], how="diagonal")
-        g = g.drop("y").sort(["symbol", "trade_date"])
-        g.write_parquet(p, compression="zstd")
+                g = pl.concat([old, g], how="diagonal")
+            g = g.drop("y").sort(["symbol", "trade_date"])
+            _atomic_write_parquet(g, p)
         out.append(p)
     return out
 
@@ -98,17 +128,19 @@ def write_minute(df: pl.DataFrame, freq: str | None = None) -> list[Path]:
         p = _root() / "minute" / f"freq={freq}" / f"year_month={period}" / "part-0.parquet"
         p.parent.mkdir(parents=True, exist_ok=True)
         g = g.drop("_ym")
-        if p.exists():
-            old = pl.read_parquet(p)
-            if "symbol" in old.columns and "ts" in old.columns:
-                old = old.filter(
-                    ~pl.struct(["symbol", "ts"]).is_in(
-                        g.select(pl.struct(["symbol", "ts"])).to_series()
+        # 同key覆盖：读旧 → 去旧 → 合并 → 原子写（锁按文件粒度）
+        with _file_lock(p):
+            if p.exists():
+                old = pl.read_parquet(p)
+                if "symbol" in old.columns and "ts" in old.columns:
+                    old = old.filter(
+                        ~pl.struct(["symbol", "ts"]).is_in(
+                            g.select(pl.struct(["symbol", "ts"])).to_series()
+                        )
                     )
-                )
-                g = pl.concat([old, g], how="diagonal")
-        g = g.sort(["symbol", "ts"]) if "ts" in g.columns else g
-        g.write_parquet(p, compression="zstd")
+                    g = pl.concat([old, g], how="diagonal")
+            g = g.sort(["symbol", "ts"]) if "ts" in g.columns else g
+            _atomic_write_parquet(g, p)
         out.append(p)
     return out
 

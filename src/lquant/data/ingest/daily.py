@@ -93,7 +93,7 @@ def backfill_pool(
             batch_failed.update(grp_failed)
             if len(df):
                 try:
-                    write_daily(_stamp(df))
+                    write_daily(_stamp(df, _provider_source(provider)))
                 except DataQualityError as e:
                     # 质量门禁 fatal 拦批：不入湖，标失败留待重试（H2）
                     logger.error(f"质量门禁拦截（fatal，不入湖）: {e}")
@@ -224,8 +224,16 @@ def backfill_daily(
     return result["done"]
 
 
-def _stamp(df: pl.DataFrame) -> pl.DataFrame:
+def _provider_source(provider) -> str:
+    """实际使用的源名（血缘 source 字段）：优先 source key，回落 name。"""
+    return getattr(provider, "source", "") or getattr(provider, "name", "baostock")
+
+
+def _stamp(df: pl.DataFrame, source: str = "baostock") -> pl.DataFrame:
     """补血缘字段 + 质量门禁（记录级断言，fatal 阻断入湖）。
+
+    source 用实际使用的 Provider 标注（provider.source 回落 provider.name），
+    fallback 到其他源时血缘不能标错 —— 湖里的 source 是跨源对拍的锚点。
 
     data_version 用 lineage.new_version()（YYYYMMDD.n）并登记到
     data_version 表 —— 湖里的 data_version 必须能对上血缘登记，
@@ -240,7 +248,7 @@ def _stamp(df: pl.DataFrame) -> pl.DataFrame:
     version = lineage.new_version()
     lineage.register(version, "daily_bar", row_count=len(df))
     stamped = df.with_columns(
-        source=pl.lit("baostock"),
+        source=pl.lit(source),
         ingested_at=pl.lit(now_cn().replace(tzinfo=None), dtype=pl.Datetime),
         data_version=pl.lit(version),
     )

@@ -46,7 +46,11 @@ def client(api_env):
 
 @pytest.fixture(autouse=True)
 def _stub_executor(monkeypatch):
-    """后台执行器 no-op：不让 demo 环境真去拉网络日线。"""
+    """后台执行器 no-op：不让 demo 环境真去拉网络日线。
+
+    顺带清空 data_task：pending 已纳入 create 互斥，避免上一个
+    测试遗留的 pending 任务挡住后续用例的 202/422 预期。
+    """
 
     def _noop(task_id):
         from lquant.data.ingest.tasks import get_task
@@ -61,6 +65,11 @@ def _stub_executor(monkeypatch):
     # data.py `from ... import execute_task` 持有引用，须一并打桩
     monkeypatch.setattr(data_mod, "execute_task", _noop)
     monkeypatch.setattr(data_mod, "run_claimed_task", _noop)
+    from lquant.core.db import writer
+
+    with writer() as con:
+        con.execute(tasks_mod._DDL)
+        con.execute("DELETE FROM data_task")
     yield
 
 
@@ -131,12 +140,16 @@ def test_create_task_409_when_running(client):
         r = client.post("/api/data/tasks", json={"kind": "daily_update",
                                                  "params": {"days": 5}})
         assert r.status_code == 409
-        assert "运行中" in r.json()["detail"]
+        assert "未完成" in r.json()["detail"]
     finally:
         _set_status(tid, "failed")
 
 
 def test_list_tasks(client):
+    # 互斥夹具会清空 data_task：自建一条保证列表非空（不再依赖前序用例遗留）
+    r = client.post("/api/data/tasks", json={"kind": "daily_update",
+                                             "params": {"days": 5}})
+    assert r.status_code == 202, r.text
     lst = client.get("/api/data/tasks").json()
     assert isinstance(lst, list) and len(lst) >= 1
     assert {"task_id", "kind", "status"} <= set(lst[0])

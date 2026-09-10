@@ -83,7 +83,7 @@ def _df(symbols: list[str], rows_per_sym: int) -> pl.DataFrame:
 def no_lake(monkeypatch):
     """绕开真实血缘/入湖：_stamp 恒等，write_daily 只记账。"""
     written: list[pl.DataFrame] = []
-    monkeypatch.setattr("lquant.data.ingest.daily._stamp", lambda df: df)
+    monkeypatch.setattr("lquant.data.ingest.daily._stamp", lambda df, source="baostock": df)
     monkeypatch.setattr(
         "lquant.data.ingest.daily.write_daily", written.append
     )

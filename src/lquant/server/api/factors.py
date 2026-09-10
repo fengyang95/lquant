@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -35,7 +36,8 @@ class EvaluateIn(BaseModel):
     factor: str = "mom20"                # 报告名
     formula: str = "pct_change_20"       # 支持 pct_change_{n} / rolling_std_{n}
     n_groups: int = Field(default=5, ge=2, le=20)
-    horizons: list[int] = Field(default=[1, 5, 10, 20])
+    horizons: list[int] = Field(default=[1, 5, 10, 20], min_length=1, max_length=20,
+                                ge=1, le=250)
     start: str = "2026-01-01"
 
 
@@ -511,6 +513,9 @@ def list_reports() -> list[dict]:
 
 @router.get("/reports/{name}")
 def get_report(name: str) -> FileResponse:
+    # 路径白名单：name 只允许字母数字下划线连字符，挡 ../ 与隐藏字符
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        raise HTTPException(422, f"非法报告名: {name!r}")
     p = REPORT_DIR / f"{name}.html"
     if not p.exists():
         raise HTTPException(404, f"报告不存在: {name}")
