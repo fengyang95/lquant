@@ -7,14 +7,17 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 
-
-@dataclass(frozen=True)
 class TicksError(Exception):
-    """实时源不可用（断网/未配置实时 Provider/标的未知）。"""
+    """实时源不可用（断网/未配置实时 Provider/标的未知）。
 
-    detail: str
+    不用 @dataclass：Exception 子类挂 dataclass 会让 args 丢失，
+    str(e) 为空、pickle 还原后 detail 也没了。
+    """
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__(detail)
+        self.detail = detail
 
 
 def fetch_quotes(symbols: list[str], backend=None, *, timeout: float = 5.0) -> list[dict]:

@@ -356,6 +356,10 @@ def validate_all_mappings(config_dir: Path | None = None) -> None:
         return
     all_errors: list[str] = []
     for path in sorted(schema_dir.glob("*.yaml")):
+        if path.stem not in SCHEMAS:
+            # 非 lake 表映射的模块配置（如 news.yaml）不进表映射校验，
+            # 否则缺 sources 节会被误判为 MappingError 拒绝启动。
+            continue
         errs = validate_table_config(path.stem, path)
         if errs:
             all_errors.extend(f"{path.name}: {e}" for e in errs)

@@ -1,5 +1,6 @@
 'use client';
 
+import { useMemo } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import useSWR from 'swr';
@@ -73,6 +74,18 @@ export default function SecurityPage() {
   );
   const { data: flows } = useSWR<FlowRow[]>(`/market/money-flow?symbol=${symbol}`, fetcher);
 
+  // bars/overlays 仅随 rows（日线）变化；行情 5s 轮询不改 rows 引用，
+  // useMemo 保证 KChart 的 effect 不因 quote 更新而重建图表、重置视口
+  const bars = useMemo(() => (rows ?? []).map((r) => ({
+    trade_date: r.trade_date, open: r.open, high: r.high,
+    low: r.low, close: r.close, volume: r.volume,
+  })), [rows]);
+  const overlays: Overlay[] = useMemo(() => ['ma5', 'ma20', 'ma60'].map((k) => ({
+    name: k,
+    color: MA_COLORS[k],
+    data: (rows ?? []).map((r) => (r as IndRow & Record<string, number | null>)[k] ?? null),
+  })), [rows]);
+
   if (isLoading) return <Loading />;
   if (error) return <ErrorNote>加载失败：{String(error)}</ErrorNote>;
 
@@ -83,16 +96,6 @@ export default function SecurityPage() {
     ? quote.change_pct / 100
     : price && prev?.close ? price / prev.close - 1 : null;
   const name = quote?.name;
-
-  const bars = (rows ?? []).map((r) => ({
-    trade_date: r.trade_date, open: r.open, high: r.high,
-    low: r.low, close: r.close, volume: r.volume,
-  }));
-  const overlays: Overlay[] = ['ma5', 'ma20', 'ma60'].map((k) => ({
-    name: k,
-    color: MA_COLORS[k],
-    data: (rows ?? []).map((r) => (r as IndRow & Record<string, number | null>)[k] ?? null),
-  }));
 
   const lastV = (k: keyof IndRow) => (last ? (last[k] as number | null) ?? null : null);
 

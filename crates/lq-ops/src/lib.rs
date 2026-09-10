@@ -9,6 +9,7 @@
 //! 每个算子都在 Python 侧有参考实现（`lquant/_rust/ops_ref.py`），
 //! 两者单测对拍（tests/unit/test_rust_alignment.py）。
 
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 /// 时序相关系数：滚动窗口内的 Pearson 相关。对应参考 `ops_ref.ts_corr`。
@@ -16,7 +17,12 @@ use pyo3::prelude::*;
 /// 语义与参考逐一对齐：`i + 1 < n` 窗口不足 → None；窗口内有空值或
 /// `cnt < n` → None；零方差 → None（而非 NaN）。
 #[pyfunction]
-fn ts_corr(x: Vec<Option<f64>>, y: Vec<Option<f64>>, n: usize) -> Vec<Option<f64>> {
+fn ts_corr(
+    x: Vec<Option<f64>>,
+    y: Vec<Option<f64>>,
+    n: usize,
+) -> PyResult<Vec<Option<f64>>> {
+    validate_xy(&x, &y, n)?;
     let len = x.len();
     let mut out = Vec::with_capacity(len);
     for i in 0..len {
@@ -53,12 +59,17 @@ fn ts_corr(x: Vec<Option<f64>>, y: Vec<Option<f64>>, n: usize) -> Vec<Option<f64
             out.push(Some(cov / (vx * vy).sqrt()));
         }
     }
-    out
+    Ok(out)
 }
 
 /// 回归 beta（y 对 x）。对应参考 `ops_ref.ts_regbeta`。
 #[pyfunction]
-fn ts_regbeta(y: Vec<Option<f64>>, x: Vec<Option<f64>>, n: usize) -> Vec<Option<f64>> {
+fn ts_regbeta(
+    y: Vec<Option<f64>>,
+    x: Vec<Option<f64>>,
+    n: usize,
+) -> PyResult<Vec<Option<f64>>> {
+    validate_xy(&y, &x, n)?;
     let len = y.len();
     let mut out = Vec::with_capacity(len);
     for i in 0..len {
@@ -79,16 +90,35 @@ fn ts_regbeta(y: Vec<Option<f64>>, x: Vec<Option<f64>>, n: usize) -> Vec<Option<
                 _ => {}
             }
         }
+        if cnt < n || cnt == 0 {
+            out.push(None);
+            continue;
+        }
         let nf = cnt as f64;
         let cov = sxy / nf - (sx / nf) * (sy / nf);
         let vx = sxx / nf - (sx / nf).powi(2);
-        if cnt < n || vx <= 0.0 {
+        if vx <= 0.0 {
             out.push(None);
         } else {
             out.push(Some(cov / vx));
         }
     }
-    out
+    Ok(out)
+}
+
+/// 入口校验：两序列必须等长、窗口 n > 0。脏输入直接报错而非越界 panic。
+fn validate_xy(x: &[Option<f64>], y: &[Option<f64>], n: usize) -> PyResult<()> {
+    if x.len() != y.len() {
+        return Err(PyValueError::new_err(format!(
+            "x/y 长度不一致: {} vs {}",
+            x.len(),
+            y.len()
+        )));
+    }
+    if n == 0 {
+        return Err(PyValueError::new_err("窗口长度 n 必须大于 0"));
+    }
+    Ok(())
 }
 
 /// 模块：显式注册算子为可直呼的 Python 函数。
@@ -98,4 +128,29 @@ fn lq_ops(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ts_corr, m)?)?;
     m.add_function(wrap_pyfunction!(ts_regbeta, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn length_mismatch_errors() {
+        let x = vec![Some(1.0), Some(2.0)];
+        let y = vec![Some(1.0)];
+        assert!(ts_corr(x, y, 2).is_err());
+    }
+
+    #[test]
+    fn zero_window_errors() {
+        let x = vec![Some(1.0), Some(2.0)];
+        assert!(ts_corr(x.clone(), x, 0).is_err());
+    }
+
+    #[test]
+    fn corr_insufficient_window_is_none() {
+        let x = vec![Some(1.0), Some(2.0), Some(3.0)];
+        let out = ts_corr(x.clone(), x, 5).unwrap();
+        assert!(out.iter().all(|v| v.is_none()));
+    }
 }

@@ -143,13 +143,13 @@ def create_task(kind: str, params: dict | None = None) -> dict:
     }
     with writer() as con:
         _ensure_table(con)
-        running = con.execute(
-            "SELECT task_id FROM data_task "
-            "WHERE status = 'running' LIMIT 1"
+        active = con.execute(
+            "SELECT task_id, status FROM data_task "
+            "WHERE status IN ('pending', 'running') LIMIT 1"
         ).fetchone()
-        if running:
+        if active:
             raise TaskConflictError(
-                f"已有运行中的数据任务（{running[0]}），请等待完成后再创建")
+                f"已有未完成的数据任务（{active[0]}，{active[1]}），请等待完成后再创建")
         if kind == "full_backfill":
             n_delisted = con.execute(
                 "SELECT count(*) FROM security "
@@ -173,18 +173,6 @@ def create_task(kind: str, params: dict | None = None) -> dict:
              total, "[]", "[]"],
         )
     return get_task(task_id)
-
-
-def _reset_running(task_id: str) -> None:
-    """进入 running：清零计数（retry 沿用同一行，重新计数）。"""
-    with writer() as con:
-        con.execute(
-            "UPDATE data_task SET status='running', phase=NULL, done_symbols=0, "
-            "failed_symbols=?::JSON, failed_detail=?::JSON, rows_written=0, "
-            "started_at=?, finished_at=NULL, message=NULL "
-            "WHERE task_id=?",
-            ["[]", "[]", datetime.now(), task_id],
-        )
 
 
 def _sync_total(task_id: str, total: int) -> None:
@@ -247,6 +235,26 @@ def _finalize(task_id, total, failed_all, early, *, done_count=None, error=None)
     return status
 
 
+def _claim_running(task_id: str) -> None:
+    """原子认领：一条 UPDATE 把 pending/interrupted/failed/partial 置 running。
+
+    check-then-act 的 TOCTOU 收口（与 claim_retry 同一手法）：竞争失败
+    （状态已变 / 已被抢先）抛 TaskConflictError，不会重复执行。
+    （认领后若进程崩溃，任务残留 running，由 mark_interrupted_on_startup 兜底）
+    """
+    with writer() as con:
+        res = con.execute(
+            "UPDATE data_task SET status='running', phase=NULL, done_symbols=0, "
+            "failed_symbols=?::JSON, failed_detail=?::JSON, rows_written=0, "
+            "started_at=?, finished_at=NULL, message=NULL "
+            "WHERE task_id=? AND status NOT IN ('running', 'ok')",
+            ["[]", "[]", datetime.now(), task_id],
+        ).fetchone()
+    if not res or not res[0]:
+        raise TaskConflictError(
+            f"任务 {task_id} 已被其他操作抢先（状态已不是可执行态）")
+
+
 def execute_task(task_id: str) -> dict:
     """执行任务：pending/interrupted/failed/partial → running → ok/partial/failed。"""
     task = get_task(task_id)
@@ -254,7 +262,7 @@ def execute_task(task_id: str) -> dict:
         raise ValueError(f"任务不存在: {task_id}")
     if task["status"] == "running":
         raise TaskConflictError(f"任务 {task_id} 正在运行中")
-    _reset_running(task_id)
+    _claim_running(task_id)
     return _run_task(task_id)
 
 

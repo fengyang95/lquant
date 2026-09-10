@@ -131,7 +131,7 @@ export default function BacktestsPage() {
     series: cmp.runs.map((r, i) => ({
       name: r.label,
       type: 'line' as const,
-      data: cmp.series[r.run_id],
+      data: cmp.series[r.run_id] ?? [],
       showSymbol: false,
       lineStyle: { width: 1.5, color: SERIES_COLORS[i % SERIES_COLORS.length] },
       itemStyle: { color: SERIES_COLORS[i % SERIES_COLORS.length] },
@@ -159,7 +159,11 @@ export default function BacktestsPage() {
           <label className="text-sm">
             <div className="mb-1 text-xs text-ink-faint">TopN</div>
             <input type="number" min={1} max={50} value={topN}
-                   onChange={(e) => setTopN(+e.target.value)}
+                   onChange={(e) => {
+                     // 清空/非法输入回退默认值，避免 NaN 提交
+                     const v = +e.target.value;
+                     setTopN(Number.isFinite(v) && v > 0 ? Math.min(50, Math.max(1, Math.round(v))) : 5);
+                   }}
                    className="input input-mono w-20" />
           </label>
           <label className="text-sm">

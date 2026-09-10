@@ -87,8 +87,16 @@ class PaperBroker:
         else:
             pos = self.positions.get(symbol)
             avail = pos.available if pos else 0
-            if avail < qty:
-                o.status, o.reason = "rejected", f"可卖不足 avail={avail} (T+N)"
+            # 已挂未成交卖单也占额度：两笔卖单合计不能超可卖，
+            # 否则逐笔都合法、合计却卖穿成负持仓
+            pending_sell = sum(
+                o.qty for o in self.orders
+                if o.symbol == symbol and o.side == "sell"
+                and o.status == "pending"
+            )
+            if avail < qty + pending_sell:
+                o.status, o.reason = "rejected", (
+                    f"可卖不足 avail={avail} 已挂卖单={pending_sell} (T+N)")
         self.orders.append(o)
         return o
 
