@@ -48,7 +48,7 @@ def split_dates(dates: list, train=0.7, val=0.15) -> tuple[list, list, list]:
 
 
 def run_session(engine, panel, generator, *, agent="builtin", n_candidates=100,
-                cov_names=None, cov_build=None, survivors=None, ret_col="fwd_ret_1") -> SessionResult:
+                covs=None, survivors=None, ret_col="fwd_ret_1") -> SessionResult:
     """跑一轮挖掘会话：G0 -> G1(train) -> G2(去重) -> G3(val 解锁一次)。
 
     generator: 可调用对象，产出候选表达式字符串。能吐字符串就能接。
@@ -73,7 +73,7 @@ def run_session(engine, panel, generator, *, agent="builtin", n_candidates=100,
             n_static += 1
             res.corrections.append({"expr": expr, "stage": "G0", "reason": g0.reason_code, "hint": g0.hint})
             continue
-        g1 = g1_fast_screen(train, expr, ret_col, engine, covs=cov_build)
+        g1 = g1_fast_screen(train, expr, ret_col, engine, covs=covs)
         if hasattr(generator, "feedback") and g1.ic is not None:
             from lquant.factors.mining.fitness import fitness
 

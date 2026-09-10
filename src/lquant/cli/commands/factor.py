@@ -162,7 +162,13 @@ def mine(agent: str, generator: str, n: int, proposals: str | None, start: str |
 
     df = read_daily(start=start).collect()
     if not len(df):
-        raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")
+        raise click.ClickException("日线数据为空，先跑 lq data demo")
+    # 方案红线：G1 快筛与适应度一律用中性化后 IC —— 挖掘会话必须带协变量
+    from lquant.factors.mining.submit import _panel_with_covs
+
+    df, cov_cols = _panel_with_covs(start=start)
+    if not len(df):
+        df, cov_cols = df, []
     eng = FactorEngine(df.lazy())
 
     if generator == "gp":
@@ -178,7 +184,8 @@ def mine(agent: str, generator: str, n: int, proposals: str | None, start: str |
 
         gen = mg(load_proposals(proposals))
 
-    res, survivors = run_session(eng, df, gen, agent=agent, n_candidates=n)
+    res, survivors = run_session(eng, df, gen, agent=agent, n_candidates=n,
+                                 covs=cov_cols)
 
     # 记账落库
     run_id = uuid.uuid4().hex[:12]

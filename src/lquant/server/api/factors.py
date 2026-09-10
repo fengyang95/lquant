@@ -469,7 +469,9 @@ def mine_run(req: dict) -> dict:
         raise HTTPException(423, f"Agent 已冻结: {agent_name}")
     if n > a.quota_eval:
         raise HTTPException(422, f"超出配额: n={n} > quota={a.quota_eval}")
-    df = read_daily(start=None).collect()
+    from lquant.factors.mining.submit import _panel_with_covs
+
+    df, cov_cols = _panel_with_covs()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
     eng = FactorEngine(df.lazy())
@@ -481,7 +483,8 @@ def mine_run(req: dict) -> dict:
         gen = make_generator()
     else:
         raise HTTPException(422, f"未知生成器: {generator}（可选 gp/random）")
-    res, survivors = run_session(eng, df, gen, agent=agent_name, n_candidates=n)
+    res, survivors = run_session(eng, df, gen, agent=agent_name, n_candidates=n,
+                                 covs=cov_cols)
     run_id = uuid.uuid4().hex[:12]
     try:
         with writer() as con:
