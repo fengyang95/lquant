@@ -9,12 +9,40 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
+import polars as pl
+from pydantic import BaseModel, Field
 
 from lquant.core.db import reader
+from lquant.data.ingest.tasks import (
+    TaskConflictError,
+    claim_retry,
+    create_task,
+    execute_task,
+    get_task,
+    list_tasks,
+    run_claimed_task,
+)
 from lquant.data.store.parquet import read_daily
 from lquant.server.deps import bare_code, resolve_symbol
+from lquant.server.jobs import enqueue
 
 router = APIRouter(prefix="/data", tags=["data"])
+
+
+class TaskIn(BaseModel):
+    kind: str = Field(min_length=1, max_length=32)
+    params: dict = Field(default_factory=dict)
+
+
+class CrosscheckIn(BaseModel):
+    start: str | None = Field(default=None, max_length=10)
+    end: str | None = Field(default=None, max_length=10)
+    peers: list[str] | None = None
+    limit: int = Field(default=200, ge=1, le=1000)
+
+
+class ResolveIn(BaseModel):
+    issue_id: str = Field(min_length=1, max_length=64)
 
 # 覆盖度要看的表：名称 → (说明, 是否按 trade_date 取最新)
 _COVER_TABLES: list[tuple[str, str]] = [
@@ -74,6 +102,50 @@ def coverage() -> dict:
     except Exception:  # noqa: BLE001
         lake["error"] = True
     return {"tables": tables, "daily_lake": lake}
+
+
+@router.get("/coverage/monthly")
+def coverage_monthly(
+    start: str | None = Query(default=None, max_length=10),
+    end: str | None = Query(default=None, max_length=10),
+) -> dict:
+    """覆盖度按月聚合：每月实际标的数趋势（spec §7.3）。
+
+    口径：avg_symbols = 当月各交易日 distinct symbol 数的算术平均，
+    days = 当月有数据的交易日数。「应有标的数」无可靠 PIT 来源
+    （security 是当前快照），不做对比 —— 缺口由前端按环比大幅下降
+    （如 >30%）标橙，阈值归前端定。空湖返回空数组不报错。
+    """
+    from datetime import date as _date
+
+    for name, val in (("start", start), ("end", end)):
+        if isinstance(val, str) and val:
+            try:
+                _date.fromisoformat(val)
+            except ValueError as e:
+                raise HTTPException(422, f"{name} 日期非法: {val}") from e
+    try:
+        lf = read_daily(start=start, end=end).select(["symbol", "trade_date"])
+        if not lf.collect_schema().names():
+            return {"rows": []}
+        per_day = lf.group_by("trade_date").agg(
+            pl.col("symbol").n_unique().alias("n_symbols"))
+        monthly = (
+            per_day.group_by(
+                pl.col("trade_date").dt.strftime("%Y-%m").alias("month"))
+            .agg(pl.col("n_symbols").mean().alias("avg_symbols"),
+                 pl.col("trade_date").len().alias("days"))
+            .sort("month"))
+        rows = [{"month": r["month"], "avg_symbols": round(r["avg_symbols"], 1),
+                 "days": int(r["days"])} for r in monthly.collect().to_dicts()]
+        return {"rows": rows}
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001 - 湖读取异常降级为空，不打断首屏
+        from loguru import logger
+
+        logger.warning(f"coverage monthly 聚合失败: {e}")
+        return {"rows": []}
 
 
 @router.get("/securities")
@@ -194,3 +266,106 @@ def quote(symbol: str = Query(min_length=6, max_length=16)) -> dict:
         "turnover_rate": data.get("f50"),
         "market_cap": data.get("f116"),
     }
+
+
+# ---------- 数据任务（全量回填 / 每日增量，T4 执行器） ----------
+
+@router.post("/tasks", status_code=202)
+def create_data_task(req: TaskIn) -> dict:
+    """创建数据任务并入队执行 → 202 + task_id。
+
+    409：已有运行中任务（单任务互斥）；422：参数/前置校验失败（未知类型、
+    日期非法、full_backfill 无退市股等）。
+    """
+    try:
+        task = create_task(req.kind, req.params)
+    except TaskConflictError as e:
+        raise HTTPException(409, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    enqueue("lquant-ingest", execute_task, task["task_id"])
+    return {"task_id": task["task_id"]}
+
+
+@router.get("/tasks")
+def list_data_tasks(limit: int = Query(default=50, ge=1, le=500)) -> list[dict]:
+    """数据任务列表（最新在前）。"""
+    return list_tasks(limit)
+
+
+@router.get("/tasks/{task_id}")
+def get_data_task(task_id: str) -> dict:
+    """任务详情：状态 / 进度 / 失败明细。WS 断开时前端轮询兜底。"""
+    task = get_task(task_id)
+    if task is None:
+        raise HTTPException(404, f"任务不存在: {task_id}")
+    return task
+
+
+@router.post("/tasks/{task_id}/retry", status_code=202)
+def retry_data_task(task_id: str) -> dict:
+    """retry 补漏：unmark 失败标的 checkpoint 后重新执行 → 202 + task_id。
+
+    端点同步原子认领（claim_retry，消除预检-入队的 TOCTOU）：
+    认领成功任务即置 running，再入队执行已认领任务。
+    409：pending/running 或竞争抢先；422：终态 ok 不可 retry；404：不存在。
+    """
+    task = get_task(task_id)
+    if task is None:
+        raise HTTPException(404, f"任务不存在: {task_id}")
+    if task["status"] == "ok":
+        raise HTTPException(422, f"任务 {task_id} 状态 ok 不可 retry")
+    try:
+        claim_retry(task_id)
+    except TaskConflictError as e:
+        raise HTTPException(409, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    enqueue("lquant-ingest", run_claimed_task, task_id)
+    return {"task_id": task_id}
+
+
+# ---------- 跨源对拍 ----------
+
+@router.post("/crosscheck")
+def run_crosscheck_ep(req: CrosscheckIn) -> dict:
+    """跨源对拍（同步端点：哨兵抽样小窗口，秒级）。返回 {summary, issues, flagged_rows}。"""
+    from lquant.data.ingest.crosscheck import run_crosscheck
+
+    try:
+        return run_crosscheck(peers=req.peers, start=req.start,
+                              end=req.end, limit=req.limit)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+
+
+@router.get("/crosscheck/issues")
+def crosscheck_issues(
+    limit: int = Query(default=200, ge=1, le=1000),
+    resolved: bool = False,
+) -> list[dict]:
+    """质量问题检索（data_quality_issue，默认未解决）。"""
+    from lquant.data.quality.issues import latest_issues
+
+    return latest_issues(limit=limit, resolved=resolved)
+
+
+@router.post("/crosscheck/issues/resolve")
+def resolve_crosscheck_issue(req: ResolveIn) -> dict:
+    """标记问题已处理；不存在 → 404。"""
+    from lquant.data.quality.issues import resolve_issue
+
+    with reader() as con:
+        try:
+            row = con.execute(
+                "SELECT issue_id FROM data_quality_issue WHERE issue_id = ?",
+                [req.issue_id]).fetchone()
+        except Exception as e:  # noqa: BLE001 - 表不存在等价于没有这条 issue
+            from loguru import logger
+
+            logger.warning(f"quality issue 查询失败（按不存在处理）: {e}")
+            row = None
+    if row is None:
+        raise HTTPException(404, f"issue 不存在: {req.issue_id}")
+    resolve_issue(req.issue_id)
+    return {"issue_id": req.issue_id, "resolved": True}

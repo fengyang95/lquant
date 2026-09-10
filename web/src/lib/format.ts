@@ -27,3 +27,12 @@ export function fmtNum(v?: number | null, digits = 2): string {
   if (v == null || Number.isNaN(v)) return '—';
   return v.toFixed(digits);
 }
+
+/** 数据任务状态 → 中文文案；未知状态原样透出（后端新增枚举不至于显示空白） */
+export function taskStatusText(s: string): string {
+  const m: Record<string, string> = {
+    pending: '等待中', running: '拉取中', ok: '完成', partial: '部分完成',
+    failed: '失败', interrupted: '已中断',
+  };
+  return m[s] ?? s;
+}

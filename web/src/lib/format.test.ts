@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { fmtNum, fmtPct, fmtYi, pctColorClass } from './format';
+import { fmtNum, fmtPct, fmtYi, pctColorClass, taskStatusText } from './format';
 
 describe('fmtPct', () => {
   it('正数带加号、负数自带负号', () => {
@@ -36,6 +36,21 @@ describe('fmtYi', () => {
 
   it('null / NaN → 占位符', () => {
     expect(fmtYi(undefined)).toBe('—');
+  });
+});
+
+describe('taskStatusText —— 任务状态中文文案', () => {
+  it('已知状态映射', () => {
+    expect(taskStatusText('pending')).toBe('等待中');
+    expect(taskStatusText('running')).toBe('拉取中');
+    expect(taskStatusText('ok')).toBe('完成');
+    expect(taskStatusText('partial')).toBe('部分完成');
+    expect(taskStatusText('failed')).toBe('失败');
+    expect(taskStatusText('interrupted')).toBe('已中断');
+  });
+
+  it('未知状态原样返回', () => {
+    expect(taskStatusText('weird')).toBe('weird');
   });
 });
 

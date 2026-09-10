@@ -6,6 +6,10 @@ import PageHeader from '@/components/PageHeader';
 import { Panel, Stat } from '@/components/Panel';
 import { Empty, ErrorNote, Loading, Msg } from '@/components/States';
 import { fetcher, post } from '@/lib/api';
+import TasksPanel from './TasksPanel';
+import SourceConfigPanel from './SourceConfigPanel';
+import CrosscheckPanel from './CrosscheckPanel';
+import CoverageMonthlyChart from './CoverageMonthlyChart';
 
 type Cover = {
   tables: { table: string; label: string; rows: number | null; latest: string | null; error?: boolean }[];
@@ -77,6 +81,11 @@ export default function DataPage() {
       />
       <Msg text={msg} />
 
+      {/* 日线数据补全：任务进度 / 数据源配置 / 跨源印证 */}
+      <TasksPanel />
+      <SourceConfigPanel />
+      <CrosscheckPanel />
+
       <Panel title="日线数据湖" meta="Parquet">
         {lake?.rows ? (
           <div className="grid grid-cols-2 gap-y-4 divide-line sm:grid-cols-4 sm:divide-x">
@@ -132,6 +141,8 @@ export default function DataPage() {
         </Panel>
       )}
 
+      <CoverageMonthlyChart />
+
       <Panel title="采集表覆盖度">
         {!data?.tables.length ? (
           <Empty>暂无采集表</Empty>
@@ -152,8 +163,9 @@ export default function DataPage() {
       </Panel>
 
       <div className="text-xs text-ink-faint">
-        共 {totalRows.toLocaleString()} 行 · 历史日线/财务/分钟线批量补数走 CLI（<code className="bg-paper px-1">lq data --help</code>），
-        盘后看板数据由调度器自动采集，也可用右上角按钮手动触发。
+        共 {totalRows.toLocaleString()} 行 · 日线全量回填/增量在上方「数据任务」区触发，
+        盘后看板数据由调度器自动采集，也可用右上角按钮手动触发；
+        历史分钟线/财务批量补数走 CLI（<code className="bg-paper px-1">lq data --help</code>）。
       </div>
     </div>
   );

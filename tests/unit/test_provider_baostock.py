@@ -13,17 +13,22 @@ import pytest
 import lquant.data.watchdog as wd
 from lquant.core.errors import DataQualityError
 from lquant.data.mapping import load_table_mapping
-from lquant.data.providers.baostock import BaoStockProvider, _attach_is_st
+from lquant.data.providers.baostock import (
+    BaoStockProvider,
+    _attach_is_st,
+    _map_daily_raw,
+)
 from lquant.data.schema import SCHEMAS
 
 DAILY_ROWS = [
-    # date, code, open, high, low, close, preclose, volume, amount(元), turn, tradestatus, isST
+    # date, code, open, high, low, close, preclose, volume, amount(元), turn,
+    # tradestatus, isST, pctChg, peTTM, pbMRQ, psTTM, pcfNcfTTM
     ["2024-01-02", "sh.600000", "10.0", "10.5", "9.8", "10.2", "10.1",
-     "1000", "3000", "1.5", "1", "0"],
+     "1000", "3000", "1.5", "1", "0", "0.5", "12.0", "1.2", "2.0", "8.0"],
     ["2024-01-03", "sh.600000", "10.2", "10.6", "10.0", "10.4", "10.2",
-     "1100", "3300", "1.6", "1", "1"],
+     "1100", "3300", "1.6", "1", "1", "-0.2", "12.4", "1.3", "2.1", "8.2"],
     ["2024-01-04", "sh.600000", "10.4", "10.8", "10.2", "10.6", "10.4",
-     "0", "0", "0", "0", "0"],  # 停牌行，应被过滤
+     "0", "0", "0", "0", "0", "", "", "", "", ""],  # 停牌行，保留 is_suspended=True
 ]
 
 
@@ -33,53 +38,39 @@ def provider() -> BaoStockProvider:
 
 
 def _daily_raw() -> pl.DataFrame:
-    return pl.DataFrame(
-        DAILY_ROWS,
-        schema=["date", "code", "open", "high", "low", "close",
-                "preclose", "volume", "amount", "turn", "tradestatus", "isST"],
-        orient="row",
-    )
-
-
-def _daily_raw_after_fetch() -> pl.DataFrame:
-    """模拟 _fetch_daily 输出：停牌过滤、cast、isST → is_st 布尔。"""
-    return (
-        _daily_raw()
-        .filter(pl.col("tradestatus") != "0")
-        .drop("tradestatus")
-        .with_columns(
-            pl.col("date").str.to_date("%Y-%m-%d"),
-            pl.col(["open", "high", "low", "close", "preclose", "volume",
-                    "amount"]).cast(pl.Float64),
-            pl.col("turn").cast(pl.Float64, strict=False),
-            is_st=pl.col("isST").cast(pl.Utf8).str.strip_chars().is_in(["1"]),
-        )
-        .drop("isST")
-    )
+    """模拟 _map_daily_raw 输出：源列名（含 tradestatus/isST），停牌行保留。"""
+    return _map_daily_raw(DAILY_ROWS)
 
 
 def test_daily_mapping_via_engine(provider: BaoStockProvider) -> None:
-    raw = _daily_raw_after_fetch()
+    raw = _daily_raw()
     out = provider.request("daily_bar", _raw=raw)
     out = _attach_is_st(out, raw)
-    assert out.columns[:16] == list(SCHEMAS["daily_bar"])
-    assert out["symbol"].to_list() == ["600000.SH", "600000.SH"]
+    assert out.columns == list(SCHEMAS["daily_bar"])
+    assert out["symbol"].to_list() == ["600000.SH"] * 3
     assert out["trade_date"].dtype == pl.Date
-    assert out["amount"].to_list() == [3000.0, 3300.0]  # 已是元，直接透传
-    assert out["pre_close"].to_list() == [10.1, 10.2]
-    assert out["turnover_rate"].to_list() == [1.5, 1.6]
-    assert out["sec_type"].to_list() == ["stock", "stock"]
-    assert out["source"].to_list() == ["baostock", "baostock"]
-    assert out["quality_flags"].to_list() == [0, 0]
-    assert out["adj_factor"].to_list() == [1.0, 1.0]
-    assert out["is_st"].to_list() == [False, True]
+    assert out["amount"].to_list() == [3000.0, 3300.0, 0.0]  # 已是元，直接透传
+    assert out["pre_close"].to_list() == [10.1, 10.2, 10.4]
+    assert out["turnover_rate"].to_list()[:2] == [1.5, 1.6]
+    assert out["turnover_rate"][2] is None  # 停牌行 turn=0 → null
+    assert out["sec_type"].to_list() == ["stock"] * 3
+    assert out["source"].to_list() == ["baostock"] * 3
+    assert out["quality_flags"].to_list() == [0, 0, 0]
+    assert out["adj_factor"].to_list() == [1.0, 1.0, 1.0]
+    assert out["is_st"].to_list() == [False, True, False]
+    assert out["is_suspended"].to_list() == [False, False, True]
+    assert out["pct_chg"].to_list()[:2] == [0.5, -0.2]
+    assert out["pe_ttm"].to_list()[:2] == [12.0, 12.4]
+    assert out["pe_ttm"][2] is None
+    assert out["float_mv"][2] is None
+    assert out["total_mv"].is_null().all()
     assert out["ingested_at"].is_null().all()
     assert out["data_version"].is_null().all()
 
 
 def test_attach_is_st_without_column(provider: BaoStockProvider) -> None:
-    """raw 无 is_st（如 _raw 直传外部数据）→ 输出补全 null 列，不依赖实例状态。"""
-    raw = _daily_raw_after_fetch().drop("is_st")
+    """raw 无 is_st（如 _raw 直传外部数据）→ 输出 is_st 全 null，不依赖实例状态。"""
+    raw = _daily_raw().drop("is_st")
     out = provider.request("daily_bar", _raw=raw)
     out = _attach_is_st(out, raw)
     assert "is_st" in out.columns
@@ -88,16 +79,16 @@ def test_attach_is_st_without_column(provider: BaoStockProvider) -> None:
 
 
 def test_attach_is_st_length_mismatch_raises() -> None:
-    raw = _daily_raw_after_fetch()
-    out = pl.DataFrame({"x": [1.0]})  # 长度 1 != raw 长度 2
+    raw = _daily_raw()
+    out = pl.DataFrame({"x": [1.0]})  # 长度 1 != raw 长度 3
     with pytest.raises(DataQualityError, match="is_st"):
         _attach_is_st(out, raw)
 
 
-def test_daily_fetch_filters_suspended_and_converts_is_st(
+def test_daily_fetch_keeps_suspended_and_converts_is_st(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """_fetch_daily：停牌行过滤 + isST→bool，watchdog 打桩不触网。"""
+    """_fetch_daily：停牌行保留（is_suspended=True），watchdog 打桩不触网。"""
     captured: dict[str, object] = {}
 
     def fake_query(fn: object, *args: object, **kw: object) -> list[list[str]]:
@@ -108,8 +99,8 @@ def test_daily_fetch_filters_suspended_and_converts_is_st(
     p = BaoStockProvider()
     raw = p._fetch_daily(["600000.SH"], date(2024, 1, 1), date(2024, 1, 4))
     assert captured["code"] == "sh.600000"
-    assert len(raw) == 2  # 停牌行被过滤
-    assert raw["is_st"].to_list() == [False, True]
+    assert len(raw) == 3  # 停牌行保留
+    assert raw["is_suspended"].to_list() == [False, False, True]
     assert "tradestatus" not in raw.columns and "isST" not in raw.columns
 
 
@@ -193,7 +184,7 @@ def test_minute_bad_freq_raises_before_network() -> None:
 
 def test_empty_raw_short_circuits(provider: BaoStockProvider) -> None:
     """零列/零行 raw → engine 短路返回 schema 形状空表（旧行为是空 df，不炸）。"""
-    for bad in (pl.DataFrame(), _daily_raw_after_fetch().clear()):
+    for bad in (pl.DataFrame(), _daily_raw().clear()):
         out = provider.request("daily_bar", _raw=bad)
         assert out.columns == list(SCHEMAS["daily_bar"])
         assert out.height == 0
@@ -204,21 +195,25 @@ def test_empty_raw_short_circuits(provider: BaoStockProvider) -> None:
 def test_daily_bars_end_to_end_no_network(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """daily_bars 全链路（watchdog 打桩）：is_st 挂回、无实例状态。"""
+    """daily_bars 全链路（watchdog 打桩）：映射层出 is_st，停牌行保留。"""
     monkeypatch.setattr(wd, "run_with_watchdog", lambda fn, *a, **k: DAILY_ROWS)
     p = BaoStockProvider()
     out = p.daily_bars(["600000.SH"], date(2024, 1, 1), date(2024, 1, 4))
-    assert out["is_st"].to_list() == [False, True]
-    assert out["amount"].to_list() == [3000.0, 3300.0]   # 已是元，直接透传
-    assert out["symbol"].to_list() == ["600000.SH", "600000.SH"]
+    assert out["is_st"].to_list() == [False, True, False]
+    assert out["is_suspended"].to_list() == [False, False, True]
+    assert out["amount"].to_list() == [3000.0, 3300.0, 0.0]  # 已是元，直接透传
+    assert out["symbol"].to_list() == ["600000.SH"] * 3
 
 
 def test_real_yaml_loads() -> None:
     """交付的两份 yaml 与 SCHEMAS 校验兼容（fail-fast 不炸）。"""
     dm = load_table_mapping("daily_bar", "baostock")
     assert dm.rename == {"date": "trade_date", "code": "symbol",
-                         "preclose": "pre_close", "turn": "turnover_rate"}
+                         "preclose": "pre_close", "turn": "turnover_rate",
+                         "pctChg": "pct_chg", "peTTM": "pe_ttm",
+                         "pbMRQ": "pb_mrq", "psTTM": "ps_ttm",
+                         "pcfNcfTTM": "pcf_ncf_ttm"}
     assert "amount" not in dm.derive   # baostock 日线 amount 单位是元，无换算
-    assert dm.fill["source"] == "baostock"
+    assert "float_mv" in dm.derive     # 流通市值推导（close×volume×100/turn）
     mm = load_table_mapping("minute_bar", "baostock")
     assert mm.fill == {"freq": "5min", "source": "baostock", "adj_factor": 1.0}

@@ -28,7 +28,58 @@ import polars as pl
 from lquant.data.quality import crosscheck
 from lquant.data.quality.issues import Issue, save_issues
 
-__all__ = ["run_crosscheck"]
+__all__ = ["run_crosscheck", "validate_peers"]
+
+
+def validate_peers(names: list[str]) -> None:
+    """对拍 peer 源合法性校验：已注册 + 声明 daily/etf_daily capability。
+
+    给 SettingsStore.put（API 层 ValueError → 422）与运维入口共用。
+    capability 取 provider 类的声明（类属性），不实例化、不触网。
+    """
+    from lquant.data.capability import Capability
+    from lquant.data.providers import PROVIDERS, _import_all
+
+    _import_all()
+    for name in names:
+        if name not in PROVIDERS:
+            raise ValueError(
+                f"未知数据源 {name!r}，可选: {PROVIDERS.keys()}")
+        caps = PROVIDERS.get(name).capability
+        if not (Capability.DAILY in caps or Capability.ETF_DAILY in caps):
+            raise ValueError(
+                f"对拍 peer {name!r} 未声明 daily/etf_daily capability，不可用")
+
+
+def _cfg() -> dict:
+    """对拍配置：SettingsStore 覆盖 > providers.yaml crosscheck 节。
+
+    - peers：settings 的 crosscheck_peers（非空）> yaml crosscheck.peers
+    - 主源：settings providers_order 首位 > yaml crosscheck.primary
+      （不另设 key，与执行器共用一个语义，改完配置下一次拉取即生效）
+    - enabled / tolerance_pct / fields 仍读 yaml
+    """
+    from lquant.core.config import load_providers
+    from lquant.core.settings_store import SettingsStore
+
+    ycfg = load_providers().get("crosscheck", {})
+    try:
+        runtime = {i["key"]: i["value"] for i in SettingsStore().all()}
+    except Exception:  # noqa: BLE001 - 表不可用时退回纯 yaml 配置
+        from loguru import logger  # noqa: PLC0415
+
+        logger.warning("settings 读取失败，crosscheck 配置回退纯 yaml（_cfg）")
+        runtime = {}
+    order = list(runtime.get("providers_order") or [])
+    peers = list(runtime.get("crosscheck_peers") or [])
+    return {
+        "enabled": bool(ycfg.get("enabled", True)),
+        "primary": (order[0] if order else None) or ycfg.get("primary"),
+        "peers": peers or list(ycfg.get("peers", [])),
+        "tolerance_pct": ycfg.get("tolerance_pct", 0.1),
+        "fields": tuple(ycfg.get(
+            "fields", ["open", "high", "low", "close", "pre_close", "volume"])),
+    }
 
 
 def _peer_daily(name: str, symbols: list[str], start: date, end: date) -> pl.DataFrame:
@@ -81,21 +132,20 @@ def _sample_symbols(limit: int) -> tuple[list[str], date, date]:
 def run_crosscheck(peers: list[str] | None = None, start: str | None = None,
                    end: str | None = None, limit: int = 200) -> dict:
     """抽检主源 vs 同行源，返回 {summary, issues, flagged_rows}。"""
-    from lquant.core.config import load_providers
     from lquant.data.store.parquet import write_daily
 
-    cfg = load_providers().get("crosscheck", {})
-    if not cfg.get("enabled", True):
+    cfg = _cfg()
+    if not cfg["enabled"]:
         return {"summary": {"L0": 1}, "issues": [], "flagged_rows": 0}
 
     # CLI 未显式给 peers 时用配置；显式给了则覆盖配置。
     conn_peers = [p for p in (peers or []) if p]
-    peers = conn_peers or cfg.get("peers", [])
+    peers = conn_peers or cfg["peers"]
     if not peers:
         return {"summary": {"L0": 1}, "issues": [], "flagged_rows": 0}
 
-    tolerance_pct = cfg.get("tolerance_pct", 0.1)
-    fields = tuple(cfg.get("fields", ["open", "high", "low", "close", "pre_close", "volume"]))
+    tolerance_pct = cfg["tolerance_pct"]
+    fields = cfg["fields"]
 
     symbols, lo, hi = _sample_symbols(limit)
     if not symbols:
@@ -129,14 +179,30 @@ def run_crosscheck(peers: list[str] | None = None, start: str | None = None,
         levels = diffs.group_by("symbol", "trade_date").agg(
             pl.col("level").max()).filter(pl.col("level") != crosscheck.L1)
         for r in levels.iter_rows(named=True):
+            rows = diffs.filter(
+                (pl.col("symbol") == r["symbol"]) &
+                (pl.col("trade_date") == r["trade_date"]))
+            # 字段级明细（spec §2.2）：取偏差最大的可比字段塞进 extra，
+            # 前端 issue 明细直接展示 primary/peer 数值 —— 只展示，不回写湖。
+            worst = rows.sort("rel_diff", descending=True, nulls_last=True) \
+                .row(0, named=True)
             issues_all.append(Issue(
                 rule=f"CROSS_SRC_DIFF.{name}.{r['level']}",
                 severity="error" if r["level"] == crosscheck.L3 else "warn",
                 detail=f"{name} 对拍 {r['level']}：{r['symbol']}@{r['trade_date']}",
                 symbol=r["symbol"], trade_date=r["trade_date"],
-                count=int((diffs.filter(
-                    (pl.col("symbol") == r["symbol"]) &
-                    (pl.col("trade_date") == r["trade_date"]))).height)))
+                count=rows.height,
+                extra={
+                    "symbol": r["symbol"],
+                    "trade_date": str(r["trade_date"]),
+                    "field": worst["field"],
+                    "primary": worst["primary"],
+                    "peer": worst["peer"],
+                    "deviation_pct": (round(float(worst["rel_diff"]) * 100, 4)
+                                      if worst["rel_diff"] is not None else None),
+                    "level": r["level"],
+                    "missing": worst["missing"],
+                }))
 
     # 跨同行源统一：任一源 L2/L3 即对该 (symbol, date) 打标降级，并持久化。
     flagged_rows = 0

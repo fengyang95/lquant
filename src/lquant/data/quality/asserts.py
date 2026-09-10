@@ -37,6 +37,23 @@ _FATAL_SPECS = [
 ]
 
 
+def _warn_issues(out: pl.DataFrame, issues: list[Issue], dataset: str) -> None:
+    """warn 级 issue 汇总（flags 已含全部命中，这里只做计数 → Issue）。"""
+    n_susp = len(out.filter((pl.col("quality_flags") & SUSPENSION_FILL) != 0))
+    n_zombie = len(out.filter((pl.col("quality_flags") & ZOMBIE) != 0))
+    n_preclose = len(out.filter((pl.col("quality_flags") & PRE_CLOSE_MISSING) != 0))
+    if n_preclose:
+        issues.append(Issue(rule="PRE_CLOSE_MISSING", severity="warn", dataset=dataset,
+                            detail=f"{n_preclose} 行 pre_close 缺失"
+                                   f"（上市首日属正常）", count=n_preclose))
+    if n_susp:
+        issues.append(Issue(rule="SUSPENSION_FILL", severity="warn", dataset=dataset,
+                            detail=f"{n_susp} 行疑似停牌填充", count=n_susp))
+    if n_zombie:
+        issues.append(Issue(rule="ZOMBIE", severity="warn", dataset=dataset,
+                            detail=f"{n_zombie} 行疑似僵尸报价", count=n_zombie))
+
+
 def run_record_checks(df: pl.DataFrame, *, raise_on_fatal: bool = True,
                       dataset: str = "daily_bar") -> tuple[pl.DataFrame, list[Issue]]:
     """八项断言的记录级部分：打标 + 出 issue；fatal 聚合后一次性抛出。
@@ -46,12 +63,20 @@ def run_record_checks(df: pl.DataFrame, *, raise_on_fatal: bool = True,
 
     注意：复权因子跳变检查假设输入按 (symbol, trade_date) 有序 ——
     入湖前 write_daily 会排序，同步链路里的批次天然满足。
+
+    停牌豁免：is_suspended=True 的行不参与记录级断言（序列级 adj 跳变检查除外）（停牌日零量零额、
+    价格静止都是常态，按正常行检查只会误报）。只影响断言，不影响入湖数据。
     """
     if not len(df):
         return df, []
 
     issues: list[Issue] = []
     masks: list[pl.Expr] = []
+    # 停牌行的所有命中条件强制为 False（行保留、flags 不打）
+    not_susp = (
+        ~pl.col("is_suspended").fill_null(False)
+        if "is_suspended" in df.columns else pl.lit(True)
+    )
 
     # 1) 价格区间（fatal）—— 0.1 ~ 10000 元；只看 o/h/l/c。
     #    pre_close 为空常见于上市首日 —— warn 打标，不阻断（H6）
@@ -59,7 +84,7 @@ def run_record_checks(df: pl.DataFrame, *, raise_on_fatal: bool = True,
     cond = pl.lit(False)
     for c in price_cols:
         cond = cond | pl.col(c).is_null() | (pl.col(c) <= 0.1) | (pl.col(c) > 10000)
-    masks.append(hit(PRICE_OUT_OF_RANGE, cond))
+    masks.append(hit(PRICE_OUT_OF_RANGE, cond & not_susp))
 
     # 2) OHLC 一致性（fatal）
     if {"open", "high", "low", "close"} <= set(df.columns):
@@ -68,7 +93,7 @@ def run_record_checks(df: pl.DataFrame, *, raise_on_fatal: bool = True,
             | (pl.col("low") > pl.min_horizontal("open", "close"))
             | (pl.col("high") < pl.col("low"))
         )
-        masks.append(hit(OHLC_CONFLICT, ohlc_bad.fill_null(False)))
+        masks.append(hit(OHLC_CONFLICT, (ohlc_bad & not_susp).fill_null(False)))
 
     # 3) 非负量额（fatal）
     qty_bad = pl.lit(False)
@@ -76,28 +101,30 @@ def run_record_checks(df: pl.DataFrame, *, raise_on_fatal: bool = True,
         qty_bad = qty_bad | (pl.col("volume") < 0)
     if "amount" in df.columns:
         qty_bad = qty_bad | (pl.col("amount") < 0)
-    masks.append(hit(NEG_QTY, qty_bad.fill_null(False)))
+    masks.append(hit(NEG_QTY, (qty_bad & not_susp).fill_null(False)))
 
     # 4) 单位归一（fatal）—— amount 应与 close*volume 同量级
     if {"amount", "close", "volume"} <= set(df.columns):
         ratio = pl.when((pl.col("volume") > 0) & (pl.col("close") > 0) & (pl.col("amount") > 0))\
             .then(pl.col("amount") / (pl.col("close") * pl.col("volume"))).otherwise(1.0)
-        masks.append(hit(UNIT_MISMATCH, (ratio < _UNIT_LO) | (ratio > _UNIT_HI)))
+        masks.append(hit(UNIT_MISMATCH,
+                         ((ratio < _UNIT_LO) | (ratio > _UNIT_HI)) & not_susp))
 
     # 5) pre_close 缺失（warn）—— 上市首日合法，其余情况提示。
     #    独立位掩码：不能混进 PRICE_OUT_OF_RANGE，否则会被 fatal 聚合误捕
     if "pre_close" in df.columns:
-        masks.append(hit(PRE_CLOSE_MISSING, pl.col("pre_close").is_null()))
+        masks.append(hit(PRE_CLOSE_MISSING,
+                         pl.col("pre_close").is_null() & not_susp))
 
     # 6) 停牌填充（warn）—— 零成交但价格在动，应显式标记而非 0 值
     if {"volume", "open", "close"} <= set(df.columns):
         susp = (pl.col("volume") == 0) & (pl.col("open") != pl.col("close"))
-        masks.append(hit(SUSPENSION_FILL, susp.fill_null(False)))
+        masks.append(hit(SUSPENSION_FILL, (susp & not_susp).fill_null(False)))
 
     # 7) 僵尸报价（warn，行级：零成交零收益；全市场占比由 validators 管）
     if {"volume", "open", "close"} <= set(df.columns):
         zombie = (pl.col("volume") == 0) & (pl.col("open") == pl.col("close"))
-        masks.append(hit(ZOMBIE, zombie.fill_null(False)))
+        masks.append(hit(ZOMBIE, (zombie & not_susp).fill_null(False)))
 
     out = or_flags(df, *masks)
 
@@ -131,20 +158,7 @@ def run_record_checks(df: pl.DataFrame, *, raise_on_fatal: bool = True,
         first = next(i for i in issues if i.severity == "fatal")
         raise DataQualityError(first.rule.lower(), first.detail)
 
-    # warn 级 issue 汇总
-    n_susp = len(out.filter((pl.col("quality_flags") & SUSPENSION_FILL) != 0))
-    n_zombie = len(out.filter((pl.col("quality_flags") & ZOMBIE) != 0))
-    n_preclose = len(out.filter((pl.col("quality_flags") & PRE_CLOSE_MISSING) != 0))
-    if n_preclose:
-        issues.append(Issue(rule="PRE_CLOSE_MISSING", severity="warn", dataset=dataset,
-                            detail=f"{n_preclose} 行 pre_close 缺失"
-                                   f"（上市首日属正常）", count=n_preclose))
-    if n_susp:
-        issues.append(Issue(rule="SUSPENSION_FILL", severity="warn", dataset=dataset,
-                            detail=f"{n_susp} 行疑似停牌填充", count=n_susp))
-    if n_zombie:
-        issues.append(Issue(rule="ZOMBIE", severity="warn", dataset=dataset,
-                            detail=f"{n_zombie} 行疑似僵尸报价", count=n_zombie))
+    _warn_issues(out, issues, dataset)
     return out, issues
 
 

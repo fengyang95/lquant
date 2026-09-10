@@ -244,10 +244,20 @@ def apply_mapping(
     cols = []
     for c, dt in schema.items():
         if c in out.columns:
-            cols.append(out[c].cast(dt, strict=False))
+            cols.append(_cast_to_schema(out[c], dt))
         else:
             cols.append(pl.lit(None, dtype=dt).alias(c))
     return out.select(cols)
+
+
+def _cast_to_schema(s: pl.Series, dt: pl.DataType) -> pl.Series:
+    """cast 到 schema dtype；Utf8 → Boolean 走 "1"/"true" 白名单（polars 不支持直转）。"""
+    if dt == pl.Boolean and s.dtype == pl.Utf8:
+        return (
+            s.cast(pl.Utf8).str.to_lowercase().str.strip_chars()
+            .is_in(["1", "true", "t", "yes"])
+        )
+    return s.cast(dt, strict=False)
 
 
 def _walk_static(node: ast.AST, target: str, errors: list[str]) -> None:

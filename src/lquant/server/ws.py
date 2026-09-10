@@ -10,6 +10,7 @@ import asyncio
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
+from lquant.data.ingest.tasks import get_task
 from lquant.market import ticks as ticks_mod
 from lquant.server.jobs import get_job
 
@@ -29,6 +30,23 @@ async def job_progress(ws: WebSocket, job_id: str) -> None:
             loop = asyncio.get_event_loop()
             job = await loop.run_in_executor(None, get_job, job_id)
             if job is None:
+                # 兜底：job 队列查不到（本地降级注册表丢失 / Redis 清空 / 进程重启），
+                # 退回 data_task 表 —— 长任务状态不丢，前端降级轮询同一协议。
+                task = await loop.run_in_executor(None, get_task, job_id)
+                if task is not None:
+                    done = task["status"] in ("ok", "partial", "failed", "interrupted")
+                    await ws.send_json({
+                        "job_id": job_id,
+                        "status": task["status"],
+                        "progress": {"done": task["done_symbols"],
+                                     "total": task["total_symbols"],
+                                     "phase": task["phase"]},
+                        "done": done,
+                    })
+                    if done:
+                        break
+                    await asyncio.sleep(_POLL_SECONDS)
+                    continue
                 await ws.send_json({"job_id": job_id, "status": "not_found", "done": True})
                 break
             status = job.get_status()

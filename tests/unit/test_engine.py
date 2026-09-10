@@ -250,3 +250,27 @@ def test_perf_zero_vol_sharpe_safe():
     perf = perf_from_nav([100.0] * 60)
     assert math.isnan(perf["sharpe"]) or math.isfinite(perf["sharpe"])
     assert perf["total_return"] == 0.0
+
+
+# ---------- 停牌拒单 ----------
+
+def test_engine_suspended_day_order_rejected():
+    """is_suspended=True 的 bar：订单被拒且 reason='suspended'，不成交。"""
+    df = make_single([
+        {"trade_date": date(2026, 1, 5), "symbol": "600000", "open": 10.0,
+         "high": 10.2, "low": 9.8, "close": 10.0, "pre_close": 9.9,
+         "volume": 100000.0, "amount": 1_000_000.0, "is_suspended": False},
+        # day2 停牌：有承接报价（close=pre_close）但不可交易
+        {"trade_date": date(2026, 1, 6), "symbol": "600000", "open": 10.0,
+         "high": 10.0, "low": 10.0, "close": 10.0, "pre_close": 10.0,
+         "volume": 0.0, "amount": 0.0, "is_suspended": True},
+        {"trade_date": date(2026, 1, 7), "symbol": "600000", "open": 10.0,
+         "high": 10.2, "low": 9.8, "close": 10.1, "pre_close": 10.0,
+         "volume": 100000.0, "amount": 1_010_000.0, "is_suspended": False},
+    ])
+    eng = Engine(AllInOne(), config=EngineConfig(), slippage=NoSlippage())
+    res = eng.run(df)
+    # 停牌日（1/6）不成交；复牌后（1/7）正常承接订单（引擎每日重出信号）
+    assert all(f.trade_date != date(2026, 1, 6) for f in res.trades)
+    suspended_rejects = [r for r in res.rejected if r[2] == "suspended"]
+    assert suspended_rejects, "停牌日订单应被拒且 reason='suspended'"

@@ -1,7 +1,8 @@
 # daily_bar 字段映射（唯一事实源：lquant.data.schema.SCHEMAS["daily_bar"]）
 # baostock 日线 amount 单位已是元，直接透传（amount 与 schema 同名）；
-# 停牌行过滤（tradestatus）与 isST 布尔转换在 provider 的 _fetch_raw 做
-# （trade_status / is_st 不是 schema 列，映射层 fail-fast 不允许 rename 到它们）。
+# 停牌行保留：is_suspended / is_st 由 provider 侧从 tradestatus/isST 转出
+# （"0"=停牌 的取反语义映射白名单表达不了），映射层按 schema 同名透传。
+# total_mv：总市值（元）——目标态：baostock 不出总股本，恒 NULL，待 tushare daily_basic 增强或 security join 填充。
 table: daily_bar
 sources:
   baostock:
@@ -10,6 +11,14 @@ sources:
       code: symbol
       preclose: pre_close
       turn: turnover_rate
+      pctChg: pct_chg
+      peTTM: pe_ttm
+      pbMRQ: pb_mrq
+      psTTM: ps_ttm
+      pcfNcfTTM: pcf_ncf_ttm
+    derive:
+      # 流通市值 ≈ close×volume/(turn/100)；turn 已在 fetch 侧把 0/空 → null
+      float_mv: {expr: "close * volume * 100 / turnover_rate", from: [close, volume, turnover_rate]}
     fill: {sec_type: stock, source: baostock, quality_flags: 0, adj_factor: 1.0}
     required: [symbol, trade_date, open, high, low, close, volume]
 

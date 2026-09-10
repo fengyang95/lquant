@@ -29,6 +29,7 @@ SETTING_DEFS: dict[str, SettingDef] = {
         choices=("next_open", "next_vwap", "next_close", "same_close"),
         label="回测默认撮合模式"),
     "timezone": SettingDef(default="Asia/Shanghai", ty="str", label="时区"),
+    "crosscheck_peers": SettingDef(default=(), ty="list", label="对拍 peer 源（跨源印证）"),
 }
 
 
@@ -151,6 +152,7 @@ class SettingsStore:
         coerced, err = coerce_setting(key, value)
         if err:
             raise ValueError(err)
+        self._validate_extra(key, coerced)
         from lquant.core.db import writer
 
         with writer() as con:
@@ -161,6 +163,19 @@ class SettingsStore:
                 "source = 'runtime', updated_at = now()",
                 [key, coerced])
         return {"key": key, "value": _parse(SETTING_DEFS[key], coerced)}
+
+    def _validate_extra(self, key: str, coerced: str) -> None:
+        """类型之外的业务校验（key 特有），非法 → ValueError。
+
+        crosscheck_peers：只接受已注册且声明 daily/etf_daily 的源。
+        校验器在 data 层（源注册表/capability 归 data 域），此处延迟导入 ——
+        与 _ensure_table 延迟导入 lquant.data.store.ddl 同方向、同理由。
+        """
+        if key != "crosscheck_peers":
+            return
+        from lquant.data.ingest.crosscheck import validate_peers
+
+        validate_peers([v for v in coerced.split(",") if v])
 
     def reset(self, key: str) -> None:
         self._ensure_table()

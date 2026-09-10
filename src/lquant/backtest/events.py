@@ -57,4 +57,5 @@ class Bar:
     amount: float
     adj_factor: float = 1.0
     halted: bool = False
+    suspended: bool = False   # 停牌日：有承接报价但不可交易 → 拒单 reason="suspended"
     fields: dict = field(default_factory=dict)
