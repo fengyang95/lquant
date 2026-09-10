@@ -8,18 +8,24 @@ IC = 截面因子值与前瞻收益的相关系数。它是因子评价的第一
 只有 IC 均值没有 IR 和 t 值，等于没看 ——
 一个均值 0.03 但标准差 0.15 的因子，实盘上是没法用的。
 """
+
 from __future__ import annotations
 
 import math
 
 import polars as pl
 
-__all__ = ["ic_series", "ic_summary", "ic_by_year", "ic_decay_table",
-           "newey_west_tstat"]
+__all__ = ["ic_series", "ic_summary", "ic_by_year", "ic_decay_table", "newey_west_tstat"]
 
 
-def ic_series(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
-              *, date_col: str = "trade_date", min_obs: int = 5) -> pl.DataFrame:
+def ic_series(
+    df: pl.DataFrame,
+    factor: str,
+    ret_col: str = "fwd_ret_1",
+    *,
+    date_col: str = "trade_date",
+    min_obs: int = 5,
+) -> pl.DataFrame:
     """逐日截面 IC / RankIC。
 
     每天样本数少于 min_obs 时该日不计入（相关性在极小样本下没有意义）。
@@ -29,18 +35,26 @@ def ic_series(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
     if miss:
         raise KeyError(f"缺少列 {miss}")
 
-    d = df.select([date_col, factor, ret_col]).with_columns(
-        [pl.col(factor).cast(pl.Float64, strict=False),
-         pl.col(ret_col).cast(pl.Float64, strict=False)]
-    ).drop_nulls()
+    d = (
+        df.select([date_col, factor, ret_col])
+        .with_columns(
+            [
+                pl.col(factor).cast(pl.Float64, strict=False),
+                pl.col(ret_col).cast(pl.Float64, strict=False),
+            ]
+        )
+        .drop_nulls()
+    )
 
     out = (
         d.group_by(date_col)
-        .agg([
-            pl.len().alias("n"),
-            pl.corr(factor, ret_col, method="pearson").alias("ic"),
-            pl.corr(factor, ret_col, method="spearman").alias("rank_ic"),
-        ])
+        .agg(
+            [
+                pl.len().alias("n"),
+                pl.corr(factor, ret_col, method="pearson").alias("ic"),
+                pl.corr(factor, ret_col, method="spearman").alias("rank_ic"),
+            ]
+        )
         .filter(pl.col("n") >= min_obs)
         .sort(date_col)
     )
@@ -62,10 +76,10 @@ def newey_west_tstat(x, lags: int | None = None) -> float:
         return float("nan")
     lags = lags or int(4 * (n / 100) ** (2 / 9)) or 1
     a = s.to_numpy() - s.mean()
-    s0 = float((a ** 2).sum()) / n
+    s0 = float((a**2).sum()) / n
     lrv = s0
     for lag in range(1, lags + 1):
-        w = 1.0 - lag / (lags + 1.0)                     # Bartlett 核
+        w = 1.0 - lag / (lags + 1.0)  # Bartlett 核
         gamma_l = float((a[lag:] * a[:-lag]).sum()) / n
         lrv += 2.0 * w * gamma_l
     if lrv <= 0:
@@ -74,18 +88,29 @@ def newey_west_tstat(x, lags: int | None = None) -> float:
     return float(s.mean()) / se
 
 
-def _summarize(series: pl.Series, annualize: bool = True, *,
-               nw_lags: int | None = None) -> dict:
+def _summarize(series: pl.Series, annualize: bool = True, *, nw_lags: int | None = None) -> dict:
     s = series.drop_nulls()
     n = len(s)
     if n == 0:
-        return {"mean": float("nan"), "std": float("nan"), "ir": float("nan"),
-                "t_stat": float("nan"), "t_stat_nw": float("nan"),
-                "positive_rate": float("nan"), "skew": float("nan"), "n_days": 0}
+        return {
+            "mean": float("nan"),
+            "std": float("nan"),
+            "ir": float("nan"),
+            "t_stat": float("nan"),
+            "t_stat_nw": float("nan"),
+            "positive_rate": float("nan"),
+            "skew": float("nan"),
+            "kurtosis": float("nan"),
+            "ic_gt_002_rate": float("nan"),
+            "n_days": 0,
+        }
     mean = float(s.mean())
     std = float(s.std()) or float("nan")
     ir = mean / std if std and std > 0 else float("nan")
     pos = float((s > 0).sum() / n)
+    # 阈值胜率：与均值同向、且幅度过 0.02 有效线的占比 —— 比单纯胜率更挑剔
+    thr = 0.02 if mean >= 0 else -0.02
+    sig = float((s > thr).sum() / n) if mean >= 0 else float((s < thr).sum() / n)
     return {
         "mean": mean,
         "std": std,
@@ -95,12 +120,15 @@ def _summarize(series: pl.Series, annualize: bool = True, *,
         "t_stat_nw": newey_west_tstat(s, lags=nw_lags),
         "positive_rate": pos,
         "skew": float(s.skew()) if n > 2 else float("nan"),
+        "kurtosis": float(s.kurtosis()) if n > 3 else float("nan"),
+        "ic_gt_002_rate": sig,
         "n_days": n,
     }
 
 
-def ic_summary(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
-               *, method: str = "both", **kw) -> dict:
+def ic_summary(
+    df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *, method: str = "both", **kw
+) -> dict:
     """汇总：IC / RankIC 的均值、标准差、IR、t 值、正比例。
 
     method="pearson" 时结果只含普通 IC，"spearman" 只含 RankIC，
@@ -121,8 +149,7 @@ def ic_summary(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
     return out
 
 
-def ic_by_year(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
-               **kw) -> pl.DataFrame:
+def ic_by_year(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", **kw) -> pl.DataFrame:
     """分年度 IC。因子失效往往不是慢慢变差，而是某一年突然反转。"""
     s = ic_series(df, factor, ret_col, **kw)
     if not len(s):
@@ -130,14 +157,16 @@ def ic_by_year(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
     return (
         s.with_columns(pl.col(kw.get("date_col", "trade_date")).dt.year().alias("year"))
         .group_by("year")
-        .agg([
-            pl.len().alias("n_days"),
-            pl.col("ic").mean().alias("ic_mean"),
-            pl.col("ic").std().alias("ic_std"),
-            (pl.col("ic").mean() / pl.col("ic").std()).alias("ir"),
-            (pl.col("ic") > 0).mean().alias("positive_rate"),
-            pl.col("rank_ic").mean().alias("rank_ic_mean"),
-        ])
+        .agg(
+            [
+                pl.len().alias("n_days"),
+                pl.col("ic").mean().alias("ic_mean"),
+                pl.col("ic").std().alias("ic_std"),
+                (pl.col("ic").mean() / pl.col("ic").std()).alias("ir"),
+                (pl.col("ic") > 0).mean().alias("positive_rate"),
+                pl.col("rank_ic").mean().alias("rank_ic_mean"),
+            ]
+        )
         .sort("year")
     )
 

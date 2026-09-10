@@ -51,6 +51,21 @@ def test_report_contains_new_sections():
     assert "viable" in html
 
 
+def test_report_rolling_section():
+    """滚动窗口章节：默认窗口 60 会因样本不足而显示空态。"""
+    html = factor_report(_df(), "mom", "fwd_ret_1")
+    assert "滚动窗口" in html
+    assert "数据不足：滚动 RankIC" in html
+
+
+def test_report_rolling_section_with_data():
+    """样本足够时滚动章节有 SVG 折线。"""
+    html = factor_report(_df(n=90), "mom", "fwd_ret_1")
+    assert "滚动窗口" in html
+    assert "<svg" in html.split("滚动窗口")[1]  # 滚动章节内有图
+    assert "数据不足" not in html.split("滚动窗口")[1]
+
+
 def test_report_backward_compatible():
     html = factor_report(_df(), "mom", "fwd_ret_1")
     assert "<html" in html

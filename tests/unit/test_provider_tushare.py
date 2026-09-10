@@ -303,17 +303,23 @@ def test_build_chain_includes_tushare_with_token(
 def test_build_chain_skips_unregistered_provider(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """enabled 但未注册的源（可选 SDK 未安装）→ 降级跳过，不炸启动。"""
+    """enabled 但未注册的源（可选 SDK 未安装）→ 降级跳过，不炸启动。
+
+    不依赖具体环境装没装某个 SDK：直接把已注册的 sina 从注册表临时移除，
+    构链后必须缺席且其余源正常 —— 确定性复现「未注册」分支。
+    """
     monkeypatch.setenv("TUSHARE_TOKEN", "fake")
     pv.reset_chain()
-    with caplog.at_level("WARNING"):
-        chain = pv.build_chain()
-    # 可选 SDK 未安装的源不在链中但启动不崩（本机装了 mootdx → 在链中是合法的）
-    from lquant.data.providers import PROVIDERS
-
-    names = [p.name for p in chain.providers]
-    assert all(n in PROVIDERS for n in names)
-    assert "baostock" in names
-    if "mootdx" not in names:   # 仅在 mootdx 未安装的环境验证降级日志
-        assert any("mootdx" in r.message for r in caplog.records)
-    pv.reset_chain()
+    saved = pv.PROVIDERS._items.pop("sina")
+    try:
+        with caplog.at_level("WARNING"):
+            chain = pv.build_chain()
+        names = [p.name for p in chain.providers]
+        # 未注册的源被降级跳过；链中出现的源必然都已注册（上游不变量）
+        assert all(n in pv.PROVIDERS for n in names)
+        assert "sina" not in names
+        assert "baostock" in names
+        assert any("sina" in r.message for r in caplog.records)
+    finally:
+        pv.PROVIDERS._items["sina"] = saved
+        pv.reset_chain()
