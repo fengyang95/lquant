@@ -555,3 +555,43 @@ def test_ws_market_ticks_empty_symbols(client):
     with client.websocket_connect("/ws/market/ticks") as ws:
         msg = ws.receive_json()
     assert msg["available"] is False and "symbols" in msg["error"]
+
+
+# ---------- 参考数据（退市名单）同步 ----------
+
+def test_reference_sync_endpoint(client, monkeypatch):
+    """POST /data/reference/sync → 202，后台任务执行一次；重入 → 409。"""
+    import threading
+
+    from lquant.server.api import data as data_mod
+
+    calls: list[dict] = []
+    done = threading.Event()
+
+    fake_result = {"calendar": 1, "securities": 1, "delisted": 2, "details": 0}
+
+    def _fake_sync(skip_details=False, detail_limit=None):
+        calls.append({"skip_details": skip_details})
+        done.set()
+        return fake_result
+
+    monkeypatch.setattr(data_mod, "sync_reference", _fake_sync)
+    monkeypatch.setattr(data_mod, "_ref_lock", threading.Lock())
+
+    r = client.post("/api/data/reference/sync", json={"sync_details": False})
+    assert r.status_code == 202
+    assert r.json()["accepted"] is True
+    assert done.wait(5), "后台任务未执行"
+    assert calls == [{"skip_details": True}]
+
+    # 上一次同步完成释放锁后可再次触发
+    done.clear()
+    r2 = client.post("/api/data/reference/sync", json={})
+    assert r2.status_code == 202
+    assert done.wait(5)
+
+    # 锁被占（上一次同步未结束）→ 409
+    monkeypatch.setattr(data_mod, "_ref_lock", threading.Lock())
+    assert data_mod._ref_lock.acquire(blocking=False)
+    r3 = client.post("/api/data/reference/sync", json={})
+    assert r3.status_code == 409

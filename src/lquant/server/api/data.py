@@ -8,12 +8,15 @@
 """
 from __future__ import annotations
 
+import threading
+
 import polars as pl
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from lquant.core.db import reader
 from lquant.data.ingest import tasks as ingest_tasks
+from lquant.data.ingest.reference import sync_reference
 from lquant.data.ingest.tasks import (  # noqa: F401  execute_task/run_claimed_task 保留模块属性供测试打桩
     TaskConflictError,
     claim_retry,
@@ -267,6 +270,42 @@ def quote(symbol: str = Query(min_length=6, max_length=16)) -> dict:
         "turnover_rate": data.get("f50"),
         "market_cap": data.get("f116"),
     }
+
+
+# ---------- 参考数据（标的清单含退市）同步 ----------
+
+# 一次只允许一个参考数据同步在后台跑（详情慢路径要 20-40 分钟）
+_ref_lock = threading.Lock()
+
+
+class ReferenceSyncIn(BaseModel):
+    sync_details: bool = Field(
+        default=False,
+        description="是否顺带逐只补 list_date/delist_date（慢路径，约 20-40 分钟）")
+
+
+@router.post("/reference/sync", status_code=202)
+def sync_reference_ep(req: ReferenceSyncIn) -> dict:
+    """同步参考数据（日历/标的/退市名单，可选详情）→ 202 后台执行。
+
+    409：上一次同步尚未结束。完成后 security 表含退市股，
+    全量回填（full_backfill）的前置校验即可通过。
+    """
+    if not _ref_lock.acquire(blocking=False):
+        raise HTTPException(409, "上一次参考数据同步尚未结束，请稍后再试")
+
+    def _job() -> None:
+        try:
+            sync_reference(skip_details=not req.sync_details)
+        except Exception as e:  # noqa: BLE001 - 后台任务失败只记日志
+            from loguru import logger
+
+            logger.exception(f"参考数据同步失败: {e}")
+        finally:
+            _ref_lock.release()
+
+    enqueue("lquant-ingest", _job)
+    return {"accepted": True, "sync_details": req.sync_details}
 
 
 # ---------- 数据任务（全量回填 / 每日增量，T4 执行器） ----------
