@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -107,10 +108,25 @@ def enqueue(queue: str, fn, *args, **kwargs):
     _register_job(job)
 
     def _run():
+        started = time.time()
+        from lquant.monitor.emit import emit_task_event
+
+        emit_task_event(event="started", job_id=job.id,
+                        job_name=getattr(fn, "__name__", str(fn)), queue=queue,
+                        enqueued_at=None, started_at=started, finished_at=None)
         try:
             job._result = fn(*args, **kwargs)
+            emit_task_event(event="finished", job_id=job.id,
+                            job_name=getattr(fn, "__name__", str(fn)),
+                            queue=queue, enqueued_at=None, started_at=started,
+                            finished_at=time.time())
         except Exception as e:  # noqa: BLE001
             job._error = f"{type(e).__name__}: {e}"
+            emit_task_event(event="failed", job_id=job.id,
+                            job_name=getattr(fn, "__name__", str(fn)),
+                            queue=queue, enqueued_at=None, started_at=started,
+                            finished_at=time.time(),
+                            message=f"{type(e).__name__}: {e}")
 
     job._thread = threading.Thread(target=_run, name=f"localjob-{job.id}", daemon=True)
     job._thread.start()
