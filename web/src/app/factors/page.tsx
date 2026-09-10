@@ -39,6 +39,14 @@ type EvalSeries = {
   decay: { horizons: number[]; ic: (number | null)[]; rank_ic: (number | null)[] };
   ic_by_year: { year: number; ic_mean: number | null; ir: number | null; positive_rate: number | null }[];
   neutral_ladder?: { label: string; covs: string[]; ic_mean: number | null; rank_ic_mean: number | null; n_days: number }[];
+  neutral_views?: unknown;   // 上游按需断言取字段（如 return_neutral_ic）
+  rolling?: {
+    window: number;
+    dates: string[];
+    ic: (number | null)[];
+    rank_ic: (number | null)[];
+    ir: (number | null)[];
+  };
 };
 type CorrResult = {
   factors: string[];
@@ -195,6 +203,22 @@ export default function FactorsPage() {
         })),
         barMaxWidth: 32,
       }],
+    };
+  }, [evalSeries]);
+
+  const rollingOption = useMemo(() => {
+    if (!evalSeries?.rolling?.dates.length) return null;
+    const r = evalSeries.rolling;
+    return {
+      tooltip: { ...tooltip, valueFormatter: (v: number) => v?.toFixed(4) },
+      legend: legend({ top: 0 }),
+      grid: { left: 48, right: 20, top: 30, bottom: 24 },
+      dataZoom: [{ type: 'inside' as const }],
+      ...axes({ data: r.dates }, { name: '滚动均值' }),
+      series: [
+        { name: `RankIC(${r.window}日)`, type: 'line' as const, data: r.rank_ic, showSymbol: false, lineStyle: { width: 1.8, color: C.indigo }, itemStyle: { color: C.indigo } },
+        { name: `IC(${r.window}日)`, type: 'line' as const, data: r.ic, showSymbol: false, lineStyle: { width: 1.5, color: C.up }, itemStyle: { color: C.up } },
+      ],
     };
   }, [evalSeries]);
 
@@ -452,6 +476,25 @@ export default function FactorsPage() {
             <Panel title="分年度 IC" meta="突降 = 因子反转预警">
               {icYearOption
                 ? <Chart option={icYearOption} height={180} />
+                : <Empty>样本不足</Empty>}
+            </Panel>
+            <Panel title={`滚动窗口指标`} meta="掉头向下/转负 = 阶段性失效预警">
+              {rollingOption
+                ? <Chart option={rollingOption} height={180} />
+                : <Empty>样本不足（需要 ≥ 60 个交易日）</Empty>}
+            </Panel>
+            <Panel title="滚动窗口 IR">
+              {rollingOption
+                ? <Chart option={{
+                    tooltip: { ...tooltip, valueFormatter: (v: number) => v?.toFixed(3) },
+                    grid: { left: 48, right: 20, top: 20, bottom: 24 },
+                    dataZoom: [{ type: 'inner' as const }],
+                    ...axes({ data: evalSeries.rolling?.dates ?? [] }, { name: 'IR' }),
+                    series: [{
+                      name: '滚动IR', type: 'line' as const, data: evalSeries.rolling?.ir ?? [],
+                      showSymbol: false, lineStyle: { width: 1.5, color: C.inkDim }, itemStyle: { color: C.inkDim },
+                    }],
+                  }} height={180} />
                 : <Empty>样本不足</Empty>}
             </Panel>
           </div>

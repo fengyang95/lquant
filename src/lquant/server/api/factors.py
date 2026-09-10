@@ -39,6 +39,7 @@ class EvaluateIn(BaseModel):
     horizons: list[int] = Field(default=[1, 5, 10, 20], min_length=1, max_length=20,
                                 ge=1, le=250)
     start: str = "2026-01-01"
+    window: int = Field(default=60, ge=20, le=250)  # 滚动窗口（交易日）
 
 
 @router.get("")
@@ -226,7 +227,8 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
         "formula": req.formula,
         "n_samples": len(d),
         "ic": {"mean": round(ic["mean"], 4), "ir": round(ic["ir"], 3),
-               "t_stat": round(ic["t_stat"], 2), "positive_rate": round(ic["positive_rate"], 4)},
+               "t_stat": round(ic["t_stat"], 2), "positive_rate": round(ic["positive_rate"], 4),
+               "ic_gt_002_rate": round(ic["ic_gt_002_rate"], 4)},
         "rank_ic_mean": round(res["ic"]["rank_ic"]["mean"], 4),
         "long_short": {"annual_return": round(ls["annual_return"], 4),
                        "sharpe": round(ls["sharpe"], 2),
@@ -292,6 +294,17 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
     _persist_ic(req.factor, ladder)
     views = _neutral_views_for(d, ret_col)
 
+    # 6) 滚动窗口 IC / RankIC / IR
+    from lquant.factors.evaluate.rolling import rolling_ic
+    rwin = rolling_ic(d, "_factor", ret_col, req.window)
+    rolling = {
+        "window": req.window,
+        "dates": [str(x) for x in rwin["trade_date"].to_list()] if len(rwin) else [],
+        "ic": [_jf(v) for v in rwin["ic_mean"].to_list()] if len(rwin) else [],
+        "rank_ic": [_jf(v) for v in rwin["rank_ic_mean"].to_list()] if len(rwin) else [],
+        "ir": [_jf(v, 3) for v in rwin["ir"].to_list()] if len(rwin) else [],
+    }
+
     series = {
         "factor": req.factor, "formula": req.formula,
         "n_groups": req.n_groups, "n_samples": len(d),
@@ -300,6 +313,7 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
                      "monotonicity": _jf(qsum.get("monotonicity"), 3)},
         "decay": decay, "ic_by_year": ic_year, "neutral_ladder": ladder,
         "neutral_views": views,
+        "rolling": rolling,
     }
     return metrics, series
 

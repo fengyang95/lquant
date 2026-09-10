@@ -204,6 +204,23 @@ def test_evaluate_series_chart_payload(client):
     assert body["decay"]["horizons"] == [1, 5, 10, 20]
     assert all(v is None or isinstance(v, (int, float)) for v in body["decay"]["ic"])
     assert isinstance(body["ic_by_year"], list)
+    # 滚动窗口序列：窗口数与序列长度一致，字段齐全
+    rw = body["rolling"]
+    assert rw["window"] == 60
+    assert len(rw["dates"]) == len(rw["ic"]) == len(rw["rank_ic"]) == len(rw["ir"])
+    assert len(rw["dates"]) > 0
+
+
+def test_evaluate_series_rolling_window_override(client):
+    """window 参数透传：window=20 的滚动序列比 window=60 的更长。"""
+    def _roll_len(window: int) -> int:
+        r = client.post("/api/factors/evaluate/series", json={
+            "factor": "MA20", "formula": "MA20", "start": "2024-06-01",
+            "window": window})
+        assert r.status_code == 200
+        return len(r.json()["rolling"]["dates"])
+
+    assert _roll_len(20) > _roll_len(60)
 
 
 # ---------- backtests ----------

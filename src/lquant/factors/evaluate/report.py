@@ -20,6 +20,7 @@ from lquant.factors.evaluate.decay import decay_profile, half_life, suggest_reba
 from lquant.factors.evaluate.group_ic import ic_by_group
 from lquant.factors.evaluate.ic import ic_by_year, ic_series, ic_summary
 from lquant.factors.evaluate.quantile import quantile_summary
+from lquant.factors.evaluate.rolling import rolling_ic
 
 __all__ = ["factor_report", "save_report"]
 
@@ -141,6 +142,7 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
                          date_col=date_col, symbol_col=symbol_col)
     hl = half_life(prof)
     yearly = ic_by_year(df, factor, ret_col, date_col=date_col)
+    rw = rolling_ic(df, factor, ret_col, 60, date_col=date_col)
 
     attr = None
     cc = cat_col or ("industry_sw1" if "industry_sw1" in df.columns else "symbol")
@@ -271,6 +273,14 @@ footer{{margin-top:40px;color:#999;font-size:12px}}
 
 <h2>累计 IC</h2>
 <div class="chart">{_svg_line(dates, cum_ic, label="累计 IC")}</div>
+
+<h2>滚动窗口（60 交易日）</h2>
+<p class="hint">滚动 RankIC / IC / IR —— 全样本指标会掩盖阶段性失效，
+滚动线掉头向下甚至转负就是减仓信号</p>
+<div class="chart">{_svg_line(
+    [str(x) for x in rw["trade_date"].to_list()] if len(rw) else [],
+    rw["rank_ic_mean"].to_list() if len(rw) else [],
+    label="滚动 RankIC")}</div>
 
 <h2>分层收益（{n_groups} 组，Q{n_groups} 为因子值最高）</h2>
 <div class="chart">{_svg_bars(q_labels, q_rets)}</div>
