@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
+import polars as pl
 from pydantic import BaseModel, Field
 
 from lquant.core.db import reader
@@ -101,6 +102,50 @@ def coverage() -> dict:
     except Exception:  # noqa: BLE001
         lake["error"] = True
     return {"tables": tables, "daily_lake": lake}
+
+
+@router.get("/coverage/monthly")
+def coverage_monthly(
+    start: str | None = Query(default=None, max_length=10),
+    end: str | None = Query(default=None, max_length=10),
+) -> dict:
+    """覆盖度按月聚合：每月实际标的数趋势（spec §7.3）。
+
+    口径：avg_symbols = 当月各交易日 distinct symbol 数的算术平均，
+    days = 当月有数据的交易日数。「应有标的数」无可靠 PIT 来源
+    （security 是当前快照），不做对比 —— 缺口由前端按环比大幅下降
+    （如 >30%）标橙，阈值归前端定。空湖返回空数组不报错。
+    """
+    from datetime import date as _date
+
+    for name, val in (("start", start), ("end", end)):
+        if isinstance(val, str) and val:
+            try:
+                _date.fromisoformat(val)
+            except ValueError as e:
+                raise HTTPException(422, f"{name} 日期非法: {val}") from e
+    try:
+        lf = read_daily(start=start, end=end).select(["symbol", "trade_date"])
+        if not lf.collect_schema().names():
+            return {"rows": []}
+        per_day = lf.group_by("trade_date").agg(
+            pl.col("symbol").n_unique().alias("n_symbols"))
+        monthly = (
+            per_day.group_by(
+                pl.col("trade_date").dt.strftime("%Y-%m").alias("month"))
+            .agg(pl.col("n_symbols").mean().alias("avg_symbols"),
+                 pl.col("trade_date").len().alias("days"))
+            .sort("month"))
+        rows = [{"month": r["month"], "avg_symbols": round(r["avg_symbols"], 1),
+                 "days": int(r["days"])} for r in monthly.collect().to_dicts()]
+        return {"rows": rows}
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001 - 湖读取异常降级为空，不打断首屏
+        from loguru import logger
+
+        logger.warning(f"coverage monthly 聚合失败: {e}")
+        return {"rows": []}
 
 
 @router.get("/securities")

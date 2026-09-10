@@ -193,6 +193,50 @@ def test_crosscheck_endpoints(client):
     assert missing.status_code == 404
 
 
+# ---------- coverage monthly ----------
+
+def test_coverage_monthly_with_lake(client):
+    """有湖：按月聚合，月升序，口径字段齐全。"""
+    r = client.get("/api/data/coverage/monthly")
+    assert r.status_code == 200, r.text
+    rows = r.json()["rows"]
+    assert rows, "demo 湖应有数据"
+    assert {"month", "avg_symbols", "days"} <= set(rows[0])
+    months = [x["month"] for x in rows]
+    assert months == sorted(months)
+    assert len(months[0]) == 7 and months[0][4] == "-"  # "2024-01"
+    assert rows[0]["avg_symbols"] > 0
+    assert rows[0]["days"] > 0
+
+    # 日期过滤：只落在窗口内
+    r2 = client.get("/api/data/coverage/monthly",
+                    params={"start": "2025-01-01", "end": "2025-12-31"})
+    assert r2.status_code == 200
+    months2 = [x["month"] for x in r2.json()["rows"]]
+    assert months2 and all(m.startswith("2025") for m in months2)
+
+
+def test_coverage_monthly_422_bad_date(client):
+    """日期格式非法 → 422，不 500。"""
+    for params in ({"start": "not-a-date"}, {"end": "2024/01/01"}):
+        r = client.get("/api/data/coverage/monthly", params=params)
+        assert r.status_code == 422, r.text
+
+
+def test_coverage_monthly_empty_lake(tmp_path, monkeypatch):
+    """空湖 → 空数组不报错（不走 client fixture，直接调视图）。"""
+    monkeypatch.chdir(tmp_path)
+    from lquant.core.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        from lquant.server.api.data import coverage_monthly
+
+        assert coverage_monthly() == {"rows": []}
+    finally:
+        get_settings.cache_clear()
+
+
 # ---------- WS data_task 兜底 ----------
 
 def test_ws_falls_back_to_data_task(client):

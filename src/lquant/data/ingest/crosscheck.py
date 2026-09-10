@@ -179,14 +179,30 @@ def run_crosscheck(peers: list[str] | None = None, start: str | None = None,
         levels = diffs.group_by("symbol", "trade_date").agg(
             pl.col("level").max()).filter(pl.col("level") != crosscheck.L1)
         for r in levels.iter_rows(named=True):
+            rows = diffs.filter(
+                (pl.col("symbol") == r["symbol"]) &
+                (pl.col("trade_date") == r["trade_date"]))
+            # 字段级明细（spec §2.2）：取偏差最大的可比字段塞进 extra，
+            # 前端 issue 明细直接展示 primary/peer 数值 —— 只展示，不回写湖。
+            worst = rows.sort("rel_diff", descending=True, nulls_last=True) \
+                .row(0, named=True)
             issues_all.append(Issue(
                 rule=f"CROSS_SRC_DIFF.{name}.{r['level']}",
                 severity="error" if r["level"] == crosscheck.L3 else "warn",
                 detail=f"{name} 对拍 {r['level']}：{r['symbol']}@{r['trade_date']}",
                 symbol=r["symbol"], trade_date=r["trade_date"],
-                count=int((diffs.filter(
-                    (pl.col("symbol") == r["symbol"]) &
-                    (pl.col("trade_date") == r["trade_date"]))).height)))
+                count=rows.height,
+                extra={
+                    "symbol": r["symbol"],
+                    "trade_date": str(r["trade_date"]),
+                    "field": worst["field"],
+                    "primary": worst["primary"],
+                    "peer": worst["peer"],
+                    "deviation_pct": (round(float(worst["rel_diff"]) * 100, 4)
+                                      if worst["rel_diff"] is not None else None),
+                    "level": r["level"],
+                    "missing": worst["missing"],
+                }))
 
     # 跨同行源统一：任一源 L2/L3 即对该 (symbol, date) 打标降级，并持久化。
     flagged_rows = 0
