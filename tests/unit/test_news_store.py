@@ -70,6 +70,15 @@ def test_query_pagination(con):
     assert len(page["items"]) == 2
 
 
+def test_query_limit_clamped_and_offset_safe(con):
+    insert_news(con, [_item(external_id=str(i)) for i in range(300)])
+    clamped = query_news(con, limit=10000)
+    assert clamped == query_news(con, limit=200)
+    assert len(clamped["items"]) <= 200
+    assert query_news(con, limit=-5)["items"] == []
+    assert query_news(con, limit=2, offset=-100)["total"] == 300
+
+
 def test_content_truncated_and_flagged(con):
     insert_news(con, [_item(external_id="x", content="字" * 3000)])
     row = query_news(con)["items"][0]

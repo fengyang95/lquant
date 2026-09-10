@@ -86,6 +86,8 @@ def query_news(  # noqa: PLR0917 — 接口按 brief 固定
     offset: int = 0,
 ) -> dict[str, Any]:
     """多维过滤查询,返回 {total, items}。items 按 published_at 倒序。"""
+    limit = min(max(int(limit), 0), 200)
+    offset = max(int(offset), 0)
     where: list[str] = []
     params: list[Any] = []
 
