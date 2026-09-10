@@ -51,6 +51,7 @@ function AskWorkspace() {
   }, [symbolParam]);
 
   const handleNew = useCallback(async () => {
+    setInitError('');
     try {
       const created = await createSession();
       setSessions((prev) => [created, ...prev]);
@@ -62,6 +63,7 @@ function AskWorkspace() {
 
   const handleDelete = useCallback(
     async (id: string) => {
+      setInitError('');
       try {
         await deleteSession(id);
       } catch (e) {
@@ -69,9 +71,7 @@ function AskWorkspace() {
         return;
       }
       setSessions((prev) => prev.filter((s) => s.id !== id));
-      if (currentId === id) {
-        setCurrentId((prev) => null);
-      }
+      if (currentId === id) setCurrentId(null);
     },
     [currentId],
   );
@@ -92,28 +92,26 @@ function AskWorkspace() {
         sub={symbol ? `上下文 ${symbol}` : 'Agent 对话分析'}
         actions={symbol ? <ContextChip symbol={symbol} /> : null}
       />
-      {sessions.length === 0 ? (
-        <Empty>还没有会话 —— 点击左上角「新建会话」开始提问</Empty>
-      ) : (
-        <div className="flex h-[calc(100vh-220px)] min-h-[480px]">
-          <aside className="w-56 shrink-0 border border-line bg-panel">
-            <SessionList
-              sessions={sessions}
-              currentId={currentId}
-              onSelect={handleSelect}
-              onNew={() => void handleNew()}
-              onDelete={(id) => void handleDelete(id)}
-            />
-          </aside>
-          <div className="min-w-0 flex-1 border border-l-0 border-line bg-white">
-            {current ? (
-              <ChatWindow session={current} key={current.id} />
-            ) : (
-              <Loading />
-            )}
-          </div>
+      {/* ready 态的错误反馈：新建/删除失败不能静默 */}
+      {initError ? <ErrorNote>操作失败：{initError}</ErrorNote> : null}
+      <div className="flex h-[calc(100vh-220px)] min-h-[480px]">
+        <aside className="w-56 shrink-0 border border-line bg-panel">
+          <SessionList
+            sessions={sessions}
+            currentId={currentId}
+            onSelect={handleSelect}
+            onNew={() => void handleNew()}
+            onDelete={(id) => void handleDelete(id)}
+          />
+        </aside>
+        <div className="min-w-0 flex-1 border border-l-0 border-line bg-white">
+          {current ? (
+            <ChatWindow session={current} key={current.id} />
+          ) : (
+            <Empty>还没有会话 —— 点击左上角「新建会话」开始提问</Empty>
+          )}
         </div>
-      )}
+      </div>
     </div>
   );
 }
