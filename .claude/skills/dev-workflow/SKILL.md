@@ -48,7 +48,8 @@ cargo test --workspace  # 若改了 crates/ 下 Rust 代码（在 crates/ 目录
 ## 阶段 3：提交、推送、建 PR
 
 1. 提交信息遵循 conventional commits：`feat: ...` / `fix: ...` 等，不加 AI 署名。
-2. `git push -u origin worktree-<name>`
+2. **push 前先 rebase**：`git fetch origin main && git rebase origin/main`；有冲突则逐个解决，解决后重跑阶段 2 验证全绿。
+3. `git push -u origin worktree-<name>`
 3. `gh pr create --base main`，PR 描述包含：背景 / 改动清单 / 测试计划。
 4. 若仓库支持，开启自动合并：`gh pr merge --squash --auto`（失败则跳过，进入盯梢模式）。
 
