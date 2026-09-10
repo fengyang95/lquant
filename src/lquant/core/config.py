@@ -37,6 +37,13 @@ def find_root() -> Path:
     return Path.cwd()
 
 
+BACKTEST_WORKERS_MAX = 4
+
+
+def clamp_backtest_workers(n: int) -> int:
+    return max(0, min(BACKTEST_WORKERS_MAX, int(n)))
+
+
 class AgentConfig(BaseModel):
     provider: str = "mock"
 
@@ -52,6 +59,12 @@ class Settings(BaseModel):
     ingest_concurrency: int = 4
     ingest_watchdog_sec: int = 120
     redis_url: str = "redis://localhost:6379/0"
+    monitor_enabled: bool = True
+    monitor_flush_interval_sec: int = 10
+    monitor_sample_interval_sec: int = 5
+    monitor_retention_days: int = 7
+    monitor_db_path: str = ""
+    backtest_workers: int = 2
     raw: dict[str, Any] = Field(default_factory=dict)
 
     @property
@@ -80,6 +93,19 @@ def get_settings() -> Settings:
         ingest_concurrency=int(ingest.get("concurrency", 4)),
         ingest_watchdog_sec=int(ingest.get("watchdog_sec", 120)),
         redis_url=os.getenv("LQ_REDIS_URL", "redis://localhost:6379/0"),
+        monitor_enabled=os.getenv("LQ_MONITOR_ENABLED", "1") != "0",
+        monitor_flush_interval_sec=int(
+            (raw.get("monitor", {}) or {}).get("flush_interval_sec", 10)),
+        monitor_sample_interval_sec=int(
+            (raw.get("monitor", {}) or {}).get("sample_interval_sec", 5)),
+        monitor_retention_days=int(
+            (raw.get("monitor", {}) or {}).get("retention_days", 7)),
+        monitor_db_path=os.getenv("LQ_MONITOR_DB", "") or str(
+            Path(str(paths.get("duckdb", "./data/duckdb/lquant.duckdb")))
+            .with_name("lquant.monitor.duckdb").resolve()),
+        backtest_workers=int(os.getenv(
+            "LQ_BACKTEST_WORKERS",
+            str((raw.get("monitor", {}) or {}).get("backtest_workers", 2)))),
         raw=raw,
     )
 
