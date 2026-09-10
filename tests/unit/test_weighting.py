@@ -1,6 +1,8 @@
 """组合权重模块测试：等权 / 逆波动 / 风险平价 / 最小方差 / HRP。"""
 from __future__ import annotations
 
+import importlib.util
+
 import numpy as np
 import polars as pl
 import pytest
@@ -47,6 +49,10 @@ def test_inverse_vol_prefers_low_vol():
 
 # ---------- 优化类 ----------
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("scipy") is None,
+    reason="scipy 未安装（factors extra）：risk_parity_weight 降级为逆波动率，ERC 断言不适用",
+)
 def test_risk_parity_equal_risk_contribution():
     r = make_returns()
     w = risk_parity_weight(r)
