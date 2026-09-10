@@ -90,6 +90,10 @@ def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
 
     if has_factor(formula):
         return qlib_compute(df, formula)
+    if "$" in formula:                     # DSL 表达式 —— 统一走 FactorEngine
+        from lquant.factors.analysis import compute_factor_col
+
+        return compute_factor_col(df, formula, "_factor")
     if formula.startswith("pct_change_") and formula.rsplit("_", 1)[1].isdigit():
         n = int(formula.rsplit("_", 1)[1])
         return df.with_columns(pl.col("close").pct_change(n).over("symbol").alias("_factor"))
@@ -424,6 +428,24 @@ def agent_guide(name: str) -> dict:
     }
 
 
+@router.get("/mine/runs")
+def list_mining_runs(limit: int = Query(default=50, ge=1, le=500)) -> list[dict]:
+    """挖掘会话台账（factor_mining_run）。"""
+    with reader() as con:
+        try:
+            rows = con.execute(
+                "SELECT run_id, agent, generator, n_evaluated, n_static_fail, n_low_ic, "
+                "n_redundant, n_size_proxy, n_survivors, created_at "
+                "FROM factor_mining_run ORDER BY created_at DESC LIMIT ?",
+                [limit]).fetchall()
+        except Exception:  # noqa: BLE001
+            return []
+    return [{"run_id": r[0], "agent": r[1], "generator": r[2],
+             "n_evaluated": r[3], "n_static_fail": r[4], "n_low_ic": r[5],
+             "n_redundant": r[6], "n_size_proxy": r[7], "n_survivors": r[8],
+             "created_at": str(r[9])} for r in rows]
+
+
 @router.post("/mine/run")
 def mine_run(req: dict) -> dict:
     """平台驱动挖掘会话（同步，有界预算）。请求: {agent, generator, n}。"""
@@ -478,22 +500,6 @@ def mine_run(req: dict) -> dict:
             "n_size_proxy": res.n_size_proxy, "n_survivors": res.n_survivors,
             "survivors": survivors[:10]}
 
-
-def list_mining_runs(limit: int = Query(default=50, ge=1, le=500)) -> list[dict]:
-    """挖掘会话台账（factor_mining_run）。"""
-    with reader() as con:
-        try:
-            rows = con.execute(
-                "SELECT run_id, agent, generator, n_evaluated, n_static_fail, n_low_ic, "
-                "n_redundant, n_size_proxy, n_survivors, created_at "
-                "FROM factor_mining_run ORDER BY created_at DESC LIMIT ?",
-                [limit]).fetchall()
-        except Exception:  # noqa: BLE001
-            return []
-    return [{"run_id": r[0], "agent": r[1], "generator": r[2],
-             "n_evaluated": r[3], "n_static_fail": r[4], "n_low_ic": r[5],
-             "n_redundant": r[6], "n_size_proxy": r[7], "n_survivors": r[8],
-             "created_at": str(r[9])} for r in rows]
 
 def list_reports() -> list[dict]:
     if not REPORT_DIR.exists():

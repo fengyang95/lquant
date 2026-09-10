@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import polars as pl
@@ -93,7 +94,7 @@ def run_session(engine, panel, generator, *, agent="builtin", n_candidates=100,
             continue
         # ---- G3: val 解锁一次 ----
         val_x = forward_return(val.sort(["symbol", "trade_date"]), "close", periods=[1])
-        val_x = val_x.drop_nulls(["fwd_ret_1"])
+        val_x = drop_nonfinite(val_x, "fwd_ret_1")
         try:
             dv = engine.compute(expr, "f")
             val_j = dv.join(val_x, on=["symbol", "trade_date"], how="inner",
@@ -102,7 +103,9 @@ def run_session(engine, panel, generator, *, agent="builtin", n_candidates=100,
             if not len(s):
                 raise ValueError("val IC 序列为空")
             ic_val = float(s["ic"].mean())
-            t_val = tstat(float(s["ic"].mean()), float(s["ic"].std()), len(s))
+            if not math.isfinite(ic_val):
+                raise ValueError("val IC 非有限值（数据 NaN 残留）")
+            t_val = tstat(ic_val, float(s["ic"].std()), len(s))
             thr = corrected_threshold(res.n_evaluated)
             if abs(t_val) < thr:
                 res.corrections.append({"expr": expr, "stage": "G3", "reason": "LOW_TSTAT",
