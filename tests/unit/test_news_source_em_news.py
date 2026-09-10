@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 
 from lquant.news.model import NewsItem
-from lquant.news.sources.em_news import EmNewsSource, get_active_pool
+from lquant.news.sources.em_news import EmColumnError, EmNewsSource, get_active_pool
 
 
 def _fake_df(symbol: str = "平安银行") -> pd.DataFrame:
@@ -87,8 +87,18 @@ def test_em_news_missing_column_raises_value_error() -> None:
     bad = _fake_df().drop(columns=["新闻标题"])
     with patch("lquant.news.sources.em_news.ak") as mock_ak:
         mock_ak.stock_news_em.return_value = bad
-        with pytest.raises(ValueError, match="新闻标题"):
+        with pytest.raises(EmColumnError, match="新闻标题"):
             EmNewsSource(pool=["000001.SZ"]).fetch(date(2026, 9, 10))
+
+
+def test_em_news_plain_value_error_is_per_symbol_failure() -> None:
+    """拉取阶段的普通 ValueError 不再向传播,按单股失败跳过。"""
+    with patch("lquant.news.sources.em_news.ak") as mock_ak:
+        mock_ak.stock_news_em.side_effect = [ValueError("bad param"), _fake_df()]
+        items = EmNewsSource(pool=["000001.SZ", "600000.SH"]).fetch(date(2026, 9, 10))
+
+    assert len(items) == 2
+    assert items[0].symbols == ("600000.SH",)
 
 
 def _seed_db(tmp_path):

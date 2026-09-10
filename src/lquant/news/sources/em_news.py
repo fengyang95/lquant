@@ -26,6 +26,10 @@ _EM_COLS = ["关键词", "新闻标题", "新闻内容", "新闻链接", "发布
 _DEFAULT_POOL_LIMIT = 200
 
 
+class EmColumnError(ValueError):
+    """akshare 返回 DataFrame 缺列(接口契约变化),应向上传播而非按单股失败吞掉。"""
+
+
 def _pool_limit() -> int:
     """从 config/schema/news.yaml 的 em_news.pool_limit 读;无配置退默认 200。"""
     try:
@@ -74,10 +78,10 @@ def _parse_time(value: Any) -> datetime | None:
 
 
 def _map_df(df: pd.DataFrame, symbol: str) -> list[NewsItem]:
-    """单股 DataFrame 映射为 NewsItem;缺列抛 ValueError。"""
+    """单股 DataFrame 映射为 NewsItem;缺列抛 EmColumnError。"""
     missing = [c for c in _EM_COLS if c not in df.columns]
     if missing:
-        raise ValueError(
+        raise EmColumnError(
             f"akshare stock_news_em 缺少列 {missing},实际列名: {df.columns.tolist()}"
         )
     items: list[NewsItem] = []
@@ -124,7 +128,7 @@ class EmNewsSource:
             try:
                 df = ak.stock_news_em(symbol=symbol)
                 items.extend(_map_df(df, symbol))
-            except ValueError:
+            except EmColumnError:
                 # 缺列属接口契约问题,直接向上传播
                 raise
             except Exception:  # noqa: BLE001 - 单股失败不中断整个 fetch
