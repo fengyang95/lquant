@@ -9,6 +9,7 @@ import { fetcher, post } from '@/lib/api';
 import TasksPanel from './TasksPanel';
 import SourceConfigPanel from './SourceConfigPanel';
 import CrosscheckPanel from './CrosscheckPanel';
+import CoverageMonthlyChart from './CoverageMonthlyChart';
 
 type Cover = {
   tables: { table: string; label: string; rows: number | null; latest: string | null; error?: boolean }[];
@@ -139,6 +140,8 @@ export default function DataPage() {
           </div>
         </Panel>
       )}
+
+      <CoverageMonthlyChart />
 
       <Panel title="采集表覆盖度">
         {!data?.tables.length ? (

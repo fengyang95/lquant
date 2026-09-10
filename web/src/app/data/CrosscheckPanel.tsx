@@ -7,8 +7,9 @@ import { Empty, Msg } from '@/components/States';
 import { fetcher, post } from '@/lib/api';
 import type { CrosscheckResult, QualityIssue } from './types';
 
-/** 跨源印证卡：触发对拍 + 最近一次 summary + 分歧明细（issues）+ 逐条 resolve。
- *  后端 issues 不含字段级 primary/peer 原值，明细列展示规则/级别/说明。 */
+/** 跨源印证卡：触发对拍 + 最近一次 summary + 字段级分歧明细（issues）+ 逐条 resolve。
+ *  CROSS_SRC_DIFF 类 issue 的 detail 携带字段级明细（field/primary/peer/deviation_pct），
+ *  由后端 Issue.extra 落库；缺失（如旧数据或非对拍规则）时对应列显示 —。 */
 export default function CrosscheckPanel() {
   const { data: issues, mutate: mutateIssues } = useSWR<QualityIssue[]>(
     '/data/crosscheck/issues?limit=200',
@@ -88,34 +89,52 @@ export default function CrosscheckPanel() {
               <tr>
                 <th className="text-left">标的</th>
                 <th className="text-left">日期</th>
+                <th className="text-left">字段</th>
+                <th className="text-right">主源</th>
+                <th className="text-right">peer</th>
+                <th className="text-right">偏差%</th>
                 <th className="text-left">级别</th>
-                <th className="text-left">规则 / 说明</th>
+                <th className="text-left">说明</th>
                 <th className="w-16 text-right">操作</th>
               </tr>
             </thead>
             <tbody>
-              {issues.map((it) => (
-                <tr key={it.issue_id}>
-                  <td className="font-mono text-xs">{it.symbol ?? '—'}</td>
-                  <td className="text-xs">{it.trade_date ?? '—'}</td>
-                  <td className={`text-xs ${it.severity === 'error' ? 'text-up' : 'text-gold'}`}>
-                    {it.severity === 'error' ? 'L3 严重' : 'L2 可疑'}
-                  </td>
-                  <td className="text-xs text-ink-dim">
-                    {it.rule_code}
-                    {it.detail?.message ? ` · ${it.detail.message}` : ''}
-                  </td>
-                  <td className="text-right">
-                    <button
-                      className="btn btn-sm"
-                      onClick={() => resolve(it.issue_id)}
-                      disabled={resolving === it.issue_id}
-                    >
-                      {resolving === it.issue_id ? '…' : '忽略'}
-                    </button>
-                  </td>
-                </tr>
-              ))}
+              {issues.map((it) => {
+                const d: QualityIssue['detail'] = it.detail ?? {};
+                const dev = typeof d.deviation_pct === 'number'
+                  ? `${d.deviation_pct.toFixed(2)}%`
+                  : '—';
+                const fmtVal = (v: unknown) =>
+                  v == null ? '—'
+                    : typeof v === 'number' ? String(v)
+                      : String(v);
+                return (
+                  <tr key={it.issue_id}>
+                    <td className="font-mono text-xs">{it.symbol ?? '—'}</td>
+                    <td className="text-xs">{it.trade_date ?? '—'}</td>
+                    <td className="font-mono text-xs">{d.field ?? '—'}</td>
+                    <td className="text-right font-mono text-xs">{fmtVal(d.primary)}</td>
+                    <td className="text-right font-mono text-xs">{fmtVal(d.peer)}</td>
+                    <td className={`text-right font-mono text-xs ${dev === '—' ? 'text-ink-faint' : 'text-gold'}`}>{dev}</td>
+                    <td className={`text-xs ${it.severity === 'error' ? 'text-up' : 'text-gold'}`}>
+                      {it.severity === 'error' ? 'L3 严重' : 'L2 可疑'}
+                    </td>
+                    <td className="max-w-40 truncate text-xs text-ink-dim" title={d.message}>
+                      {it.rule_code}
+                      {d.message ? ` · ${d.message}` : ''}
+                    </td>
+                    <td className="text-right">
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => resolve(it.issue_id)}
+                        disabled={resolving === it.issue_id}
+                      >
+                        {resolving === it.issue_id ? '…' : '忽略'}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

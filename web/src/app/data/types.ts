@@ -42,7 +42,8 @@ export type CrosscheckResult = {
   flagged_rows: number;
 };
 
-/** 数据质量 issue（GET /data/crosscheck/issues，未持久化 primary/peer 原值与偏差%） */
+/** 数据质量 issue（GET /data/crosscheck/issues）。
+ *  字段级对拍明细来自 detail（Issue.extra），CROSS_SRC_DIFF 类 issue 才有 */
 export type QualityIssue = {
   issue_id: string;
   dataset: string;
@@ -50,8 +51,15 @@ export type QualityIssue = {
   trade_date: string | null;
   rule_code: string;
   severity: string;
-  /** 后端存 JSON（如 {"message": "..."}），非纯字符串 */
-  detail: { message?: string } & Record<string, unknown>;
+  /** 后端存 JSON（如 {"message": "..."}），CROSS_SRC_DIFF 附带 field/primary/peer/deviation_pct/level */
+  detail: {
+    message?: string;
+    field?: string;
+    primary?: number | string | null;
+    peer?: number | string | null;
+    deviation_pct?: number | null;
+    level?: string;
+  } & Record<string, unknown>;
   count: number;
   resolved: boolean;
   created_at: string;
