@@ -14,7 +14,9 @@
             order_target_value(s, context.portfolio.total_value / 2)
 
 兼容面（日频子集）：
-    生命周期   initialize / handle_data / run_daily / run_weekly / run_monthly
+    生命周期   initialize / handle_data / before_trading_start / after_trading_end
+               run_daily / run_weekly / run_monthly
+    采集       record(**kv)（每日每键一条 (trade_date, value) 自定义曲线）
     设置       set_benchmark / set_option / set_order_cost / set_slippage / set_universe
     下单       order / order_value / order_target / order_target_value / cancel_order
     行情       get_price / history / attribute_history / get_current_data
@@ -47,6 +49,7 @@ from lquant.backtest.metrics import perf_from_returns, turnover_from_trades
 from lquant.backtest.rules.model import Commission, TaxSchedule
 from lquant.backtest.slippage import PctSlippage, TickSlippage
 from lquant.core.types import parse_symbol
+from lquant.factors.panel import compute_factor_columns
 
 __all__ = ["JQRunner", "JQResult"]
 
@@ -61,6 +64,7 @@ class JQResult:
     positions: dict[date, dict[str, float]] = field(default_factory=dict)
     metrics: dict = field(default_factory=dict)
     logs: list[str] = field(default_factory=list)
+    records: dict[str, list[tuple[date, float]]] = field(default_factory=dict)
     error: str | None = None
 
     def to_frame(self) -> pl.DataFrame:
@@ -289,12 +293,14 @@ class JQRunner:
 
     def __init__(self, code: str, *, initial_cash: float = 1_000_000.0,
                  benchmark: str = "000300.SH", rebalance: str = "none",
-                 participation: float = 0.1, ruleset=None) -> None:
+                 participation: float = 0.1, ruleset=None,
+                 factor_formulas: list[str] | None = None) -> None:
         self.code = code
         self.initial_cash = initial_cash
         self.default_benchmark = benchmark
         self._ruleset = ruleset
         self._participation = participation
+        self._factor_formulas = [str(f) for f in (factor_formulas or [])]
 
         # 运行期状态
         self.account = Account(cash=initial_cash)
@@ -307,6 +313,7 @@ class JQRunner:
         self._day_index = 0
         self._dates: list[date] = []
         self._bars_by_day: dict[date, dict[str, Bar]] = {}
+        self._factor_panels: dict[str, dict[tuple[date, str], float]] = {}
 
         # 用户代码命名空间（exec 共享 globals，模块级变量等价聚宽的 g.*）
         self.ns: dict = {"__name__": "__jq__", "g": type("G", (), {})()}
@@ -322,6 +329,8 @@ class JQRunner:
             raise ValueError(f"策略代码执行失败: {e}\n{traceback.format_exc(limit=4)}") from e
         self._initialize_fn = self.ns.get("initialize")
         self._handle_data_fn = self.ns.get("handle_data")
+        self._before_trading_fn = self.ns.get("before_trading_start")
+        self._after_trading_fn = self.ns.get("after_trading_end")
         self._sched: list[tuple] = []          # run() 里 initialize 之后构建
 
     def _build_sched(self) -> None:
@@ -428,8 +437,10 @@ class JQRunner:
             run_daily=run_daily, run_weekly=run_weekly, run_monthly=run_monthly,
             order=order, order_value=order_value, order_target=order_target,
             order_target_value=order_target_value, cancel_order=cancel_order,
+            record=lambda **kv: r._record(kv),
             get_current_data=get_current_data, history=history,
             attribute_history=attribute_history, get_price=get_price,
+            get_factor_values=r._get_factor_values,
             get_all_securities=get_current_user_query_result,
             get_Ashares=get_current_user_query_result,
             FixedSlippage=FixedSlippage, PriceRelatedSlippage=PriceRelatedSlippage,
@@ -439,6 +450,32 @@ class JQRunner:
         ns["context"] = self.context
 
     # ---- 内部工具 ----
+
+    def _record(self, kv: dict) -> None:
+        """record(**kv)：自定义曲线采集，每日每键一条 (trade_date, value)。
+
+        非有限值（NaN/Inf）静默跳过，避免污染曲线序列。
+        """
+        for k, v in kv.items():
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(fv):
+                continue
+            self.res.records.setdefault(str(k), []).append((self._today, fv))
+
+    def _run_hook(self, fn, d: date, when: str) -> str | None:
+        """跑生命周期钩子；异常时返回错误文本（调用方置 res.error 并终止）。"""
+        self._bucket = "open" if when == "open" else "close"
+        self.context.current_dt = datetime.combine(
+            d, dtime(9, 30) if when == "open" else dtime(15, 0))
+        try:
+            fn(self.context) if fn.__code__.co_argcount else fn()
+        except Exception as e:                    # noqa: BLE001
+            name = getattr(fn, "__name__", "?")
+            return (f"{d} {when} 钩子 {name} 异常: {e}\n{traceback.format_exc(limit=4)}")
+        return None
 
     def _round_lot(self, sym: str, qty: float) -> float:
         rules = self._rules.get(sym)
@@ -643,12 +680,50 @@ class JQRunner:
 
     # ---- 主循环 ----
 
+    def _get_factor_values(self, formula: str, security_list=None,
+                           count: int = 1) -> dict[str, list[float]]:
+        """聚宽 get_factor_values：{security: [值...]}，严格截至当日（无未来函数）。"""
+        f = str(formula).upper()
+        panel = self._factor_panels.get(f)
+        if panel is None:
+            raise ValueError(f"因子 {formula} 未注册（回测请求需带 factor_formulas）")
+        secs = [str(s) for s in (security_list or sorted(self._bars_today))]
+        i = self._day_index
+        out: dict[str, list[float]] = {}
+        for s in secs:
+            out[s] = [panel[(self._dates[j], s)]
+                      for j in range(max(0, i - int(count) + 1), i + 1)
+                      if (self._dates[j], s) in panel]
+        return out
+
+    def _build_factor_panels(self, raw_df: pl.DataFrame | None
+                             ) -> dict[str, dict[tuple[date, str], float]]:
+        """一次性算好全部因子面板 {formula.upper(): {(date, symbol): value}}。"""
+        if not self._factor_formulas or raw_df is None:
+            return {}
+        df2, colmap = compute_factor_columns(raw_df, self._factor_formulas)
+        panels: dict[str, dict[tuple[date, str], float]] = {}
+        for f, col in colmap.items():
+            sub = df2.select(["trade_date", "symbol", col]).drop_nulls()
+            # NaN（如停牌前 pct_change 的溢出值）与 null 一并剔除
+            sub = sub.filter(pl.col(col).is_not_nan())
+            panels[f.upper()] = {(r[0], r[1]): float(r[2]) for r in sub.iter_rows()}
+        return panels
+
+
     def run(self, data) -> JQResult:
+        if self._factor_formulas and not isinstance(data, pl.DataFrame):
+            raise ValueError(
+                "factor_formulas 需要 DataFrame 输入（bars_by_day dict 不支持因子面板）")
+        raw_df = data if isinstance(data, pl.DataFrame) else None
         bars_by_day = data if isinstance(data, dict) else Engine.prepare(data)
         self._bars_by_day = bars_by_day
         self._dates = sorted(bars_by_day)
         if not self._dates:
             return self.res
+
+        # 因子面板：panel.compute_factor_columns 统一算内置/DSL 因子（一次，主循环外）
+        self._factor_panels = self._build_factor_panels(raw_df)
 
         symbols = sorted({s for b in bars_by_day.values() for s in b})
         self.account = Account(cash=self.initial_cash)
@@ -678,13 +753,18 @@ class JQRunner:
         self._rules = build_rules(symbols, ruleset)
         self._broker = Broker(self._rules, self._slippage)
 
-        prev_nav = self.initial_cash
         for i, d in enumerate(self._dates):
             self._today = d
             self._day_index = i
             self._bars_today = bars_by_day[d]
             self.context.current_dt = datetime.combine(d, dtime(9, 30))
             self.context.previous_date = self._dates[i - 1] if i > 0 else None
+
+            # 盘前钩子（bucket=open）
+            if self._before_trading_fn and (err := self._run_hook(
+                    self._before_trading_fn, d, "open")):
+                self.res.error = err
+                return self.res
 
             for fn, bucket in self._due_funcs(d, i):
                 self._bucket = bucket
@@ -699,17 +779,27 @@ class JQRunner:
                                       f"异常: {e}\n{traceback.format_exc(limit=4)}")
                     return self.res
 
+            # 盘后钩子（bucket=close）
+            if self._after_trading_fn and (err := self._run_hook(
+                    self._after_trading_fn, d, "close")):
+                self.res.error = err
+                return self.res
+
             # 收盘估值 + 持仓快照
-            self._bucket = "close"
-            prices = {s: b.close for s, b in self._bars_today.items()}
-            nav = self.account.nav(prices)
-            if nav > 0:
-                self.res.nav.append((d, nav))
-            prev_nav = nav
-            self.res.positions[d] = {s: p.qty for s, p in self.account.positions.items() if p.qty}
+            self._settle(d)
 
         self._finalize()
         return self.res
+
+    def _settle(self, d: date) -> None:
+        """收盘估值 + 持仓快照。"""
+        self._bucket = "close"
+        prices = {s: b.close for s, b in self._bars_today.items()}
+        nav = self.account.nav(prices)
+        if nav > 0:
+            self.res.nav.append((d, nav))
+        self.res.positions[d] = {
+            s: p.qty for s, p in self.account.positions.items() if p.qty}
 
     def _finalize(self) -> None:
         rets = [self.res.nav[i][1] / self.res.nav[i - 1][1] - 1
