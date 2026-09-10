@@ -13,7 +13,8 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from lquant.core.db import reader
-from lquant.data.ingest.tasks import (
+from lquant.data.ingest import tasks as ingest_tasks
+from lquant.data.ingest.tasks import (  # noqa: F401  execute_task/run_claimed_task 保留模块属性供测试打桩
     TaskConflictError,
     claim_retry,
     create_task,
@@ -283,7 +284,7 @@ def create_data_task(req: TaskIn) -> dict:
         raise HTTPException(409, str(e)) from e
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
-    enqueue("lquant-ingest", execute_task, task["task_id"])
+    enqueue("lquant-ingest", ingest_tasks.execute_task, task["task_id"])
     return {"task_id": task["task_id"]}
 
 
@@ -313,6 +314,9 @@ def retry_data_task(task_id: str) -> dict:
     task = get_task(task_id)
     if task is None:
         raise HTTPException(404, f"任务不存在: {task_id}")
+    if task["status"] == "pending":
+        # 排队中的任务走任务中心重跑；本端点保留旧口径（pending → 409）
+        raise HTTPException(409, f"任务 {task_id} 排队中（pending），不可 retry")
     if task["status"] == "ok":
         raise HTTPException(422, f"任务 {task_id} 状态 ok 不可 retry")
     try:
@@ -321,7 +325,7 @@ def retry_data_task(task_id: str) -> dict:
         raise HTTPException(409, str(e)) from e
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
-    enqueue("lquant-ingest", run_claimed_task, task_id)
+    enqueue("lquant-ingest", ingest_tasks.run_claimed_task, task_id)
     return {"task_id": task_id}
 
 

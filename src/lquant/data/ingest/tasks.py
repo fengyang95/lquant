@@ -134,13 +134,11 @@ def create_task(kind: str, params: dict | None = None) -> dict:
         raise ValueError(f"未知任务类型: {kind!r}（可选 {_KINDS}）")
     p = dict(params or {})
     start, end = _resolve_range(kind, p)
-    stored = {
-        "start": str(start),
-        "end": str(end),
-        "days": p.get("days"),
-        "market": p.get("market"),
-        "auto_crosscheck": p.get("auto_crosscheck", True),
-    }
+    # 保留调用方自定义键（如 note 标记），start/end 以解析后的规范值落库
+    stored = {**{k: v for k, v in p.items() if k not in ("start", "end")},
+              "start": str(start), "end": str(end),
+              "days": p.get("days"), "market": p.get("market"),
+              "auto_crosscheck": p.get("auto_crosscheck", True)}
     with writer() as con:
         _ensure_table(con)
         active = con.execute(
@@ -343,30 +341,41 @@ def _auto_crosscheck(task_id: str, start: date, end: date) -> None:
         logger.warning(f"任务 {task_id} 自动对拍失败（忽略）: {e}")
 
 
-def claim_retry(task_id: str) -> dict:
+def claim_retry(task_id: str, params: dict | None = None,
+                allow_finished: bool = False) -> dict:
     """原子认领 retry：一条 UPDATE check-and-update 到 running（含计数清零），
     并 unmark 失败标的 checkpoint。
 
-    消除端点「先预检再入队」的 TOCTOU：竞争失败（状态已不是 retriable，
+    消除端点「先预检再入队」的 TOCTOU：竞争失败（状态已不是可认领态，
     或已被其他请求抢先）抛 TaskConflictError，不存在抛 ValueError。
+    pending（排队未启动）也视为可认领 —— retry 排队中的任务等价于重新认领。
+    allow_finished=True 时 ok（已完成）也可认领 —— 任务中心「重跑（可改配置）」
+    语义；默认拒绝，补漏型 retry 仍不接受已完成任务。
+    params 非空时合并覆盖任务参数（重跑前改配置）。
     返回认领后的 task。
     （认领后若进程崩溃，任务残留 running，由 mark_interrupted_on_startup 兜底恢复）
     """
     task = get_task(task_id)
     if task is None:
         raise ValueError(f"任务不存在: {task_id}")
+    # 参数合并：调用方给了 params 就按 key 覆盖旧参数（重跑前改配置）
+    stored = {**(task.get("params") or {}), **(params or {})}
+    stored_json = json.dumps(stored, ensure_ascii=False)
+    claimable = ("pending", "partial", "failed", "interrupted")
+    if allow_finished:
+        claimable = (*claimable, "ok")
     with writer() as con:
         _ensure_table(con)
         res = con.execute(
             "UPDATE data_task SET status='running', phase=NULL, done_symbols=0, "
             "failed_symbols='[]'::JSON, failed_detail='[]'::JSON, rows_written=0, "
-            "started_at=?, finished_at=NULL, message=NULL "
-            "WHERE task_id=? AND status IN ('partial', 'failed', 'interrupted')",
-            [datetime.now(), task_id],
+            "params=?, started_at=?, finished_at=NULL, message=NULL "
+            f"WHERE task_id=? AND status IN {claimable}",
+            [stored_json, datetime.now(), task_id],
         ).fetchone()
     if not res or not res[0]:
         raise TaskConflictError(
-            f"任务 {task_id} 状态不可 retry（需 partial/failed/interrupted），"
+            f"任务 {task_id} 状态不可 retry（需 {','.join(claimable)}），"
             "或已被其他操作抢先")
     failed = task["failed_symbols"] or []
     if failed:
