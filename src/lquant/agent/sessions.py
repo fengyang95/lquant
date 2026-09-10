@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS ask_sessions (
     id           TEXT PRIMARY KEY,
     title        TEXT NOT NULL DEFAULT '新会话',
     context_json TEXT NOT NULL DEFAULT '{}',
-    created_at   TEXT NOT NULL
+    created_at   TEXT NOT NULL,
+    claude_session_id TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS ask_messages (
     id              TEXT PRIMARY KEY,
@@ -27,6 +28,16 @@ CREATE TABLE IF NOT EXISTS ask_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_ask_messages_sid ON ask_messages(session_id, created_at);
 """
+
+
+async def _migrate(db: aiosqlite.Connection) -> None:
+    """幂等迁移：老库缺列则补上（新建库由 _DDL 直接带列）。"""
+    try:
+        await db.execute(
+            "ALTER TABLE ask_sessions ADD COLUMN claude_session_id TEXT NOT NULL DEFAULT ''")
+        await db.commit()
+    except aiosqlite.OperationalError:
+        pass  # 列已存在
 
 
 def _now() -> str:
@@ -46,6 +57,7 @@ class SessionStore:
                 db = await aiosqlite.connect(self._path)
                 await db.execute("PRAGMA foreign_keys = ON")
                 await db.executescript(_DDL)
+                await _migrate(db)
                 await db.commit()
             except BaseException:
                 if db is not None:
@@ -130,4 +142,19 @@ class SessionStore:
     async def delete_messages(self, sid: str) -> None:
         con = await self._conn()
         await con.execute("DELETE FROM ask_messages WHERE session_id=?", (sid,))
+        await con.commit()
+
+    async def get_claude_session_id(self, sid: str) -> str | None:
+        con = await self._conn()
+        cur = await con.execute(
+            "SELECT claude_session_id FROM ask_sessions WHERE id=?", (sid,))
+        r = await cur.fetchone()
+        if r is None:
+            return None
+        return r[0] or None
+
+    async def set_claude_session_id(self, sid: str, claude_sid: str) -> None:
+        con = await self._conn()
+        await con.execute(
+            "UPDATE ask_sessions SET claude_session_id=? WHERE id=?", (claude_sid, sid))
         await con.commit()

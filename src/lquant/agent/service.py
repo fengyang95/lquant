@@ -49,6 +49,12 @@ async def get_agent_service() -> AgentService:
             from lquant.agent.mock import MockAgentService  # noqa: PLC0415
 
             _cache["service"] = MockAgentService(store)
+        elif provider == "claude_code":
+            from lquant.agent.claude_code import (  # noqa: PLC0415
+                ClaudeCodeAgentService,
+            )
+
+            _cache["service"] = ClaudeCodeAgentService(store)
         else:
             raise AgentError(f"未知 agent provider: {provider}")
     return _cache["service"]
