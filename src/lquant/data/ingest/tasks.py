@@ -20,6 +20,7 @@ from typing import Any
 import duckdb
 
 from lquant.core.db import reader, writer
+from lquant.core.types import today_cn
 from lquant.data.ingest.checkpoint import Checkpoint
 from lquant.data.ingest.daily import backfill_pool
 
@@ -76,7 +77,7 @@ def _parse_date(raw: Any, label: str) -> date:
 
 def _resolve_range(kind: str, p: dict) -> tuple[date, date]:
     """解析时间范围：daily_update 默认回看 days 天；start 显式给出时优先。"""
-    today = date.today()
+    today = today_cn()
     if "start" in p and p["start"] is not None:
         start = _parse_date(p["start"], "起始日期")
     elif kind == "daily_update":
@@ -270,7 +271,7 @@ def _run_task(task_id: str) -> dict:
     params = task["params"]
     start = _parse_date(params["start"], "起始日期")
     end = (_parse_date(params["end"], "结束日期") if params.get("end")
-           else date.today())
+           else today_cn())
     cp = Checkpoint(f"daily:{task_id}")
     with reader() as con:
         phases = _pool_from_con(con, task["kind"], start, end)

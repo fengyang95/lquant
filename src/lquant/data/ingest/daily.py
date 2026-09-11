@@ -20,7 +20,7 @@ import polars as pl
 
 from lquant.core.config import get_settings
 from lquant.core.errors import DataQualityError
-from lquant.core.types import now_cn
+from lquant.core.types import now_cn, today_cn
 from lquant.data.ingest.checkpoint import Checkpoint
 from lquant.data.store.parquet import write_daily
 
@@ -205,7 +205,7 @@ def backfill_daily(
     from lquant.data.store.catalog import SecurityRepo
 
     s = get_settings()
-    end_d = date.fromisoformat(end) if end else date.today()
+    end_d = date.fromisoformat(end) if end else today_cn()
     start_d = date.fromisoformat(start)
 
     symbols = SecurityRepo().active_symbols()
@@ -226,7 +226,9 @@ def backfill_daily(
 
 def _provider_source(provider) -> str:
     """实际使用的源名（血缘 source 字段）：优先 source key，回落 name。"""
-    return getattr(provider, "source", "") or getattr(provider, "name", "baostock")
+    from lquant.data.base import source_name
+
+    return source_name(provider)
 
 
 def _stamp(df: pl.DataFrame, source: str = "baostock") -> pl.DataFrame:

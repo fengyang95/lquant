@@ -178,7 +178,22 @@ class SettingsStore:
                 f'ON CONFLICT (setting_key) DO UPDATE SET setting_value = excluded.setting_value, '
                 "source = 'runtime', updated_at = now()",
                 [key, coerced])
+        self._invalidate_provider_cache(key)
         return {"key": key, "value": _parse(SETTING_DEFS[key], coerced)}
+
+    @staticmethod
+    def _invalidate_provider_cache(key: str) -> None:
+        """影响 provider 链的配置写入后立刻失效 build_chain 缓存。
+
+        providers_order 决定 Fallback 链顺序（首位 = 主源），crosscheck_peers
+        决定对拍 peer。不失效的话 lru_cache 会让「保存并立即生效」变成
+        「重启才生效」——设计契约要求改完下一次拉取即生效。
+        """
+        if key not in ("providers_order", "crosscheck_peers"):
+            return
+        from lquant.data.providers import reset_chain
+
+        reset_chain()
 
     def _validate_extra(self, key: str, coerced: str) -> None:
         """类型之外的业务校验（key 特有），非法 → ValueError。
@@ -199,3 +214,4 @@ class SettingsStore:
 
         with writer() as con:
             con.execute(f'DELETE FROM "{self.table}" WHERE setting_key = ?', [key])
+        self._invalidate_provider_cache(key)

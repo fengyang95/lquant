@@ -174,13 +174,15 @@ def _financial_frame(items: dict[Column, str], symbols: list[str] | None,
 def _valuation_frame(cols: list[Column], symbols: list[str] | None,
                      day: _date) -> dict[Column, dict[str, float]]:
     """{Column: {symbol: value}}，从日线取 trade_date <= day 最近一根 bar。"""
-    from lquant.data.store.parquet import read_daily
+    from lquant.data.store.parquet import lake_is_empty, read_daily
 
     if not cols:
         return {}
+    # 全新 checkout：日线库为空，返回空表。用显式的湖空判定，而不是
+    # 「读出来是空帧」—— 后者在湖有数据但该区间无标的时同样成立。
+    if lake_is_empty("daily"):
+        return {c: {} for c in cols}
     lf = read_daily(symbols=symbols, end=day)
-    if not lf.collect_schema().names():
-        return {c: {} for c in cols}      # 全新 checkout：日线库为空，返回空表
     colnames = sorted({_VALUATION_MAP[c.name] for c in cols})
     last = (lf.filter(pl.col("trade_date") <= day)
               .sort("trade_date")
