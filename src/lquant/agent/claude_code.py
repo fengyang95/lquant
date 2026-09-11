@@ -135,10 +135,12 @@ class ClaudeCodeAgentService(AgentService):
         ans_msg = await self.store.add_message(sid, "assistant", "")
         started = time.monotonic()
         saw_done = False
+        error_text = ""  # kind=error 时记录，收尾跳过二次 fail
         try:
             while True:
                 if time.monotonic() - started > self._timeout:
-                    proc.terminate()
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.terminate()
                     tail = "\n".join(stderr_lines[-5:])[-400:]
                     await self._fail_with(sid, ans_msg.id,
                                           f"执行超时；stderr 梗概：{tail}")
@@ -173,18 +175,24 @@ class ClaudeCodeAgentService(AgentService):
                         await on_event(AgentEvent(
                             type="done", message_id=ans_msg.id))
                     elif kind == "error":
-                        await self.store.add_message(sid, "assistant", ev["text"])
-                        await on_event(AgentEvent(type="error", message=ev["text"]))
+                        error_text = ev["text"]
+                        # 与 done 对齐：错误文本复用增量消息，只发一次 error 事件
+                        await self.store.append_assistant_delta(
+                            sid, ans_msg.id, ev["text"])
+                        await self.store.finish_assistant(sid, ans_msg.id)
+                        await on_event(AgentEvent(
+                            type="error", message=ev["text"]))
         finally:
             if proc.returncode is None:
-                proc.terminate()
+                with contextlib.suppress(ProcessLookupError):
+                    proc.terminate()
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
             stderr_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, TimeoutError):
                 await asyncio.wait_for(stderr_task, timeout=2.0)
             self._procs.pop(sid, None)
-        if not saw_done:
+        if not saw_done and not error_text:
             tail = "\n".join(stderr_lines[-5:])[-400:]
             await self._fail_with(sid, ans_msg.id,
                                   f"claude CLI 未正常收尾；stderr 梗概：{tail}")

@@ -7,6 +7,7 @@ CLAUDE.md（角色与数据访问优先级）、.claude/mcp.json（lquant MCP se
 
 import json
 import shutil
+import sys
 from pathlib import Path
 
 _MCP_SERVER_ARGS = ["-m", "lquant.agent.mcp_server"]
@@ -41,7 +42,7 @@ def _write_mcp_json(workspace: Path, root: Path) -> None:
         "mcpServers": {
             "lquant": {
                 "type": "stdio",
-                "command": "python",
+                "command": sys.executable,
                 "args": _MCP_SERVER_ARGS,
                 "env": {
                     "LQ_ROOT": str(root),

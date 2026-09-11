@@ -1,6 +1,7 @@
 """workspace.ensure_workspace 的单元测试。"""
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -40,7 +41,7 @@ def test_mcp_json_structure(root: Path) -> None:
     data = json.loads((ws / ".claude" / "mcp.json").read_text(encoding="utf-8"))
     server = data["mcpServers"]["lquant"]
     assert server["type"] == "stdio"
-    assert server["command"] == "python"
+    assert server["command"] == sys.executable
     assert server["args"] == ["-m", "lquant.agent.mcp_server"]
     assert server["env"]["LQ_ROOT"] == str(root)
     assert server["env"]["PYTHONPATH"] == str(root / "src")

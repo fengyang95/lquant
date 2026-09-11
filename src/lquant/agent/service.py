@@ -1,6 +1,7 @@
 """AgentService 抽象与工厂。claude code 接入方实现同一接口。"""
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 
@@ -36,6 +37,8 @@ class AgentService(ABC):
 
 _cache: dict[str, AgentService] = {}
 
+_WARNED_PROVIDERS: set[str] = set()
+
 
 async def get_agent_service() -> AgentService:
     """按 settings.agent.provider 选实现；单例缓存。"""
@@ -54,6 +57,11 @@ async def get_agent_service() -> AgentService:
                 ClaudeCodeAgentService,
             )
 
+            if provider not in _WARNED_PROVIDERS:
+                logging.getLogger(__name__).warning(
+                    "claude_code provider 以 --dangerously-skip-permissions 全自主运行："
+                    "该权限边界仅限本地单人环境，勿将服务暴露到非本机地址")
+                _WARNED_PROVIDERS.add(provider)
             _cache["service"] = ClaudeCodeAgentService(store)
         else:
             raise AgentError(f"未知 agent provider: {provider}")
