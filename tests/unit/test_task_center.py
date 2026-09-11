@@ -192,6 +192,172 @@ def test_factor_mine_run_async(client, monkeypatch):
     assert row is not None
 
 
+def _wait_status(getter, pred, timeout=5.0, interval=0.02):
+    """轮询等待异步（本地线程）执行到位，超时抛 AssertionError。"""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        v = getter()
+        if pred(v):
+            return v
+        time.sleep(interval)
+    raise AssertionError(f"等待状态超时: {getter()!r}")
+
+
+def test_list_rejects_unknown_kind_422(client):
+    """kind 非法（不在 KINDS）→ 422，与端点 _items 的兜底一致。"""
+    r = client.get("/api/tasks", params={"kind": "bogus"})
+    assert r.status_code == 422
+    assert "未知任务类别" in r.text
+
+
+def test_list_limit_validation(client):
+    """limit 边界：ge=1/le=500，越界 422；合法 limit 生效。"""
+    for bad in ("0", "-1", "501"):
+        r = client.get("/api/tasks", params={"limit": bad})
+        assert r.status_code == 422, (bad, r.status_code)
+    r = client.get("/api/tasks", params={"limit": 1})
+    assert r.status_code == 200
+    assert len(r.json()) <= 1
+
+
+def test_retry_non_data_kind_422(client):
+    """retry 仅支持 data：backtest/factor 类别 → 422。"""
+    r = client.post("/api/tasks/backtest/whatever/retry", json={"params": {}})
+    assert r.status_code == 422
+    assert "暂不支持 retry" in r.text
+
+
+def _clear_active_tasks() -> None:
+    """把遗留的 pending/running 数据任务落成 ok 终态。
+
+    create_task 有「同时仅一个未完成任务」互斥；前面的用例可能故意留下
+    running 态任务（如 retry 语义用例），不清掉后续创建会 409。
+    """
+    from lquant.data.ingest.tasks import _finalize, list_tasks
+
+    for t in list_tasks(50):
+        if t["status"] in ("pending", "running"):
+            _finalize(t["task_id"], total=0, failed_all=[], early=False,
+                      done_count=0)
+
+
+def _wait_task_status(tid, pred, timeout=5.0):
+    """轮询等待数据任务落到预期状态（本地线程异步执行有延迟）。"""
+    from lquant.data.ingest.tasks import get_task
+
+    return _wait_status(lambda: get_task(tid)["status"], pred, timeout)
+
+
+def test_retry_running_task_409(client):
+    """running 态任务不可 retry（claim_retry 原子认领失败）→ 409 TaskConflictError。"""
+    _clear_active_tasks()
+    from lquant.data.ingest.tasks import _finalize, get_task
+
+    r = client.post("/api/data/tasks", json={"kind": "daily_update",
+                                             "params": {"days": 3}})
+    tid = r.json()["task_id"]
+    # 第一次 retry：ok/pending → running（stub 执行体不动 running 任务）
+    rr = client.post(f"/api/tasks/data/{tid}/retry", json={"params": {}})
+    assert rr.status_code == 202, rr.text
+    assert get_task(tid)["status"] == "running"
+    # 第二次 retry：running 不在可认领集合 → 409
+    rc = client.post(f"/api/tasks/data/{tid}/retry", json={"params": {}})
+    assert rc.status_code == 409, rc.text
+    # stub 执行体不处理 running 任务 —— 收尾落 ok，避免 mutex 卡死后续用例
+    _finalize(tid, total=0, failed_all=[], early=False, done_count=0)
+    _wait_task_status(tid, lambda s: s == "ok")
+
+
+def test_retry_without_body_keeps_params(client):
+    """retry 无请求体（req=None）：参数原样保留，仍 202。"""
+    _clear_active_tasks()
+    from lquant.data.ingest.tasks import _finalize
+
+    r = client.post("/api/data/tasks", json={"kind": "daily_update",
+                                             "params": {"days": 2, "note": "keep"}})
+    tid = r.json()["task_id"]
+    rr = client.post(f"/api/tasks/data/{tid}/retry")
+    assert rr.status_code == 202, rr.text
+    from lquant.data.ingest.tasks import get_task
+
+    task = get_task(tid)
+    # create_task 落库时会补 start/end/market/auto_crosscheck 规范键，只比对原键
+    assert {k: task["params"][k] for k in ("days", "note")} == {"days": 2,
+                                                               "note": "keep"}
+    # 收尾落终态，避免 running 卡死后续用例的创建互斥
+    _finalize(tid, total=0, failed_all=[], early=False, done_count=0)
+    _wait_task_status(tid, lambda s: s == "ok")
+
+
+def test_failed_data_task_surfaces_error_in_list(client, monkeypatch):
+    """执行异常落 failed 的数据任务：列表 state=failed 且带 error 信息。"""
+    _clear_active_tasks()
+    from lquant.data.ingest import tasks as tasks_mod
+
+    def _boom(task_id):
+        tasks_mod._finalize(task_id, total=0, failed_all=[], early=False,
+                            done_count=0, error="模拟崩溃")
+
+    monkeypatch.setattr(tasks_mod, "run_claimed_task", _boom)
+    r = client.post("/api/data/tasks", json={"kind": "daily_update",
+                                             "params": {"days": 1}})
+    tid = r.json()["task_id"]
+    # noop 执行体（autouse）会瞬时完成；retry 换上 _boom 执行体制造 failed
+    rr = client.post(f"/api/tasks/data/{tid}/retry", json={"params": {}})
+    assert rr.status_code == 202, rr.text
+    _wait_status(lambda: tasks_mod.get_task(tid)["status"],
+                 lambda s: s == "failed")
+
+    items = client.get("/api/tasks", params={"kind": "data"}).json()
+    hit = next(x for x in items if x["id"] == tid)
+    assert hit["state"] == "failed"
+    assert hit["status"] == "failed"
+    assert "模拟崩溃" in (hit["error"] or "")
+
+
+def test_cancel_data_task_id_404(client):
+    """cancel 只作用于队列任务：data 任务 id 不在 job 注册表 → 404。"""
+    _clear_active_tasks()
+    r = client.post("/api/data/tasks", json={"kind": "daily_update",
+                                             "params": {"days": 1}})
+    tid = r.json()["task_id"]
+    rr = client.post(f"/api/tasks/data/{tid}/cancel")
+    assert rr.status_code == 404
+
+
+def test_summary_counts_canceled(client):
+    """summary 含 canceled 计数：取消的 sweep 计入 backtest.canceled。"""
+    r = client.post("/api/backtests/sweep", json={"formula": "pct_change_5",
+                                                  "param": "top_n",
+                                                  "values": [1],
+                                                  "rebalance": "monthly"})
+    sid = r.json()["sweep_id"]
+    rr = client.post(f"/api/tasks/backtest/{sid}/cancel")
+    assert rr.status_code == 200, rr.text
+
+    body = client.get("/api/tasks/summary").json()
+    bt = body["kinds"]["backtest"]
+    assert bt["canceled"] >= 1
+    assert set(bt) == {"total", "running", "failed", "succeeded", "canceled"}
+
+
+def test_ts_normalization_and_sort_order(client):
+    """created_at 归一：数值直用、ISO 字符串解析、非法串/空值兜底 0，倒序输出。"""
+    from lquant.server.api.task_center import _ts
+
+    assert _ts(1717000000.5) == 1717000000.5
+    assert _ts("2026-06-30T00:00:00") > 0
+    assert _ts("not-a-date") == 0.0
+    assert _ts("") == 0.0
+    assert _ts(None) == 0.0
+
+    items = client.get("/api/tasks").json()
+    keys = [_ts(x["created_at"]) for x in items]
+    assert keys == sorted(keys, reverse=True)
+
+
 def test_factor_mine_run_sync_mode(client, monkeypatch):
     """sync=true 保留旧行为：直接返回结果体。"""
     import types

@@ -10,3 +10,8 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { workspace = true }
 serde = { workspace = true }
+
+[features]
+# 见 lq-ops 同段注释：test 时需 --no-default-features 才会链接 libpython
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
