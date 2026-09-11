@@ -62,6 +62,69 @@ def sync_securities(day: date | None = None) -> int:
     return n
 
 
+def _ak_delist_module():
+    """akshare 退市接口入口（独立函数便于测试替身替换）。"""
+    import akshare  # noqa: PLC0415
+
+    return akshare
+
+
+def sync_delisted() -> int:
+    """退市股名单（akshare 沪深退市接口）。幂等 upsert。
+
+    快路径 sync_securities 只拿在市标的，退市股没有入口 → full_backfill
+    的「security 表没有退市股」前置校验必然失败。这里补上退市名单；
+    入表后慢路径 sync_security_details 会自动逐只补齐缺失字段。
+    """
+    from loguru import logger
+
+    ak = _ak_delist_module()
+    frames = []
+    for fetch, code_col, name_col, list_col, delist_col in (
+        (ak.stock_info_sh_delist, "公司代码", "公司简称", "上市日期", "暂停上市日期"),
+        (ak.stock_info_sz_delist, "证券代码", "证券简称", "上市日期", "终止上市日期"),
+    ):
+        try:
+            df = _normalize_delist(fetch(), code_col, name_col, list_col, delist_col)
+        except Exception as e:  # noqa: BLE001 - 单一交易所失败不拖垮另一家
+            logger.warning(f"退市名单获取失败（{code_col}）: {e}")
+            continue
+        if len(df):
+            frames.append(df)
+    if not frames:
+        logger.warning("退市名单返回为空")
+        return 0
+    df = pl.concat(frames).unique(subset=["symbol"], keep="first")
+    df = _merge_existing_details(df, keep_existing=True).with_columns(
+        source=pl.lit("akshare"),
+        updated_at=pl.lit(now_cn().replace(tzinfo=None), dtype=pl.Datetime),
+    )
+    n = SecurityRepo().upsert(df)
+    logger.info(f"退市股名单 {n} 只")
+    return n
+
+
+def _normalize_delist(df, code_col: str, name_col: str, list_col: str,
+                      delist_col: str) -> pl.DataFrame:
+    """交易所退市表 → security 表列（symbol 统一 000003.SZ 形态）。"""
+    from lquant.core.types import parse_symbol
+
+    if df is None or not len(df):
+        return pl.DataFrame()
+    out = pl.from_pandas(df) if not isinstance(df, pl.DataFrame) else df
+    return out.select(
+        pl.col(code_col).cast(pl.Utf8).str.strip_chars()
+        .map_elements(lambda s: str(parse_symbol(s)), return_dtype=pl.Utf8)
+        .alias("symbol"),
+        pl.col(name_col).cast(pl.Utf8).alias("name"),
+        pl.col(list_col).cast(pl.Utf8).str.to_date("%Y-%m-%d", strict=False)
+        .alias("list_date"),
+        pl.col(delist_col).cast(pl.Utf8).str.to_date("%Y-%m-%d", strict=False)
+        .alias("delist_date"),
+        pl.lit("stock").alias("sec_type"),
+    )
+
+
 def sync_security_details(limit: int | None = None, batch: int = 200) -> int:
     """慢路径：逐只补 ipoDate / outDate，断点续传。
 
@@ -105,16 +168,22 @@ def sync_security_details(limit: int | None = None, batch: int = 200) -> int:
 
 def sync_reference(skip_details: bool = False, detail_limit: int | None = None) -> dict:
     """一键补齐地基。返回各步写入行数，供 CLI/脚本打印。"""
-    out = {"calendar": sync_calendar(), "securities": sync_securities()}
+    out = {
+        "calendar": sync_calendar(),
+        "securities": sync_securities(),
+        "delisted": sync_delisted(),
+    }
     if not skip_details:
         out["details"] = sync_security_details(limit=detail_limit)
     return out
 
 
-def _merge_existing_details(df: pl.DataFrame) -> pl.DataFrame:
+def _merge_existing_details(df: pl.DataFrame, *, keep_existing: bool = False) -> pl.DataFrame:
     """保留库里已有的 list_date / delist_date，避免快路径把它们冲成 NULL。
 
     注意：INSERT OR REPLACE 是整行覆盖，不合并就会丢失慢路径的成果。
+    keep_existing=True（退市名单等官方口径与库内已有值冲突时以库内为准）：
+    旧值非空则完全保留，新值只补空缺。
     """
     try:
         with reader() as con:
@@ -124,16 +193,21 @@ def _merge_existing_details(df: pl.DataFrame) -> pl.DataFrame:
     if not len(old):
         return df
     joined = df.join(old, on="symbol", how="left")
+    new_list, old_list = (pl.col("list_date_right"), pl.col("list_date")) \
+        if keep_existing else (pl.col("list_date"), pl.col("list_date_right"))
+    new_delist, old_delist = (pl.col("delist_date_right"), pl.col("delist_date")) \
+        if keep_existing else (pl.col("delist_date"), pl.col("delist_date_right"))
     return joined.with_columns(
         list_date=pl.coalesce(
-            pl.col("list_date").cast(pl.Date, strict=False),
-            pl.col("list_date_right").cast(pl.Date, strict=False),
+            new_list.cast(pl.Date, strict=False),
+            old_list.cast(pl.Date, strict=False),
         ),
         delist_date=pl.coalesce(
-            pl.col("delist_date").cast(pl.Date, strict=False),
-            pl.col("delist_date_right").cast(pl.Date, strict=False),
+            new_delist.cast(pl.Date, strict=False),
+            old_delist.cast(pl.Date, strict=False),
         ),
     ).drop("list_date_right", "delist_date_right")
 
 
-__all__ = ["sync_calendar", "sync_securities", "sync_security_details", "sync_reference"]
+__all__ = ["sync_calendar", "sync_securities", "sync_delisted",
+           "sync_security_details", "sync_reference"]

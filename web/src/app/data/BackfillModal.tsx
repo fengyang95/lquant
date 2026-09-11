@@ -56,8 +56,7 @@ export default function BackfillModal({
         <h3 className="mb-1 font-song text-lg font-semibold">全量回填</h3>
         <p className="mb-4 text-xs text-ink-faint">
           按时间范围补齐日线湖（主源按 providers_order 依次尝试）。创建后后台执行，可关闭弹窗在任务列表看进度。
-        </p>
-        <div className="mb-3 grid grid-cols-2 gap-3">
+        </p>        <div className="mb-3 grid grid-cols-2 gap-3">
           <label className="text-sm">
             <span className="mb-1 block text-xs text-ink-faint">开始日期</span>
             <input
@@ -77,7 +76,16 @@ export default function BackfillModal({
             />
           </label>
         </div>
-        {err && <p className="mb-3 border-l-2 border-up bg-panel px-3 py-2 text-sm text-up">{err}</p>}
+        {err && (
+          <div className="mb-3 border-l-2 border-up bg-panel px-3 py-2 text-sm text-up">
+            <p>{err}</p>
+            {err.includes('退市股') && (
+              <p className="mt-1 text-xs text-ink-faint">
+                请先在页面右上角点击「同步全市场清单（含退市）」，待后台同步完成后再创建全量回填任务。
+              </p>
+            )}
+          </div>
+        )}
         <div className="flex justify-end gap-2">
           <button className="btn" onClick={onClose} disabled={busy}>
             取消

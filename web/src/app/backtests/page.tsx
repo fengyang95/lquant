@@ -1,316 +1,366 @@
 'use client';
 
 /**
- * 回测列表 —— 「研报台」版式：运行表单 + 记录表 + 多运行对比（B6）。
- * 数据逻辑（SWR / state / 接口）与旧版一致，仅重构呈现层。
+ * 回测工作台 —— 策略编辑 · 保存 · 编译运行 · 结果内联 三栏一体（Task 7 编排层）。
+ * 状态全部收在本页：三个 Pane 均为纯受控组件，handler 经 @/lib/api 直连后端。
  */
 
-import { useState } from 'react';
-import Link from 'next/link';
-import { useRouter } from 'next/navigation';
+import { Suspense, useEffect, useRef, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
 import useSWR from 'swr';
-import Chart from '@/components/Chart';
-import { Panel } from '@/components/Panel';
 import PageHeader from '@/components/PageHeader';
-import { Empty, ErrorNote } from '@/components/States';
-import { get, post } from '@/lib/api';
-import { SERIES_COLORS, axes, legend, tooltip } from '@/lib/chart';
+import { ErrorNote, Loading, Msg } from '@/components/States';
+import { del, get, post, putData } from '@/lib/api';
+import RunBar from './workspace/RunBar';
+import StrategyPane from './workspace/StrategyPane';
+import EditorPane from './workspace/EditorPane';
+import ResultPane from './workspace/ResultPane';
+import QuickRunPanel from './workspace/QuickRunPanel';
+import HistoryPanel from './workspace/HistoryPanel';
+import {
+  buildRunPayload,
+  isDirty,
+  parseFormulas,
+  type EditorParams,
+  type Snapshot,
+  type StrategyMeta,
+} from './workspace/state';
 
-type RunRow = {
-  run_id: string;
-  strategy: string;
-  params: { factor?: string; top_n?: number; rebalance?: string };
-  start_date: string;
-  end_date: string;
-  status: string;
-  metrics: Record<string, number>;
-  created_at: string;
-};
-
-type StrategyMeta = {
+type StrategyDetail = {
   id?: string;
   name: string;
-  source: 'builtin' | 'user';
   description?: string;
+  source?: string;
+  config?: Record<string, unknown>;
 };
 
 type RunCodeResult = { run_id: string };
 
-type CompareResult = {
-  runs: { run_id: string; label: string; metrics: Record<string, number> }[];
-  dates: string[];
-  series: Record<string, (number | null)[]>;
+const DQ_TEMPLATE = `# 双均线择时示例 —— lquant 用户策略
+# 可用 API: initialize / handle_data / run_daily / order / order_target_value
+#           record(**kv) / get_factor_values(formula, security_list, count) / log.info
+
+FACTOR = 'pct_change_20'
+
+
+def initialize(context):
+    context.security = '000300.SH'
+    context.count = 20
+    # 每日开盘前运行
+    run_daily(before_open, time='before_open')
+    log.info('策略初始化完成')
+
+
+def before_open(context):
+    # 拉取因子序列，计算动量
+    rows = get_factor_values(
+        formula=FACTOR,
+        security_list=[context.security],
+        count=context.count,
+    )
+    vals = rows.get(context.security) or []
+    context.momentum = vals[-1] if vals else 0.0
+    record(momentum=context.momentum)
+
+
+def handle_data(context):
+    # 动量为正持有，为负清仓（T+1 开盘价撮合）
+    if context.momentum > 0:
+        order_target_value(context.security, context.portfolio.total_value)
+    else:
+        order_target_value(context.security, 0)
+`;
+
+const START_DEFAULT = '2024-01-01';
+const END_DEFAULT = '2024-12-31';
+const FACTOR_DEFAULT = 'pct_change_20';
+
+const PARAMS_DEFAULT: EditorParams = {
+  start: START_DEFAULT,
+  end: END_DEFAULT,
+  formulas: FACTOR_DEFAULT,
 };
 
-const FORMULAS = ['pct_change_5', 'pct_change_10', 'pct_change_20', 'rolling_std_20'];
-const REBALANCES = ['daily', 'weekly', 'monthly'];
+type TabId = 'workspace' | 'quick' | 'history';
 
-export default function BacktestsPage() {
-  const { data: runs, mutate } = useSWR<RunRow[]>('/backtests', get, { refreshInterval: 5000 });
-  const [formula, setFormula] = useState('pct_change_20');
-  const [topN, setTopN] = useState(5);
-  const [rebalance, setRebalance] = useState('monthly');
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState('');
-  // B6 多运行对比
-  const [picked, setPicked] = useState<string[]>([]);
-  const [cmp, setCmp] = useState<CompareResult | null>(null);
-  const [cmpBusy, setCmpBusy] = useState(false);
-  // 策略库运行
-  const { data: strategies } = useSWR<StrategyMeta[]>('/strategies', get);
-  const userStrategies = (strategies ?? []).filter((s) => s.source === 'user');
-  const [strategyId, setStrategyId] = useState('');
-  const [runStrategyBusy, setRunStrategyBusy] = useState(false);
-  const router = useRouter();
+const TABS: { id: TabId; label: string }[] = [
+  { id: 'workspace', label: '策略回测' },
+  { id: 'quick', label: '快速回测' },
+  { id: 'history', label: '历史与对比' },
+];
 
-  async function runStrategy() {
-    if (!strategyId) return;
-    setRunStrategyBusy(true);
-    setErr('');
+function BacktestWorkspace() {
+  const {
+    data: allStrategies,
+    mutate: mutateStrategies,
+  } = useSWR<StrategyMeta[]>('/strategies', get);
+
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [code, setCode] = useState(DQ_TEMPLATE);
+  const [params, setParams] = useState<EditorParams>(PARAMS_DEFAULT);
+  const [loadedConfig, setLoadedConfig] = useState<Record<string, unknown>>({});
+  const [base, setBase] = useState<Snapshot | null>(null);
+  const [busy, setBusy] = useState<'' | 'save' | 'validate' | 'run'>('');
+  const [notice, setNotice] = useState('');
+  const [errors, setErrors] = useState<string[]>([]);
+  const [runId, setRunId] = useState<string | null>(null);
+  const [tab, setTab] = useState<TabId>('workspace');
+  const searchParams = useSearchParams();
+
+  const currentSnapshot = (): Snapshot => ({
+    name,
+    description,
+    code,
+    params: { ...params },
+  });
+
+  /** 载入策略：填充全部字段 + 基准快照 + 原 config（保存时合并 factor_formulas） */
+  async function loadStrategy(id: string) {
+    setErrors([]);
+    setNotice('');
     try {
-      const detail = await get<{
-        source: string;
-        benchmark?: string;
-        config?: { factor_formulas?: unknown };
-      }>(`/strategies/${strategyId}`);
-      const rawFormulas = detail.config?.factor_formulas;
-      const factorFormulas = Array.isArray(rawFormulas)
-        ? rawFormulas.filter((f): f is string => typeof f === 'string')
-        : [];
-      const body: Record<string, unknown> = {
-        code: detail.source,
-        start: '2024-01-01',
-        end: '2024-12-31',
-        strategy_id: strategyId,
-      };
-      if (factorFormulas.length > 0) body.factor_formulas = factorFormulas;
-      const r = await post<RunCodeResult>('/backtests/run-code', body);
-      router.push(`/backtests/${r.run_id}`);
+      const s = await get<StrategyDetail>(`/strategies/${id}`);
+      setSelectedId(id);
+      setName(s?.name ?? '');
+      setDescription(s?.description ?? '');
+      setCode(s?.source || '');
+      setLoadedConfig(s?.config ?? {});
+      setBase({
+        name: s?.name ?? '',
+        description: s?.description ?? '',
+        code: s?.source || '',
+        params: { ...params },
+      });
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setRunStrategyBusy(false);
+      setErrors([e instanceof Error ? e.message : String(e)]);
     }
   }
 
-  function toggle(id: string) {
-    setCmp(null);
-    setPicked((p) => (p.includes(id) ? p.filter((x) => x !== id) : p.length >= 6 ? p : [...p, id]));
-  }
-
-  async function run() {
-    setBusy(true);
-    setErr('');
+  /** 从历史运行载入代码：新建态回填 code，无基准快照（视为已修改） */
+  async function loadRunCode(id: string) {
+    setErrors([]);
+    setNotice('');
     try {
-      await post('/backtests/run', { top_n: topN, rebalance, formula });
-      mutate();
+      const info = await get<{ run_id: string; code: string | null }>(
+        `/backtests/${id}/code`,
+      );
+      setSelectedId(null);
+      setName('');
+      setDescription('');
+      setCode(info?.code ?? '');
+      setLoadedConfig({});
+      setBase(null);
+      setRunId(id);
+      setTab('workspace');
+      setNotice(`已从运行 ${id} 载入策略代码`);
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
+      setErrors([e instanceof Error ? e.message : String(e)]);
     }
   }
 
-  async function compare() {
-    setCmpBusy(true);
-    setErr('');
+  function resetToNew() {
+    setSelectedId(null);
+    setName('');
+    setDescription('');
+    setCode(DQ_TEMPLATE);
+    setLoadedConfig({});
+    setBase(null);
+    setErrors([]);
+    setNotice('');
+  }
+
+  async function handleSave() {
+    if (!selectedId && !name.trim()) {
+      setErrors(['请填写策略名称']);
+      return;
+    }
+    setBusy('save');
+    setErrors([]);
     try {
-      setCmp(await get<CompareResult>(`/backtests/compare?ids=${picked.join(',')}`));
+      const config = { ...loadedConfig, factor_formulas: parseFormulas(params.formulas) };
+      if (selectedId) {
+        // PUT 契约：StrategySourceIn 只有 source/description/config，不可改名
+        await putData(`/strategies/${selectedId}`, { source: code, description, config });
+        setNotice(`已更新「${name}」`);
+      } else {
+        const row = await post<StrategyMeta>('/strategies', {
+          name,
+          source: code,
+          description,
+          config,
+        });
+        if (!row?.id) {
+          setErrors(['保存接口未返回策略 id，请检查后端响应']);
+          return;
+        }
+        setSelectedId(row.id);
+        setNotice(`已创建「${name}」`);
+      }
+      setBase(currentSnapshot());
+      void mutateStrategies();
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      setErrors([e instanceof Error ? e.message : String(e)]);
     } finally {
-      setCmpBusy(false);
+      setBusy('');
     }
   }
 
-  const cmpOption = cmp ? {
-    tooltip,
-    legend: legend({ top: 0, data: cmp.runs.map((r) => r.label) }),
-    grid: { left: 60, right: 20, top: 36, bottom: 30 },
-    ...axes({ data: cmp.dates }, { scale: true, name: '净值(归一)' }),
-    series: cmp.runs.map((r, i) => ({
-      name: r.label,
-      type: 'line' as const,
-      data: cmp.series[r.run_id] ?? [],
-      showSymbol: false,
-      lineStyle: { width: 1.5, color: SERIES_COLORS[i % SERIES_COLORS.length] },
-      itemStyle: { color: SERIES_COLORS[i % SERIES_COLORS.length] },
-    })),
-  } : null;
+  async function handleValidate() {
+    setBusy('validate');
+    setErrors([]);
+    setNotice('');
+    try {
+      const r = await post<{ errors: string[] }>('/strategies/validate', { source: code });
+      const errs = r.errors ?? [];
+      setErrors(errs);
+      if (!errs.length) setNotice('校验通过');
+    } catch (e) {
+      setErrors([e instanceof Error ? e.message : String(e)]);
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function handleRun() {
+    setBusy('run');
+    setErrors([]);
+    setNotice('');
+    try {
+      const payload = buildRunPayload(code, params, selectedId);
+      const r = await post<RunCodeResult>('/backtests/run-code', payload);
+      setRunId(r.run_id);
+      setTab('workspace');
+    } catch (e) {
+      setErrors([e instanceof Error ? e.message : String(e)]);
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function handleDeleteStrategy(id: string, strategyName: string) {
+    setErrors([]);
+    setNotice('');
+    try {
+      await del(`/strategies/${id}`);
+      void mutateStrategies();
+      if (id === selectedId) resetToNew();
+      setNotice(`已删除「${strategyName}」`);
+      return;
+    } catch (e) {
+      setErrors([e instanceof Error ? e.message : String(e)]);
+    }
+  }
+
+  // 路由参数：?id → 载入策略；?run → 载入运行代码。仅首次挂载执行一次。
+  const booted = useRef(false);
+  useEffect(() => {
+    if (booted.current) return;
+    booted.current = true;
+    const id = searchParams.get('id');
+    const run = searchParams.get('run');
+    if (id) void loadStrategy(id);
+    else if (run) void loadRunCode(run);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const snapshot: Snapshot = { name, description, code, params };
+  const dirty = isDirty(snapshot, base);
 
   return (
     <div className="space-y-5">
       <PageHeader
-        title="回测"
-        sub="T+1 开盘价撮合 · 真实费率 · 涨跌停拒单"
+        title="回测工作台"
+        sub="编辑 · 保存 · 编译运行 · 结果内联"
+        actions={
+          <RunBar
+            dirty={dirty}
+            busy={busy}
+            onNew={resetToNew}
+            onSave={() => void handleSave()}
+            onValidate={() => void handleValidate()}
+            onRun={() => void handleRun()}
+          />
+        }
       />
 
-      {err && <ErrorNote>{err}</ErrorNote>}
-
-      {/* 运行回测 */}
-      <Panel title="运行回测">
-        <div className="flex flex-wrap items-end gap-3">
-          <label className="text-sm">
-            <div className="mb-1 text-xs text-ink-faint">因子公式</div>
-            <select value={formula} onChange={(e) => setFormula(e.target.value)} className="input">
-              {FORMULAS.map((f) => <option key={f}>{f}</option>)}
-            </select>
-          </label>
-          <label className="text-sm">
-            <div className="mb-1 text-xs text-ink-faint">TopN</div>
-            <input type="number" min={1} max={50} value={topN}
-                   onChange={(e) => {
-                     // 清空/非法输入回退默认值，避免 NaN 提交
-                     const v = +e.target.value;
-                     setTopN(Number.isFinite(v) && v > 0 ? Math.min(50, Math.max(1, Math.round(v))) : 5);
-                   }}
-                   className="input input-mono w-20" />
-          </label>
-          <label className="text-sm">
-            <div className="mb-1 text-xs text-ink-faint">调仓频率</div>
-            <select value={rebalance} onChange={(e) => setRebalance(e.target.value)} className="input">
-              {REBALANCES.map((r) => <option key={r}>{r}</option>)}
-            </select>
-          </label>
-          <button onClick={run} disabled={busy} className="btn btn-accent">
-            {busy ? '回测中…' : '运行回测'}
+      {/* 顶部一级 Tab */}
+      <div className="flex flex-wrap items-center gap-2">
+        {TABS.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => setTab(t.id)}
+            className={`btn btn-sm ${tab === t.id ? 'btn-primary' : ''}`}
+          >
+            {t.label}
           </button>
+        ))}
+      </div>
+
+      {(errors.length > 0 || notice) && (
+        <div className="space-y-2">
+          {errors.map((e, i) => (
+            <ErrorNote key={i}>{e}</ErrorNote>
+          ))}
+          {notice && <Msg text={`✓ ${notice}`} />}
         </div>
-      </Panel>
+      )}
 
-      {/* 策略库运行入口 */}
-      <Panel title="从策略库运行" meta="自定义 Python 策略">
-        {userStrategies.length === 0 ? (
-          <div className="flex items-center justify-between gap-3">
-            <span className="text-xs text-ink-faint">策略库还是空的 —— 先到编辑器保存一个策略</span>
-            <Link href="/strategies/editor" className="btn btn-sm btn-primary">
-              打开策略编辑器
-            </Link>
+      {tab === 'workspace' && (
+        <div className="flex items-stretch gap-5">
+          {/* 左栏：策略库 */}
+          <div className="w-64 shrink-0">
+            <StrategyPane
+              strategies={(allStrategies ?? []).filter((s) => s.source === 'user')}
+              selectedId={selectedId}
+              onLoad={(id) => void loadStrategy(id)}
+              onDelete={(id, n) => void handleDeleteStrategy(id, n)}
+              onNew={resetToNew}
+            />
           </div>
-        ) : (
-          <div className="flex flex-wrap items-end gap-3">
-            <label className="text-sm">
-              <div className="mb-1 text-xs text-ink-faint">用户策略</div>
-              <select value={strategyId} onChange={(e) => setStrategyId(e.target.value)} className="input w-56">
-                <option value="">选择策略…</option>
-                {userStrategies.map((s) => (
-                  <option key={s.id} value={s.id}>{s.name}</option>
-                ))}
-              </select>
-            </label>
-            <button
-              onClick={runStrategy}
-              disabled={!strategyId || runStrategyBusy}
-              className="btn btn-accent"
-            >
-              {runStrategyBusy ? '运行中…' : '运行策略'}
-            </button>
-            <Link href="/strategies/editor" className="btn btn-sm">
-              编辑器
-            </Link>
+          {/* 中栏：编辑器 */}
+          <div className="min-w-0 flex-1">
+            <EditorPane
+              name={name}
+              description={description}
+              code={code}
+              params={params}
+              selectedId={selectedId}
+              onChange={(next) => {
+                setName(next.name);
+                setDescription(next.description);
+                setCode(next.code);
+                setParams(next.params);
+              }}
+            />
           </div>
-        )}
-      </Panel>
+          {/* 右栏：结果 */}
+          <div className="w-[380px] shrink-0">
+            <ResultPane runId={runId} />
+          </div>
+        </div>
+      )}
 
-      {/* 回测记录 */}
-      <Panel
-        title="回测记录"
-        meta={`共 ${runs?.length ?? 0} 条${picked.length > 0 ? ` · 已选 ${picked.length}/6` : ''}`}
-        actions={picked.length >= 2 ? (
-          <button onClick={compare} disabled={cmpBusy} className="btn btn-primary btn-sm">
-            {cmpBusy ? '生成对比…' : `对比选中 ${picked.length} 项`}
-          </button>
-        ) : null}
-        bodyClass="p-0"
-      >
-        {!runs?.length ? (
-          <div className="p-4"><Empty>还没有回测 —— 用上方表单跑一个</Empty></div>
-        ) : (
-          <div className="overflow-x-auto p-4">
-            <table className="table-dense">
-              <thead>
-                <tr>
-                  <th className="w-10 pl-1 text-left">对比</th>
-                  <th className="text-left">Run</th>
-                  <th className="text-left">因子 / 参数</th>
-                  <th className="text-right">总收益</th>
-                  <th className="text-right">年化</th>
-                  <th className="text-right">夏普</th>
-                  <th className="text-right">最大回撤</th>
-                  <th className="text-right">时间</th>
-                </tr>
-              </thead>
-              <tbody>
-                {runs.map((r) => (
-                  <tr key={r.run_id} className="hover:bg-white">
-                    <td className="pl-1">
-                      <input type="checkbox" checked={picked.includes(r.run_id)}
-                             onChange={() => toggle(r.run_id)}
-                             className="h-3.5 w-3.5 accent-up" />
-                    </td>
-                    <td>
-                      <Link href={`/backtests/${r.run_id}`} className="font-mono text-xs text-indigo hover:underline">
-                        {r.run_id}
-                      </Link>
-                    </td>
-                    <td className="text-xs text-ink-dim">
-                      {r.params.factor} · Top{r.params.top_n} · {r.params.rebalance}
-                    </td>
-                    <td className={`text-right ${(r.metrics.total_return ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
-                      {((r.metrics.total_return ?? 0) * 100).toFixed(2)}%
-                    </td>
-                    <td className={`text-right ${(r.metrics.annual_return ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
-                      {((r.metrics.annual_return ?? 0) * 100).toFixed(2)}%
-                    </td>
-                    <td className="text-right">{(r.metrics.sharpe ?? 0).toFixed(2)}</td>
-                    <td className="text-right text-down">
-                      {((r.metrics.max_drawdown ?? 0) * 100).toFixed(2)}%
-                    </td>
-                    <td className="text-right text-xs text-ink-faint">{r.created_at?.slice(5, 16)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </Panel>
-
-      {/* B6 对比结果 */}
-      {cmp && (
-        <Panel title="运行对比" meta="净值按各自首日归一">
-          <Chart option={cmpOption} height={320} />
-          <table className="table-dense mt-4">
-            <thead>
-              <tr>
-                <th className="text-left">Run</th>
-                <th className="text-right">年化</th>
-                <th className="text-right">夏普</th>
-                <th className="text-right">最大回撤</th>
-                <th className="text-right">胜率</th>
-                <th className="text-right">换手</th>
-              </tr>
-            </thead>
-            <tbody>
-              {cmp.runs.map((r) => (
-                <tr key={r.run_id} className="hover:bg-white">
-                  <td>
-                    <span className="mr-1.5 inline-block h-2 w-2 rounded-[1px]"
-                          style={{ background: SERIES_COLORS[cmp.runs.indexOf(r) % SERIES_COLORS.length] }} />
-                    {r.label}
-                  </td>
-                  <td className={`text-right ${(r.metrics.annual_return ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
-                    {((r.metrics.annual_return ?? 0) * 100).toFixed(2)}%
-                  </td>
-                  <td className="text-right">{(r.metrics.sharpe ?? 0).toFixed(2)}</td>
-                  <td className="text-right text-down">{((r.metrics.max_drawdown ?? 0) * 100).toFixed(2)}%</td>
-                  <td className="text-right">{((r.metrics.win_rate ?? 0) * 100).toFixed(0)}%</td>
-                  <td className="text-right">{((r.metrics.turnover ?? 0) * 100).toFixed(0)}%</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </Panel>
+      {tab === 'quick' && <QuickRunPanel />}
+      {tab === 'history' && (
+        <HistoryPanel
+          onLoadRun={(row) =>
+            void (row.params?.strategy_id
+              ? loadStrategy(row.params.strategy_id)
+              : loadRunCode(row.run_id))
+          }
+        />
       )}
     </div>
+  );
+}
+
+export default function Page() {
+  return (
+    <Suspense fallback={<Loading>加载中…</Loading>}>
+      <BacktestWorkspace />
+    </Suspense>
   );
 }
