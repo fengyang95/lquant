@@ -96,6 +96,9 @@ export default function FactorsPage() {
   const [corr, setCorr] = useState<CorrResult | null>(null);
   const [syn, setSyn] = useState<SynResult | null>(null);
   const [builtinQuery, setBuiltinQuery] = useState('');
+  const [customFormula, setCustomFormula] = useState('');
+  const [corrStart, setCorrStart] = useState('2026-01-01');
+  const [corrThreshold, setCorrThreshold] = useState(0.8);
 
   // 内置因子按族浏览 + 搜索（158 个）
   const builtinShown = useMemo(() => {
@@ -226,6 +229,13 @@ export default function FactorsPage() {
     setPicked((p) => (p.includes(f) ? p.filter((x) => x !== f) : [...p, f]));
   }
 
+  function addCustom() {
+    const f = customFormula.trim();
+    if (!f || picked.includes(f) || picked.length >= 8) return;
+    setPicked((p) => [...p, f]);
+    setCustomFormula('');
+  }
+
   async function register() {
     setBusy('reg');
     setMsg('');
@@ -271,11 +281,27 @@ export default function FactorsPage() {
     }
   }
 
+  async function seedYaml() {
+    setBusy('seed');
+    setMsg('');
+    try {
+      const r = await post<{ seeded: number }>('/factors/seed-yaml', {});
+      setMsg(`✓ 已入库 ${r.seeded} 个 YAML 自定义因子`);
+      mutate();
+    } catch (e) {
+      setMsg(`✗ ${e instanceof Error ? e.message : e}`);
+    } finally {
+      setBusy('');
+    }
+  }
+
   async function analyze() {
     setBusy('corr');
     setMsg('');
     try {
-      setCorr(await post<CorrResult>('/factors/analyze', { formulas: picked }));
+      setCorr(await post<CorrResult>('/factors/analyze', {
+        formulas: picked, start: corrStart, threshold: corrThreshold,
+      }));
     } catch (e) {
       setMsg(`✗ ${e instanceof Error ? e.message : e}`);
     } finally {
@@ -287,7 +313,9 @@ export default function FactorsPage() {
     setBusy('syn');
     setMsg('');
     try {
-      setSyn(await post<SynResult>('/factors/synthesize', { formulas: picked, method }));
+      setSyn(await post<SynResult>('/factors/synthesize', {
+        formulas: picked, method, start: corrStart,
+      }));
     } catch (e) {
       setMsg(`✗ ${e instanceof Error ? e.message : e}`);
     } finally {
@@ -531,6 +559,52 @@ export default function FactorsPage() {
         }
       >
         <div className="mb-4 flex flex-wrap gap-1">
+          {picked.map((f) => (
+            <button
+              key={f}
+              title="点击移除"
+              onClick={() => toggle(f)}
+              className={`tag ${FORMULAS.includes(f) ? 'tag-on' : ''}`}
+            >
+              {f} ×
+            </button>
+          ))}
+        </div>
+
+        <div className="mb-4 flex flex-wrap items-center gap-2">
+          <input
+            value={customFormula}
+            onChange={(e) => setCustomFormula(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') addCustom(); }}
+            list="builtin-factors"
+            placeholder="自定义公式 / DSL（如 $close/$open 或 CORR60），回车添加"
+            className="input input-mono w-72 py-1 text-xs"
+          />
+          <datalist id="builtin-factors-lab">
+            {(builtin ?? []).map((b) => <option key={b.name} value={b.name}>{b.formula}</option>)}
+            {['pct_change_5', 'pct_change_10', 'pct_change_20', 'rolling_std_20', 'turnover']
+              .map((f) => <option key={f} value={f} />)}
+          </datalist>
+          <button onClick={addCustom} disabled={!customFormula.trim()} className="btn btn-sm">
+            添加
+          </button>
+          <span className="text-xs text-ink-faint">
+            已选 {picked.length}/8 ·
+          </span>
+          <label className="flex items-center gap-1 text-xs text-ink-dim">
+            起始日
+            <input type="date" value={corrStart} onChange={(e) => setCorrStart(e.target.value)}
+              className="input w-36 py-1 text-xs" />
+          </label>
+          <label className="flex items-center gap-1 text-xs text-ink-dim">
+            冗余阈值
+            <input type="number" min={0.5} max={1} step={0.05} value={corrThreshold}
+              onChange={(e) => setCorrThreshold(Number(e.target.value))}
+              className="input w-20 py-1 text-xs" />
+          </label>
+        </div>
+
+        <div className="mb-4 flex flex-wrap gap-1">
           {FORMULAS.map((f) => (
             <button
               key={f}
@@ -545,7 +619,7 @@ export default function FactorsPage() {
         {corr && (
           <div className="mb-4 overflow-x-auto">
             <div className="mb-1 text-xs text-ink-faint">
-              横截面 Spearman 相关（{corr.n_dates} 日均值）· |ρ|≥0.8 判冗余
+              横截面 Spearman 相关（{corr.n_dates} 日均值）· |ρ|≥{corrThreshold} 判冗余
             </div>
             <table className="text-xs">
               <thead>
@@ -614,13 +688,22 @@ export default function FactorsPage() {
         title="已注册因子"
         meta={<>共 {shownFactors.length} 个 · Qlib Alpha158 内置因子可一键入库</>}
         actions={
-          <button
-            onClick={seedBuiltin}
-            disabled={busy === 'seed'}
-            className="btn btn-sm"
-          >
-            {busy === 'seed' ? '入库中…' : '一键入库内置因子'}
-          </button>
+          <>
+            <button
+              onClick={seedBuiltin}
+              disabled={busy === 'seed'}
+              className="btn btn-sm"
+            >
+              {busy === 'seed' ? '入库中…' : '一键入库内置因子'}
+            </button>
+            <button
+              onClick={seedYaml}
+              disabled={busy === 'seed'}
+              className="btn btn-sm"
+            >
+              导入 YAML 因子
+            </button>
+          </>
         }
       >
         <div className="mb-3 flex flex-wrap items-center gap-1">
