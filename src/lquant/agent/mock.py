@@ -40,13 +40,14 @@ class MockAgentService(AgentService):
     async def get_messages(self, sid: str) -> list[Message]:
         return await self.store.messages(sid)
 
-    async def send_message(self, sid, content, on_event) -> Message:
+    async def send_message(self, sid, content, on_event, user_msg=None) -> Message:
         if not content.strip():
             raise AgentError("消息不能为空", status_code=400)
         ses = await self.store.get(sid)
         if ses is None:
             raise AgentError("会话不存在", status_code=404)
-        user_msg = await self.store.add_message(sid, "user", content)
+        # API 路径已同步落库并传入，避免二次写入（也避免轮询等待）
+        user_msg = user_msg or await self.persist_user_message(sid, content)
         self._tasks[sid] = asyncio.current_task()
         try:
             await self._run(sid, content, ses.context, on_event)

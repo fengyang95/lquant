@@ -8,9 +8,12 @@ config/agents/*.yaml，fail-fast 校验。kind x driver 正交：
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import yaml
+
+_LOG = logging.getLogger(__name__)
 
 AGENT_KINDS = {"builtin", "skill", "external"}
 DRIVERS = {"platform", "agent"}
@@ -62,22 +65,33 @@ def find_agent(name: str) -> AgentProfile | None:
 
 
 def record_eval(agent: str, n: int = 1) -> int:
-    """eval 记账（方案 6.3 硬护栏 2）：按 Agent 累计，返回累计值。"""
+    """eval 记账（方案 6.3 硬护栏 2）：按 Agent **原子**累加，返回累计值。
+
+    用单条 UPSERT 而不是「先读后写」：后者在并发下会丢更新 —— 两个请求各自读到
+    同一个旧值、各自写回 old+n，实际只加了一次。而这是配额护栏的计数底座，
+    少记就是护栏失效。顺带也不再在 writer 事务里另开 reader 连接去读同一个库。
+    """
     import datetime as dt
 
     from lquant.core.db import writer
 
+    n = max(0, int(n))
+    now = dt.datetime.now()
     try:
         with writer() as con:
-            con.execute(
-                "INSERT OR REPLACE INTO agent_ledger VALUES (?,?,?,?)",
-                [agent,
-                 eval_usage(agent) + n,
-                 dt.datetime.now(),
-                 dt.datetime.now()])
-    except Exception:  # noqa: BLE001
-        pass
-    return eval_usage(agent)
+            row = con.execute(
+                "INSERT INTO agent_ledger (agent, eval_count, eval_last, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (agent) DO UPDATE SET "
+                "  eval_count = agent_ledger.eval_count + excluded.eval_count, "
+                "  eval_last = excluded.eval_last, updated_at = excluded.updated_at "
+                "RETURNING eval_count",
+                [agent, n, now, now]).fetchone()
+        return int(row[0]) if row else 0
+    except Exception:  # noqa: BLE001 - 无库/无表时不该炸调用方
+        _LOG.warning("agent_ledger 记账失败（agent=%s, n=%d），本次不计入配额",
+                     agent, n, exc_info=True)
+        return eval_usage(agent)
 
 
 def eval_usage(agent: str) -> int:
@@ -88,7 +102,7 @@ def eval_usage(agent: str) -> int:
             row = con.execute("SELECT eval_count FROM agent_ledger WHERE agent = ?",
                               [agent]).fetchone()
         return int(row[0]) if row else 0
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 - 无库环境优雅退化为 0
         return 0
 
 
@@ -97,3 +111,15 @@ def quota_remaining(agent: str) -> int:
     if not a:
         raise ValueError(f"Agent 未注册: {agent}")
     return max(0, a.quota_eval - eval_usage(agent))
+
+
+def ensure_quota(agent: str, n: int) -> int:
+    """配额前置检查：够就返回剩余额度，不够抛 ValueError（调用方转 422/ClickException）。
+
+    与 CLI 的 ``lq factor eval --agent`` 共用同一个账本与同一条判定，
+    避免「CLI 记账、API 不记账」两条路径口径不一。
+    """
+    remaining = quota_remaining(agent)
+    if remaining < n:
+        raise ValueError(f"配额不足: 需要 {n} 次，剩余 {remaining} 次（agent={agent}）")
+    return remaining

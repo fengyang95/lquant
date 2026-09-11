@@ -16,18 +16,50 @@ from typing import Any
 QUEUES = ("lquant-default", "lquant-ingest", "lquant-backtest", "lquant-mining")
 
 
-@lru_cache(maxsize=1)
-def _redis_available() -> bool:
+# Redis 可用性探测结果的 TTL 缓存（秒）。
+# 早期这里是 @lru_cache(maxsize=1)，即首次探测结果被进程永久记住。单机环境下
+# 这是坑：docker-compose 里 API 常比 Redis 先起来，首次探测失败就永久降级为
+# 本地线程，即使 Redis 随后就绪也不会启用队列，直到手动重启 API；反过来 Redis
+# 中途挂掉也会一直走 RQ 分支白等超时。改成带 TTL 的探测缓存后能自愈。
+_REDIS_PROBE_TTL = 30.0  # 秒
+_redis_probe_ok: bool | None = None
+_redis_probe_at: float = 0.0
+_redis_probe_lock = threading.Lock()
+
+
+def _probe_redis() -> bool:
+    """真正 ping 一次 Redis。没装 redis 包 / 连不上，都算不可用。
+
+    单独建一个带 1s 连接超时的客户端，避免探测本身在 Redis 不可达时长时间阻塞
+    （`get_redis()` 返回的客户端不带超时，是给正常操作复用的）。
+    """
     try:
         import redis
 
         from lquant.core.config import get_settings
 
         r = redis.from_url(get_settings().redis_url, socket_connect_timeout=1)
-        r.ping()
-        return True
+        return bool(r.ping())
     except Exception:  # noqa: BLE001 - 没装 redis 包 / 连不上，都算不可用
         return False
+
+
+def _redis_available(ttl: float = _REDIS_PROBE_TTL) -> bool:
+    """Redis 是否可用。结果按 ttl 秒缓存，避免热路径（每条任务事件）都去 ping。
+
+    ttl<=0 表示无条件重新探测（测试或强制刷新用）。
+    """
+    global _redis_probe_ok, _redis_probe_at
+    if ttl > 0 and _redis_probe_ok is not None \
+            and (time.monotonic() - _redis_probe_at) < ttl:
+        return _redis_probe_ok
+    with _redis_probe_lock:
+        if ttl > 0 and _redis_probe_ok is not None \
+                and (time.monotonic() - _redis_probe_at) < ttl:
+            return _redis_probe_ok
+        _redis_probe_ok = _probe_redis()
+        _redis_probe_at = time.monotonic()
+        return _redis_probe_ok
 
 
 @lru_cache(maxsize=1)

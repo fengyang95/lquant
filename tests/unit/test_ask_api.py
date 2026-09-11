@@ -77,23 +77,51 @@ async def test_unknown_session_404(client):
     assert r.status_code == 404
 
 
-async def test_send_message_500_cancels_background_task(client, monkeypatch):
-    """202 轮询超时返回 500 时，后台 agent 任务必须被收敛，不留孤儿任务。"""
+async def test_user_message_persisted_before_202(client, monkeypatch):
+    """user 消息在返回 202 之前就已同步落库 —— 不依赖任何轮询。
+
+    旧实现是「先起任务再轮询 get_messages 等落库」，所以这里把 get_messages
+    打断到永远返回空：新实现应当照常 202（不落库的实现在这里会 500）。
+    """
     svc = await get_agent_service()
     r = await client.post("/api/ask/sessions", json=None)
     sid = r.json()["data"]["id"]
 
-    # 轮询永远看不到 user 消息 → 强制走 500 分支
     async def _no_messages(_sid):
         return []
 
     monkeypatch.setattr(svc, "get_messages", _no_messages)
 
     r = await client.post(f"/api/ask/sessions/{sid}/messages", json={"content": "大盘怎么样"})
-    assert r.status_code == 500
+    assert r.status_code == 202, r.text
+    user = r.json()["data"]["user_message"]
+    assert user["role"] == "user" and user["content"] == "大盘怎么样"
 
-    # 后台任务已被取消：service 内不再登记，全局任务集也已收敛
+    # 确实已落库：直接查 store（绕过被 monkeypatch 的 get_messages）。
+    # 后台 agent 与本次断言并发，assistant 消息可能已落 —— 只要求 user 消息在最前。
+    msgs = await svc.store.messages(sid)
+    assert msgs, "user 消息应已落库"
+    assert msgs[0].role == "user" and msgs[0].content == "大盘怎么样"
+
+    await client.delete(f"/api/ask/sessions/{sid}")
+
+
+async def test_agent_failure_keeps_user_message_and_202(client, monkeypatch):
+    """agent 跑挂不该回滚 user 消息、也不该让请求失败（后台异常走事件通道）。"""
+    svc = await get_agent_service()
+    r = await client.post("/api/ask/sessions", json=None)
+    sid = r.json()["data"]["id"]
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("agent 炸了")
+
+    monkeypatch.setattr(svc, "send_message", _boom)
+
+    r = await client.post(f"/api/ask/sessions/{sid}/messages", json={"content": "大盘怎么样"})
+    assert r.status_code == 202, r.text
+
+    await asyncio.sleep(0.2)          # 让后台任务跑完并收敛
+    assert not ask_api._tasks, "后台任务应正常收敛，不留孤儿"
     assert sid not in svc._tasks
-    assert not ask_api._tasks, "500 返回后不应残留后台任务"
 
     await client.delete(f"/api/ask/sessions/{sid}")

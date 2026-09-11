@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 
 from fastapi import HTTPException
@@ -21,10 +20,6 @@ _bus = AskEventBus()
 
 # 持有后台任务引用，防止协程被 GC（done 后自动移除）
 _tasks: set[asyncio.Task] = set()
-
-# 等 user 消息落库的轮询参数：40 × 50ms = 2s 上限
-_POLL_TIMES = 40
-_POLL_INTERVAL = 0.05
 
 
 def get_event_bus() -> AskEventBus:
@@ -82,9 +77,14 @@ async def send_message(sid: str, body: dict):
     async def on_event(e: AgentEvent) -> None:
         await bus.publish(sid, e)
 
+    # 同步落库 user 消息，再起后台任务跑 agent。
+    # 旧写法是「先起任务、再轮询 get_messages 等 user 消息落库」，两个毛病：
+    # 同会话并发时会取到别人那条 user 消息；轮询上限到点就 500 并把任务掐掉。
+    user_msg = await svc.persist_user_message(sid, content)
+
     async def run() -> None:
         try:
-            await svc.send_message(sid, content, on_event)
+            await svc.send_message(sid, content, on_event, user_msg=user_msg)
         except asyncio.CancelledError:
             # MockAgentService 内部已发 error 事件；这里兜底意外取消（非 service 内）
             _LOG.info("agent 任务被取消 sid=%s", sid)
@@ -97,21 +97,7 @@ async def send_message(sid: str, body: dict):
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
 
-    # 等 user 消息落库后再返回（上限 2s），保证前端拿到完整 user_message
-    user = None
-    for _ in range(_POLL_TIMES):
-        msgs = await svc.get_messages(sid)
-        user = next((m for m in reversed(msgs) if m.role == "user"), None)
-        if user is not None:
-            break
-        await asyncio.sleep(_POLL_INTERVAL)
-    if user is None:
-        # 收敛后台任务：返回 500 时不能留孤儿 agent 任务继续跑
-        await svc.cancel(sid)
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-        raise HTTPException(500, "消息落库失败")
     return JSONResponse(
         status_code=202,
-        content={"user_message": user.model_dump(), "agent_task": "started"},
+        content={"user_message": user_msg.model_dump(), "agent_task": "started"},
     )
