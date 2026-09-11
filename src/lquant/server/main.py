@@ -46,8 +46,14 @@ def create_app() -> FastAPI:
         start_monitor()
 
     @app.on_event("shutdown")
-    def _monitor_shutdown() -> None:
+    async def _monitor_shutdown() -> None:
         stop_monitor()
+        # 除监控外，还要收掉 agent 会话存储：它是 aiosqlite，worker 线程 non-daemon，
+        # 只有 await close() 才停得掉。不关的话 uvicorn 优雅停机会卡在解释器退出
+        # 阶段（进程不退出），pytest 收尾同理。
+        from lquant.agent.service import shutdown_agent_service  # noqa: PLC0415
+
+        await shutdown_agent_service()
 
     return MonitorMiddleware(app)
 
