@@ -13,6 +13,7 @@ from datetime import date, timedelta
 
 import polars as pl
 
+from lquant.core.types import today_cn
 from lquant.data.store.parquet import read_daily, write_daily
 
 
@@ -26,7 +27,7 @@ def refresh_adj_factors(*, symbols: list[str] | None = None,
     """
     from datetime import datetime
 
-    end_d = date.fromisoformat(end) if end else date.today()
+    end_d = date.fromisoformat(end) if end else today_cn()
     start_d = date.fromisoformat(start) if start else end_d - timedelta(days=days)
 
     lake = read_daily(symbols=symbols, start=start_d, end=end_d).select(

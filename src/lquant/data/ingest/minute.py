@@ -11,6 +11,7 @@ from datetime import date
 
 import polars as pl
 
+from lquant.core.types import today_cn
 from lquant.data.ingest.checkpoint import Checkpoint
 from lquant.data.store.parquet import write_minute
 
@@ -30,7 +31,7 @@ def backfill_minute(
         raise ValueError(f"BaoStock 无 {freq}，1min 请用 mootdx")
 
     start_d = start if isinstance(start, date) else date.fromisoformat(start)
-    end_d = end if isinstance(end, date) else (date.fromisoformat(end) if end else date.today())
+    end_d = end if isinstance(end, date) else (date.fromisoformat(end) if end else today_cn())
 
     provider = get_provider()
     target = provider.providers[0] if hasattr(provider, "providers") else provider

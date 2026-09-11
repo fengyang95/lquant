@@ -17,7 +17,7 @@ from typing import Any
 import polars as pl
 
 from lquant.core.errors import DataQualityError
-from lquant.core.types import SecType, parse_symbol
+from lquant.core.types import SecType, parse_symbol, today_cn
 from lquant.data.capability import Capability
 from lquant.data.normalize import normalize_60min_bounds, normalize_symbols
 from lquant.data.providers import PROVIDERS
@@ -407,7 +407,7 @@ class BaoStockProvider(MappingProvider):
         """
         from lquant.data.watchdog import run_with_watchdog
 
-        day = day or date.today()
+        day = day or today_cn()
         rows = run_with_watchdog(_bs_all_stock, day.isoformat())
         if not rows:
             return pl.DataFrame()
@@ -486,7 +486,7 @@ class BaoStockProvider(MappingProvider):
             pl.lit(None, dtype=pl.Float64).alias("custody_fee"),
             pl.lit(None, dtype=pl.Float64).alias("fund_size"),
             pl.lit(None, dtype=pl.Float64).alias("share_outstanding"),
-            pl.lit(date.today(), dtype=pl.Date).alias("as_of"),
+            pl.lit(today_cn(), dtype=pl.Date).alias("as_of"),
             pl.lit("baostock").alias("source"),
         )
 

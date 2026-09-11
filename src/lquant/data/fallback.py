@@ -11,6 +11,7 @@ from datetime import date, timedelta
 import polars as pl
 
 from lquant.core.errors import SourceUnavailable
+from lquant.core.types import today_cn
 from lquant.data.base import DataProvider
 from lquant.data.capability import Capability
 
@@ -118,7 +119,7 @@ class FallbackProvider(DataProvider):
 
     def recent_daily_probe(self) -> pl.DataFrame:
         """健康检查用：拉最近一天少量数据。"""
-        end = date.today()
+        end = today_cn()
         return self._call(
             Capability.DAILY, "daily_bars",
             symbols=["000001.SH"], start=end - timedelta(days=10), end=end,

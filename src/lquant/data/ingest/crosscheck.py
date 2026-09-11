@@ -28,8 +28,6 @@ import polars as pl
 from lquant.data.quality import crosscheck
 from lquant.data.quality.issues import Issue, save_issues
 
-__all__ = ["run_crosscheck", "validate_peers"]
-
 
 def validate_peers(names: list[str]) -> None:
     """对拍 peer 源合法性校验：已注册 + 声明 daily/etf_daily capability。
@@ -128,7 +126,7 @@ def _sample_symbols(limit: int) -> tuple[list[str], date, date]:
     symbols = [r[0] for r in rows]
     lo, hi = daily_range()
     if lo is None or hi is None:
-        lo, hi = date(2024, 1, 1), date.today()
+        lo, hi = date(2024, 1, 1), today_cn()
     return symbols, lo, hi
 
 
