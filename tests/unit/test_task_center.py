@@ -118,6 +118,9 @@ def test_data_retry_with_param_override(client):
                                              "params": {"days": 3, "note": "v1"}})
     assert r.status_code == 202, r.text
     tid = r.json()["task_id"]
+    # 等 noop 执行体把任务落终态再 retry：否则后台线程的 _finalize 与
+    # 主线程的 claim_retry 并发写 duckdb，负载下偶发撞写锁
+    _wait_task_status(tid, lambda s: s == "ok")
 
     rr = client.post(f"/api/tasks/data/{tid}/retry",
                      json={"params": {"days": 5, "end": "2026-06-30"}})
@@ -203,6 +206,12 @@ def _wait_status(getter, pred, timeout=5.0, interval=0.02):
             return v
         time.sleep(interval)
     raise AssertionError(f"等待状态超时: {getter()!r}")
+
+
+# 注意：本模块用例共享 module 级 duckdb（client fixture 未按用例换库），
+# 且 create_task 有「同时仅一个未完成任务」互斥，用例间存在文件内顺序
+# 依赖——不可乱序、不可 pytest-xdist 并行；retry 语义用例自带 _finalize
+# 收尾，新用例若留下 running 态任务请先 _clear_active_tasks()。
 
 
 def test_list_rejects_unknown_kind_422(client):
@@ -304,7 +313,9 @@ def test_failed_data_task_surfaces_error_in_list(client, monkeypatch):
     r = client.post("/api/data/tasks", json={"kind": "daily_update",
                                              "params": {"days": 1}})
     tid = r.json()["task_id"]
-    # noop 执行体（autouse）会瞬时完成；retry 换上 _boom 执行体制造 failed
+    # 等 noop 执行体落终态再 retry：避免后台 _finalize 与端点写锁竞态
+    _wait_task_status(tid, lambda s: s == "ok")
+    # retry 换上 _boom 执行体制造 failed
     rr = client.post(f"/api/tasks/data/{tid}/retry", json={"params": {}})
     assert rr.status_code == 202, rr.text
     _wait_status(lambda: tasks_mod.get_task(tid)["status"],

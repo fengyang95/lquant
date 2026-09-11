@@ -5,12 +5,22 @@
 """
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 
 import duckdb
 
 from lquant.core.config import get_settings
+
+# 同进程多线程同时首次 duckdb.connect() 同一文件会撞 instance cache
+# （Unique file handle conflict），建连阶段串行化
+_connect_lock = threading.Lock()
+
+
+def _connect() -> duckdb.DuckDBPyConnection:
+    with _connect_lock:
+        return duckdb.connect(_path())
 
 
 def _path() -> str:
@@ -22,7 +32,7 @@ def _path() -> str:
 @contextmanager
 def writer():
     """写连接 —— 同一时刻只允许一个进程持有。"""
-    con = duckdb.connect(_path())
+    con = _connect()
     try:
         yield con
         con.commit()
@@ -39,7 +49,7 @@ def reader():
     （症状：写完立刻读不到 / 同进程读写不一致）。统一用同一配置，
     让所有连接共享同一实例，由 DuckDB 内部锁保证并发安全。
     """
-    con = duckdb.connect(_path())
+    con = _connect()
     try:
         yield con
     finally:

@@ -108,7 +108,7 @@ describe('DataPanel', () => {
     expect(screen.getByText(/✓ 增量任务已创建（12345678…）/)).toBeInTheDocument();
   });
 
-  it('点「全量回填」打开 BackfillModal，创建成功后关闭并透出反馈', async () => {
+  it('点「全量回填」打开 BackfillModal（modal 本体行为由其自有测试覆盖）', async () => {
     setup([]);
     const user = userEvent.setup();
     await user.click(screen.getByRole('button', { name: '全量回填' }));

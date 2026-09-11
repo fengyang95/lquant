@@ -58,7 +58,9 @@ def test_api_latency_series_buckets(mdb):
     assert all({"bucket", "count", "avg", "p50", "p95", "err_rate"} == set(r) for r in rows)
     total = sum(r["count"] for r in rows)
     assert total == 10
-    assert sum(r["err_rate"] for r in rows) == pytest.approx(0.2)
+    # err_rate 是每桶内的比率，跨桶求和必须按 count 加权——种子 9 秒跨度
+    # 可能跨 60s 分桶边界，直接 sum 会随运行时刻漂移（曾致 0.2/0.5 随机摆动）
+    assert sum(r["err_rate"] * r["count"] for r in rows) / total == pytest.approx(0.2)
 
 
 def test_slowest_routes(mdb):
