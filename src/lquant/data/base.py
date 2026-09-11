@@ -60,13 +60,7 @@ class DataProvider(ABC):
         """必须返回 stat_date 与 pub_date 双日期。"""
 
     @abstractmethod
-    def securities(self, day: date | None = None) -> pl.DataFrame:
-        """全市场标的清单。
-
-        ``day`` 是「截至该日的口径」提示：baostock 等源支持按日取状态，
-        不支持的源必须接受并忽略它（默认 None = 最新口径）。
-        参数是契约的一部分 —— 路由层只按统一签名转发，源各自裁剪。
-        """
+    def securities(self) -> pl.DataFrame: ...
 
     @abstractmethod
     def trade_calendar(self, start: date, end: date) -> pl.DataFrame: ...

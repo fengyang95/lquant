@@ -105,8 +105,8 @@ class FallbackProvider(DataProvider):
     def financial_pit(self, symbols, start, end):
         return self._call(Capability.FINANCIAL_PIT, "financial_pit", symbols=symbols, start=start, end=end)
 
-    def securities(self, day: date | None = None):
-        return self._call(Capability.REFERENCE, "securities", day=day)
+    def securities(self):
+        return self._call(Capability.REFERENCE, "securities")
 
     def trade_calendar(self, start, end):
         return self._call(Capability.CALENDAR, "trade_calendar", start=start, end=end)

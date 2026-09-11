@@ -49,6 +49,11 @@ class AgentConfig(BaseModel):
     claude_path: str = "claude"
     workspace_dir: str = "data/agent_workspace"
     timeout_seconds: int = 300
+    # 无头 claude CLI 需要跳过交互式授权，否则会挂在确认提示上；
+    # 但那是「全自主」权限，等价于让 CLI 任意读写本机。
+    # 默认保持 True 以免破坏既有用法，service.py 启用时会打印告警。
+    # 只要不需要 CLI 落盘/执行命令，就设成 false。
+    skip_permissions: bool = True
 
 
 class Settings(BaseModel):

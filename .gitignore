@@ -19,7 +19,10 @@ web/.next/
 web/out/
 
 # Data & runtime artifacts
-data/
+# 注意：这里只能写 data/<子目录>/ 或 data/<模式>，不能写裸的 `data/`
+# —— gitignore 里不带前导斜杠的目录模式匹配**任意层级**，裸 `data/` 会把
+# src/lquant/data/（数据模块源码）一起忽略掉，new file 静默不入库。
+data/duckdb/
 data/parquet/
 data/cache/
 data/logs/

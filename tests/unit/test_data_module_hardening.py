@@ -1,17 +1,16 @@
-"""数据模块硬化回归：provider 契约、parquet 湖语义、主源可配置。
+"""数据模块硬化回归：血缘源标注、parquet 湖语义、主源可配置。
 
 覆盖三类曾经真实存在的坑：
-1. `securities(day)` 在 base / fallback / 各 provider 之间签名不一致 ——
-   `lq data reference` 走 FallbackProvider 必然 TypeError；
+1. 血缘 `source` 硬编码 `baostock` —— Fallback 切到辅源后血缘失真；
 2. 「幽灵表」：DDL 里有 DuckDB `daily_bar` 表，但日线只入 parquet 湖，
-   查表恒空且失败是静默的；
+   查表恒空且失败是静默的；空湖还读出 0 列帧，下游 `.select()` 直接炸，
+   且「没同步过」与「窗口内无该标的」两种空无法区分；
 3. 主源（`providers_order`）只对跨源对拍生效，回填/增量仍按 yaml 取链头，
    前端「保存并立即生效」是假的。
 """
 
 from __future__ import annotations
 
-import inspect
 from datetime import date
 
 import polars as pl
@@ -26,13 +25,10 @@ from lquant.data.fallback import FallbackProvider
 
 
 class _RefProvider(DataProvider):
-    """最小 reference provider：记录收到的 day。"""
+    """最小 reference provider：securities 返回空清单（走通链路用）。"""
 
     name = "stub"
     capability = frozenset({Capability.REFERENCE})
-
-    def __init__(self) -> None:
-        self.seen_day: object = "<unset>"
 
     def daily_bars(self, *a, **k): ...
 
@@ -42,22 +38,10 @@ class _RefProvider(DataProvider):
 
     def financial_pit(self, *a, **k): ...
 
-    def securities(self, day: object = None):
-        self.seen_day = day
+    def securities(self):
         return pl.DataFrame()
 
     def trade_calendar(self, *a, **k): ...
-
-
-def test_fallback_securities_forwards_day() -> None:
-    """reference.sync_securities 传的 day 必须原样到达底层源。"""
-    p = _RefProvider()
-    fb = FallbackProvider([p])
-    d = date(2026, 1, 5)
-
-    fb.securities(d)
-
-    assert p.seen_day == d
 
 
 def test_fallback_records_serving_source() -> None:
@@ -65,34 +49,45 @@ def test_fallback_records_serving_source() -> None:
     p = _RefProvider()
     fb = FallbackProvider([p])
 
-    fb.securities(None)
+    fb.securities()
 
     assert fb.last_source == "stub"
     assert source_name(fb) == "stub"
 
 
-def test_every_registered_provider_securities_accepts_day() -> None:
-    """所有已注册 provider 的 securities 都必须接受 day（统一契约）。"""
-    from lquant.data.providers import PROVIDERS, _import_all
-
-    _import_all()
-    for name in PROVIDERS.keys():
-        cls = PROVIDERS.get(name)
-        method = getattr(cls, "securities", None)
-        assert method is not None, f"{name} 缺 securities"
-        params = inspect.signature(method).parameters
-        assert "day" in params, f"{name}.securities 不接受 day，路由层会 TypeError"
+def test_source_name_falls_back_to_name_without_last_source() -> None:
+    """还没服务过任何请求时（last_source 未置）应回落到 name。"""
+    assert source_name(_RefProvider()) == "stub"
 
 
-def test_sync_securities_does_not_typeerror_with_stub(monkeypatch) -> None:
-    """回归：sync_securities 走 get_provider().securities(day) 不得 TypeError。"""
+def test_sync_securities_stamps_actual_serving_source(monkeypatch) -> None:
+    """sync_securities 的血缘 source 必须是实际服务源。
+
+    原先硬编码 `pl.lit("baostock")`：Fallback 切到辅源后会把辅源的数据
+    标成主源，血缘失真且不可追。
+    """
     from lquant.data.ingest import reference
 
-    fb = FallbackProvider([_RefProvider()])
-    # sync_securities 内是「函数内 import」，必须打在 providers 模块属性上
-    monkeypatch.setattr("lquant.data.providers.get_provider", lambda: fb)
+    seen: dict[str, list[str]] = {}
 
-    assert reference.sync_securities() == 0  # 空结果 → 0，但链路已走通
+    class _Repo:
+        def upsert(self, df) -> int:
+            seen["source"] = df["source"].to_list()
+            return len(df)
+
+    class _Prov(_RefProvider):
+        name = "tushare"
+
+        def securities(self):
+            return pl.DataFrame({"symbol": ["000001.SZ"], "name": ["平安银行"]})
+
+    fb = FallbackProvider([_Prov()])
+    monkeypatch.setattr("lquant.data.providers.get_provider", lambda: fb)
+    monkeypatch.setattr(reference, "SecurityRepo", _Repo)
+    monkeypatch.setattr(reference, "_merge_existing_details", lambda df, **k: df)
+
+    assert reference.sync_securities() == 1
+    assert seen["source"] == ["tushare"]
 
 
 # ---------------------------------------------------------------- parquet 湖语义

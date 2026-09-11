@@ -127,7 +127,7 @@ class MootdxProvider(DataProvider):
         self.require(Capability.FINANCIAL_PIT)
         raise NotImplementedError
 
-    def securities(self, day=None):
+    def securities(self):
         self.require(Capability.REFERENCE)
         raise NotImplementedError
 

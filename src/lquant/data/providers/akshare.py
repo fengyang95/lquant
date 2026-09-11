@@ -238,11 +238,8 @@ class AkShareProvider(MappingProvider):
             "symbol", "trade_date", "factor", pl.lit("akshare").alias("source")
         )
 
-    def securities(self, day: date | None = None) -> pl.DataFrame:
-        """全市场 A 股代码-名称清单（仅 symbol/name，其余列由 parse_symbol 推断）。
-
-        akshare 无按日口径接口，``day`` 只作契约占位、忽略。
-        """
+    def securities(self) -> pl.DataFrame:
+        """全市场 A 股代码-名称清单（仅 symbol/name，其余列由 parse_symbol 推断）。"""
         import akshare as ak  # noqa: PLC0415  延迟导入：akshare 可选依赖
 
         self._bucket.acquire()
