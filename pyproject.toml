@@ -26,6 +26,7 @@ dependencies = [
   "baostock>=0.8.8",
   "pandas>=2.2",
   "aiosqlite>=0.22.1",
+  "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
@@ -74,7 +75,8 @@ packages = ["src/lquant"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
-markers = ["slow: 需要网络或大数据", "rust: 依赖 Rust 扩展"]
+markers = ["slow: 需要网络或大数据", "rust: 依赖 Rust 扩展",
+    "integration: 集成测试（需要本机 Redis）"]
 
 [tool.ruff]
 line-length = 100

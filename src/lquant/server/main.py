@@ -4,6 +4,8 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from lquant.monitor import start_monitor, stop_monitor
+from lquant.monitor.api_mw import MonitorMiddleware
 from lquant.server import ws
 from lquant.server.api import (
     analyses,
@@ -14,6 +16,7 @@ from lquant.server.api import (
     factors,
     health,
     market,
+    monitor,
     news,
     paper,
     settings,
@@ -34,16 +37,28 @@ def create_app() -> FastAPI:
     )
     for r in (health, data, factors, backtests, market, paper, watchlist,
               strategies, analyses, sync, etf, news, settings, ask,
-              task_center):
+              task_center, monitor):
         app.include_router(r.router, prefix="/api")
     app.include_router(ws.router)  # /ws/jobs/{id}，无 /api 前缀（与前端代理一致）
-    return app
+
+    @app.on_event("startup")
+    def _monitor_startup() -> None:
+        start_monitor()
+
+    @app.on_event("shutdown")
+    def _monitor_shutdown() -> None:
+        stop_monitor()
+
+    return MonitorMiddleware(app)
 
 
 app = create_app()
+# MonitorMiddleware 是纯 ASGI 包裹，没有 on_event；模块级既有 startup 钩子仍需
+# 注册到底层 FastAPI 实例上（uvicorn 的 "main:app" 指向包了中间件的 ASGI 栈）。
+_fastapi_app = app.app if isinstance(app, MonitorMiddleware) else app
 
 
-@app.on_event("startup")
+@_fastapi_app.on_event("startup")
 def _startup() -> None:
     from lquant._rust.loader import print_status
 

@@ -30,6 +30,7 @@ const GROUPS: { label: string; items: { href: string; label: string }[] }[] = [
       { href: '/data', label: '数据总览' },
       { href: '/sync', label: '同步' },
       { href: '/tasks', label: '任务管理' },
+      { href: '/monitor', label: '监控' },
     ],
   },
 ];
