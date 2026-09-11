@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
+from lquant.backtest.sandbox import safe_builtins
 from lquant.backtest.validation import validate_source
 
 
@@ -23,6 +24,9 @@ def _ns() -> dict:
           "date": date, "datetime": datetime, "timedelta": timedelta,
           "Counter": Counter, "defaultdict": defaultdict, "deque": deque,
           "np": np, "pd": pd, "pl": pl}
+    # 不设 __builtins__ 时 CPython 会自动注入**完整**内建（于是 __import__ 可用，
+    # import 白名单形同虚设）。这里显式换成受限集合。
+    ns["__builtins__"] = safe_builtins()
     return ns
 
 
