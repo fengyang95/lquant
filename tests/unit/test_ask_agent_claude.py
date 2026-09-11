@@ -119,6 +119,9 @@ async def test_timeout_terminates(tmp_path, fake_script):
     ses = await svc.create_session(None)
     events = await _run(svc, ses.id, "慢慢想")
     assert any(e.type == "error" and "执行超时" in e.message for e in events)
+    # 不留空 assistant 消息：错误文本复用增量消息
+    msgs = await svc.get_messages(ses.id)
+    assert all(m.content for m in msgs if m.role == "assistant")
 
 
 async def test_missing_cli_error(tmp_path):

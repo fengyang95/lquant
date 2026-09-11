@@ -80,9 +80,11 @@ class ClaudeCodeAgentService(AgentService):
             raise
         except Exception as e:  # noqa: BLE001
             _LOG.exception("claude_code agent 失败")
-            err = await self.store.add_message(sid, "assistant", f"出错了：{e}")
+            if not getattr(e, "recorded", False):
+                # _fail_with 已把错误写入增量消息；此处兜底其他异常
+                await self.store.add_message(sid, "assistant", f"出错了：{e}")
             await on_event(AgentEvent(type="error", message=str(e)))
-            return err
+            return user_msg
         return user_msg
 
     async def cancel(self, sid: str) -> None:
@@ -138,7 +140,8 @@ class ClaudeCodeAgentService(AgentService):
                 if time.monotonic() - started > self._timeout:
                     proc.terminate()
                     tail = "\n".join(stderr_lines[-5:])[-400:]
-                    raise AgentError(f"执行超时；stderr 梗概：{tail}")
+                    await self._fail_with(sid, ans_msg.id,
+                                          f"执行超时；stderr 梗概：{tail}")
                 try:
                     raw = await asyncio.wait_for(
                         proc.stdout.readline(), timeout=1.0)
@@ -175,8 +178,20 @@ class ClaudeCodeAgentService(AgentService):
         finally:
             if proc.returncode is None:
                 proc.terminate()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
             stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+                await asyncio.wait_for(stderr_task, timeout=2.0)
             self._procs.pop(sid, None)
         if not saw_done:
             tail = "\n".join(stderr_lines[-5:])[-400:]
-            raise AgentError(f"claude CLI 未正常收尾；stderr 梗概：{tail}")
+            await self._fail_with(sid, ans_msg.id,
+                                  f"claude CLI 未正常收尾；stderr 梗概：{tail}")
+
+    async def _fail_with(self, sid: str, mid: str, text: str) -> None:
+        """失败收尾：错误文本复用增量 assistant 消息，不另落一条。"""
+        await self.store.append_assistant_delta(sid, mid, text)
+        err = AgentError(text)
+        err.recorded = True  # send_message 据此跳过重复落库
+        raise err

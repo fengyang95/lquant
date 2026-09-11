@@ -36,8 +36,9 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         await db.execute(
             "ALTER TABLE ask_sessions ADD COLUMN claude_session_id TEXT NOT NULL DEFAULT ''")
         await db.commit()
-    except aiosqlite.OperationalError:
-        pass  # 列已存在
+    except aiosqlite.OperationalError as e:
+        if "duplicate column name" not in str(e):
+            raise  # 列已存在属预期；其他迁移错误向上抛
 
 
 def _now() -> str:
