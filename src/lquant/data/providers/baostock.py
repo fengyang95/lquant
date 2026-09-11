@@ -11,7 +11,7 @@
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import polars as pl
@@ -30,6 +30,31 @@ _FREQ_MAP = {
 }
 # query_stock_basic 的 type: 1=股票 2=指数 3=其它 4=ETF 5=LOF
 _BS_TYPE_TO_SEC = {"1": "stock", "2": "index", "3": "other", "4": "etf", "5": "lof"}
+
+# baostock query_trade_dates 对 >10 年区间静默挂起（watchdog 只能杀，拿不到数据）
+_CAL_CHUNK_YEARS = 5
+
+
+def _add_years(d: date, n: int) -> date:
+    try:
+        return d.replace(year=d.year + n)
+    except ValueError:  # 2/29 → 平年
+        return d.replace(year=d.year + n, day=28)
+
+
+def _cal_chunks(start: date, end: date,
+                years: int = _CAL_CHUNK_YEARS) -> list[tuple[date, date]]:
+    """把 [start, end] 切成首尾相接的 ≤years 年区间。"""
+    chunks: list[tuple[date, date]] = []
+    cur = start
+    while cur <= end:
+        nxt = _add_years(cur, years)
+        if nxt > end:
+            chunks.append((cur, end))
+            break
+        chunks.append((cur, nxt - timedelta(days=1)))
+        cur = nxt
+    return chunks
 
 # T+0 品种关键词：跨境(QDII)、债券、黄金、货币、商品 —— 名称命中即 T+0 可卖。
 # 这是启发式；权威值以 rules/cn_a_share.yaml 的 sellable_after_days 覆盖为准。
@@ -449,7 +474,10 @@ class BaoStockProvider(MappingProvider):
     def trade_calendar(self, start: date, end: date) -> pl.DataFrame:
         from lquant.data.watchdog import run_with_watchdog
 
-        rows = run_with_watchdog(_bs_trade_dates, start.isoformat(), end.isoformat())
+        # baostock 对 >10 年的区间会静默挂起（watchdog 超时），按 5 年分段拉取
+        rows: list[list[str]] = []
+        for s, e in _cal_chunks(start, end, _CAL_CHUNK_YEARS):
+            rows.extend(run_with_watchdog(_bs_trade_dates, s.isoformat(), e.isoformat()))
         if not rows:
             return pl.DataFrame()
         df = pl.DataFrame(rows, schema=["trade_date", "is_open"], orient="row")
