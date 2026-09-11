@@ -470,16 +470,23 @@ class MineIn(BaseModel):
 
 
 def _validate_mine_req(agent_name: str, generator: str, n: int) -> None:
-    """入队前的同步前置校验（404/423/422），失败给客户端明确错误。"""
-    from lquant.factors.agents import find_agent
+    """入队前的同步前置校验（404/423/422），失败给客户端明确错误。
+
+    配额按**账本剩余**判定（与 CLI ``lq factor eval --agent`` 同一口径），
+    而不是只看配置里的静态上限 —— 后者下反复调用本端点就能无限刷挖掘，
+    而 agent_ledger 永远是空的。
+    """
+    from lquant.factors.agents import ensure_quota, find_agent
 
     a = find_agent(agent_name)
     if not a:
         raise HTTPException(404, f"Agent 未注册: {agent_name}")
     if not a.enabled:
         raise HTTPException(423, f"Agent 已冻结: {agent_name}")
-    if n > a.quota_eval:
-        raise HTTPException(422, f"超出配额: n={n} > quota={a.quota_eval}")
+    try:
+        ensure_quota(agent_name, n)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
 
 
 def _new_run_id() -> str:
@@ -533,6 +540,10 @@ def _run_mine_job(agent_name: str, generator: str, n: int, run_id: str) -> dict:
         raise HTTPException(422, f"未知生成器: {generator}（可选 gp/random）")
     res, survivors = run_session(eng, df, gen, agent=agent_name, n_candidates=n,
                                  covs=cov_cols)
+    # 记账：与 CLI 共用同一账本，把实际评估数计入配额（此前 API 路径完全不记账）
+    from lquant.factors.agents import record_eval
+
+    record_eval(agent_name, res.n_evaluated)
     try:
         with writer() as con:
             con.execute(

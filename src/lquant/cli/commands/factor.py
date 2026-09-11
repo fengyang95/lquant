@@ -84,16 +84,23 @@ def eval_(expr: str, start: str | None, neutral: bool, agent: str | None) -> Non
     # 预算内建：n_trials（eval+挖掘评估总账）、校正门槛、剩余配额
     n_trials, remaining, hints, thr = 0, None, [], None
     if agent:
-        from lquant.factors.agents import find_agent, quota_remaining, record_eval
+        from lquant.factors.agents import (
+            ensure_quota,
+            find_agent,
+            quota_remaining,
+            record_eval,
+        )
 
         a = find_agent(agent)
         if not a:
             raise click.ClickException(f"Agent 未注册: {agent}")
+        try:
+            ensure_quota(agent, 1)      # 先判后记：超配额时不该再计数
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
         n_trials = record_eval(agent)
         remaining = quota_remaining(agent)
         thr = corrected_threshold(max(n_trials, 2))
-        if a.quota_eval <= 0 or remaining <= 0:
-            raise click.ClickException(f"配额已用尽: {agent}")
         if abs(t) < thr:
             hints.append(f"|t|={abs(t):.2f} 低于校正门槛 {thr:.2f}（n_trials={n_trials}）")
         hints.append(f"剩余配额 {remaining} 次")
