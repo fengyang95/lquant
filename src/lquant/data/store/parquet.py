@@ -60,6 +60,29 @@ def lake_glob(kind: str = "daily") -> str:
     return str(_root() / kind / "**" / "*.parquet")
 
 
+def _has_parquet(root: Path) -> bool:
+    """目录下是否至少有一个 parquet 文件。
+
+    `rglob` 是生成器，`any()` 命中首个文件即短路 —— 有数据时几乎零成本，
+    只有真·空目录才会走完整个树。
+    """
+    return root.is_dir() and any(root.rglob("*.parquet"))
+
+
+def lake_is_empty(subdir: str = "daily") -> bool:
+    """湖的某个分区是否**一个 parquet 文件都没有**（`subdir` 相对湖根，
+    如 `daily` / `minute/freq=60min`）。
+
+    存在的意义是区分两种语义不同的「空」：
+    - 湖为空：全新 checkout / 从未同步 → 消费方该提示「先同步数据」；
+    - 湖有数据但没有目标标的或区间 → 正常的空结果。
+
+    读函数返回的是**有 schema 的空帧**（空库读出空结果，不是抛异常），
+    所以「帧是空的」无法再区分上面两种情形，必须显式问这个。
+    """
+    return not _has_parquet(_root() / subdir)
+
+
 def _empty_frame(name: str) -> pl.LazyFrame:
     """空湖返回「有 schema 的空帧」而不是 0 列空帧。
 
@@ -118,7 +141,7 @@ def read_daily(symbols: list[str] | None = None, start=None, end=None) -> pl.Laz
     root = _root() / "daily"
     # data 目录 gitignore，全新 checkout 下根目录不存在 → rglob 会抛
     # FileNotFoundError。用 is_dir 短路：无库即空帧，而不是炸读取。
-    if not root.is_dir() or not any(root.rglob("*.parquet")):
+    if not _has_parquet(root):
         return _empty_frame("daily_bar")
     # 字符串日期显式转 Date，避免 filter 时类型比较失败
     if isinstance(start, str):
@@ -148,7 +171,7 @@ def daily_range() -> tuple[date | None, date | None]:
     走 parquet 统计做 min/max 下推，不物化数据。
     """
     root = _root() / "daily"
-    if not root.is_dir() or not any(root.rglob("*.parquet")):
+    if not _has_parquet(root):
         return None, None
     try:
         row = (
@@ -222,7 +245,7 @@ def write_minute(df: pl.DataFrame, freq: str | None = None) -> list[Path]:
 def read_minute(symbols: list[str] | None = None, freq: str = "60min",
                 start=None, end=None) -> pl.LazyFrame:
     root = _root() / "minute" / f"freq={freq}"
-    if not root.is_dir() or not any(root.rglob("*.parquet")):
+    if not _has_parquet(root):
         return _empty_frame("minute_bar")
     lf = pl.scan_parquet(str(root / "**" / "*.parquet"))
     if symbols:

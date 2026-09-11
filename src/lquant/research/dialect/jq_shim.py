@@ -40,15 +40,18 @@ def _history_frame(secs: list[str], fields: list[str], count: int,
     fq="pre"：p × f / f_latest（窗口内最新因子归一）；
     fq="post"：p × f；fq=None：原始价。
     """
-    from lquant.data.store.parquet import read_daily
+    from lquant.data.store.parquet import lake_is_empty, read_daily
 
     lf = read_daily(symbols=secs, end=current_dt)
-    if not lf.collect_schema().names():
-        raise ValueError(
-            f"无日线数据（数据根目录为空，先同步数据），无法取 {secs} 截至 {current_dt}")
     df = (lf.sort(["symbol", "trade_date"])
             .group_by("symbol", maintain_order=True).tail(count).collect())
     if df.is_empty():
+        # 读函数对空湖返回的是「有 schema 的空帧」，所以「帧为空」既可能是
+        # 没同步过、也可能是窗口内确实没这只标的 —— 两者提示不同，需显式问
+        # 湖是否为空。只在失败路径探文件系统，history 热路径不付代价。
+        if lake_is_empty("daily"):
+            raise ValueError(
+                f"无日线数据（数据根目录为空，先同步数据），无法取 {secs} 截至 {current_dt}")
         raise ValueError(f"{secs} 无日线数据（窗口 {count} 天，截至 {current_dt}）")
 
     # 复权在取字段前完成：price 列 × adj_factor（pre 再除以窗口内最新因子）。

@@ -15,6 +15,7 @@ import inspect
 from datetime import date
 
 import polars as pl
+import pytest
 
 from lquant.data.base import DataProvider, source_name
 from lquant.data.capability import Capability
@@ -174,6 +175,80 @@ def test_lake_glob_is_absolute(tmp_path, monkeypatch) -> None:
 
     assert pq.lake_glob("daily").startswith(str(tmp_path))
     assert pq.lake_glob("daily").endswith("*.parquet")
+
+
+# ---------------------------- 「湖为空」vs「湖有数据但没命中」的区分
+
+
+def test_lake_is_empty_distinguishes_missing_from_empty_result(
+        tmp_path, monkeypatch) -> None:
+    """两种「空」语义不同，必须能区分。
+
+    读函数对空湖返回「有 schema 的空帧」，所以「帧是空的」既可能是
+    没同步过（该提示先同步）、也可能是窗口内确实没这只标的（正常空结果）。
+    早期实现靠「返回 0 列帧」来推断前者，代价是任何 `.select()` 都会炸。
+    """
+    pq = _lake(tmp_path, monkeypatch)
+
+    assert pq.lake_is_empty("daily") is True
+
+    pq.write_daily(_bars(["000001.SZ"], date(2024, 3, 1)))
+
+    assert pq.lake_is_empty("daily") is False
+    # 湖里有数据，但过滤到一个不存在的标的 → 帧为空、湖不为空
+    assert pq.read_daily(symbols=["999999.SZ"]).collect().is_empty()
+    assert pq.lake_is_empty("daily") is False
+
+
+def test_lake_is_empty_is_per_partition(tmp_path, monkeypatch) -> None:
+    """日线有数据不代表分钟线分区非空（各自独立探测）。"""
+    pq = _lake(tmp_path, monkeypatch)
+
+    pq.write_daily(_bars(["000001.SZ"], date(2024, 3, 1)))
+
+    assert pq.lake_is_empty("daily") is False
+    assert pq.lake_is_empty("minute/freq=60min") is True
+
+
+def test_history_empty_lake_says_sync_first(tmp_path, monkeypatch) -> None:
+    """全新 checkout：报可读的「数据根目录为空」，不是 polars 裸异常。"""
+    _lake(tmp_path, monkeypatch)
+    from lquant.research.dialect import jq_shim
+
+    jq_shim.bind(jq_shim.JQContext(
+        engine=None, trade_date=date(2026, 6, 12), universe=["600519.SH"]))
+    try:
+        with pytest.raises(ValueError, match="数据根目录为空"):
+            jq_shim.history(3, "1d", "close")
+    finally:
+        jq_shim.bind(None)
+
+
+def test_history_nonempty_lake_reports_window_not_missing_lake(
+        tmp_path, monkeypatch) -> None:
+    """湖里有数据、只是该标的没 bar → 报窗口型错误，不能误报「没同步过」。"""
+    pq = _lake(tmp_path, monkeypatch)
+    pq.write_daily(_bars(["000001.SZ"], date(2026, 6, 10)))
+    from lquant.research.dialect import jq_shim
+
+    jq_shim.bind(jq_shim.JQContext(
+        engine=None, trade_date=date(2026, 6, 12), universe=["600519.SH"]))
+    try:
+        with pytest.raises(ValueError, match="窗口 3 天"):
+            jq_shim.history(3, "1d", "close")
+    finally:
+        jq_shim.bind(None)
+
+
+def test_valuation_frame_empty_lake_returns_empty_tables(
+        tmp_path, monkeypatch) -> None:
+    """get_fundamentals 的估值列在空湖下返回空表（不抛、不误报）。"""
+    _lake(tmp_path, monkeypatch)
+    from lquant.research.dialect.fundamentals import _valuation_frame, valuation
+
+    out = _valuation_frame([valuation.pe_ratio], ["600519.SH"], date(2026, 6, 12))
+
+    assert list(out.values()) == [{}]
 
 
 def test_ensure_views_skips_empty_lake(tmp_path) -> None:
