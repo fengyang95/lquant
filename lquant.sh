@@ -34,6 +34,10 @@ RUSTUP_DIST_SERVER="${LQ_RUSTUP_DIST_SERVER:-https://rsproxy.cn}"
 RUSTUP_UPDATE_ROOT="${LQ_RUSTUP_UPDATE_ROOT:-https://rsproxy.cn/rustup/dist}"
 API_PORT="${LQ_API_PORT:-8000}"
 WEB_PORT="${LQ_WEB_PORT:-3000}"
+# 默认只绑回环。API 无鉴权，且 /api/analyses、/api/backtests/run-code 等端点会
+# exec 用户代码 —— 绑 0.0.0.0 等于把 RCE 开放给同网段。确需对外时显式设
+# LQ_API_HOST=0.0.0.0（会打印告警）。
+API_HOST="${LQ_API_HOST:-127.0.0.1}"
 PYTHON_MIN="3.12"
 
 RUN_DIR=".run"
@@ -432,8 +436,12 @@ cmd_start() {
   if pid_ok "$RUN_DIR/api.pid"; then warn "API 已在运行 (pid $(cat "$RUN_DIR/api.pid"))"; else
     free_port "$API_PORT"
     start_redis
-    info "启动 API (uvicorn, port $API_PORT)"
-    spawn api "$LOG_DIR/api.log" .venv/bin/uvicorn lquant.server.main:app --host 0.0.0.0 --port "$API_PORT"
+    info "启动 API (uvicorn, ${API_HOST}:$API_PORT)"
+    if [ "$API_HOST" != "127.0.0.1" ] && [ "$API_HOST" != "localhost" ]; then
+      warn "API 绑定在 $API_HOST（非回环）。API 无鉴权且会执行用户代码，"
+      warn "请确认所在网络可信，否则改回 LQ_API_HOST=127.0.0.1"
+    fi
+    spawn api "$LOG_DIR/api.log" .venv/bin/uvicorn lquant.server.main:app --host "$API_HOST" --port "$API_PORT"
     wait_api || true
   fi
 

@@ -329,3 +329,23 @@ def rebal(context):
     # params 里应带 strategy_id / factor_formulas / logs
     assert body["params"]["factor_formulas"] == [factor]
     assert "strategy_id" in body["params"]
+
+
+# ---------- run-code 静态闸（安全边界） ----------
+
+def test_run_code_rejects_dynamic_execution(client):
+    """用户代码入口必须先过 validate_source，不能直接进 exec。"""
+    r = client.post("/api/backtests/run-code", json={
+        "code": "def initialize(context):\n    __import__('os').system('id')\n",
+        "start": "2026-01-01", "initial_cash": 1_000_000})
+    assert r.status_code == 422, r.text
+    assert "__import__" in r.text
+
+
+def test_run_code_rejects_object_graph_escape(client):
+    r = client.post("/api/backtests/run-code", json={
+        "code": ("def initialize(context):\n"
+                 "    x = ().__class__.__bases__[0]\n"),
+        "start": "2026-01-01", "initial_cash": 1_000_000})
+    assert r.status_code == 422, r.text
+    assert "__class__" in r.text

@@ -58,9 +58,12 @@ async def get_agent_service() -> AgentService:
             )
 
             if provider not in _WARNED_PROVIDERS:
-                logging.getLogger(__name__).warning(
-                    "claude_code provider 以 --dangerously-skip-permissions 全自主运行："
-                    "该权限边界仅限本地单人环境，勿将服务暴露到非本机地址")
+                if s.agent.skip_permissions:
+                    logging.getLogger(__name__).warning(
+                        "claude_code provider 以 --dangerously-skip-permissions 全自主运行："
+                        "该权限边界仅限本地单人环境，勿将服务暴露到非本机地址"
+                        "（API 绑定由 LQ_API_HOST 控制，默认 127.0.0.1）。"
+                        "不需要 CLI 落盘/执行命令时，设 agent.skip_permissions=false")
                 _WARNED_PROVIDERS.add(provider)
             _cache["service"] = ClaudeCodeAgentService(store)
         else:

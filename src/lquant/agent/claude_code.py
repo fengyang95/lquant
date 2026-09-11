@@ -37,6 +37,7 @@ class ClaudeCodeAgentService(AgentService):
         workspace_dir: str | None = None,
         root: Path | None = None,
         timeout_seconds: int | None = None,
+        skip_permissions: bool | None = None,
     ) -> None:
         from lquant.core.config import get_settings  # noqa: PLC0415
 
@@ -47,6 +48,10 @@ class ClaudeCodeAgentService(AgentService):
         self._root = Path(root) if root else s.root
         self._timeout = float(timeout_seconds if timeout_seconds is not None
                               else s.agent.timeout_seconds)
+        # 无头 claude 需要跳过交互式授权，否则会挂住；但它是「全自主」权限。
+        # 做成开关（默认保持原行为），不要散在命令行里硬编码。
+        self._skip_permissions = (
+            s.agent.skip_permissions if skip_permissions is None else skip_permissions)
         super().__init__(store)
         self._workspace = ensure_workspace(self._workspace_dir, self._root)
         self._tasks: dict[str, asyncio.Task] = {}
@@ -103,10 +108,11 @@ class ClaudeCodeAgentService(AgentService):
             "-p", content,
             "--output-format", "stream-json",
             "--verbose",
-            "--dangerously-skip-permissions",
             "--append-system-prompt", _SYSTEM_PROMPT,
             "--mcp-config", str(self._workspace / ".claude" / "mcp.json"),
         ]
+        if self._skip_permissions:
+            cmd.append("--dangerously-skip-permissions")
         if claude_sid:
             cmd += ["--resume", claude_sid]
         cmd += self._claude_args
