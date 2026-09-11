@@ -462,21 +462,17 @@ def list_mining_runs(limit: int = Query(default=50, ge=1, le=500)) -> list[dict]
              "created_at": str(r[9])} for r in rows]
 
 
-@router.post("/mine/run")
-def mine_run(req: dict) -> dict:
-    """平台驱动挖掘会话（同步，有界预算）。请求: {agent, generator, n}。"""
-    import datetime as dt
-    import json
-    import uuid
+class MineIn(BaseModel):
+    agent: str = "gp-internal"
+    generator: str = Field(default="gp", pattern="^(gp|random)$")
+    n: int = Field(default=100, ge=1)
+    sync: bool = False
 
-    from lquant.core.db import writer
+
+def _validate_mine_req(agent_name: str, generator: str, n: int) -> None:
+    """入队前的同步前置校验（404/423/422），失败给客户端明确错误。"""
     from lquant.factors.agents import find_agent
-    from lquant.factors.engine import FactorEngine
-    from lquant.factors.mining.runner import run_session
 
-    agent_name = (req or {}).get("agent", "gp-internal")
-    generator = (req or {}).get("generator", "gp")
-    n = int((req or {}).get("n", 100))
     a = find_agent(agent_name)
     if not a:
         raise HTTPException(404, f"Agent 未注册: {agent_name}")
@@ -484,6 +480,41 @@ def mine_run(req: dict) -> dict:
         raise HTTPException(423, f"Agent 已冻结: {agent_name}")
     if n > a.quota_eval:
         raise HTTPException(422, f"超出配额: n={n} > quota={a.quota_eval}")
+
+
+def _new_run_id() -> str:
+    import uuid
+
+    return uuid.uuid4().hex[:12]
+
+
+def _mine_placeholder(run_id: str, agent: str, generator: str) -> None:
+    """入队时预落 ledger 占位行（全 0）：job 完成后 INSERT OR REPLACE 覆盖。
+
+    这样任务中心在任务尚未跑完时也能看到这条因子挖掘任务，
+    测试也能确定性断言 ledger 行存在。
+    """
+    import datetime as dt
+
+    from lquant.core.db import writer
+
+    try:
+        with writer() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO factor_mining_run VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                [run_id, agent, generator, 0, 0, 0, 0, 0, 0, "{}", dt.datetime.now()])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _run_mine_job(agent_name: str, generator: str, n: int, run_id: str) -> dict:
+    """挖掘会话执行体：跑会话 → 覆盖 factor_mining_run → 返回结果体。"""
+    import datetime as dt
+    import json
+
+    from lquant.core.db import writer
+    from lquant.factors.engine import FactorEngine
+    from lquant.factors.mining.runner import run_session
     from lquant.factors.mining.submit import _panel_with_covs
 
     df, cov_cols = _panel_with_covs()
@@ -492,21 +523,22 @@ def mine_run(req: dict) -> dict:
     eng = FactorEngine(df.lazy())
     if generator == "gp":
         from lquant.factors.mining.gp import GPGenerator
+
         gen = GPGenerator()
     elif generator == "random":
         from lquant.factors.mining.random_gen import make_generator
+
         gen = make_generator()
     else:
         raise HTTPException(422, f"未知生成器: {generator}（可选 gp/random）")
     res, survivors = run_session(eng, df, gen, agent=agent_name, n_candidates=n,
                                  covs=cov_cols)
-    run_id = uuid.uuid4().hex[:12]
     try:
         with writer() as con:
             con.execute(
                 "INSERT OR REPLACE INTO factor_mining_run VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 [run_id, agent_name, generator, res.n_evaluated, res.n_static_fail,
-                 res.n_redundant, res.n_size_proxy, res.n_survivors,
+                 res.n_low_ic, res.n_redundant, res.n_size_proxy, res.n_survivors,
                  json.dumps(res.corrections, ensure_ascii=False)[:10000], dt.datetime.now()])
     except Exception:  # noqa: BLE001
         pass  # 记账失败不阻断结果
@@ -515,6 +547,26 @@ def mine_run(req: dict) -> dict:
             "n_low_ic": res.n_low_ic, "n_redundant": res.n_redundant,
             "n_size_proxy": res.n_size_proxy, "n_survivors": res.n_survivors,
             "survivors": survivors[:10]}
+
+
+@router.post("/mine/run")
+def mine_run(req: MineIn) -> dict:
+    """平台驱动挖掘会话：默认异步（202 + task_id，跑完落 factor_mining_run）；
+    sync=true 保留旧行为直接返回结果体。请求: {agent, generator, n, sync}。"""
+    from fastapi.responses import JSONResponse
+
+    from lquant.server.jobs import enqueue
+
+    _validate_mine_req(req.agent, req.generator, req.n)
+    if req.sync:
+        return _run_mine_job(req.agent, req.generator, req.n, run_id=_new_run_id())
+    run_id = _new_run_id()
+    _mine_placeholder(run_id, req.agent, req.generator)
+    enqueue("lquant-mining", _run_mine_job, req.agent, req.generator, req.n,
+            run_id=run_id)
+    return JSONResponse(status_code=202, content={
+        "status": "queued", "task_id": run_id, "agent": req.agent,
+        "generator": req.generator, "n": req.n})
 
 
 def list_reports() -> list[dict]:
