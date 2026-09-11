@@ -525,6 +525,11 @@ def list_reports() -> list[dict]:
             for p in sorted(REPORT_DIR.glob("*.html"), key=lambda x: -x.stat().st_mtime)]
 
 
+@router.get("/reports")
+def reports_list() -> list[dict]:
+    return list_reports()
+
+
 @router.get("/reports/{name}")
 def get_report(name: str) -> FileResponse:
     # 路径白名单：name 只允许字母数字下划线连字符，挡 ../ 与隐藏字符
