@@ -25,6 +25,7 @@ from datetime import date
 
 import polars as pl
 
+from lquant.core.types import today_cn
 from lquant.data.quality import crosscheck
 from lquant.data.quality.issues import Issue, save_issues
 

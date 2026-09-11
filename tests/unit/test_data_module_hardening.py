@@ -20,7 +20,6 @@ from lquant.data.base import DataProvider, source_name
 from lquant.data.capability import Capability
 from lquant.data.fallback import FallbackProvider
 
-
 # ---------------------------------------------------------------- 契约：securities
 
 
@@ -290,8 +289,8 @@ def test_build_chain_honors_providers_order(monkeypatch) -> None:
 
 def test_settings_put_invalidates_chain_cache() -> None:
     """写 providers_order 后 build_chain 缓存必须失效（否则要重启才生效）。"""
-    from lquant.data import providers as pv
     from lquant.core.settings_store import SettingsStore
+    from lquant.data import providers as pv
 
     calls = {"n": 0}
     real = pv.reset_chain
