@@ -100,6 +100,33 @@ def test_sync_delisted_preserves_existing_details(fake_settings, fake_ak):
     assert str(row[2]) == "2009-01-15"
 
 
+def test_sync_delisted_skips_unparseable_codes(fake_settings, monkeypatch):
+    """B股等 parse_symbol 不认识的代码只丢行，不能拖垮整张退市表（真实故障点）。"""
+    class _BShareAk:
+        @staticmethod
+        def stock_info_sh_delist(symbol: str = "全部") -> pl.DataFrame:
+            return pl.DataFrame()
+
+        @staticmethod
+        def stock_info_sz_delist(symbol: str = "终止上市公司") -> pl.DataFrame:
+            return pl.DataFrame({
+                "证券代码": ["000003", "200002"],   # 后者是深市 B 股
+                "证券简称": ["PT金田Ａ", "PT金田B"],
+                "上市日期": ["1991-01-14", "1991-01-14"],
+                "终止上市日期": ["2002-06-14", "2002-06-14"],
+            })
+
+    monkeypatch.setattr(reference_mod, "_ak_delist_module", lambda: _BShareAk)
+    _seed_security([])
+    n = reference_mod.sync_delisted()
+    assert n == 1  # 000003 入库，200002 被跳过
+    from lquant.core.db import reader
+
+    with reader() as con:
+        syms = [r[0] for r in con.execute("SELECT symbol FROM security").fetchall()]
+    assert syms == ["000003.SZ"]
+
+
 def test_sync_delisted_empty_source(fake_settings, monkeypatch):
     class _Empty:
         @staticmethod
@@ -127,3 +154,44 @@ def test_sync_reference_includes_delisted(fake_settings, fake_ak, monkeypatch):
     out = reference_mod.sync_reference()
     assert order == ["cal", "sec", "delist", "details"]
     assert out["delisted"] == 1
+
+
+def test_sync_reference_continues_on_step_failure(
+    fake_settings, fake_ak, monkeypatch,
+):
+    """单步失败不中断整体：日历挂了，退市名单仍要入库；最后汇总报错。"""
+    def boom(*a, **k):
+        raise RuntimeError("baostock 挂起")
+
+    order: list[str] = []
+    monkeypatch.setattr(reference_mod, "sync_calendar", boom)
+    monkeypatch.setattr(
+        reference_mod, "sync_securities", lambda *a, **k: order.append("sec") or 5)
+    monkeypatch.setattr(
+        reference_mod, "sync_delisted", lambda *a, **k: order.append("delist") or 4)
+    monkeypatch.setattr(
+        reference_mod, "sync_security_details",
+        lambda *a, **k: order.append("details") or 0)
+    with pytest.raises(RuntimeError, match="calendar"):
+        reference_mod.sync_reference()
+    assert order == ["sec", "delist", "details"]
+
+
+def test_sync_securities_calls_provider_without_args(fake_settings, monkeypatch):
+    """回归：sync_securities 不能把 day 传给 provider.securities() ——
+    FallbackProvider.securities() 不收参数，传了会 TypeError。"""
+    calls: list[tuple] = []
+
+    class _P:
+        def securities(self):
+            calls.append(())
+            return pl.DataFrame({
+                "symbol": ["600001.SH"], "name": ["x"],
+                "sec_type": ["stock"],
+            })
+
+    monkeypatch.setattr(
+        "lquant.data.providers.get_provider", lambda: _P())
+    _seed_security([])
+    assert reference_mod.sync_securities() == 1
+    assert calls == [()]

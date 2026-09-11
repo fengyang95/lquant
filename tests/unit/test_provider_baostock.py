@@ -205,6 +205,44 @@ def test_daily_bars_end_to_end_no_network(
     assert out["symbol"].to_list() == ["600000.SH"] * 3
 
 
+def test_trade_calendar_long_range_chunked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """>5 年的日历请求必须分段 —— baostock 对 >10 年区间会静默挂起。"""
+    calls: list[tuple[str, str]] = []
+
+    def fake_query(fn: object, *args: object) -> list[list[str]]:
+        start, end = args
+        calls.append((str(start), str(end)))
+        return [[str(start), "1"]]
+
+    monkeypatch.setattr(wd, "run_with_watchdog", fake_query)
+    p = BaoStockProvider()
+    out = p.trade_calendar(date(1990, 12, 19), date(2035, 12, 31))
+    spans = [(date.fromisoformat(s), date.fromisoformat(e)) for s, e in calls]
+    assert len(spans) >= 9  # 45 年 ÷ 5 年
+    assert all((e - s).days <= 366 * 5 for s, e in spans), spans
+    assert spans[0][0] == date(1990, 12, 19)
+    assert spans[-1][1] == date(2035, 12, 31)
+    # 相邻段无缝衔接
+    assert all(spans[i + 1][0] > spans[i][1] for i in range(len(spans) - 1))
+    assert len(out) == len(spans)
+
+
+def test_trade_calendar_short_range_single_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def fake_query(fn: object, *args: object) -> list[list[str]]:
+        calls.append((str(args[0]), str(args[1])))
+        return [[str(args[0]), "1"]]
+
+    monkeypatch.setattr(wd, "run_with_watchdog", fake_query)
+    p = BaoStockProvider()
+    out = p.trade_calendar(date(2024, 1, 1), date(2024, 12, 31))
+    assert len(calls) == 1
+    assert len(out) == 1
+
+
 def test_real_yaml_loads() -> None:
     """交付的两份 yaml 与 SCHEMAS 校验兼容（fail-fast 不炸）。"""
     dm = load_table_mapping("daily_bar", "baostock")

@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import date
 
 import polars as pl
@@ -44,12 +45,15 @@ def sync_calendar(start: date | str = _CAL_START, end: date | str = _CAL_END) ->
 
 
 def sync_securities(day: date | None = None) -> int:
-    """快路径：全市场标的清单。库里已有 list_date 要保住，不能被覆盖成 NULL。"""
+    """快路径：全市场标的清单。库里已有 list_date 要保住，不能被覆盖成 NULL。
+
+    day 参数已废弃（provider 接口 securities() 不收日期），仅为兼容保留。
+    """
     from loguru import logger
 
     from lquant.data.providers import get_provider
 
-    df = get_provider().securities(day)
+    df = get_provider().securities()
     if not len(df):
         logger.warning("标的清单返回为空")
         return 0
@@ -106,15 +110,26 @@ def sync_delisted() -> int:
 
 def _normalize_delist(df, code_col: str, name_col: str, list_col: str,
                       delist_col: str) -> pl.DataFrame:
-    """交易所退市表 → security 表列（symbol 统一 000003.SZ 形态）。"""
+    """交易所退市表 → security 表列（symbol 统一 000003.SZ 形态）。
+
+    B 股等 parse_symbol 不认识的代码跳过（不能让一只 200002 拖垮整张退市表）。
+    """
+    from loguru import logger
+
     from lquant.core.types import parse_symbol
+
+    def _safe_symbol(raw: str) -> str | None:
+        try:
+            return str(parse_symbol(raw))
+        except Exception:  # noqa: BLE001 - 无法识别的代码段（B股等），丢行
+            return None
 
     if df is None or not len(df):
         return pl.DataFrame()
     out = pl.from_pandas(df) if not isinstance(df, pl.DataFrame) else df
-    return out.select(
+    res = out.select(
         pl.col(code_col).cast(pl.Utf8).str.strip_chars()
-        .map_elements(lambda s: str(parse_symbol(s)), return_dtype=pl.Utf8)
+        .map_elements(_safe_symbol, return_dtype=pl.Utf8)
         .alias("symbol"),
         pl.col(name_col).cast(pl.Utf8).alias("name"),
         pl.col(list_col).cast(pl.Utf8).str.to_date("%Y-%m-%d", strict=False)
@@ -123,6 +138,11 @@ def _normalize_delist(df, code_col: str, name_col: str, list_col: str,
         .alias("delist_date"),
         pl.lit("stock").alias("sec_type"),
     )
+    n_before = len(res)
+    res = res.filter(pl.col("symbol").is_not_null())
+    if skipped := n_before - len(res):
+        logger.warning(f"退市名单跳过 {skipped} 只无法识别代码的标的（B股等）")
+    return res
 
 
 def sync_security_details(limit: int | None = None, batch: int = 200) -> int:
@@ -167,14 +187,32 @@ def sync_security_details(limit: int | None = None, batch: int = 200) -> int:
 
 
 def sync_reference(skip_details: bool = False, detail_limit: int | None = None) -> dict:
-    """一键补齐地基。返回各步写入行数，供 CLI/脚本打印。"""
-    out = {
-        "calendar": sync_calendar(),
-        "securities": sync_securities(),
-        "delisted": sync_delisted(),
-    }
+    """一键补齐地基。返回各步写入行数，供 CLI/脚本打印。
+
+    单步失败不中断整体（日历挂了不能拖累退市名单入库），
+    全部跑完后若有失败则汇总抛错 —— 已写入的部分不回滚，重跑幂等。
+    """
+    from loguru import logger
+
+    out: dict = {}
+    errors: list[str] = []
+    steps: list[tuple[str, Callable[[], int]]] = [
+        ("calendar", sync_calendar),
+        ("securities", sync_securities),
+        ("delisted", sync_delisted),
+    ]
     if not skip_details:
-        out["details"] = sync_security_details(limit=detail_limit)
+        steps.append(("details", lambda: sync_security_details(limit=detail_limit)))
+    for name, fn in steps:
+        try:
+            out[name] = fn()
+        except Exception as e:  # noqa: BLE001 - 单步失败记下，继续跑后面的步骤
+            logger.warning(f"reference 步骤 {name} 失败: {e}")
+            out[name] = 0
+            errors.append(f"{name}: {e}")
+    if errors:
+        raise RuntimeError(
+            "reference 同步部分失败（成功部分已写入，重跑幂等）: " + "; ".join(errors))
     return out
 
 
