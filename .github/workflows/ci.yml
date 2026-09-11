@@ -19,9 +19,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates
+      # cargo test（--no-default-features，即非 extension-module）需要链接 libpython
+      - name: Install libpython
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
       - name: cargo test
         working-directory: crates
-        run: cargo test --workspace
+        # --no-default-features 关闭 extension-module，让测试二进制链接 libpython
+        run: cargo test --workspace --no-default-features
 
   python:
     name: Python (pytest)
