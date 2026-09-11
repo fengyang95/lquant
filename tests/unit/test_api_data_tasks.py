@@ -62,7 +62,10 @@ def _stub_executor(monkeypatch):
 
     monkeypatch.setattr(tasks_mod, "execute_task", _noop)
     monkeypatch.setattr(tasks_mod, "retry_task", _noop)
-    # data.py `from ... import execute_task` 持有引用，须一并打桩
+    monkeypatch.setattr(tasks_mod, "run_claimed_task", _noop)
+    # data.py `from ... import execute_task` 持有引用，须一并打桩；
+    # 端点经 `ingest_tasks.run_claimed_task` 属性现取，两处都得覆盖，
+    # 否则 retry 会真实跑回填（偶发拉 baostock，线程与 pytest 退出竞态）
     monkeypatch.setattr(data_mod, "execute_task", _noop)
     monkeypatch.setattr(data_mod, "run_claimed_task", _noop)
     from lquant.core.db import writer
