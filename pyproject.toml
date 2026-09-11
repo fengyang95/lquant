@@ -74,7 +74,11 @@ packages = ["src/lquant"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# 注意：这份配置是唯一的 pytest 配置源。曾经仓库里同时存在 pytest.ini，
+# 而 pytest 只会读「根目录下优先级最高」的那一个（pytest.ini > pyproject.toml），
+# 于是这里的 --strict-markers 与 slow/rust 两个 marker 声明全被静默忽略。
 addopts = "-q --strict-markers"
+asyncio_mode = "auto"
 markers = ["slow: 需要网络或大数据", "rust: 依赖 Rust 扩展",
     "integration: 集成测试（需要本机 Redis）"]
 
