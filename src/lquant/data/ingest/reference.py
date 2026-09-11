@@ -7,6 +7,7 @@
 - 快路径 sync_securities()：一次请求拿全市场 code/name/status
 - 慢路径 sync_security_details()：逐只补 ipoDate/outDate，走 checkpoint 增量
 """
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -19,7 +20,7 @@ from lquant.core.types import now_cn
 from lquant.data.ingest.checkpoint import Checkpoint
 from lquant.data.store.catalog import SecurityRepo, TradeCalendarRepo
 
-_CAL_START = date(1990, 12, 19)   # 上交所开市
+_CAL_START = date(1990, 12, 19)  # 上交所开市
 _CAL_END = date(2035, 12, 31)
 
 
@@ -111,8 +112,9 @@ def sync_delisted() -> int:
     return n
 
 
-def _normalize_delist(df, code_col: str, name_col: str, list_col: str,
-                      delist_col: str) -> pl.DataFrame:
+def _normalize_delist(
+    df, code_col: str, name_col: str, list_col: str, delist_col: str
+) -> pl.DataFrame:
     """交易所退市表 → security 表列（symbol 统一 000003.SZ 形态）。
 
     B 股等 parse_symbol 不认识的代码跳过（不能让一只 200002 拖垮整张退市表）。
@@ -131,14 +133,14 @@ def _normalize_delist(df, code_col: str, name_col: str, list_col: str,
         return pl.DataFrame()
     out = pl.from_pandas(df) if not isinstance(df, pl.DataFrame) else df
     res = out.select(
-        pl.col(code_col).cast(pl.Utf8).str.strip_chars()
+        pl.col(code_col)
+        .cast(pl.Utf8)
+        .str.strip_chars()
         .map_elements(_safe_symbol, return_dtype=pl.Utf8)
         .alias("symbol"),
         pl.col(name_col).cast(pl.Utf8).alias("name"),
-        pl.col(list_col).cast(pl.Utf8).str.to_date("%Y-%m-%d", strict=False)
-        .alias("list_date"),
-        pl.col(delist_col).cast(pl.Utf8).str.to_date("%Y-%m-%d", strict=False)
-        .alias("delist_date"),
+        pl.col(list_col).cast(pl.Utf8).str.to_date("%Y-%m-%d", strict=False).alias("list_date"),
+        pl.col(delist_col).cast(pl.Utf8).str.to_date("%Y-%m-%d", strict=False).alias("delist_date"),
         pl.lit("stock").alias("sec_type"),
     )
     n_before = len(res)
@@ -180,11 +182,26 @@ def sync_security_details(limit: int | None = None, batch: int = 200) -> int:
         chunk = todo[i : i + batch]
         df = target.security_details(chunk)
         if len(df):
-            repo.upsert(df.with_columns(
-                source=pl.lit(src),
-                updated_at=pl.lit(now_cn().replace(tzinfo=None), dtype=pl.Datetime),
-            ).select([c for c in ("symbol", "name", "list_date", "delist_date",
-                                  "sec_type", "source", "updated_at") if c in df.columns]))
+            repo.upsert(
+                df.with_columns(
+                    source=pl.lit(src),
+                    updated_at=pl.lit(now_cn().replace(tzinfo=None), dtype=pl.Datetime),
+                ).select(
+                    [
+                        c
+                        for c in (
+                            "symbol",
+                            "name",
+                            "list_date",
+                            "delist_date",
+                            "sec_type",
+                            "source",
+                            "updated_at",
+                        )
+                        if c in df.columns
+                    ]
+                )
+            )
         cp.mark(chunk)
         done += len(chunk)
         logger.info(f"  详情进度 {done}/{len(todo)}")
@@ -217,7 +234,8 @@ def sync_reference(skip_details: bool = False, detail_limit: int | None = None) 
             errors.append(f"{name}: {e}")
     if errors:
         raise RuntimeError(
-            "reference 同步部分失败（成功部分已写入，重跑幂等）: " + "; ".join(errors))
+            "reference 同步部分失败（成功部分已写入，重跑幂等）: " + "; ".join(errors)
+        )
     return out
 
 
@@ -236,21 +254,28 @@ def _merge_existing_details(df: pl.DataFrame, *, keep_existing: bool = False) ->
     if not len(old):
         return df
     joined = df.join(old, on="symbol", how="left")
-    new_list, old_list = (pl.col("list_date_right"), pl.col("list_date")) \
-        if keep_existing else (pl.col("list_date"), pl.col("list_date_right"))
-    new_delist, old_delist = (pl.col("delist_date_right"), pl.col("delist_date")) \
-        if keep_existing else (pl.col("delist_date"), pl.col("delist_date_right"))
-    return joined.with_columns(
-        list_date=pl.coalesce(
-            new_list.cast(pl.Date, strict=False),
-            old_list.cast(pl.Date, strict=False),
-        ),
-        delist_date=pl.coalesce(
-            new_delist.cast(pl.Date, strict=False),
-            old_delist.cast(pl.Date, strict=False),
-        ),
-    ).drop("list_date_right", "delist_date_right")
+    # 新清单可能不带日期列（baostock 快路径只有 code/name/status）——
+    # 此时 join 无列名冲突，不会产生 _right 后缀，旧值即最终值。
+    exprs: dict[str, pl.Expr] = {}
+    drops: list[str] = []
+    for col in ("list_date", "delist_date"):
+        if col in df.columns:
+            new_c, old_c = (f"{col}_right", col) if keep_existing else (col, f"{col}_right")
+            exprs[col] = pl.coalesce(
+                pl.col(new_c).cast(pl.Date, strict=False),
+                pl.col(old_c).cast(pl.Date, strict=False),
+            )
+            drops.append(f"{col}_right")
+        else:
+            exprs[col] = pl.col(col).cast(pl.Date, strict=False)
+    out = joined.with_columns(**exprs)
+    return out.drop(drops) if drops else out
 
 
-__all__ = ["sync_calendar", "sync_securities", "sync_delisted",
-           "sync_security_details", "sync_reference"]
+__all__ = [
+    "sync_calendar",
+    "sync_securities",
+    "sync_delisted",
+    "sync_security_details",
+    "sync_reference",
+]

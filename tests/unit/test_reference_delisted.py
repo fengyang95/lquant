@@ -2,6 +2,7 @@
 
 隔离方式沿用 test_data_tasks：LQ_ROOT env + chdir + cache_clear。
 """
+
 from __future__ import annotations
 
 import polars as pl
@@ -43,21 +44,25 @@ class _FakeAk:
 
     @staticmethod
     def stock_info_sh_delist(symbol: str = "全部") -> pl.DataFrame:
-        return pl.DataFrame({
-            "公司代码": ["600001", "600002"],
-            "公司简称": ["邯郸钢铁", "齐鲁退市"],
-            "上市日期": ["1998-01-22", "1998-04-08"],
-            "暂停上市日期": ["2009-12-29", "2006-04-24"],
-        })
+        return pl.DataFrame(
+            {
+                "公司代码": ["600001", "600002"],
+                "公司简称": ["邯郸钢铁", "齐鲁退市"],
+                "上市日期": ["1998-01-22", "1998-04-08"],
+                "暂停上市日期": ["2009-12-29", "2006-04-24"],
+            }
+        )
 
     @staticmethod
     def stock_info_sz_delist(symbol: str = "终止上市公司") -> pl.DataFrame:
-        return pl.DataFrame({
-            "证券代码": ["000003", "000004"],
-            "证券简称": ["PT金田Ａ", "国华退"],
-            "上市日期": ["1991-01-14", "1990-12-01"],
-            "终止上市日期": ["2002-06-14", "2026-07-14"],
-        })
+        return pl.DataFrame(
+            {
+                "证券代码": ["000003", "000004"],
+                "证券简称": ["PT金田Ａ", "国华退"],
+                "上市日期": ["1991-01-14", "1990-12-01"],
+                "终止上市日期": ["2002-06-14", "2026-07-14"],
+            }
+        )
 
 
 @pytest.fixture
@@ -73,8 +78,7 @@ def test_sync_delisted_upserts_all(fake_settings, fake_ak):
 
     with reader() as con:
         rows = con.execute(
-            "SELECT symbol, name, list_date, delist_date, sec_type "
-            "FROM security ORDER BY symbol"
+            "SELECT symbol, name, list_date, delist_date, sec_type FROM security ORDER BY symbol"
         ).fetchall()
     by_sym = {r[0]: r for r in rows}
     assert by_sym["600001.SH"][1] == "邯郸钢铁"
@@ -102,6 +106,7 @@ def test_sync_delisted_preserves_existing_details(fake_settings, fake_ak):
 
 def test_sync_delisted_skips_unparseable_codes(fake_settings, monkeypatch):
     """B股等 parse_symbol 不认识的代码只丢行，不能拖垮整张退市表（真实故障点）。"""
+
     class _BShareAk:
         @staticmethod
         def stock_info_sh_delist(symbol: str = "全部") -> pl.DataFrame:
@@ -109,12 +114,14 @@ def test_sync_delisted_skips_unparseable_codes(fake_settings, monkeypatch):
 
         @staticmethod
         def stock_info_sz_delist(symbol: str = "终止上市公司") -> pl.DataFrame:
-            return pl.DataFrame({
-                "证券代码": ["000003", "200002"],   # 后者是深市 B 股
-                "证券简称": ["PT金田Ａ", "PT金田B"],
-                "上市日期": ["1991-01-14", "1991-01-14"],
-                "终止上市日期": ["2002-06-14", "2002-06-14"],
-            })
+            return pl.DataFrame(
+                {
+                    "证券代码": ["000003", "200002"],  # 后者是深市 B 股
+                    "证券简称": ["PT金田Ａ", "PT金田B"],
+                    "上市日期": ["1991-01-14", "1991-01-14"],
+                    "终止上市日期": ["2002-06-14", "2002-06-14"],
+                }
+            )
 
     monkeypatch.setattr(reference_mod, "_ak_delist_module", lambda: _BShareAk)
     _seed_security([])
@@ -149,29 +156,30 @@ def test_sync_reference_includes_delisted(fake_settings, fake_ak, monkeypatch):
     monkeypatch.setattr(reference_mod, "sync_securities", lambda *a, **k: order.append("sec") or 1)
     monkeypatch.setattr(reference_mod, "sync_delisted", lambda *a, **k: order.append("delist") or 1)
     monkeypatch.setattr(
-        reference_mod, "sync_security_details",
-        lambda *a, **k: order.append("details") or 0)
+        reference_mod, "sync_security_details", lambda *a, **k: order.append("details") or 0
+    )
     out = reference_mod.sync_reference()
     assert order == ["cal", "sec", "delist", "details"]
     assert out["delisted"] == 1
 
 
 def test_sync_reference_continues_on_step_failure(
-    fake_settings, fake_ak, monkeypatch,
+    fake_settings,
+    fake_ak,
+    monkeypatch,
 ):
     """单步失败不中断整体：日历挂了，退市名单仍要入库；最后汇总报错。"""
+
     def boom(*a, **k):
         raise RuntimeError("baostock 挂起")
 
     order: list[str] = []
     monkeypatch.setattr(reference_mod, "sync_calendar", boom)
+    monkeypatch.setattr(reference_mod, "sync_securities", lambda *a, **k: order.append("sec") or 5)
+    monkeypatch.setattr(reference_mod, "sync_delisted", lambda *a, **k: order.append("delist") or 4)
     monkeypatch.setattr(
-        reference_mod, "sync_securities", lambda *a, **k: order.append("sec") or 5)
-    monkeypatch.setattr(
-        reference_mod, "sync_delisted", lambda *a, **k: order.append("delist") or 4)
-    monkeypatch.setattr(
-        reference_mod, "sync_security_details",
-        lambda *a, **k: order.append("details") or 0)
+        reference_mod, "sync_security_details", lambda *a, **k: order.append("details") or 0
+    )
     with pytest.raises(RuntimeError, match="calendar"):
         reference_mod.sync_reference()
     assert order == ["sec", "delist", "details"]
@@ -185,13 +193,75 @@ def test_sync_securities_calls_provider_without_args(fake_settings, monkeypatch)
     class _P:
         def securities(self):
             calls.append(())
-            return pl.DataFrame({
-                "symbol": ["600001.SH"], "name": ["x"],
-                "sec_type": ["stock"],
-            })
+            return pl.DataFrame(
+                {
+                    "symbol": ["600001.SH"],
+                    "name": ["x"],
+                    "sec_type": ["stock"],
+                }
+            )
 
-    monkeypatch.setattr(
-        "lquant.data.providers.get_provider", lambda: _P())
+    monkeypatch.setattr("lquant.data.providers.get_provider", lambda: _P())
     _seed_security([])
     assert reference_mod.sync_securities() == 1
     assert calls == [()]
+
+
+def test_merge_preserves_old_dates_when_new_frame_has_no_date_cols(fake_settings):
+    """回归：baostock 快路径清单不含 list_date/delist_date 列。
+
+    旧实现无条件引用 join 后的 *_right 列 → ColumnNotFoundError，
+    全市场 reference 同步必炸。不带日期列时应直接保留库内旧值。
+    """
+    _seed_security([("600001.SH", "stock", "1998-01-22", None)])
+    df = pl.DataFrame(
+        {
+            "symbol": ["600001.SH", "600002.SH"],
+            "name": ["x", "y"],
+            "sec_type": ["stock", "stock"],
+            "board": ["main", "main"],
+        }
+    )
+    out = reference_mod._merge_existing_details(df)
+    assert set(out.columns) >= {"symbol", "list_date", "delist_date"}
+    row = out.filter(pl.col("symbol") == "600001.SH")
+    assert row["list_date"][0] is not None and str(row["list_date"][0]) == "1998-01-22"
+    assert row["delist_date"][0] is None
+    # 库里没有的新标的：日期列为 NULL，不炸
+    new_row = out.filter(pl.col("symbol") == "600002.SH")
+    assert new_row["list_date"][0] is None
+
+
+def test_merge_coalesce_keeps_new_over_old_by_default(fake_settings):
+    """默认（keep_existing=False）：新值优先，空缺回落旧值。"""
+    _seed_security([("600001.SH", "stock", "1990-01-01", None)])
+    df = pl.DataFrame(
+        {
+            "symbol": ["600001.SH"],
+            "name": ["x"],
+            "sec_type": ["stock"],
+            "board": ["main"],
+            "list_date": [None],
+        }
+    )
+    out = reference_mod._merge_existing_details(df)
+    # 新值为 NULL → 回落旧值
+    assert str(out["list_date"][0]) == "1990-01-01"
+
+
+def test_merge_keep_existing_prefers_old(fake_settings):
+    """keep_existing=True（退市官方口径）：旧值非空则完全保留。"""
+    _seed_security([("600001.SH", "stock", "1990-01-01", None)])
+    df = pl.DataFrame(
+        {
+            "symbol": ["600001.SH"],
+            "name": ["x"],
+            "sec_type": ["stock"],
+            "board": ["main"],
+            "list_date": ["1998-01-22"],
+            "delist_date": ["2009-12-29"],
+        }
+    )
+    out = reference_mod._merge_existing_details(df, keep_existing=True)
+    assert str(out["list_date"][0]) == "1990-01-01"
+    assert str(out["delist_date"][0]) == "2009-12-29"  # 旧值为空 → 补新值
