@@ -63,7 +63,7 @@ class MappingProvider(DataProvider):
     ) -> pl.DataFrame:
         raise NotImplementedError(f"{self.name} 未实现 financial_pit")
 
-    def securities(self) -> pl.DataFrame:
+    def securities(self, day: date | None = None) -> pl.DataFrame:
         raise NotImplementedError(f"{self.name} 未实现 securities")
 
     def trade_calendar(self, start: date, end: date) -> pl.DataFrame:

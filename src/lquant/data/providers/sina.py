@@ -132,7 +132,7 @@ class SinaProvider(DataProvider):
         self.require(Capability.FINANCIAL_PIT)
         raise NotImplementedError
 
-    def securities(self):
+    def securities(self, day=None):
         self.require(Capability.REFERENCE)
         raise NotImplementedError
 

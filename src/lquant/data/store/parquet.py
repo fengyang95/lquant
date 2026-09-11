@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import os
 import threading
+from datetime import date
 from pathlib import Path
 
 import polars as pl
 
 from lquant.core.config import get_settings
+from lquant.data.schema import SCHEMAS
 
 # 读-改-写按 (路径) 加锁：不同 year / (freq, ym) 文件互不阻塞。
 # 锁保护同进程并发（sync-worker 线程与本地任务线程同进程），
@@ -47,6 +49,46 @@ def _root() -> Path:
     return p
 
 
+def lake_glob(kind: str = "daily") -> str:
+    """某类数据的 parquet glob（**绝对路径**）。
+
+    SQL 侧（`read_parquet`）必须用这个，不要在 SQL 里硬编码
+    `'data/parquet/...'` —— 那是相对 CWD 的路径，服务进程与 CLI 的 CWD
+    不同就会读到空集，且失败是静默的（曾经 DuckDB `daily_bar` 幽灵表
+    就是这么来的：表在 DDL 里，却从没有任何写入路径）。
+    """
+    return str(_root() / kind / "**" / "*.parquet")
+
+
+def _empty_frame(name: str) -> pl.LazyFrame:
+    """空湖返回「有 schema 的空帧」而不是 0 列空帧。
+
+    0 列空帧一旦被下游 `.select(["symbol", "trade_date"])` 命中就是
+    ColumnNotFoundError —— 空库应当读出空结果，不是炸读取。
+    """
+    return pl.DataFrame(schema=SCHEMAS[name]).lazy()
+
+
+def _overlay(old: pl.DataFrame, new: pl.DataFrame, keys: list[str]) -> pl.DataFrame:
+    """把 new 覆盖到 old 上（同主键替换语义）。
+
+    三步：① 主键 dtype 对齐到湖内既有 schema（老文件不被新批改写列类型）；
+    ② anti-join 去掉 old 里与 new 同键的行；③ diagonal 合并（容忍跨版本加列）。
+
+    为什么不用 `struct(keys).is_in(new_keys)`：dtype 漂移（旧年文件
+    trade_date=Date / 新批 Datetime）时 is_in **静默返回全 False** ——
+    去重失效、重复行悄悄累积且读取侧不可见；join 会显式报错。
+    """
+    if not old.height:
+        return new
+    if all(k in old.columns and k in new.columns for k in keys):
+        new = new.with_columns(
+            pl.col(k).cast(old.schema[k], strict=False) for k in keys
+        )
+        old = old.join(new.select(keys).unique(), on=keys, how="anti")
+    return pl.concat([old, new], how="diagonal")
+
+
 def _daily_path(year: int) -> Path:
     return _root() / "daily" / f"year={year}" / "part-0.parquet"
 
@@ -59,17 +101,12 @@ def write_daily(df: pl.DataFrame) -> list[Path]:
         y = year[0]
         p = _daily_path(y)
         p.parent.mkdir(parents=True, exist_ok=True)
-        # 同key覆盖：读旧 → 去旧 → 合并 → 原子写（锁按文件粒度，不串行全年份）
+        g = g.drop("y")
+        # 同key覆盖：读旧 → 覆盖合并 → 原子写（锁按文件粒度，不串行全年份）
         with _file_lock(p):
             if p.exists():
-                old = pl.read_parquet(p)
-                old = old.filter(
-                    ~pl.struct(["symbol", "trade_date"]).is_in(
-                        g.select(pl.struct(["symbol", "trade_date"])).to_series()
-                    )
-                )
-                g = pl.concat([old, g], how="diagonal")
-            g = g.drop("y").sort(["symbol", "trade_date"])
+                g = _overlay(pl.read_parquet(p), g, ["symbol", "trade_date"])
+            g = g.sort(["symbol", "trade_date"])
             _atomic_write_parquet(g, p)
         out.append(p)
     return out
@@ -82,7 +119,7 @@ def read_daily(symbols: list[str] | None = None, start=None, end=None) -> pl.Laz
     # data 目录 gitignore，全新 checkout 下根目录不存在 → rglob 会抛
     # FileNotFoundError。用 is_dir 短路：无库即空帧，而不是炸读取。
     if not root.is_dir() or not any(root.rglob("*.parquet")):
-        return pl.DataFrame().lazy()
+        return _empty_frame("daily_bar")
     # 字符串日期显式转 Date，避免 filter 时类型比较失败
     if isinstance(start, str):
         start = _date.fromisoformat(start)
@@ -102,6 +139,50 @@ def read_daily(symbols: list[str] | None = None, start=None, end=None) -> pl.Laz
     if end:
         lf = lf.filter(pl.col("trade_date") <= end)
     return lf
+
+
+def daily_range() -> tuple[date | None, date | None]:
+    """湖内日线的最小 / 最大交易日（空湖 → (None, None)）。
+
+    给「该拉哪一段」类逻辑用（跨源对拍窗口、覆盖度报告）。
+    走 parquet 统计做 min/max 下推，不物化数据。
+    """
+    root = _root() / "daily"
+    if not root.is_dir() or not any(root.rglob("*.parquet")):
+        return None, None
+    try:
+        row = (
+            pl.scan_parquet(str(root / "**" / "*.parquet"))
+            .select(pl.col("trade_date").min().alias("lo"),
+                    pl.col("trade_date").max().alias("hi"))
+            .collect()
+            .row(0)
+        )
+    except Exception:  # noqa: BLE001 - 读湖失败不阻断调用方的降级路径
+        return None, None
+    return row[0], row[1]
+
+
+def latest_trade_date() -> date | None:
+    return daily_range()[1]
+
+
+def latest_top_by_amount(limit: int = 200) -> list[str]:
+    """最近交易日成交额 top N 的标的（新闻/看板活跃池）。空湖 → []。"""
+    lo, hi = daily_range()
+    if hi is None:
+        return []
+    df = (
+        read_daily(start=hi, end=hi)
+        .select("symbol", "amount")
+        .collect()
+    )
+    if not len(df):
+        return []
+    return (
+        df.sort("amount", descending=True, nulls_last=True)
+        .head(limit)["symbol"].to_list()
+    )
 
 
 def write_factor(factor: str, df: pl.DataFrame) -> Path:
@@ -128,17 +209,10 @@ def write_minute(df: pl.DataFrame, freq: str | None = None) -> list[Path]:
         p = _root() / "minute" / f"freq={freq}" / f"year_month={period}" / "part-0.parquet"
         p.parent.mkdir(parents=True, exist_ok=True)
         g = g.drop("_ym")
-        # 同key覆盖：读旧 → 去旧 → 合并 → 原子写（锁按文件粒度）
+        # 同key覆盖：读旧 → 覆盖合并 → 原子写（锁按文件粒度）
         with _file_lock(p):
             if p.exists():
-                old = pl.read_parquet(p)
-                if "symbol" in old.columns and "ts" in old.columns:
-                    old = old.filter(
-                        ~pl.struct(["symbol", "ts"]).is_in(
-                            g.select(pl.struct(["symbol", "ts"])).to_series()
-                        )
-                    )
-                    g = pl.concat([old, g], how="diagonal")
+                g = _overlay(pl.read_parquet(p), g, ["symbol", "ts"])
             g = g.sort(["symbol", "ts"]) if "ts" in g.columns else g
             _atomic_write_parquet(g, p)
         out.append(p)
@@ -149,7 +223,7 @@ def read_minute(symbols: list[str] | None = None, freq: str = "60min",
                 start=None, end=None) -> pl.LazyFrame:
     root = _root() / "minute" / f"freq={freq}"
     if not root.is_dir() or not any(root.rglob("*.parquet")):
-        return pl.DataFrame().lazy()
+        return _empty_frame("minute_bar")
     lf = pl.scan_parquet(str(root / "**" / "*.parquet"))
     if symbols:
         lf = lf.filter(pl.col("symbol").is_in(symbols))

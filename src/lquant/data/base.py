@@ -13,6 +13,20 @@ import polars as pl
 from lquant.data.capability import Capability
 
 
+def source_name(provider: object) -> str:
+    """Provider 的源名，用于血缘 source 字段。
+
+    优先 ``source``（yaml sources key），回落 ``name``；
+    FallbackProvider 上优先 ``last_source``（实际服务的那一个，
+    切源后血缘不能标成链头）。
+    """
+    for attr in ("last_source", "source", "name"):
+        v = getattr(provider, attr, None)
+        if isinstance(v, str) and v:
+            return v
+    return "unknown"
+
+
 class DataProvider(ABC):
     name: str = "base"
     # 子类声明支持的能力；路由层据此选源
@@ -46,7 +60,13 @@ class DataProvider(ABC):
         """必须返回 stat_date 与 pub_date 双日期。"""
 
     @abstractmethod
-    def securities(self) -> pl.DataFrame: ...
+    def securities(self, day: date | None = None) -> pl.DataFrame:
+        """全市场标的清单。
+
+        ``day`` 是「截至该日的口径」提示：baostock 等源支持按日取状态，
+        不支持的源必须接受并忽略它（默认 None = 最新口径）。
+        参数是契约的一部分 —— 路由层只按统一签名转发，源各自裁剪。
+        """
 
     @abstractmethod
     def trade_calendar(self, start: date, end: date) -> pl.DataFrame: ...

@@ -183,8 +183,8 @@ def test_refresh_adj_factors_merges_into_lake():
     from lquant.data.ingest.adj import refresh_adj_factors
     from lquant.data.store.parquet import read_daily
 
-    # 先 collect 再判空：空湖 read_daily 返回无 schema 的空帧，直接 .select
-    # 会抛 ColumnNotFoundError（没有 "symbol" 列）。先取行数，0 行即跳过。
+    # 空湖 read_daily 现在返回「有 schema 的空帧」，.select 安全；仍先判空跳过，
+    # 因为本用例要对真实湖行做复权因子回写。
     lake = read_daily(start="2026-06-01").collect()
     if not len(lake):
         pytest.skip("湖为空")

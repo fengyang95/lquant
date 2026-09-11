@@ -135,9 +135,11 @@ class TencentProvider(DataProvider):
         payload = _fetch_quotes([_gtimg_code(s) for s in symbols])
         return parse_quotes(payload)
 
-    def securities(self) -> pl.DataFrame:
+    def securities(self, day: date | None = None) -> pl.DataFrame:
         """辅源清单：常见指数 + 无退市信息 —— 仅作 reference 兜底，
-        退市/上市日以 BaoStock 为主源（幸存者偏差防护不能靠这里）。"""
+        退市/上市日以 BaoStock 为主源（幸存者偏差防护不能靠这里）。
+
+        ``day`` 只作契约占位、忽略。"""
         indices = ["sh000001", "sh000300", "sh000905", "sh000852",
                    "sz399001", "sz399006", "sh000688"]
         df = parse_quotes(_fetch_quotes(indices))

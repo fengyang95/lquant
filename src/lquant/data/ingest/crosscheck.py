@@ -108,8 +108,13 @@ def _sample_symbols(limit: int) -> tuple[list[str], date, date]:
     §3.8.4 本偏好指数哨兵作"价格基准"，但当前可用的 daily peer（akshare）
     没有指数日线路由，指数会打到股票接口 000001.SH→平安银行 造成假 L3。
     故对拍抽样用股票哨兵，直到存在 index_daily 的 peer 再切回。
+
+    窗口取**湖内**（parquet）的真实起止日 —— 之前查 DuckDB `daily_bar` 表，
+    而日线只入 parquet 湖，该表恒空，窗口静默退回默认值，抽检范围与
+    实际数据范围脱节。
     """
     from lquant.core.db import reader
+    from lquant.data.store.parquet import daily_range
 
     with reader() as con:
         # 一次连接内完成：优先非 ST 股票，避免指数无 index_daily 路由的假偏差。
@@ -120,13 +125,11 @@ def _sample_symbols(limit: int) -> tuple[list[str], date, date]:
             rows = con.execute(
                 "SELECT symbol FROM security WHERE sec_type='index' AND "
                 "delist_date IS NULL ORDER BY symbol LIMIT ?", [limit]).fetchall()
-        d = con.execute(
-            "SELECT min(trade_date), max(trade_date) FROM daily_bar").fetchone()
     symbols = [r[0] for r in rows]
-    lo, hi = d[0], d[1] if d and d[0] else None
-    if lo is None:
+    lo, hi = daily_range()
+    if lo is None or hi is None:
         lo, hi = date(2024, 1, 1), date.today()
-    return symbols, lo, hi or date.today()
+    return symbols, lo, hi
 
 
 def run_crosscheck(peers: list[str] | None = None, start: str | None = None,

@@ -226,7 +226,9 @@ def backfill_daily(
 
 def _provider_source(provider) -> str:
     """实际使用的源名（血缘 source 字段）：优先 source key，回落 name。"""
-    return getattr(provider, "source", "") or getattr(provider, "name", "baostock")
+    from lquant.data.base import source_name
+
+    return source_name(provider)
 
 
 def _stamp(df: pl.DataFrame, source: str = "baostock") -> pl.DataFrame:

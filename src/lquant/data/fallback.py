@@ -44,6 +44,8 @@ class FallbackProvider(DataProvider):
         self.providers = providers
         self.health = health or HealthTracker()
         self.name = "fallback"
+        # 实际服务了最近一次调用的源名（血缘用：fallback 切源后 source 不能标错）
+        self.last_source: str | None = None
         self.capability = frozenset().union(*(p.capability for p in providers))
 
     def _route(self, cap: Capability) -> list[DataProvider]:
@@ -57,15 +59,23 @@ class FallbackProvider(DataProvider):
         return cands
 
     def _call(self, cap: Capability, method: str, **kw):
+        from loguru import logger
+
         last: Exception | None = None
         for p in self._route(cap):
             try:
                 out = getattr(p, method)(**kw)
                 self.health.ok(p.name)
+                self.last_source = p.name
                 return out
             except Exception as e:  # noqa: BLE001
                 last = e
                 self.health.fail(p.name)
+                # 逐源记录：只留最后一个错误会让多源链的失败原因不可诊断
+                logger.warning(
+                    f"provider {p.name} 调用 {method} 失败，切换下一源: "
+                    f"{type(e).__name__}: {e}"
+                )
                 continue
         raise SourceUnavailable("fallback", f"所有源均失败: {last}")
 
@@ -94,8 +104,8 @@ class FallbackProvider(DataProvider):
     def financial_pit(self, symbols, start, end):
         return self._call(Capability.FINANCIAL_PIT, "financial_pit", symbols=symbols, start=start, end=end)
 
-    def securities(self):
-        return self._call(Capability.REFERENCE, "securities")
+    def securities(self, day: date | None = None):
+        return self._call(Capability.REFERENCE, "securities", day=day)
 
     def trade_calendar(self, start, end):
         return self._call(Capability.CALENDAR, "trade_calendar", start=start, end=end)

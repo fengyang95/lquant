@@ -24,6 +24,10 @@ data/parquet/
 data/cache/
 data/logs/
 data/reports/
+# agent 会话库（data/ask.db）等 sqlite 运行时文件
+data/*.db
+data/*.db-shm
+data/*.db-wal
 .run/
 *.duckdb
 *.wal

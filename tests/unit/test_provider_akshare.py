@@ -278,9 +278,12 @@ def test_import_failure_not_registered(monkeypatch: pytest.MonkeyPatch) -> None:
     """akshare provider 模块 import 失败 → _import_all 吞掉不注册。"""
     import lquant.data.providers as pv  # noqa: PLC0415
 
-    sys.modules.pop("lquant.data.providers.akshare", None)
+    # 用 monkeypatch.delitem 而非裸 pop：裸 pop 不还原，会让后续测试
+    # （如 test_baostock_daily_fields 的 pickle 同一性断言）看到重新 import
+    # 出的**新**模块对象 —— 测试间污染，且与本次改动无关。
+    monkeypatch.delitem(sys.modules, "lquant.data.providers.akshare", raising=False)
     # baostock 可能已被其他测试文件导入（装饰器不再重跑），一并弹出让其重新注册
-    sys.modules.pop("lquant.data.providers.baostock", None)
+    monkeypatch.delitem(sys.modules, "lquant.data.providers.baostock", raising=False)
 
     real_import = importlib.import_module
 

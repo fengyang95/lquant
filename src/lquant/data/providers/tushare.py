@@ -309,8 +309,11 @@ class TushareProvider(MappingProvider):
         return normalize_symbols(pl.concat(out, how="diagonal"))
 
     # ------------------------------------------------------------ 参考数据
-    def securities(self) -> pl.DataFrame:
-        """stock_basic：L/D/P 三种 list_status 全拉，天然含退市（防幸存者偏差）。"""
+    def securities(self, day: date | None = None) -> pl.DataFrame:
+        """stock_basic：L/D/P 三种 list_status 全拉，天然含退市（防幸存者偏差）。
+
+        tushare 无按日口径，``day`` 只作契约占位、忽略。
+        """
         frames = []
         for status in ("L", "D", "P"):
             df = self._call(

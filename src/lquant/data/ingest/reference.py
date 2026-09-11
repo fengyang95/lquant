@@ -47,18 +47,21 @@ def sync_securities(day: date | None = None) -> int:
     """快路径：全市场标的清单。库里已有 list_date 要保住，不能被覆盖成 NULL。"""
     from loguru import logger
 
+    from lquant.data.base import source_name
     from lquant.data.providers import get_provider
 
-    df = get_provider().securities(day)
+    provider = get_provider()
+    df = provider.securities(day)
     if not len(df):
         logger.warning("标的清单返回为空")
         return 0
     df = _merge_existing_details(df).with_columns(
-        source=pl.lit("baostock"),
+        # 血缘标实际服务源（fallback 切到辅源时不能硬编码主源名）
+        source=pl.lit(source_name(provider)),
         updated_at=pl.lit(now_cn().replace(tzinfo=None), dtype=pl.Datetime),
     )
     n = SecurityRepo().upsert(df)
-    logger.info(f"标的清单 {n} 只")
+    logger.info(f"标的清单 {n} 只（源 {source_name(provider)}）")
     return n
 
 
@@ -132,6 +135,7 @@ def sync_security_details(limit: int | None = None, batch: int = 200) -> int:
     """
     from loguru import logger
 
+    from lquant.data.base import source_name
     from lquant.data.providers import get_provider
 
     repo = SecurityRepo()
@@ -150,13 +154,14 @@ def sync_security_details(limit: int | None = None, batch: int = 200) -> int:
 
     provider = get_provider()
     target = provider.providers[0] if hasattr(provider, "providers") else provider
+    src = source_name(target)
     done = 0
     for i in range(0, len(todo), batch):
         chunk = todo[i : i + batch]
         df = target.security_details(chunk)
         if len(df):
             repo.upsert(df.with_columns(
-                source=pl.lit("baostock"),
+                source=pl.lit(src),
                 updated_at=pl.lit(now_cn().replace(tzinfo=None), dtype=pl.Datetime),
             ).select([c for c in ("symbol", "name", "list_date", "delist_date",
                                   "sec_type", "source", "updated_at") if c in df.columns]))
