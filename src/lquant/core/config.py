@@ -46,6 +46,9 @@ def clamp_backtest_workers(n: int) -> int:
 
 class AgentConfig(BaseModel):
     provider: str = "mock"
+    claude_path: str = "claude"
+    workspace_dir: str = "data/agent_workspace"
+    timeout_seconds: int = 300
 
 
 class Settings(BaseModel):
@@ -82,10 +85,11 @@ def get_settings() -> Settings:
 
     paths = raw.get("paths", {})
     ingest = raw.get("ingest", {})
+    agent = raw.get("agent", {})
     return Settings(
         root=root,
         env=raw.get("env", "dev"),
-        agent=AgentConfig(provider=raw.get("agent", {}).get("provider", "mock")),
+        agent=AgentConfig(**agent),
         timezone=raw.get("timezone", "Asia/Shanghai"),
         duckdb_path=str(paths.get("duckdb", "./data/duckdb/lquant.duckdb")),
         parquet_dir=str(paths.get("parquet", "./data/parquet")),
