@@ -360,8 +360,9 @@ def test_daily_mapping_empty_volume_not_crash() -> None:
 def test_securities_falls_back_on_non_trading_day(monkeypatch) -> None:
     """回归：周末/节假日 query_all_stock(day=今天) 返回空，应回退最近
     交易日重试，而不是静默返回空帧（周六跑 reference 空转）。"""
-    import lquant.data.watchdog as wd
     from datetime import date
+
+    import lquant.data.watchdog as wd
 
     calls: list[str] = []
 
