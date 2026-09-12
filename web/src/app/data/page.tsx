@@ -9,6 +9,8 @@ import { fetcher, post } from '@/lib/api';
 import TasksPanel from './TasksPanel';
 import SourceConfigPanel from './SourceConfigPanel';
 import CrosscheckPanel from './CrosscheckPanel';
+import QualityPanel from './QualityPanel';
+import CheckpointPanel from './CheckpointPanel';
 import CoverageMonthlyChart from './CoverageMonthlyChart';
 
 type Cover = {
@@ -100,10 +102,12 @@ export default function DataPage() {
       />
       <Msg text={msg} />
 
-      {/* 日线数据补全：任务进度 / 数据源配置 / 跨源印证 */}
+      {/* 日线数据补全：任务进度 / 断点续传 / 数据源配置 / 跨源印证 / 全湖质量检查 */}
       <TasksPanel />
+      <CheckpointPanel />
       <SourceConfigPanel />
       <CrosscheckPanel />
+      <QualityPanel />
 
       <Panel title="日线数据湖" meta="Parquet">
         {lake?.rows ? (
