@@ -6,4 +6,4 @@ permissions:
   can_submit: true
   can_export_data: false
 enabled: true
-skill_sha256: ed0d4bfebf164af9
+skill_sha256: 6d55279a82f4e464

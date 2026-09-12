@@ -54,6 +54,34 @@ MA20 / RSV10：qlib_alpha 内置实现 vs DSL 翻译版逐点对照（test_f5_cr
 
 **状态**：⏳ M2.5 中性化里程碑
 
+## 评估阶梯 L0-L3（因子筛选侧，与 F/N 互补）
+
+F1-F6/N1-N6 验的是"**算得对不对**"；下面四层验的是"**这个因子值不值得留**"。
+前者是平台单元测试，后者是 Agent 每次提交前的证据链。命令见 `docs/agent-skill/SKILL.md`，
+细则与原因码见 `config/skills/factor-mining/`。
+
+| 层 | 入口 | 判据 | 对应测试 |
+|---|---|---|---|
+| L0 静态 | `lq factor check` | 语法/算子/字段/最小窗口 ≥1；`#` 注释在词法层丢弃 | tests/unit/test_dsl.py |
+| L1 快筛 | `lq factor eval` / `g1_fast_screen` | \|IC\| 过筛、中性化后不归零、过校正门槛 sqrt(2·ln n) | tests/unit/test_factor_accuracy.py（F2）、test_mining.py |
+| L2 全量 | `lq factor audit` | 分层单调、IC 衰减、收益归因、**评级**、OOS 衰减 | tests/unit/test_factor_rating.py |
+| L3 稳健 | `lq factor robust` | 参数扰动、分段稳定、起点敏感（变异系数）、月度剔除 | tests/unit/test_factor_robustness.py |
+
+**评级口径**（`config/factors/rating.yaml`，缺失走内置兜底）：
+Strong ⇐ |ICIR|≥0.5 且 |单调性|≥0.8 且 |L/S Sharpe|≥1.0 且过门槛；Moderate / Weak 依次降档。
+多重检验：门槛随试验次数 n_trials 上浮，前 100 次试验的"显著"在后 500 次里自动失效。
+
+**稳健性判据的三处反直觉点**（都是踩过的坑）：
+- 起点敏感性用**变异系数** `std/|mean|` 而非绝对 std —— ICIR≈198 时绝对 std≈8 会误判失败。
+- 样本太短（月数 < 2·top_n）时月度剔除返回 `insufficient`，记 skipped 而非 failed。
+- 零方差完美因子 → IR 记 `inf`（而不是 NaN 被降档），否则最强的因子反而被评低。
+
+**状态**：✅ 本轮（rating / robustness / audit / robust / report + 70/15/15 分段复用）
+
 ## 运行方式
 
     uv run python scripts/validate_factor.py   # F1-F4 逐层 PASS/FAIL，失败退出 1
+    PYTHONPATH=src python -m pytest tests/unit/test_dsl.py \
+        tests/unit/test_factor_accuracy.py tests/unit/test_factor_rating.py \
+        tests/unit/test_factor_robustness.py -q     # L0-L3 逐层
+

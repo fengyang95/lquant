@@ -19,6 +19,7 @@ pytestmark = pytest.mark.usefixtures("api_env")
 @pytest.fixture(scope="module")
 def api_env(tmp_path_factory):
     base = tmp_path_factory.mktemp("api_tasks")
+    prev_cwd = os.getcwd()  # 模块级 fixture 必须还原 CWD，否则污染后续测试文件
     os.chdir(base)
     from lquant.core.config import get_settings
 
@@ -33,6 +34,7 @@ def api_env(tmp_path_factory):
             con.execute(stmt)
     generate_demo(start="2024-01-01", end="2026-06-30")
     yield base
+    os.chdir(prev_cwd)
     get_settings.cache_clear()
 
 

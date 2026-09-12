@@ -33,33 +33,44 @@ def _panel_with_covs(start=None):
     return df, present
 
 
-def _split_eval(df, cov_cols, expr):
-    """train/val 切分 + 重算 train/val IC（含中性化）。"""
+def prepare_segment(df, cov_cols, expr, dates, *, horizons=(1, 5)):
+    """在给定交易日子集上算因子 → 前瞻收益 → 中性化，返回分析就绪的 df。
+
+    train/val 切分、submit 重验、``lq factor audit`` 深度校验、``lq factor robust``
+    鲁棒性检验共用这一条实现 —— 口径一旦分叉，「JSON 里的 ic_mean」和
+    「报告里的 ic_mean」就对不上，这种不一致最难查。
+    """
     from lquant.factors.analysis import compute_factor_col
     from lquant.factors.evaluate import forward_return
-    from lquant.factors.evaluate.ic import ic_series
-    from lquant.factors.mining.runner import split_dates
     from lquant.factors.preprocess.pipeline import drop_nonfinite
     from lquant.factors.preprocess.pipeline import run as pipeline_run
 
+    sub = df.filter(pl.col("trade_date").is_in(list(dates)))
+    sub = forward_return(sub.sort(["symbol", "trade_date"]), "close", periods=list(horizons))
+    d = drop_nonfinite(compute_factor_col(sub, expr, "f"), "f")
+    if "fwd_ret_1" in d.columns:
+        d = drop_nonfinite(d, "fwd_ret_1")
+    if cov_cols:
+        d = pipeline_run(d, "f", [
+            {"op": "winsorize", "method": "mad", "n": 5},
+            {"op": "standardize", "method": "zscore"},
+            {"op": "neutralize", "method": "ols", "factors": cov_cols},
+        ])
+    d = drop_nonfinite(d, "f")
+    return d
+
+
+def _split_eval(df, cov_cols, expr):
+    """train/val 切分 + 重算 train/val IC（含中性化）。"""
+    from lquant.factors.evaluate.ic import ic_series
+    from lquant.factors.mining.runner import split_dates
+
     dates = df["trade_date"].unique().to_list()
     train_d, val_d, _ = split_dates(dates)
-    out = {}
-    for label, dd in (("train", train_d), ("val", val_d)):
-        sub = df.filter(pl.col("trade_date").is_in(dd))
-        sub = forward_return(sub.sort(["symbol", "trade_date"]), "close", periods=[1, 5])
-        d = drop_nonfinite(compute_factor_col(sub, expr, "f"), "f")
-        d = drop_nonfinite(d, "fwd_ret_1")
-        if cov_cols:
-            d = pipeline_run(d, "f", [
-                {"op": "winsorize", "method": "mad", "n": 5},
-                {"op": "standardize", "method": "zscore"},
-                {"op": "neutralize", "method": "ols", "factors": cov_cols},
-            ])
-        d = drop_nonfinite(d, "f")
-        s = ic_series(d, "f", "fwd_ret_1")
-        out[label] = s
-    return out
+    return {
+        label: ic_series(prepare_segment(df, cov_cols, expr, dd), "f", "fwd_ret_1")
+        for label, dd in (("train", train_d), ("val", val_d))
+    }
 
 
 def verify_and_register(spec: dict) -> tuple[bool, dict]:
