@@ -650,7 +650,24 @@ class JQRunner:
                 if b:
                     row[s] = {f: self._bar_field(b, f) for f in fields}
             rows.append(row)
-        return self._history_df(secs, fields, rows)
+        # 聚宽语义：单标的 → 列=fields（history 才是单字段→列=证券，二者不同）；
+        # 多标的 → (标的, 字段) MultiIndex。
+        index = [r["day"] for r in rows]
+        if _JQFrame is not None:
+            import pandas as pd
+            if len(secs) == 1:
+                data = {f: [r.get(secs[0], {}).get(f) for r in rows] for f in fields}
+                return _JQFrame(data, index=index)
+            cols = pd.MultiIndex.from_product([secs, fields])
+            out = _JQFrame(index=index, columns=cols)
+            for s in secs:
+                for f in fields:
+                    out[(s, f)] = [r.get(s, {}).get(f) for r in rows]
+            return out
+        # 无 pandas：单标的 {field: [...]}, 多标的 {sec: {field: [...]}}
+        if len(secs) == 1:
+            return {f: [r.get(secs[0], {}).get(f) for r in rows] for f in fields}
+        return {s: {f: [r.get(s, {}).get(f) for r in rows] for f in fields} for s in secs}
 
     # ---- 下单 ----
 
