@@ -379,3 +379,45 @@ def test_securities_falls_back_on_non_trading_day(monkeypatch) -> None:
     assert df["symbol"][0] == "000001.SH"
     # 今天空 → 回退 09-11（周五）拿到数据后停止
     assert calls[-1] == "2026-09-11"
+
+
+def _fake_query_2024(code: str, *a, **k) -> list[list[str]]:
+    return [
+        [
+            "2024-01-02",
+            code,
+            "10.0",
+            "10.5",
+            "9.8",
+            "10.2",
+            "10.1",
+            "1000",
+            "3000",
+            "1.5",
+            "1",
+            "0",
+            "0.5",
+            "12.0",
+            "1.2",
+            "2.0",
+            "8.0",
+        ]
+    ]
+
+
+def test_fetch_daily_parallel_preserves_order(monkeypatch) -> None:
+    """线程池并行拉取后必须按入参顺序拼接（顺序影响对拍与断点语义）。"""
+    import datetime
+
+    import lquant.data.watchdog as wd
+
+    monkeypatch.setattr("lquant.data.providers.baostock._bs_query", _fake_query_2024)
+    # 真实 run_with_watchdog 会把 fn pickle 进子进程 —— 模块级替身可 pickle，
+    # 但为了不真开子进程，这里换成透传
+    monkeypatch.setattr(wd, "run_with_watchdog", lambda fn, *a, **k: fn(*a, **k))
+    syms = [f"60000{i}.SH" for i in range(10)]
+    df = BaoStockProvider()._fetch_daily(
+        syms, datetime.date(2024, 1, 1), datetime.date(2024, 1, 31)
+    )
+    # _fetch_daily 产出源列名（code，baostock 前缀式），symbol 由映射引擎转换
+    assert df["code"].to_list() == [f"sh.{600000 + i}" for i in range(10)]
