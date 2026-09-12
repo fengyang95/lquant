@@ -355,3 +355,26 @@ def test_daily_mapping_empty_volume_not_crash() -> None:
     assert df["volume"][0] is None
     assert df["amount"][0] is None
     assert df["close"][0] == 10.2  # 正常字段不受影响
+
+
+def test_securities_falls_back_on_non_trading_day(monkeypatch) -> None:
+    """回归：周末/节假日 query_all_stock(day=今天) 返回空，应回退最近
+    交易日重试，而不是静默返回空帧（周六跑 reference 空转）。"""
+    import lquant.data.watchdog as wd
+    from datetime import date
+
+    calls: list[str] = []
+
+    def fake_all_stock(day: str) -> list[list[str]]:
+        calls.append(day)
+        if day <= "2026-09-11":  # 周五及以前回数据，周末空
+            return [["sh.000001", "1", "上证综合指数"]]
+        return []
+
+    monkeypatch.setattr(wd, "run_with_watchdog", lambda fn, *a, **k: fake_all_stock(*a))
+    monkeypatch.setattr("lquant.data.providers.baostock.today_cn", lambda: date(2026, 9, 12))
+    df = BaoStockProvider().securities()
+    assert len(df) == 1
+    assert df["symbol"][0] == "000001.SH"
+    # 今天空 → 回退 09-11（周五）拿到数据后停止
+    assert calls[-1] == "2026-09-11"

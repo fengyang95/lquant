@@ -540,6 +540,14 @@ class BaoStockProvider(MappingProvider):
 
         day = day or today_cn()
         rows = run_with_watchdog(_bs_all_stock, day.isoformat())
+        # 非交易日（周末/节假日）当日清单为空 —— 回退找最近有数据的日期，
+        # 否则周六跑 reference 会静默空转（实测 2026-09-12 周六 securities=0）
+        probe = day
+        for _ in range(10):
+            if rows:
+                break
+            probe -= timedelta(days=1)
+            rows = run_with_watchdog(_bs_all_stock, probe.isoformat())
         if not rows:
             return pl.DataFrame()
         df = pl.DataFrame(rows, schema=["symbol", "trade_status", "name"], orient="row")
