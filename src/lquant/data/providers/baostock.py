@@ -9,6 +9,7 @@
   由 run_with_watchdog 在子进程里调用。
 - 每个子进程自己 login/logout，绝不复用父进程的 socket（复用了必挂）。
 """
+
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
@@ -25,8 +26,13 @@ from lquant.data.providers._engine import MappingProvider
 
 # baostock 代码格式：sh.600000 / sz.000001
 _FREQ_MAP = {
-    "5min": "5", "15min": "15", "30min": "30", "60min": "60",
-    "1d": "d", "1w": "w", "1m": "m",
+    "5min": "5",
+    "15min": "15",
+    "30min": "30",
+    "60min": "60",
+    "1d": "d",
+    "1w": "w",
+    "1m": "m",
 }
 # query_stock_basic 的 type: 1=股票 2=指数 3=其它 4=ETF 5=LOF
 _BS_TYPE_TO_SEC = {"1": "stock", "2": "index", "3": "other", "4": "etf", "5": "lof"}
@@ -42,8 +48,7 @@ def _add_years(d: date, n: int) -> date:
         return d.replace(year=d.year + n, day=28)
 
 
-def _cal_chunks(start: date, end: date,
-                years: int = _CAL_CHUNK_YEARS) -> list[tuple[date, date]]:
+def _cal_chunks(start: date, end: date, years: int = _CAL_CHUNK_YEARS) -> list[tuple[date, date]]:
     """把 [start, end] 切成首尾相接的 ≤years 年区间。"""
     chunks: list[tuple[date, date]] = []
     cur = start
@@ -56,19 +61,52 @@ def _cal_chunks(start: date, end: date,
         cur = nxt
     return chunks
 
+
 # T+0 品种关键词：跨境(QDII)、债券、黄金、货币、商品 —— 名称命中即 T+0 可卖。
 # 这是启发式；权威值以 rules/cn_a_share.yaml 的 sellable_after_days 覆盖为准。
 _T0_KEYWORDS = (
-    "纳指", "纳斯达克", "标普", "恒生", "港股", "中概", "日经", "德国", "法国",
-    "东南亚", "沙特", "美国", "海外", "QDII", "国际", "亚太", "日本", "越南", "印度",
-    "债", "国债", "政金", "城投", "短融", "可转债", "信用",
-    "黄金", "商品", "豆粕", "有色", "能源", "原油",
-    "货币", "现金", "保证金",
+    "纳指",
+    "纳斯达克",
+    "标普",
+    "恒生",
+    "港股",
+    "中概",
+    "日经",
+    "德国",
+    "法国",
+    "东南亚",
+    "沙特",
+    "美国",
+    "海外",
+    "QDII",
+    "国际",
+    "亚太",
+    "日本",
+    "越南",
+    "印度",
+    "债",
+    "国债",
+    "政金",
+    "城投",
+    "短融",
+    "可转债",
+    "信用",
+    "黄金",
+    "商品",
+    "豆粕",
+    "有色",
+    "能源",
+    "原油",
+    "货币",
+    "现金",
+    "保证金",
 )
 
 # 日线 17 字段：新增 pctChg + 估值四列（peTTM/pbMRQ/psTTM/pcfNcfTTM）
-_DAILY_FIELDS = ("date,code,open,high,low,close,preclose,volume,amount,"
-                 "turn,tradestatus,isST,pctChg,peTTM,pbMRQ,psTTM,pcfNcfTTM")
+_DAILY_FIELDS = (
+    "date,code,open,high,low,close,preclose,volume,amount,"
+    "turn,tradestatus,isST,pctChg,peTTM,pbMRQ,psTTM,pcfNcfTTM"
+)
 _MINUTE_FIELDS = "date,time,code,open,high,low,close,volume,amount,adjustflag"
 
 
@@ -84,8 +122,9 @@ def _bs_login():  # pragma: no cover - 需要网络
     return bs
 
 
-def _bs_query(code: str, fields: str, start: str, end: str, freq: str,
-              adjustflag: str = "3") -> list[list[str]]:  # pragma: no cover
+def _bs_query(
+    code: str, fields: str, start: str, end: str, freq: str, adjustflag: str = "3"
+) -> list[list[str]]:  # pragma: no cover
     """K 线查询。adjustflag: 1=后复权 2=前复权 3=不复权。"""
     bs = _bs_login()
     try:
@@ -93,8 +132,12 @@ def _bs_query(code: str, fields: str, start: str, end: str, freq: str,
         if f is None:
             raise ValueError(f"baostock 不支持 {freq}")
         rs = bs.query_history_k_data_plus(
-            code, fields, start_date=start, end_date=end,
-            frequency=f, adjustflag=adjustflag,
+            code,
+            fields,
+            start_date=start,
+            end_date=end,
+            frequency=f,
+            adjustflag=adjustflag,
         )
         if rs.error_code != "0":
             raise RuntimeError(f"baostock {rs.error_code}: {rs.error_msg}")
@@ -151,7 +194,9 @@ def _bs_trade_dates(start: str, end: str) -> list[list[str]]:  # pragma: no cove
         bs.logout()
 
 
-def _bs_report(kind: str, code: str, year: int, quarter: int) -> list[list[str]]:  # pragma: no cover
+def _bs_report(
+    kind: str, code: str, year: int, quarter: int
+) -> list[list[str]]:  # pragma: no cover
     """季频报表，首行为字段名。kind: profit | balance | cashflow | dupont。"""
     bs = _bs_login()
     try:
@@ -212,9 +257,25 @@ def _year_slices(start: date, end: date):
     return out
 
 
-_DAILY_RAW_SCHEMA = ["date", "code", "open", "high", "low", "close", "preclose",
-                     "volume", "amount", "turn", "tradestatus", "isST",
-                     "pctChg", "peTTM", "pbMRQ", "psTTM", "pcfNcfTTM"]
+_DAILY_RAW_SCHEMA = [
+    "date",
+    "code",
+    "open",
+    "high",
+    "low",
+    "close",
+    "preclose",
+    "volume",
+    "amount",
+    "turn",
+    "tradestatus",
+    "isST",
+    "pctChg",
+    "peTTM",
+    "pbMRQ",
+    "psTTM",
+    "pcfNcfTTM",
+]
 
 
 def _map_daily_raw(rows: list[list[str]]) -> pl.DataFrame:
@@ -228,20 +289,24 @@ def _map_daily_raw(rows: list[list[str]]) -> pl.DataFrame:
     df = pl.DataFrame(rows, schema=_DAILY_RAW_SCHEMA, orient="row")
     return df.with_columns(
         pl.col("date").str.to_date("%Y-%m-%d"),
-        pl.col(["open", "high", "low", "close", "preclose", "volume",
-                "amount"]).cast(pl.Float64),
+        # 量价字段一律非严格 cast：指数/停牌行 volume、amount 可能是空串 ""
+        # （实测 000001.SH 有 5/169 行 volume=""），strict cast 会炸掉整批
+        pl.col(["open", "high", "low", "close", "preclose", "volume", "amount"]).cast(
+            pl.Float64, strict=False
+        ),
         # turn 兜底：cast 后为 0（含 "0"/"0.0000"）→ null，防 float_mv 除法产 inf
         # （float_mv derive 在 config/schema/daily_bar.yaml：turn 为 null 时除法结果自然为 null）
         pl.when(pl.col("turn").cast(pl.Float64, strict=False) == 0)
-          .then(pl.lit(None, dtype=pl.Float64))
-          .otherwise(pl.col("turn").cast(pl.Float64, strict=False))
-          .alias("turn"),
-        pl.col(["pctChg", "peTTM", "pbMRQ", "psTTM", "pcfNcfTTM"])
-          .cast(pl.Float64, strict=False),   # 空串 → null
-        (pl.col("tradestatus").cast(pl.Utf8).str.strip_chars() == "0")
-          .alias("is_suspended"),            # "0"=停牌 → True；行保留不丢
-        (pl.col("isST").cast(pl.Utf8).str.strip_chars() == "1")
-          .alias("is_st"),                   # "1"=ST → True
+        .then(pl.lit(None, dtype=pl.Float64))
+        .otherwise(pl.col("turn").cast(pl.Float64, strict=False))
+        .alias("turn"),
+        pl.col(["pctChg", "peTTM", "pbMRQ", "psTTM", "pcfNcfTTM"]).cast(
+            pl.Float64, strict=False
+        ),  # 空串 → null
+        (pl.col("tradestatus").cast(pl.Utf8).str.strip_chars() == "0").alias(
+            "is_suspended"
+        ),  # "0"=停牌 → True；行保留不丢
+        (pl.col("isST").cast(pl.Utf8).str.strip_chars() == "1").alias("is_st"),  # "1"=ST → True
     ).drop("tradestatus", "isST")
 
 
@@ -252,7 +317,7 @@ def _attach_is_st(out: pl.DataFrame, raw: pl.DataFrame) -> pl.DataFrame:
     保持旧 daily_bars 输出恒有该列。
     """
     if "is_st" in out.columns and out["is_st"].is_not_null().any():
-        return out   # 映射层已产出 is_st（rename isST），不覆写
+        return out  # 映射层已产出 is_st（rename isST），不覆写
     if "is_st" not in out.columns:
         out = out.with_columns(pl.lit(None, dtype=pl.Boolean).alias("is_st"))
     if raw.is_empty() or "is_st" not in raw.columns:
@@ -263,8 +328,12 @@ def _attach_is_st(out: pl.DataFrame, raw: pl.DataFrame) -> pl.DataFrame:
             f"is_st 行数与映射输出不一致: raw={len(raw)} out={len(out)}",
         )
     return out.with_columns(
-        raw["is_st"].cast(pl.Utf8).str.to_lowercase().str.strip_chars()
-        .is_in(["1", "true"]).alias("is_st")
+        raw["is_st"]
+        .cast(pl.Utf8)
+        .str.to_lowercase()
+        .str.strip_chars()
+        .is_in(["1", "true"])
+        .alias("is_st")
     )
 
 
@@ -291,13 +360,23 @@ def _guess_track_index(name: str) -> str | None:
 class BaoStockProvider(MappingProvider):
     name = "baostock"
     source = "baostock"
-    capability = frozenset({
-        Capability.DAILY, Capability.MINUTE_5, Capability.MINUTE_15,
-        Capability.MINUTE_30, Capability.MINUTE_60, Capability.ETF_DAILY,
-        Capability.ETF_MINUTE_60, Capability.INDEX_DAILY, Capability.FINANCIAL_PIT,
-        Capability.CALENDAR, Capability.REFERENCE,
-        Capability.ADJ_FACTOR, Capability.ETF_META,
-    })
+    capability = frozenset(
+        {
+            Capability.DAILY,
+            Capability.MINUTE_5,
+            Capability.MINUTE_15,
+            Capability.MINUTE_30,
+            Capability.MINUTE_60,
+            Capability.ETF_DAILY,
+            Capability.ETF_MINUTE_60,
+            Capability.INDEX_DAILY,
+            Capability.FINANCIAL_PIT,
+            Capability.CALENDAR,
+            Capability.REFERENCE,
+            Capability.ADJ_FACTOR,
+            Capability.ETF_META,
+        }
+    )
 
     def __init__(self, qps: float = 0, capability: frozenset[Capability] | None = None) -> None:
         self.capability = capability or self.capability
@@ -310,9 +389,7 @@ class BaoStockProvider(MappingProvider):
             return self._fetch_minute(**params)
         raise NotImplementedError(f"baostock 不支持表 {table!r}")
 
-    def _fetch_daily(
-        self, symbols: list[str], start: date, end: date
-    ) -> pl.DataFrame:
+    def _fetch_daily(self, symbols: list[str], start: date, end: date) -> pl.DataFrame:
         """watchdog 拉日线：产出**源列名** df，映射交给 engine。
 
         停牌行保留（is_suspended 由映射层得出），行级转换收敛到 _map_daily_raw。
@@ -323,8 +400,13 @@ class BaoStockProvider(MappingProvider):
         for sym in symbols:
             # 单只也要走看门狗：静默挂起是逐请求发生的
             rows = run_with_watchdog(
-                _bs_query, _bs_code(sym), _DAILY_FIELDS,
-                start.isoformat(), end.isoformat(), "1d", "3",
+                _bs_query,
+                _bs_code(sym),
+                _DAILY_FIELDS,
+                start.isoformat(),
+                end.isoformat(),
+                "1d",
+                "3",
             )
             if rows:
                 frames.append(_map_daily_raw(rows))
@@ -345,28 +427,47 @@ class BaoStockProvider(MappingProvider):
         for sym in symbols:
             for y0, y1 in _year_slices(start, end):
                 rows = run_with_watchdog(
-                    _bs_query, _bs_code(sym), _MINUTE_FIELDS,
-                    y0.isoformat(), y1.isoformat(), freq, "3",
+                    _bs_query,
+                    _bs_code(sym),
+                    _MINUTE_FIELDS,
+                    y0.isoformat(),
+                    y1.isoformat(),
+                    freq,
+                    "3",
                 )
                 if not rows:
                     continue
-                frames.append(pl.DataFrame(
-                    rows,
-                    schema=["date", "time", "code", "open", "high", "low",
-                            "close", "volume", "amount", "adjustflag"],
-                    orient="row",
-                ))
+                frames.append(
+                    pl.DataFrame(
+                        rows,
+                        schema=[
+                            "date",
+                            "time",
+                            "code",
+                            "open",
+                            "high",
+                            "low",
+                            "close",
+                            "volume",
+                            "amount",
+                            "adjustflag",
+                        ],
+                        orient="row",
+                    )
+                )
         if not frames:
             return pl.DataFrame()
         # time 形如 20220930103500000（含毫秒），取前 14 位拼时间戳
-        return pl.concat(frames, how="diagonal").with_columns(
-            pl.col(["open", "high", "low", "close", "volume", "amount"]).cast(pl.Float64),
-            ts=pl.col("time").cast(pl.Utf8).str.slice(0, 14).str.to_datetime("%Y%m%d%H%M%S"),
-        ).drop(["time", "date"])
+        return (
+            pl.concat(frames, how="diagonal")
+            .with_columns(
+                pl.col(["open", "high", "low", "close", "volume", "amount"]).cast(pl.Float64),
+                ts=pl.col("time").cast(pl.Utf8).str.slice(0, 14).str.to_datetime("%Y%m%d%H%M%S"),
+            )
+            .drop(["time", "date"])
+        )
 
-    def daily_bars(
-        self, symbols: list[str], start: date, end: date
-    ) -> pl.DataFrame:
+    def daily_bars(self, symbols: list[str], start: date, end: date) -> pl.DataFrame:
         raw = self._fetch_daily(symbols, start, end)
         out = self.request("daily_bar", _raw=raw)
         return _attach_is_st(out, raw)
@@ -375,9 +476,7 @@ class BaoStockProvider(MappingProvider):
         self, symbols: list[str], start: date, end: date, freq: str = "60min"
     ) -> pl.DataFrame:
         """分钟线。BaoStock 单次返回有上限，长区间按年切片（_fetch_minute）。"""
-        return self.request(
-            "minute_bar", symbols=symbols, start=start, end=end, freq=freq
-        )
+        return self.request("minute_bar", symbols=symbols, start=start, end=end, freq=freq)
 
     def _post_normalize(self, df: pl.DataFrame, table: str) -> pl.DataFrame:
         """引擎归一化后的 provider 侧钩子：符号归一、60min 边界、ingested_at。"""
@@ -388,7 +487,6 @@ class BaoStockProvider(MappingProvider):
                 ingested_at=pl.lit(datetime.now(), dtype=pl.Datetime),
             )
         return df
-
 
     # ---------------------------------------------------------------- 复权
     def adj_factors(self, symbols: list[str], start: date, end: date) -> pl.DataFrame:
@@ -401,23 +499,31 @@ class BaoStockProvider(MappingProvider):
         out = []
         fields = "date,code,close"
         for sym in symbols:
-            raw = run_with_watchdog(_bs_query, _bs_code(sym), fields,
-                                    start.isoformat(), end.isoformat(), "1d", "3")
-            hfq = run_with_watchdog(_bs_query, _bs_code(sym), fields,
-                                    start.isoformat(), end.isoformat(), "1d", "1")
+            raw = run_with_watchdog(
+                _bs_query, _bs_code(sym), fields, start.isoformat(), end.isoformat(), "1d", "3"
+            )
+            hfq = run_with_watchdog(
+                _bs_query, _bs_code(sym), fields, start.isoformat(), end.isoformat(), "1d", "1"
+            )
             if not raw or not hfq or len(raw) != len(hfq):
                 continue
-            out.append(pl.DataFrame(
-                [[r[0], r[1], float(r[2]), float(h[2])] for r, h in zip(raw, hfq, strict=False)],
-                schema=["trade_date", "symbol", "close", "hfq_close"], orient="row",
-            ))
+            out.append(
+                pl.DataFrame(
+                    [
+                        [r[0], r[1], float(r[2]), float(h[2])]
+                        for r, h in zip(raw, hfq, strict=False)
+                    ],
+                    schema=["trade_date", "symbol", "close", "hfq_close"],
+                    orient="row",
+                )
+            )
         if not out:
             return pl.DataFrame()
         df = pl.concat(out).with_columns(
             pl.col("trade_date").str.to_date("%Y-%m-%d"),
             factor=pl.when(pl.col("close") > 0)
-                   .then(pl.col("hfq_close") / pl.col("close"))
-                   .otherwise(1.0),
+            .then(pl.col("hfq_close") / pl.col("close"))
+            .otherwise(1.0),
         )
         return normalize_symbols(df).select(
             "symbol", "trade_date", "factor", pl.lit("baostock").alias("source")
@@ -438,14 +544,17 @@ class BaoStockProvider(MappingProvider):
             return pl.DataFrame()
         df = pl.DataFrame(rows, schema=["symbol", "trade_status", "name"], orient="row")
         df = df.with_columns(
-            symbol=pl.col("symbol").cast(pl.Utf8).map_elements(
-                lambda s: str(parse_symbol(s)), return_dtype=pl.Utf8),
+            symbol=pl.col("symbol")
+            .cast(pl.Utf8)
+            .map_elements(lambda s: str(parse_symbol(s)), return_dtype=pl.Utf8),
             is_st=pl.col("name").cast(pl.Utf8).str.contains(r"ST"),
         ).with_columns(
             sec_type=pl.col("symbol").map_elements(
-                lambda s: _sec_type_of(s).value, return_dtype=pl.Utf8),
+                lambda s: _sec_type_of(s).value, return_dtype=pl.Utf8
+            ),
             board=pl.col("symbol").map_elements(
-                lambda s: parse_symbol(s).board.value, return_dtype=pl.Utf8),
+                lambda s: parse_symbol(s).board.value, return_dtype=pl.Utf8
+            ),
         )
         return df.select("symbol", "name", "sec_type", "board", "is_st", "trade_status")
 
@@ -462,13 +571,15 @@ class BaoStockProvider(MappingProvider):
             if not rows or not rows[0]:
                 continue
             r = rows[0]
-            out.append({
-                "symbol": str(parse_symbol(r[0])),
-                "name": r[1],
-                "list_date": _to_date(r[2]),
-                "delist_date": _to_date(r[3]),
-                "sec_type": _BS_TYPE_TO_SEC.get(r[4], "other"),
-            })
+            out.append(
+                {
+                    "symbol": str(parse_symbol(r[0])),
+                    "name": r[1],
+                    "list_date": _to_date(r[2]),
+                    "delist_date": _to_date(r[3]),
+                    "sec_type": _BS_TYPE_TO_SEC.get(r[4], "other"),
+                }
+            )
         return pl.DataFrame(out) if out else pl.DataFrame()
 
     def trade_calendar(self, start: date, end: date) -> pl.DataFrame:
@@ -503,13 +614,20 @@ class BaoStockProvider(MappingProvider):
         if not len(etfs):
             return pl.DataFrame()
         return etfs.select(
-            "symbol", "name",
-            pl.col("name").cast(pl.Utf8).map_elements(
-                _guess_track_index, return_dtype=pl.Utf8).alias("track_index"),
+            "symbol",
+            "name",
+            pl.col("name")
+            .cast(pl.Utf8)
+            .map_elements(_guess_track_index, return_dtype=pl.Utf8)
+            .alias("track_index"),
             pl.lit(None, dtype=pl.Utf8).alias("fund_type"),
-            pl.col("name").cast(pl.Utf8).map_elements(
-                lambda n: _guess_sellable_days(n), return_dtype=pl.Int8,
-            ).alias("sellable_after_days"),
+            pl.col("name")
+            .cast(pl.Utf8)
+            .map_elements(
+                lambda n: _guess_sellable_days(n),
+                return_dtype=pl.Int8,
+            )
+            .alias("sellable_after_days"),
             pl.lit(None, dtype=pl.Float64).alias("management_fee"),
             pl.lit(None, dtype=pl.Float64).alias("custody_fee"),
             pl.lit(None, dtype=pl.Float64).alias("fund_size"),
@@ -519,9 +637,13 @@ class BaoStockProvider(MappingProvider):
         )
 
     # ---------------------------------------------------------------- 财务
-    def financial_pit(self, symbols: list[str], start: date, end: date,
-                      kinds: tuple[str, ...] = ("profit", "balance", "cashflow"),
-                      ) -> pl.DataFrame:
+    def financial_pit(
+        self,
+        symbols: list[str],
+        start: date,
+        end: date,
+        kinds: tuple[str, ...] = ("profit", "balance", "cashflow"),
+    ) -> pl.DataFrame:
         """PIT 财务：stat_date（报告期）+ pub_date（公告日）双日期。
 
         缺 pub_date 就等于给未来函数开门 —— 宁可丢数据也不放行。
@@ -532,11 +654,12 @@ class BaoStockProvider(MappingProvider):
 
         recs: list[dict] = []
         for sym in symbols:
-            for (y, q) in _quarters(start, end):
+            for y, q in _quarters(start, end):
                 for kind in kinds:
                     try:
                         payload = run_with_watchdog(
-                            _bs_report, kind, _bs_code(sym), y, q, timeout=30)
+                            _bs_report, kind, _bs_code(sym), y, q, timeout=30
+                        )
                     except (TimeoutError, RuntimeError):
                         continue
                     if len(payload) < 2:
@@ -558,11 +681,17 @@ class BaoStockProvider(MappingProvider):
                                 fv = float(val)
                             except (TypeError, ValueError):
                                 continue
-                            recs.append({
-                                "symbol": str(parse_symbol(code)),
-                                "stat_date": stat_d, "pub_date": pub_d,
-                                "report_type": f"{y}Q{q}", "item": f"{kind}.{col}",
-                                "value": fv, "unit": None,
-                                "source": "baostock", "ingested_at": datetime.now(),
-                            })
+                            recs.append(
+                                {
+                                    "symbol": str(parse_symbol(code)),
+                                    "stat_date": stat_d,
+                                    "pub_date": pub_d,
+                                    "report_type": f"{y}Q{q}",
+                                    "item": f"{kind}.{col}",
+                                    "value": fv,
+                                    "unit": None,
+                                    "source": "baostock",
+                                    "ingested_at": datetime.now(),
+                                }
+                            )
         return pl.DataFrame(recs) if recs else pl.DataFrame()
