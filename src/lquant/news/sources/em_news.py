@@ -17,6 +17,7 @@ import pandas as pd
 
 from lquant.core.config import load_yaml
 from lquant.news.model import NewsItem
+from lquant.news.sources.akcompat import ak_call
 from lquant.news.sources.base import register
 
 logger = logging.getLogger(__name__)
@@ -124,7 +125,9 @@ class EmNewsSource:
         items: list[NewsItem] = []
         for symbol in pool:
             try:
-                df = ak.stock_news_em(symbol=symbol)
+                # 走 ak_call: pandas 3 的 Arrow 字符串后端会让该接口在读数据阶段
+                # 抛 ArrowInvalid（akshare 内部 r"\u3000" 正则不被 RE2 接受）
+                df = ak_call(ak.stock_news_em, symbol=symbol)
                 items.extend(_map_df(df, symbol))
             except EmColumnError:
                 # 缺列属接口契约问题,直接向上传播

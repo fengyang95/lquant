@@ -17,6 +17,7 @@ import akshare as ak
 import pandas as pd
 
 from lquant.news.model import NewsItem
+from lquant.news.sources.akcompat import ak_call
 from lquant.news.sources.base import register
 
 _CLS_SOURCE = "cls"
@@ -120,7 +121,7 @@ class _TelegraphMixin:
         return items
 
     def _fetch_sina(self) -> list[NewsItem]:
-        df = ak.stock_info_global_sina()
+        df = ak_call(ak.stock_info_global_sina)
         return self._map_df(df, _SINA_SOURCE, is_cls=False)
 
 
@@ -135,7 +136,7 @@ class ClsTelegraphSource(_TelegraphMixin):
         try:
             # 仅对 akshare 调用本身(网络/接口错误)做 fallback;
             # 映射阶段的缺列 ValueError 不在此 except 范围内,向上传播
-            df = ak.stock_info_global_cls()
+            df = ak_call(ak.stock_info_global_cls)
         except Exception:  # noqa: BLE001 - 上游任何异常都走 fallback
             return self._fetch_sina()
         return self._map_df(df, _CLS_SOURCE, is_cls=True)

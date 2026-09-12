@@ -2,10 +2,28 @@
 import { getData, postData } from '@/lib/api';
 import type { IndustryStat, ItemFilter, ItemsPage, NewsTaskResult, NewsTaskRow, SourceStat } from './types';
 
-/** 过滤对象 → query string（undefined/空串字段丢弃） */
+/**
+ * 快源集合：每条来源单次请求即可取回，界面「采集快讯」用。
+ * 不含逐股循环的 em_news（个股新闻）与 em_research（个股研报）—— 那两个要按
+ * 成交额活跃池逐股请求，耗时数十秒到数分钟，走「全量采集」或定时任务。
+ */
+export const FAST_SOURCES = [
+  'em_global',
+  'ths_global',
+  'futu_global',
+  'cls_telegraph',
+  'sina_7x24',
+  'em_cjzc',
+  'cctv_news',
+  'em_notice',
+  'baidu_hot',
+] as const;
+
+/** 过滤对象 → query string（undefined/空串字段丢弃；reload 只用于前端触发重查） */
 export function itemsQuery(f: ItemFilter = {}): string {
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(f)) {
+    if (k === 'reload') continue;
     if (v !== undefined && v !== '') p.set(k, String(v));
   }
   return p.toString();
