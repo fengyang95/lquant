@@ -88,6 +88,47 @@ class JQResult:
         } for f in self.trades], schema_overrides={"qty": pl.Float64, "amount": pl.Float64})
 
 
+# ---------- pandas 兼容层 ----------
+
+def _build_jq_pandas():
+    """聚宽沙箱用老版 pandas：``s[-1]`` 等负数下标按**位置**解释。
+
+    新版 pandas 对整数/字符串索引一律按标签查，社区策略的主流写法
+    ``attribute_history(...)['close'][-1]`` 会直接 KeyError。这里用
+    Series 子类恢复老语义（负 int 标量 → iloc），其余行为不变；
+    负数切片新版本就按位置处理，无需干预。
+    """
+    import pandas as pd
+
+    class _JQSeries(pd.Series):
+        @property
+        def _constructor(self):
+            return _JQSeries
+
+        def __getitem__(self, key):
+            # 老 pandas：非整数索引下，不在索引里的 int 键一律回退按位置取
+            if isinstance(key, int) and key not in self.index:
+                return self.iloc[key]
+            return super().__getitem__(key)
+
+    class _JQFrame(pd.DataFrame):
+        @property
+        def _constructor(self):
+            return _JQFrame
+
+        @property
+        def _constructor_sliced(self):
+            return _JQSeries
+
+    return _JQFrame
+
+
+try:
+    _JQFrame = _build_jq_pandas()
+except ImportError:                            # 无 pandas 环境：历史接口回退 dict/list
+    _JQFrame = None
+
+
 # ---------- 用户可见的辅助类型 ----------
 
 class FixedSlippage:
@@ -531,12 +572,12 @@ class JQRunner:
         f0 = fields[0]
         if len(fields) == 1:
             data = {s: [row.get(s, {}).get(f0) for row in rows] for s in secs}
-            return pd.DataFrame(data, index=index)
+            return _JQFrame(data, index=index)
         if len(secs) == 1:
             data = {f: [row.get(secs[0], {}).get(f) for row in rows] for f in fields}
-            return pd.DataFrame(data, index=index)
+            return _JQFrame(data, index=index)
         cols = pd.MultiIndex.from_product([secs, fields])
-        df = pd.DataFrame(index=index, columns=cols)
+        df = _JQFrame(index=index, columns=cols)
         for s in secs:
             for f in fields:
                 df[(s, f)] = [row.get(s, {}).get(f) for row in rows]
@@ -582,8 +623,8 @@ class JQRunner:
                 rows.append({"day": self._dates[j], **{f: self._bar_field(b, f) for f in fields}})
         if pd is None:
             return {f: [r[f] for r in rows] for f in fields}
-        return pd.DataFrame([{**r, "day": str(r["day"])} for r in rows]
-                            ).set_index("day") if rows else pd.DataFrame(columns=fields)
+        return _JQFrame([{**r, "day": str(r["day"])} for r in rows]
+                        ).set_index("day") if rows else _JQFrame(columns=fields)
 
     def _get_price(self, security, start_date=None, end_date=None,
                    fields=None, count=None):
