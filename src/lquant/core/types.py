@@ -5,6 +5,7 @@
 2. 时间统一 ISO 8601 + Asia/Shanghai
 3. 金额统一元
 """
+
 from __future__ import annotations
 
 import re
@@ -17,8 +18,8 @@ TZ = ZoneInfo("Asia/Shanghai")
 
 # 交易所代码段。注意 adata 的 exchange_suffix 表不含 ETF 段，这里必须自己补。
 _SUFFIX_RULES = [
-    (re.compile(r"^(60|68|51|56|58|50|11|5[0-9])\d{4}$"), "SH"),   # 沪股 + 沪 ETF/LOF
-    (re.compile(r"^(00|30|15|16|159|12|18)\d{3,4}$"), "SZ"),       # 深股 + 深 ETF/LOF
+    (re.compile(r"^(60|68|51|56|58|50|11|5[0-9])\d{4}$"), "SH"),  # 沪股 + 沪 ETF/LOF
+    (re.compile(r"^(00|30|15|16|159|12|18)\d{3,4}$"), "SZ"),  # 深股 + 深 ETF/LOF
     (re.compile(r"^(4|8|92)\d{4}$"), "BJ"),
 ]
 _SYMBOL_RE = re.compile(r"^(\d{6})\.(SH|SZ|BJ)$")
@@ -34,9 +35,9 @@ class SecType(StrEnum):
 
 class Board(StrEnum):
     MAIN = "main"
-    GEM = "gem"        # 创业板 300/301
-    STAR = "star"      # 科创板 688
-    BSE = "bse"        # 北交所
+    GEM = "gem"  # 创业板 300/301
+    STAR = "star"  # 科创板 688
+    BSE = "bse"  # 北交所
     UNKNOWN = "unknown"
 
 
@@ -60,7 +61,10 @@ class Symbol:
                 return SecType.LOF
         if self.exchange == "SZ" and c.startswith(("15", "16", "159")):
             return SecType.ETF
-        if c in ("000001", "000300", "000905", "000852") and self.exchange == "SH":
+        # 沪市 000xxx 全段是指数（上证指数/上证A股指数/行业指数等）——
+        # 沪市股票从 600 起，绝无 000 段；只硬编码 4 只会漏掉其余指数
+        # （实测 000002.SH 上证A股指数等 63 只被误标成 stock）。
+        if self.exchange == "SH" and c.startswith("000"):
             return SecType.INDEX
         if c.startswith("399") and self.exchange == "SZ":
             return SecType.INDEX

@@ -182,11 +182,24 @@ def sync_security_details(limit: int | None = None, batch: int = 200) -> int:
         chunk = todo[i : i + batch]
         df = target.security_details(chunk)
         if len(df):
+            # 注意：列存在性要对着 with_columns 之后的帧判断 —— 曾有 bug
+            # 用原始 df 判断，source/updated_at 被自己的 select 过滤掉，
+            # INSERT OR REPLACE 把已入库行的 board/is_st/source 冲成 NULL。
+            out = df.with_columns(
+                source=pl.lit(src),
+                updated_at=pl.lit(now_cn().replace(tzinfo=None), dtype=pl.Datetime),
+            )
+            # details 接口不带 board/is_st，但 INSERT OR REPLACE 是整行覆盖
+            # —— 写前必须把库内已有值带回去，否则每轮补详情都把这两列冲 NULL。
+            try:
+                with reader() as con:
+                    old_meta = con.execute("SELECT symbol, board, is_st FROM security").pl()
+                if len(old_meta) and "board" not in out.columns:
+                    out = out.join(old_meta, on="symbol", how="left")
+            except Exception:  # noqa: BLE001 - 表不存在等场景，直接按无旧值处理
+                pass
             repo.upsert(
-                df.with_columns(
-                    source=pl.lit(src),
-                    updated_at=pl.lit(now_cn().replace(tzinfo=None), dtype=pl.Datetime),
-                ).select(
+                out.select(
                     [
                         c
                         for c in (
@@ -195,10 +208,12 @@ def sync_security_details(limit: int | None = None, batch: int = 200) -> int:
                             "list_date",
                             "delist_date",
                             "sec_type",
+                            "board",
+                            "is_st",
                             "source",
                             "updated_at",
                         )
-                        if c in df.columns
+                        if c in out.columns
                     ]
                 )
             )

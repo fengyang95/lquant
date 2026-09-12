@@ -265,3 +265,49 @@ def test_merge_keep_existing_prefers_old(fake_settings):
     out = reference_mod._merge_existing_details(df, keep_existing=True)
     assert str(out["list_date"][0]) == "1990-01-01"
     assert str(out["delist_date"][0]) == "2009-12-29"  # 旧值为空 → 补新值
+
+
+def test_sync_security_details_keeps_source_and_updated_at(fake_settings, monkeypatch):
+    """回归：details 落库时列存在性误用原始 df 判断，source/updated_at
+    被自己的 select 过滤 → INSERT OR REPLACE 把已入库行的
+    board/is_st/source/updated_at 冲成 NULL（实测 6920 行受害）。"""
+    _seed_security([("000002.SH", "stock", None, None)])
+    from lquant.core.db import writer
+
+    with writer() as con:
+        con.execute(
+            "UPDATE security SET board='main', is_st=false, "
+            "source='baostock', updated_at='2026-01-01 00:00:00' WHERE symbol='000002.SH'"
+        )
+
+    import polars as pl
+
+    class _P:
+        def security_details(self, symbols):
+            return pl.DataFrame(
+                [
+                    {
+                        "symbol": "000002.SH",
+                        "name": "上证A股指数",
+                        "list_date": None,
+                        "delist_date": None,
+                        "sec_type": "index",
+                    }
+                ]
+            )
+
+    import lquant.data.providers as prov_mod
+
+    monkeypatch.setattr(prov_mod, "get_provider", lambda: _P())
+    n = reference_mod.sync_security_details()
+    assert n == 1
+    from lquant.core.db import reader
+
+    with reader() as con:
+        row = con.execute(
+            "SELECT sec_type, source, board, is_st FROM security WHERE symbol='000002.SH'"
+        ).fetchone()
+    assert row[0] == "index"
+    assert row[1] is not None and row[1] != ""  # source 必须保住
+    assert row[2] == "main"  # 未提供的列不能被冲成 NULL
+    assert row[3] == False  # noqa: E712  is_st 同理

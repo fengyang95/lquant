@@ -11,8 +11,8 @@ def main() -> None:
     pl.Config.set_tbl_rows(25)
     pl.Config.set_tbl_width_chars(220)
 
-    syms = SecurityRepo().active_symbols()[:16]
-    print("前16只:", syms)
+    syms = SecurityRepo().active_symbols(exclude_index=True)[:8]
+    print("前8只(无指数):", syms)
     p = BaoStockProvider()
     df = p.daily_bars(syms, date(2026, 1, 1), date(2026, 9, 12))
     print("rows:", len(df))
