@@ -4,7 +4,6 @@ from __future__ import annotations
 import random
 
 import polars as pl
-import pytest
 
 from lquant.factors.evaluate.style_corr import style_correlation
 
