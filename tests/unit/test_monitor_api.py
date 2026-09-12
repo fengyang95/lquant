@@ -158,7 +158,7 @@ def test_data_pulls_endpoint(tmp_path, monkeypatch):
     """collect_log 视角：主库 reader() 读 recent + by_job。"""
     import os
 
-    os.chdir(tmp_path)
+    monkeypatch.chdir(tmp_path)  # 模块级 fixture 之外改动 CWD 必须用 monkeypatch 自动还原
     monkeypatch.setenv("LQ_MONITOR_DB", str(tmp_path / "mon.duckdb"))
     from lquant.core.config import get_settings
 

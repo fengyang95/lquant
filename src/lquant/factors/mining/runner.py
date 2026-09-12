@@ -70,7 +70,12 @@ def run_session(engine, panel, generator, *, agent="builtin", n_candidates=100,
     res = SessionResult(agent=agent)
     n_static = n_ic = n_red = n_proxy = 0
     for _ in range(n_candidates):
-        expr = generator()
+        try:
+            expr = generator()
+        except StopIteration:
+            # 有限生成器（如 LLM 提案列表）提前耗尽 —— 是「提案用完了」，不是出错。
+            # 让它冒泡会把 n 略大于提案条数这种常见情况变成一次难懂的崩溃。
+            break
         res.n_evaluated += 1
         g0 = g0_static(expr, allowed_fields=set(panel.columns))
         if not g0.passed:

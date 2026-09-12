@@ -31,11 +31,20 @@ class AgentProfile:
     enabled: bool = True
 
 
-def load_agents(directory: str = "config/agents") -> list[AgentProfile]:
-    """读 config/agents/*.yaml，fail-fast：格式错/未知 kind/driver 直接抛。"""
+def load_agents(directory: str | None = None) -> list[AgentProfile]:
+    """读 Agent 注册表 yaml（默认 config/agents/*.yaml），fail-fast。
+
+    相对路径一律相对**仓库根**解析（`find_root()`），不依赖进程 CWD ——
+    否则 `lq factor mine` / `lq agent list` 换个工作目录启动就会报
+    "Agent 未注册"，而注册表其实一直在仓库里。显式传入绝对路径时原样使用。
+    """
     from pathlib import Path
 
-    d = Path(directory)
+    from lquant.core.config import find_root
+
+    d = Path(directory) if directory else Path("config/agents")
+    if not d.is_absolute():
+        d = find_root() / d
     if not d.exists():
         return []
     out = []
