@@ -394,26 +394,38 @@ class BaoStockProvider(MappingProvider):
 
         停牌行保留（is_suspended 由映射层得出），行级转换收敛到 _map_daily_raw。
         """
+        import time as _time
         from concurrent.futures import ThreadPoolExecutor
 
         from lquant.data.watchdog import run_with_watchdog
 
         def _one(sym: str) -> pl.DataFrame | None:
             # 单只也要走看门狗：静默挂起是逐请求发生的
-            rows = run_with_watchdog(
-                _bs_query,
-                _bs_code(sym),
-                _DAILY_FIELDS,
-                start.isoformat(),
-                end.isoformat(),
-                "1d",
-                "3",
-            )
-            return _map_daily_raw(rows) if rows else None
+            for attempt in range(3):
+                try:
+                    rows = run_with_watchdog(
+                        _bs_query,
+                        _bs_code(sym),
+                        _DAILY_FIELDS,
+                        start.isoformat(),
+                        end.isoformat(),
+                        "1d",
+                        "3",
+                    )
+                    return _map_daily_raw(rows) if rows else None
+                except RuntimeError as e:
+                    # 并发子进程同时登录会间歇性触发「10001001 用户未登录」
+                    # —— 退避重试；其余错误按原语义抛出（整组失败）
+                    if attempt < 2 and "未登录" in str(e):
+                        _time.sleep(1.5 * (attempt + 1))
+                        continue
+                    raise
+            return None
 
         # 每只一个 watchdog 子进程（spawn + baostock 登录 ~1.5s），串行是
-        # 回填吞吐瓶颈；子进程彼此独立，线程池安全。8 路并行批 12 只约 2 波。
-        workers = min(8, max(1, len(symbols)))
+        # 回填吞吐瓶颈。并发上限 4：实测 8 路会频繁触发服务端并发登录
+        # 拒绝（10001001），4 路配合退避重试基本无损。
+        workers = min(4, max(1, len(symbols)))
         if workers > 1:
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 frames = [f for f in ex.map(_one, symbols) if f is not None]
