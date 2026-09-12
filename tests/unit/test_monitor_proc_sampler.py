@@ -66,7 +66,10 @@ def test_start_sampler_thread(monkeypatch):
     time_mod.sleep(0.1)
     ps.stop_sampler()
     assert fake.setex.call_count >= 1
-    # 停止后不再新增
+    # 停止后不再新增。stop_sampler 只设事件不 join：已越过 wait 的在途
+    # 采样会在停止后落地一次，所以先用一个远大于 interval 的窗口等它
+    # 落定，再取基线断言下一个窗口稳定（直接比较会偶发 +1，见 push 门禁）。
+    time_mod.sleep(0.2)
     n = fake.setex.call_count
-    time_mod.sleep(0.05)
+    time_mod.sleep(0.2)
     assert fake.setex.call_count == n
