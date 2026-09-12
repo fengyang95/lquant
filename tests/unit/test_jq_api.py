@@ -199,3 +199,34 @@ def buy(context):
 def test_syntax_error_raises():
     with pytest.raises(ValueError, match="策略代码执行失败"):
         JQRunner("def initialize(context\n    pass", initial_cash=1e6)
+
+
+def test_handle_data_two_arg_signature():
+    """聚宽标准签名 handle_data(context, data)：data 是当日 bar 视图，可下单。"""
+    import polars as pl
+    from datetime import date, timedelta
+    rows = []
+    for i in range(6):
+        d = date(2026, 1, 5) + timedelta(days=i)
+        px = 10.0 + i
+        rows.append(dict(trade_date=d, symbol="600000.SH", open=px, high=px,
+                         low=px, close=px, pre_close=px - 1 if i else 9.0,
+                         volume=1e6, amount=1e7))
+    df = pl.DataFrame(rows)
+    code = '''
+def initialize(context):
+    g.seen = 0
+
+def handle_data(context, data):
+    # 双参数签名：data 支持 open/close 属性访问
+    assert abs(data["600000.SH"].open - data["600000.SH"].close) < 1e-9
+    if context.current_dt.date() >= date(2026, 1, 7) and g.seen == 0:
+        order_value("600000.SH", 50000)
+        g.seen = 1
+'''
+    from datetime import date as _date
+    res = JQRunner(code.replace("date(2026, 1, 7)", "__import__('datetime').date(2026, 1, 7)"),
+                   initial_cash=1_000_000).run(df)
+    assert res.error is None, res.error
+    assert len(res.trades) == 1
+    assert res.trades[0].qty == 4100      # 50000 / 12.0 / 1.001 → floor 100 手

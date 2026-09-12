@@ -785,7 +785,11 @@ class JQRunner:
                 try:
                     if bucket == "close" and fn is self._handle_data_fn:
                         continue               # handle_data 不重复在 close 跑
-                    fn(self.context) if fn.__code__.co_argcount else fn()
+                    if fn is self._handle_data_fn and fn.__code__.co_argcount >= 2:
+                        # 聚宽标准签名 handle_data(context, data) —— data 是当日 bar 视图
+                        fn(self.context, _DataProxy(self))
+                    else:
+                        fn(self.context) if fn.__code__.co_argcount else fn()
                 except Exception as e:        # noqa: BLE001
                     self.res.error = (f"{d} {self._bucket} 调度 {getattr(fn, '__name__', '?')} "
                                       f"异常: {e}\n{traceback.format_exc(limit=4)}")
