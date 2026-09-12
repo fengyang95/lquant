@@ -16,6 +16,14 @@ import { get, post } from '@/lib/api';
 import { C, SERIES_COLORS, axes, legend, tooltip } from '@/lib/chart';
 
 type FactorRow = { name: string; expression: string; description: string; created_at: string };
+type TopNRow = {
+  n: number; annual_return: number | null; annual_excess: number | null;
+  excess_sharpe: number | null; max_drawdown: number | null; annual_turnover: number | null;
+};
+type StyleRow = {
+  style: string; kind: string; corr_mean: number | null;
+  corr_abs_max: number | null; passed: boolean | null;
+};
 type EvalResult = {
   factor: string;
   n_samples: number;
@@ -25,6 +33,10 @@ type EvalResult = {
   monotonicity: number;
   half_life: number | null;
   suggested_rebalance: string;
+  excess: { annual_excess: number | null; excess_sharpe: number | null; excess_mdd: number | null };
+  annual_turnover: number | null;
+  top_n: TopNRow[];
+  style_corr: { max_abs: number | null; passed: boolean | null };
   report_url: string;
 };
 type EvalSeries = {
@@ -47,6 +59,9 @@ type EvalSeries = {
     rank_ic: (number | null)[];
     ir: (number | null)[];
   };
+  excess?: { dates: string[]; curves: Record<string, (number | null)[]>; benchmark: string };
+  top_n?: TopNRow[];
+  style_corr?: { styles: StyleRow[]; threshold: number; max_abs: number | null; passed: boolean | null };
 };
 type CorrResult = {
   factors: string[];
@@ -221,6 +236,27 @@ export default function FactorsPage() {
       series: [
         { name: `RankIC(${r.window}日)`, type: 'line' as const, data: r.rank_ic, showSymbol: false, lineStyle: { width: 1.8, color: C.indigo }, itemStyle: { color: C.indigo } },
         { name: `IC(${r.window}日)`, type: 'line' as const, data: r.ic, showSymbol: false, lineStyle: { width: 1.5, color: C.up }, itemStyle: { color: C.up } },
+      ],
+    };
+  }, [evalSeries]);
+
+  const excessOption = useMemo(() => {
+    const ex = evalSeries?.excess;
+    if (!ex?.dates.length) return null;
+    const mk = (k: string, name: string, color: string, width: number) => ({
+      name, type: 'line' as const, data: ex.curves[k] ?? [], showSymbol: false,
+      lineStyle: { width, color }, itemStyle: { color },
+    });
+    return {
+      tooltip: { ...tooltip, valueFormatter: (v: number) => v?.toFixed(3) },
+      legend: legend({ top: 0 }),
+      grid: { left: 48, right: 20, top: 30, bottom: 24 },
+      dataZoom: [{ type: 'inside' as const }],
+      ...axes({ data: ex.dates }, { scale: true, name: '超额净值' }),
+      series: [
+        mk(`ex_q${evalSeries!.n_groups}`, '最高组超额', C.up, 2.5),
+        mk('ex_q1', '最低组超额', C.down, 1.5),
+        mk('ex_long_short', '多空相对强弱', C.indigo, 1.5),
       ],
     };
   }, [evalSeries]);
@@ -441,6 +477,77 @@ export default function FactorsPage() {
         </Panel>
       )}
 
+      {evalRes && (
+        <Panel
+          title="超额与持仓收缩"
+          meta={`基准：股票池等权 · 几何超额口径${evalRes.style_corr?.passed != null ? (evalRes.style_corr.passed ? ' · 风格相关性 ✓ 达标' : ' · 风格相关性 ⚠ 超阈值') : ''}`}
+        >
+          <div className="grid grid-cols-2 gap-y-4 divide-line md:grid-cols-5 md:divide-x">
+            <div className="pr-4">
+              <Stat label="年化超额(最高组)"
+                value={evalRes.excess?.annual_excess != null ? `${(evalRes.excess.annual_excess * 100).toFixed(2)}%` : '—'}
+                tone={(evalRes.excess?.annual_excess ?? 0) > 0 ? 'text-up' : 'text-down'} />
+            </div>
+            <div className="px-4">
+              <Stat label="超额夏普" value={evalRes.excess?.excess_sharpe ?? '—'} />
+            </div>
+            <div className="px-4">
+              <Stat label="超额最大回撤"
+                value={evalRes.excess?.excess_mdd != null ? `${(evalRes.excess.excess_mdd * 100).toFixed(2)}%` : '—'}
+                tone="text-down" />
+            </div>
+            <div className="px-4">
+              <Stat label="年化换手(多空)"
+                value={evalRes.annual_turnover != null ? `${(evalRes.annual_turnover * 100).toFixed(0)}%` : '—'} />
+            </div>
+            <div className="px-4">
+              <Stat label="风格相关 max|ρ|"
+                value={evalRes.style_corr?.max_abs != null ? evalRes.style_corr.max_abs.toFixed(3) : '—'}
+                hint="阈值 0.14" />
+            </div>
+          </div>
+          {(evalRes.top_n?.length ?? 0) > 0 && (
+            <div className="mt-5">
+              <div className="mb-2 text-xs text-ink-faint">
+                Top-N 持仓收缩测试：头部集中通常收益不升、波动加大 —— 头部靠数量而非强度时会露馅
+              </div>
+              <table className="table-dense">
+                <thead>
+                  <tr>
+                    <th className="text-left">持仓数</th>
+                    <th className="text-left">年化收益</th>
+                    <th className="text-left">年化超额</th>
+                    <th className="text-left">超额夏普</th>
+                    <th className="text-left">最大回撤</th>
+                    <th className="text-left">年化换手</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {evalRes.top_n.map((r) => (
+                    <tr key={r.n}>
+                      <td className="font-medium">Top {r.n}</td>
+                      <td className={`font-mono ${(r.annual_return ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
+                        {r.annual_return != null ? `${(r.annual_return * 100).toFixed(2)}%` : '—'}
+                      </td>
+                      <td className={`font-mono ${(r.annual_excess ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
+                        {r.annual_excess != null ? `${(r.annual_excess * 100).toFixed(2)}%` : '—'}
+                      </td>
+                      <td className="font-mono">{r.excess_sharpe ?? '—'}</td>
+                      <td className="font-mono text-down">
+                        {r.max_drawdown != null ? `${(r.max_drawdown * 100).toFixed(2)}%` : '—'}
+                      </td>
+                      <td className="font-mono">
+                        {r.annual_turnover != null ? `${(r.annual_turnover * 100).toFixed(0)}%` : '—'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Panel>
+      )}
+
       {/* 图表加载失败显式提示（缺陷 #4：不再伪装成「样本不足」） */}
       {seriesError && (
         <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
@@ -464,6 +571,11 @@ export default function FactorsPage() {
           <Panel title="分层净值曲线" meta={`${evalSeries.n_groups} 组 + 多空`}>
             {quantileOption
               ? <Chart option={quantileOption} height={280} />
+              : <Empty>样本不足</Empty>}
+          </Panel>
+          <Panel title="超额净值曲线" meta={`相对${evalSeries.excess?.benchmark ?? '股票池等权'}基准 · 稳定上行 = 真超额`}>
+            {excessOption
+              ? <Chart option={excessOption} height={280} />
               : <Empty>样本不足</Empty>}
           </Panel>
           <div className="space-y-5">
@@ -493,6 +605,43 @@ export default function FactorsPage() {
                     </div>
                   );
                 })}
+              </div>
+            ) : <Empty>协变量数据不足</Empty>}
+          </Panel>
+          <Panel
+            title="中性化后风格相关性"
+            meta={(evalSeries.style_corr?.styles?.length ?? 0) > 0
+              ? `市值+行业中性化残差 vs 风格 · 阈值 ${evalSeries.style_corr?.threshold ?? 0.14}`
+              : '市值+行业中性化残差 vs 风格'}
+          >
+            {(evalSeries.style_corr?.styles?.length ?? 0) > 0 ? (
+              <div className="space-y-1.5 px-1 py-2 text-xs">
+                {evalSeries.style_corr!.styles.map((s) => {
+                  const v = s.corr_abs_max;
+                  const ok = s.passed;
+                  return (
+                    <div key={s.style} className="flex items-center gap-2 rounded-sm px-1">
+                      <span className="w-32 truncate text-ink-dim" title={s.style}>
+                        {s.style.replace(/^cov_/, '')}{s.kind.startsWith('cat') ? ' (eta)' : ''}
+                      </span>
+                      <div className="h-3 flex-1 rounded-sm bg-ink-faint/10">
+                        {v != null && (
+                          <div className="h-3 rounded-sm"
+                            style={{ width: `${Math.min(v * 100, 100)}%`, background: ok ? 'var(--c-up, #1E7C55)' : 'var(--c-down, #C3352B)' }} />
+                        )}
+                      </div>
+                      <span className="w-14 text-right font-mono">{v != null ? v.toFixed(3) : '—'}</span>
+                      <span className="w-8 text-right">{ok == null ? '—' : ok ? '✓' : '⚠'}</span>
+                    </div>
+                  );
+                })}
+                {evalSeries.style_corr?.passed != null && (
+                  <div className={`px-1 pt-1 ${evalSeries.style_corr.passed ? 'text-up' : 'text-gold'}`}>
+                    {evalSeries.style_corr.passed
+                      ? '✓ 所有风格 max|ρ| 均在阈值内 —— 中性化后未偷风格暴露'
+                      : '⚠ 存在超阈值风格相关 —— alpha 可能是某个风格的马甲，继续加中性化或重设计'}
+                  </div>
+                )}
               </div>
             ) : <Empty>协变量数据不足</Empty>}
           </Panel>
