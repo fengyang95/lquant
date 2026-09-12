@@ -19,6 +19,7 @@ pytestmark = pytest.mark.usefixtures("api_env")
 @pytest.fixture(scope="module")
 def api_env(tmp_path_factory):
     base = tmp_path_factory.mktemp("api_tasks")
+    prev_cwd = os.getcwd()  # 模块级 fixture 必须还原 CWD，否则污染后续测试文件
     os.chdir(base)
     from lquant.core.config import get_settings
 
@@ -33,6 +34,7 @@ def api_env(tmp_path_factory):
             con.execute(stmt)
     generate_demo(start="2024-01-01", end="2026-06-30")
     yield base
+    os.chdir(prev_cwd)
     get_settings.cache_clear()
 
 
@@ -207,6 +209,76 @@ def test_crosscheck_endpoints(client):
     missing = client.post("/api/data/crosscheck/issues/resolve",
                           json={"issue_id": "ghost"})
     assert missing.status_code == 404
+
+
+# ---------- 全湖质量检查 / 断点管理 ----------
+
+def test_lake_check_endpoint(client):
+    """demo 湖全量校验：summary 契约固定四档 + total，issues 明细可空。"""
+    r = client.post("/api/data/check", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert {"total", "fatal", "error", "warn", "info"} <= set(body["summary"])
+    assert body["summary"]["total"] == sum(
+        body["summary"][k] for k in ("fatal", "error", "warn", "info"))
+    assert isinstance(body["issues"], list)
+    for it in body["issues"]:
+        assert {"rule", "severity", "detail", "dataset", "count"} <= set(it)
+
+
+def test_lake_check_endpoint_422_bad_date(client):
+    for payload in ({"start": "not-a-date"}, {"end": "2024/01/01"}):
+        r = client.post("/api/data/check", json=payload)
+        assert r.status_code == 422, r.text
+
+
+def test_checkpoints_list_and_archive(client):
+    from pathlib import Path
+
+    from lquant.core.config import get_settings
+
+    cp_dir = Path(get_settings().cache_dir) / "checkpoints"
+    cp_dir.mkdir(parents=True, exist_ok=True)
+    (cp_dir / "daily-uitest.json").write_text(
+        '{"done": ["600519.SH", "000001.SZ"], '
+        '"updated_at": "2026-09-12T00:00:00", '
+        '"meta": {"start": "2024-01-01", "end": "2025-12-31"}}',
+        encoding="utf-8")
+    try:
+        lst = client.get("/api/data/checkpoints").json()
+        entry = next(c for c in lst if c["name"] == "daily-uitest")
+        assert entry["done"] == 2
+        assert entry["meta"]["start"] == "2024-01-01"
+        assert entry["updated_at"] == "2026-09-12T00:00:00"
+
+        r = client.delete("/api/data/checkpoints/daily-uitest")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["name"] == "daily-uitest"
+        assert body["archived_to"].startswith("daily-uitest.done-")
+        assert not (cp_dir / "daily-uitest.json").exists()
+        assert (cp_dir / body["archived_to"]).exists()
+        # 归档后仍在列表可见（保留可追溯），但原文件已重命名
+        names = [c["name"] for c in client.get("/api/data/checkpoints").json()]
+        assert any(n.startswith("daily-uitest.done-") for n in names)
+    finally:
+        for p in cp_dir.glob("daily-uitest*"):
+            p.unlink(missing_ok=True)
+
+
+def test_archive_checkpoint_404_and_422(api_env):
+    """直接调视图断言（绕开 httpx 对 .. 的 URL 归一化）。"""
+    from fastapi import HTTPException
+
+    from lquant.server.api.data import archive_checkpoint
+
+    with pytest.raises(HTTPException) as ei:
+        archive_checkpoint("no_such_checkpoint")
+    assert ei.value.status_code == 404
+    for bad in ("../etc", "a/b", "a\\b", "..", ".hidden", ""):
+        with pytest.raises(HTTPException) as ei:
+            archive_checkpoint(bad)
+        assert ei.value.status_code == 422
 
 
 # ---------- coverage monthly ----------
