@@ -77,6 +77,20 @@ def test_industry_pit_asof():
     assert rep_late[0]["coverage"] < 1.0
 
 
+def test_industry_asof_no_sortedness_warning():
+    """join_asof 带 by 组时 polars 无法跨组校验排序，曾每次调用刷一条
+    UserWarning 噪音。修复后（显式 check_sortedness=False，组内有序由
+    sort 保证）不得再出现该告警 —— 告警会让 Agent 误判成数据问题。"""
+    import warnings
+
+    d = _panel(n_days=10)
+    ind = _industry()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out, rep = build_covariates(d, ["industry_sw1"], industry_df=ind)
+    assert rep[0]["coverage"] == pytest.approx(1.0)
+
+
 def test_missing_covariate_never_filled_zero():
     """硬约束 3: 缺失整行剔除/留 null，绝不填 0。"""
     d = _panel(n_days=10)

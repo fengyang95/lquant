@@ -54,3 +54,33 @@ def test_pct_change_still_works():
 
     out = _compute_factor(_panel(), "pct_change_5")
     assert "_factor" in out.columns
+
+
+def test_compute_factor_col_overwrites_existing_f_column():
+    """robust 链路：train 帧已带上一轮 prepare_segment 算出的 f 列。
+
+    多步表达式 compute(name='f') 曾因 rename 到已存在列名抛
+    DuplicateError: column 'f' is duplicate —— 而单步路径 with_columns
+    是覆盖语义。修复后两条路径一致：同名列 = 覆盖重算。
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(3)
+    rows = []
+    for sym in ("A", "B", "C"):
+        px = 10.0
+        for i in range(30):
+            px *= 1 + rng.normal(0, 0.02)
+            rows.append({"symbol": sym,
+                         "trade_date": dt.date(2025, 1, 1) + dt.timedelta(days=i),
+                         "close": px, "volume": float(1e5 * (1 + rng.normal(0, 0.3)))})
+    df = pl.DataFrame(rows)
+    # 预置同名 f 列（旧值显然与重算结果不同）
+    df = df.with_columns(pl.col("close").pct_change().over("symbol").alias("f"))
+
+    from lquant.factors.analysis import compute_factor_col
+
+    out = compute_factor_col(df, "Rank(-Ts_Corr(Rank(close), Rank(volume), 10))", "f")
+    assert "f" in out.columns and len(out) == len(df)
+    # 覆盖语义：非空行不应再是旧 pct_change 值
+    assert out["f"].null_count() < len(out)

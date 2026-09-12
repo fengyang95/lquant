@@ -149,7 +149,6 @@ def mine(agent: str, generator: str, n: int, proposals: str | None, start: str |
     import uuid
 
     from lquant.core.db import writer
-    from lquant.data.store.parquet import read_daily
     from lquant.factors.agents import find_agent
     from lquant.factors.engine import FactorEngine
     from lquant.factors.mining.runner import run_session
@@ -174,15 +173,14 @@ def mine(agent: str, generator: str, n: int, proposals: str | None, start: str |
             "generator=proposals 需要 --proposals <JSONL 路径>"
             "（每行一个 {\"expr\": \"...\", \"note\": \"...\"} 对象）")
 
-    df = read_daily(start=start).collect()
-    if not len(df):
-        raise click.ClickException("日线数据为空，先跑 lq data demo")
-    # 方案红线：G1 快筛与适应度一律用中性化后 IC —— 挖掘会话必须带协变量
+    # 方案红线：G1 快筛与适应度一律用中性化后 IC —— 挖掘会话必须带协变量。
+    # 只读一次面板：此前 read_daily 判空 + _panel_with_covs 各翻一遍湖，
+    # 全量数据下纯多付一次全湖扫描（实测 2026 年分区 1.3s/次，无 --start 更贵）。
     from lquant.factors.mining.submit import _panel_with_covs
 
     df, cov_cols = _panel_with_covs(start=start)
     if not len(df):
-        df, cov_cols = df, []
+        raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")
     eng = FactorEngine(df.lazy())
 
     if generator == "gp":
