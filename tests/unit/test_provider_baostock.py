@@ -408,13 +408,18 @@ def _fake_query_2024(code: str, *a, **k) -> list[list[str]]:
 def test_fetch_daily_parallel_preserves_order(monkeypatch) -> None:
     """线程池并行拉取后必须按入参顺序拼接（顺序影响对拍与断点语义）。"""
     import datetime
+    import sys
 
-    import lquant.data.watchdog as wd
+    def _passthrough(fn, *a, **k):
+        return fn(*a, **k)
 
-    monkeypatch.setattr("lquant.data.providers.baostock._bs_query", _fake_query_2024)
-    # 真实 run_with_watchdog 会把 fn pickle 进子进程 —— 模块级替身可 pickle，
-    # 但为了不真开子进程，这里换成透传
-    monkeypatch.setattr(wd, "run_with_watchdog", lambda fn, *a, **k: fn(*a, **k))
+    # 直接 patch 方法实际读取的对象，不走 monkeypatch 字符串解析：
+    # test_provider_akshare 的模块重导入会让 import 图分裂，字符串
+    # target 经 getattr 链可能 resolve 到另一个模块对象，patch 落不到
+    # _one 闭包真正读取的 __globals__ → 全量套件下偶发走真登录。
+    g = BaoStockProvider._fetch_daily.__globals__
+    monkeypatch.setitem(g, "_bs_query", _fake_query_2024)
+    monkeypatch.setattr(sys.modules["lquant.data.watchdog"], "run_with_watchdog", _passthrough)
     syms = [f"60000{i}.SH" for i in range(10)]
     df = BaoStockProvider()._fetch_daily(
         syms, datetime.date(2024, 1, 1), datetime.date(2024, 1, 31)
