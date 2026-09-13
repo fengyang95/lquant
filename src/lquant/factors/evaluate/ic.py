@@ -15,7 +15,8 @@ import math
 
 import polars as pl
 
-__all__ = ["ic_series", "ic_summary", "ic_by_year", "ic_decay_table", "newey_west_tstat"]
+__all__ = ["ic_series", "ic_summary", "ic_by_year", "ic_decay_table", "newey_west_tstat",
+           "ic_autocorr"]
 
 
 def ic_series(
@@ -68,6 +69,29 @@ def _t_stat(mean: float, std: float, n: int) -> float:
     return mean / (std / math.sqrt(n))
 
 
+def ic_autocorr(series: pl.Series, lag: int = 1) -> float:
+    """IC 序列的 lag 阶自相关：高自相关 = 信号可预测且稳定，近零/负 = 噪声主导。
+
+    与 ICIR 互补：ICIR 说「平均强度/波动」，自相关说「这种强度能不能延续」。
+    一个 ICIR 0.4 但自相关 −0.2 的因子，很可能只是在一个个独立的行情片段上碰运气。
+
+    手算 Pearson 而不是调库：polars 各版本对 ``Series.autocorr`` 的支持并不一致
+    （缺失时静默降级会把这一项变成 NaN，看着像「数据不够」）。
+    """
+    s = series.drop_nulls() if isinstance(series, pl.Series) else pl.Series(series).drop_nulls()
+    n = len(s)
+    if lag < 1 or n <= lag + 1:
+        return float("nan")
+    a = s.cast(pl.Float64, strict=False).to_numpy()
+    x, y = a[lag:], a[:-lag]
+    xm, ym = x - x.mean(), y - y.mean()
+    den = math.sqrt(float((xm**2).sum()) * float((ym**2).sum()))
+    if den <= 0:
+        return float("nan")
+    v = float((xm * ym).sum()) / den
+    return v if math.isfinite(v) else float("nan")
+
+
 def newey_west_tstat(x, lags: int | None = None) -> float:
     """NW 一致 t 值：日度 IC 强自相关下，朴素 t = IR·√N 会高估显著性 3~5 倍。"""
     s = pl.Series(x).drop_nulls() if not isinstance(x, pl.Series) else x.drop_nulls()
@@ -102,10 +126,15 @@ def _summarize(series: pl.Series, annualize: bool = True, *, nw_lags: int | None
             "skew": float("nan"),
             "kurtosis": float("nan"),
             "ic_gt_002_rate": float("nan"),
+            "ic_autocorr": float("nan"),
             "n_days": 0,
         }
     mean = float(s.mean())
-    std = float(s.std()) or float("nan")
+    # std=0 是合法值（IC 恒定）——不能和「样本不足算不出 std」一起折成 NaN，
+    # 否则下游分不清「完美稳定」和「没有数据」（评级会把最强因子判成 moderate）。
+    std_raw = s.std()
+    std = (float(std_raw) if std_raw is not None and math.isfinite(float(std_raw))
+           else float("nan"))
     ir = mean / std if std and std > 0 else float("nan")
     pos = float((s > 0).sum() / n)
     # 阈值胜率：与均值同向、且幅度过 0.02 有效线的占比 —— 比单纯胜率更挑剔
@@ -122,6 +151,7 @@ def _summarize(series: pl.Series, annualize: bool = True, *, nw_lags: int | None
         "skew": float(s.skew()) if n > 2 else float("nan"),
         "kurtosis": float(s.kurtosis()) if n > 3 else float("nan"),
         "ic_gt_002_rate": sig,
+        "ic_autocorr": ic_autocorr(s, lag=1),
         "n_days": n,
     }
 

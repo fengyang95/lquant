@@ -99,3 +99,34 @@ def test_nested_ts_cs_materialization():
     out = FactorEngine(df.lazy()).compute("Ts_Mean(Rank($close), 5)", "f")
     assert "f" in out.columns
     assert out["f"].is_not_null().sum() > 0
+
+
+def test_inline_comment_is_ignored():
+    """# 行内注释必须被忽略 —— 文档里的候选模板要能直接复制粘贴提交。"""
+    from lquant.factors.dsl.lexer import tokenize
+
+    toks = tokenize("Ts_Mean($close, 5)  # 均线（平滑动量）")
+    assert toks == [("name", "Ts_Mean"), ("op", "("), ("field", "$close"),
+                    ("op", ","), ("number", "5"), ("op", ")")]
+
+    # 纯注释行 = 空 token；注释里的括号/字段不得漏进 token 流
+    assert tokenize("# Ts_Return($close, 20)  全是注释") == []
+
+
+def test_comment_does_not_change_semantics_or_canonical_id():
+    """带注释与不带注释是同一个因子：AST、最小窗口、canonical id 都必须一致。"""
+    from lquant.factors.dsl.analyzer import check
+    from lquant.factors.dsl.parser import parse
+    from lquant.factors.dsl.printer import canonical, canonical_id
+
+    plain = "Ts_Return($close, 20) / Ts_Std(Ts_Return($close, 1), 20)"
+    commented = plain + "   # 风险调整动量"
+
+    a, b = parse(plain, "f"), parse(commented, "f")
+    assert canonical(a.root) == canonical(b.root)
+    check(a)
+    check(b)
+    assert a.min_window == b.min_window == 20
+    assert a.fields == b.fields
+    # 走完整 dedup 通道（canonical_id 内部再 parse 一次）
+    assert canonical_id(plain) == canonical_id(commented)

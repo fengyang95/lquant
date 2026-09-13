@@ -1,10 +1,13 @@
 """端到端：创建会话 → WS 订阅 → 发消息 → 断言事件流与落库对账。"""
 import asyncio
+import shutil
 import time
+from pathlib import Path
 
 import pytest
 from starlette.testclient import TestClient
 
+from lquant.core.config import get_settings
 from lquant.server.main import app
 
 _TIMEOUT = 10.0
@@ -13,6 +16,27 @@ _FAKE_QUOTE = {
     "symbol": "600519", "price": 1700.0, "change_pct": 1.2,
     "ts": "2026-09-10 10:00:00", "source": "stub",
 }
+
+
+@pytest.fixture(autouse=True)
+def fake_env(tmp_path, monkeypatch):
+    """LQ_ROOT + chdir + cache_clear 隔离，杜绝写真实 ./data。
+
+    SessionStore 路径取 settings.root/data/ask.db（agent/service.py 惰性
+    单例），所以必须连 agent service 的单例 _cache 一起清，否则首个用例
+    建立的 store 绑定会泄漏到后续用例。
+    """
+    import lquant.agent.service as agent_service
+
+    root = Path(__file__).resolve().parents[2]
+    shutil.copytree(root / "config", tmp_path / "config")
+    monkeypatch.setenv("LQ_ROOT", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    get_settings.cache_clear()
+    agent_service._cache.clear()
+    yield
+    get_settings.cache_clear()
+    agent_service._cache.clear()
 
 
 @pytest.fixture(autouse=True)

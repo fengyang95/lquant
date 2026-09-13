@@ -29,8 +29,16 @@
    但涨跌停拒单、T+1 可卖、按订单累计最低佣金全部走本引擎规则表；
 2. history/attribute_history 严格截到**上一交易日**，杜绝未来函数。
 
-安全边界：exec 执行用户代码是本功能的设计前提（同聚宽/本地研究环境），
-API 只绑 127.0.0.1/内网，不暴露公网。
+安全边界：exec 执行用户代码是本功能的设计前提（同聚宽/本地研究环境）。
+防护分三层，逐层收口：
+1. 静态校验 ``validate_source``：import 白名单 + 危险调用/属性黑名单；
+2. 执行侧受限内建 ``sandbox.safe_builtins()``：显式覆盖 CPython 自动注入的完整
+   内建，命名空间里没有 ``eval/exec/open/getattr``；``__import__`` 换成
+   只放行白名单模块的守卫版；
+3. 服务默认只绑 ``127.0.0.1``（``lquant.sh`` 的 ``LQ_API_HOST``）。
+
+**这三层都不是容器级隔离**——exec 下通过对象图逃逸在理论上始终可达。
+不要把本服务暴露到不可信网络。见 ``docs/SECURITY.md``。
 """
 from __future__ import annotations
 
@@ -47,6 +55,7 @@ from lquant.backtest.broker import Broker
 from lquant.backtest.engine import Engine, build_rules
 from lquant.backtest.events import Bar, Fill, Order, Side
 from lquant.backtest.metrics import perf_from_returns, turnover_from_trades
+from lquant.backtest.sandbox import safe_builtins
 from lquant.backtest.slippage import PctSlippage
 from lquant.core.types import parse_symbol
 from lquant.factors.panel import compute_factor_columns
@@ -316,7 +325,10 @@ class JQRunner:
         self._factor_panels: dict[str, dict[tuple[date, str], float]] = {}
 
         # 用户代码命名空间（exec 共享 globals，模块级变量等价聚宽的 g.*）
+        # __builtins__ 显式收口：不设的话 CPython 会注入完整内建，用户代码可直接
+        # __import__("os")，绕过 validate_source 的 import 白名单。
         self.ns: dict = {"__name__": "__jq__", "g": type("G", (), {})()}
+        self.ns["__builtins__"] = safe_builtins()
         self._install_api()
         self._compile()
 

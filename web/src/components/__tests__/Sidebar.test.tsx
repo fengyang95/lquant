@@ -11,4 +11,9 @@ describe('Sidebar', () => {
     const link = screen.getByRole('link', { name: '资讯' });
     expect(link).toHaveAttribute('href', '/news');
   });
+
+  it('不再包含「策略编辑」入口', () => {
+    render(<Sidebar />);
+    expect(screen.queryByText('策略编辑')).not.toBeInTheDocument();
+  });
 });

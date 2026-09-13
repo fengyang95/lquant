@@ -34,6 +34,10 @@ RUSTUP_DIST_SERVER="${LQ_RUSTUP_DIST_SERVER:-https://rsproxy.cn}"
 RUSTUP_UPDATE_ROOT="${LQ_RUSTUP_UPDATE_ROOT:-https://rsproxy.cn/rustup/dist}"
 API_PORT="${LQ_API_PORT:-8000}"
 WEB_PORT="${LQ_WEB_PORT:-3000}"
+# 默认只绑回环。API 无鉴权，且 /api/analyses、/api/backtests/run-code 等端点会
+# exec 用户代码 —— 绑 0.0.0.0 等于把 RCE 开放给同网段。确需对外时显式设
+# LQ_API_HOST=0.0.0.0（会打印告警）。
+API_HOST="${LQ_API_HOST:-127.0.0.1}"
 PYTHON_MIN="3.12"
 
 RUN_DIR=".run"
@@ -432,8 +436,12 @@ cmd_start() {
   if pid_ok "$RUN_DIR/api.pid"; then warn "API 已在运行 (pid $(cat "$RUN_DIR/api.pid"))"; else
     free_port "$API_PORT"
     start_redis
-    info "启动 API (uvicorn, port $API_PORT)"
-    spawn api "$LOG_DIR/api.log" .venv/bin/uvicorn lquant.server.main:app --host 0.0.0.0 --port "$API_PORT"
+    info "启动 API (uvicorn, ${API_HOST}:$API_PORT)"
+    if [ "$API_HOST" != "127.0.0.1" ] && [ "$API_HOST" != "localhost" ]; then
+      warn "API 绑定在 $API_HOST（非回环）。API 无鉴权且会执行用户代码，"
+      warn "请确认所在网络可信，否则改回 LQ_API_HOST=127.0.0.1"
+    fi
+    spawn api "$LOG_DIR/api.log" .venv/bin/uvicorn lquant.server.main:app --host "$API_HOST" --port "$API_PORT"
     wait_api || true
   fi
 
@@ -450,6 +458,17 @@ sys.exit(0 if _redis_available() else 1)" 2>/dev/null; then
         --url "${LQ_REDIS_URL:-redis://localhost:6379/0}"
     else
       warn "无 Redis，跳过独立 Worker（任务在 API 进程内本地执行）"
+    fi
+  fi
+
+  # 监控 worker 进程组（lq worker：1 通用 + K 回测，K=LQ_BACKTEST_WORKERS 或默认 2）
+  if ! pid_ok "$RUN_DIR/lqworker.pid"; then
+    mkdir -p logs
+    if command -v redis-cli >/dev/null 2>&1 && redis-cli -u "${LQ_REDIS_URL:-redis://localhost:6379/0}" ping >/dev/null 2>&1; then
+      info "启动监控 Worker 进程组 (lq worker)"
+      spawn lqworker logs/worker.log .venv/bin/lq worker
+    else
+      warn "Redis 不可用，跳过监控 Worker 启动（监控页将显示 offline）"
     fi
   fi
 
@@ -481,7 +500,7 @@ sys.exit(0 if _redis_available() else 1)" 2>/dev/null; then
 
 cmd_stop() {
   info "停止服务"
-  for name in web worker api; do
+  for name in web lqworker worker api; do
     if pid_ok "$RUN_DIR/$name.pid"; then
       local pid; pid="$(cat "$RUN_DIR/$name.pid")"
       kill "$pid" 2>/dev/null || true
@@ -494,13 +513,14 @@ cmd_stop() {
   # uvicorn/rq/next 可能有残留子进程
   pkill -f "uvicorn lquant.server.main" 2>/dev/null && dim "清理残留 uvicorn" || true
   pkill -f "rq worker lquant" 2>/dev/null || true
+  pkill -f "lq worker" 2>/dev/null || true
   info "done"
 }
 
 cmd_status() {
   echo "== lquant 服务状态 =="
   local name pid
-  for name in api worker web; do
+  for name in api lqworker worker web; do
     if pid_ok "$RUN_DIR/$name.pid"; then
       echo "  [运行中] $name  pid=$(cat "$RUN_DIR/$name.pid")"
     else
@@ -519,6 +539,7 @@ cmd_logs() {
   local name="${1:-api}"
   case "$name" in
     api|worker|web) tail -n 100 -f "$LOG_DIR/$name.log" ;;
+    lqworker) tail -n 100 -f logs/worker.log ;;
     *) fail "用法: ./lquant.sh logs [api|worker|web]" ;;
   esac
 }

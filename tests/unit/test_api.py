@@ -223,6 +223,31 @@ def test_evaluate_series_rolling_window_override(client):
     assert _roll_len(20) > _roll_len(60)
 
 
+def test_evaluate_excess_topn_style_payload(client):
+    """研报三件套：超额体系 / Top-N 收缩 / 中性化后风格相关，字段齐全且形态正确。"""
+    r = client.post("/api/factors/evaluate/series", json={
+        "factor": "MA20", "formula": "MA20", "n_groups": 5, "start": "2024-06-01",
+        "top_ns": [20, 50]})
+    assert r.status_code == 200
+    body = r.json()
+    # 超额净值曲线：日期对齐 + 各组 ex_* + 多空相对强弱
+    ex = body["excess"]
+    assert ex["dates"] and set(ex["curves"]) >= {f"ex_q{i}" for i in range(1, 6)} | {"ex_long_short"}
+    assert len(ex["dates"]) == len(ex["curves"]["ex_q1"])
+    # Top-N：请求的每个 N 都有行，指标形态正确
+    tn = {row["n"]: row for row in body["top_n"]}
+    assert set(tn) == {20, 50}
+    for row in tn.values():
+        for k in ("annual_return", "annual_excess", "excess_sharpe",
+                  "max_drawdown", "annual_turnover"):
+            assert row[k] is None or isinstance(row[k], (int, float))
+    # 风格相关：styles 列表 + 阈值判定字段
+    sc = body["style_corr"]
+    assert sc["threshold"] == 0.14
+    assert isinstance(sc["styles"], list)
+    assert sc["passed"] in (True, False, None)
+
+
 # ---------- backtests ----------
 
 def test_backtest_run_list_detail_compare(client):
@@ -555,3 +580,43 @@ def test_ws_market_ticks_empty_symbols(client):
     with client.websocket_connect("/ws/market/ticks") as ws:
         msg = ws.receive_json()
     assert msg["available"] is False and "symbols" in msg["error"]
+
+
+# ---------- 参考数据（退市名单）同步 ----------
+
+def test_reference_sync_endpoint(client, monkeypatch):
+    """POST /data/reference/sync → 202，后台任务执行一次；重入 → 409。"""
+    import threading
+
+    from lquant.server.api import data as data_mod
+
+    calls: list[dict] = []
+    done = threading.Event()
+
+    fake_result = {"calendar": 1, "securities": 1, "delisted": 2, "details": 0}
+
+    def _fake_sync(skip_details=False, detail_limit=None):
+        calls.append({"skip_details": skip_details})
+        done.set()
+        return fake_result
+
+    monkeypatch.setattr(data_mod, "sync_reference", _fake_sync)
+    monkeypatch.setattr(data_mod, "_ref_lock", threading.Lock())
+
+    r = client.post("/api/data/reference/sync", json={"sync_details": False})
+    assert r.status_code == 202
+    assert r.json()["accepted"] is True
+    assert done.wait(5), "后台任务未执行"
+    assert calls == [{"skip_details": True}]
+
+    # 上一次同步完成释放锁后可再次触发
+    done.clear()
+    r2 = client.post("/api/data/reference/sync", json={})
+    assert r2.status_code == 202
+    assert done.wait(5)
+
+    # 锁被占（上一次同步未结束）→ 409
+    monkeypatch.setattr(data_mod, "_ref_lock", threading.Lock())
+    assert data_mod._ref_lock.acquire(blocking=False)
+    r3 = client.post("/api/data/reference/sync", json={})
+    assert r3.status_code == 409

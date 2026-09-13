@@ -11,6 +11,7 @@ backfill_pool 是核心逐批回填循环（T3 重构）：
 - TimeoutError → 缩到 SUB_BATCH 再试；质量门禁 fatal → 拦整组不入湖
 - 连续 EARLY_STOP_BATCHES 批全失败 → 早停，避免对挂掉的数据源空转
 """
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -20,7 +21,7 @@ import polars as pl
 
 from lquant.core.config import get_settings
 from lquant.core.errors import DataQualityError
-from lquant.core.types import now_cn
+from lquant.core.types import now_cn, today_cn
 from lquant.data.ingest.checkpoint import Checkpoint
 from lquant.data.store.parquet import write_daily
 
@@ -105,13 +106,16 @@ def backfill_pool(
         rows += batch_rows
         failed.extend({"symbol": s, "reason": batch_failed[s]} for s in batch_failed)
         logger.info(f"  进度 {done}/{total}（本批失败 {len(batch_failed)}）")
-        _notify(on_progress, {
-            "done": done,
-            "total": total,
-            "failed": list(failed),  # 快照：消费方存帧不被后续批次追溯改写
-            "rows": rows,
-            "early_stopped": False,
-        })
+        _notify(
+            on_progress,
+            {
+                "done": done,
+                "total": total,
+                "failed": list(failed),  # 快照：消费方存帧不被后续批次追溯改写
+                "rows": rows,
+                "early_stopped": False,
+            },
+        )
         if batch_failed and not ok:
             consecutive_full_failures += 1
             if consecutive_full_failures >= EARLY_STOP_BATCHES:
@@ -125,13 +129,16 @@ def backfill_pool(
             consecutive_full_failures = 0
 
     if stopped:
-        _notify(on_progress, {
-            "done": done,
-            "total": total,
-            "failed": list(failed),  # 快照
-            "rows": rows,
-            "early_stopped": True,
-        })
+        _notify(
+            on_progress,
+            {
+                "done": done,
+                "total": total,
+                "failed": list(failed),  # 快照
+                "rows": rows,
+                "early_stopped": True,
+            },
+        )
     return {
         "done": done,
         "failed": failed,
@@ -205,10 +212,11 @@ def backfill_daily(
     from lquant.data.store.catalog import SecurityRepo
 
     s = get_settings()
-    end_d = date.fromisoformat(end) if end else date.today()
+    end_d = date.fromisoformat(end) if end else today_cn()
     start_d = date.fromisoformat(start)
 
-    symbols = SecurityRepo().active_symbols()
+    # 指数不入日线湖：点位超价格护栏、量纲断言不成立（详见 active_symbols docstring）
+    symbols = SecurityRepo().active_symbols(exclude_index=True)
     if not full:
         # 哨兵池：大中小盘 + ETF，快速验证链路
         symbols = symbols[:200]
@@ -226,7 +234,9 @@ def backfill_daily(
 
 def _provider_source(provider) -> str:
     """实际使用的源名（血缘 source 字段）：优先 source key，回落 name。"""
-    return getattr(provider, "source", "") or getattr(provider, "name", "baostock")
+    from lquant.data.base import source_name
+
+    return source_name(provider)
 
 
 def _stamp(df: pl.DataFrame, source: str = "baostock") -> pl.DataFrame:

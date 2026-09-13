@@ -40,6 +40,10 @@ class EvaluateIn(BaseModel):
                                 ge=1, le=250)
     start: str = "2026-01-01"
     window: int = Field(default=60, ge=20, le=250)  # 滚动窗口（交易日）
+    top_ns: list[int] = Field(default=[50, 100], min_length=1, max_length=5,
+                              description="Top-N 持仓收缩测试的 N 列表")
+    style_threshold: float = Field(default=0.14, ge=0.0, le=1.0,
+                                   description="中性化后风格相关性阈值（max|ρ| 判定线）")
 
 
 @router.get("")
@@ -236,6 +240,10 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
         "monotonicity": round(res["quantile"]["monotonicity"], 3),
         "half_life": res["decay"]["half_life"],
         "suggested_rebalance": res["decay"]["suggested_rebalance"],
+        "excess": {},                    # 计算体在下方超额块完成后回填
+        "annual_turnover": None,
+        "top_n": [],
+        "style_corr": {"max_abs": None, "passed": None},
         "report_url": f"/api/factors/reports/{report_path.stem}",
     }
 
@@ -277,7 +285,7 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
                for r in icy.to_dicts()] if len(icy) else []
 
     # ---- IC 归因阶梯（方案 5.3）+ 三种中性化视图标注（方案 5.1） ----
-    cov_names_all = ["market_cap", "industry_sw1", "turnover_1m"]
+    cov_names_all = ["market_cap", "industry_sw1", "turnover_1m", "momentum_1m"]
     try:
         with reader() as con:
             ind = con.execute("SELECT symbol, std, code, std_date FROM industry_classify").pl()
@@ -293,6 +301,78 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
     ladder = _neutral_ladder(d, "_factor", ret_col, dd=d, cov_report=cov_map)
     _persist_ic(req.factor, ladder)
     views = _neutral_views_for(d, ret_col)
+
+    # ---- 超额收益体系 / Top-N 收缩测试 / 中性化后风格相关性（研报标准三件套） ----
+    from lquant.factors.evaluate.excess import (
+        benchmark_series,
+        group_excess_summary,
+        quantile_excess_nav,
+    )
+
+    bench = benchmark_series(d, ret_col)
+    exnav = quantile_excess_nav(d, "_factor", ret_col, req.n_groups, bench)
+    ex_dates = [str(x) for x in exnav["trade_date"].to_list()] if len(exnav) else []
+    ex_curves = {c: [_jf(v, 4) for v in exnav[c].to_list()]
+                 for c in exnav.columns if c != "trade_date"} if len(exnav) else {}
+    gex = group_excess_summary(d, "_factor", ret_col, req.n_groups, bench)
+    # 最高组（q=N）相对基准的绩效 —— 研报 G0 组口径
+    excess_metrics = {}
+    if len(gex):
+        r0 = gex.filter(pl.col("q") == req.n_groups)
+        if len(r0):
+            row = r0.to_dicts()[0]
+            excess_metrics = {"annual_excess": _jf(row["annual_excess"]),
+                              "excess_sharpe": _jf(row["excess_sharpe"], 2),
+                              "excess_mdd": _jf(row["excess_mdd"])}
+
+    try:
+        from lquant.factors.evaluate.top_n import top_n_summary
+
+        tn = top_n_summary(d, "_factor", ret_col, n_list=req.top_ns, bench=bench)
+        top_n_rows = [{"n": int(r["n"]), "annual_return": _jf(r["annual_return"]),
+                       "annual_excess": _jf(r["annual_excess"]),
+                       "excess_sharpe": _jf(r["excess_sharpe"], 2),
+                       "max_drawdown": _jf(r["max_drawdown"]),
+                       "annual_turnover": _jf(r["annual_turnover"], 2)}
+                      for r in tn.to_dicts()] if len(tn) else []
+    except Exception:  # noqa: BLE001
+        top_n_rows = []
+
+    try:
+        from lquant.factors.evaluate.style_corr import style_correlation
+        from lquant.factors.preprocess.pipeline import run as pipeline_run
+
+        steps = [{"op": "winsorize", "method": "mad", "n": 5},
+                 {"op": "standardize", "method": "zscore"}]
+        cap_ind = [c for c in ("cov_market_cap", "cov_industry_sw1") if c in d.columns]
+        if cap_ind:
+            steps.append({"op": "neutralize", "method": "ols", "factors": cap_ind})
+        rn = pipeline_run(d, "_factor", steps)
+        rn = drop_nonfinite(rn, "_factor")
+        style_cols = [c for c in ("cov_market_cap", "cov_turnover_1m", "cov_momentum_1m")
+                      if c in rn.columns]
+        style_corr = style_correlation(
+            rn, "_factor", style_cols,
+            group_col="cov_industry_sw1" if "cov_industry_sw1" in rn.columns else None,
+            threshold=req.style_threshold)
+    except Exception:  # noqa: BLE001
+        style_corr = {}
+
+    try:
+        from lquant.factors.evaluate.costs import factor_turnover
+
+        to_df = factor_turnover(d, "_factor", req.n_groups)
+        mean_to = to_df["turnover_avg"].drop_nulls().mean() if len(to_df) else None
+        annual_turnover = _jf(float(mean_to) * 252, 2) if mean_to is not None else None
+    except Exception:  # noqa: BLE001
+        annual_turnover = None
+
+    # 回填 metrics（超额/TopN/风格相关在 metrics 构造后才可算，这里统一写入）
+    metrics["excess"] = excess_metrics
+    metrics["annual_turnover"] = annual_turnover
+    metrics["top_n"] = top_n_rows
+    metrics["style_corr"] = {"max_abs": style_corr.get("max_abs"),
+                             "passed": style_corr.get("passed")}
 
     # 6) 滚动窗口 IC / RankIC / IR
     from lquant.factors.evaluate.rolling import rolling_ic
@@ -314,6 +394,9 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
         "decay": decay, "ic_by_year": ic_year, "neutral_ladder": ladder,
         "neutral_views": views,
         "rolling": rolling,
+        "excess": {"dates": ex_dates, "curves": ex_curves, "benchmark": "股票池等权"},
+        "top_n": top_n_rows,
+        "style_corr": style_corr,
     }
     return metrics, series
 
@@ -462,28 +545,66 @@ def list_mining_runs(limit: int = Query(default=50, ge=1, le=500)) -> list[dict]
              "created_at": str(r[9])} for r in rows]
 
 
-@router.post("/mine/run")
-def mine_run(req: dict) -> dict:
-    """平台驱动挖掘会话（同步，有界预算）。请求: {agent, generator, n}。"""
-    import datetime as dt
-    import json
-    import uuid
+class MineIn(BaseModel):
+    agent: str = "gp-internal"
+    generator: str = Field(default="gp", pattern="^(gp|random)$")
+    n: int = Field(default=100, ge=1)
+    sync: bool = False
 
-    from lquant.core.db import writer
-    from lquant.factors.agents import find_agent
-    from lquant.factors.engine import FactorEngine
-    from lquant.factors.mining.runner import run_session
 
-    agent_name = (req or {}).get("agent", "gp-internal")
-    generator = (req or {}).get("generator", "gp")
-    n = int((req or {}).get("n", 100))
+def _validate_mine_req(agent_name: str, generator: str, n: int) -> None:
+    """入队前的同步前置校验（404/423/422），失败给客户端明确错误。
+
+    配额按**账本剩余**判定（与 CLI ``lq factor eval --agent`` 同一口径），
+    而不是只看配置里的静态上限 —— 后者下反复调用本端点就能无限刷挖掘，
+    而 agent_ledger 永远是空的。
+    """
+    from lquant.factors.agents import ensure_quota, find_agent
+
     a = find_agent(agent_name)
     if not a:
         raise HTTPException(404, f"Agent 未注册: {agent_name}")
     if not a.enabled:
         raise HTTPException(423, f"Agent 已冻结: {agent_name}")
-    if n > a.quota_eval:
-        raise HTTPException(422, f"超出配额: n={n} > quota={a.quota_eval}")
+    try:
+        ensure_quota(agent_name, n)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+
+
+def _new_run_id() -> str:
+    import uuid
+
+    return uuid.uuid4().hex[:12]
+
+
+def _mine_placeholder(run_id: str, agent: str, generator: str) -> None:
+    """入队时预落 ledger 占位行（全 0）：job 完成后 INSERT OR REPLACE 覆盖。
+
+    这样任务中心在任务尚未跑完时也能看到这条因子挖掘任务，
+    测试也能确定性断言 ledger 行存在。
+    """
+    import datetime as dt
+
+    from lquant.core.db import writer
+
+    try:
+        with writer() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO factor_mining_run VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                [run_id, agent, generator, 0, 0, 0, 0, 0, 0, "{}", dt.datetime.now()])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _run_mine_job(agent_name: str, generator: str, n: int, run_id: str) -> dict:
+    """挖掘会话执行体：跑会话 → 覆盖 factor_mining_run → 返回结果体。"""
+    import datetime as dt
+    import json
+
+    from lquant.core.db import writer
+    from lquant.factors.engine import FactorEngine
+    from lquant.factors.mining.runner import run_session
     from lquant.factors.mining.submit import _panel_with_covs
 
     df, cov_cols = _panel_with_covs()
@@ -492,21 +613,26 @@ def mine_run(req: dict) -> dict:
     eng = FactorEngine(df.lazy())
     if generator == "gp":
         from lquant.factors.mining.gp import GPGenerator
+
         gen = GPGenerator()
     elif generator == "random":
         from lquant.factors.mining.random_gen import make_generator
+
         gen = make_generator()
     else:
         raise HTTPException(422, f"未知生成器: {generator}（可选 gp/random）")
     res, survivors = run_session(eng, df, gen, agent=agent_name, n_candidates=n,
                                  covs=cov_cols)
-    run_id = uuid.uuid4().hex[:12]
+    # 记账：与 CLI 共用同一账本，把实际评估数计入配额（此前 API 路径完全不记账）
+    from lquant.factors.agents import record_eval
+
+    record_eval(agent_name, res.n_evaluated)
     try:
         with writer() as con:
             con.execute(
                 "INSERT OR REPLACE INTO factor_mining_run VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 [run_id, agent_name, generator, res.n_evaluated, res.n_static_fail,
-                 res.n_redundant, res.n_size_proxy, res.n_survivors,
+                 res.n_low_ic, res.n_redundant, res.n_size_proxy, res.n_survivors,
                  json.dumps(res.corrections, ensure_ascii=False)[:10000], dt.datetime.now()])
     except Exception:  # noqa: BLE001
         pass  # 记账失败不阻断结果
@@ -515,6 +641,26 @@ def mine_run(req: dict) -> dict:
             "n_low_ic": res.n_low_ic, "n_redundant": res.n_redundant,
             "n_size_proxy": res.n_size_proxy, "n_survivors": res.n_survivors,
             "survivors": survivors[:10]}
+
+
+@router.post("/mine/run")
+def mine_run(req: MineIn) -> dict:
+    """平台驱动挖掘会话：默认异步（202 + task_id，跑完落 factor_mining_run）；
+    sync=true 保留旧行为直接返回结果体。请求: {agent, generator, n, sync}。"""
+    from fastapi.responses import JSONResponse
+
+    from lquant.server.jobs import enqueue
+
+    _validate_mine_req(req.agent, req.generator, req.n)
+    if req.sync:
+        return _run_mine_job(req.agent, req.generator, req.n, run_id=_new_run_id())
+    run_id = _new_run_id()
+    _mine_placeholder(run_id, req.agent, req.generator)
+    enqueue("lquant-mining", _run_mine_job, req.agent, req.generator, req.n,
+            run_id=run_id)
+    return JSONResponse(status_code=202, content={
+        "status": "queued", "task_id": run_id, "agent": req.agent,
+        "generator": req.generator, "n": req.n})
 
 
 def list_reports() -> list[dict]:

@@ -24,7 +24,13 @@ def exposure(df: pl.DataFrame, factor: str, by: str = "industry_sw1",
     if by not in df.columns:
         return pl.DataFrame()
 
-    ranked = df.with_columns(
+    # 分类未知的行必须剔除：既不能算进行业暴露（未知不是行业 beta），
+    # 也会让下面的 sorted(set(dh) | set(dl)) 在 None 与 str 之间比较时直接抛错。
+    d = df.drop_nulls(by)
+    if not len(d):
+        return pl.DataFrame()
+
+    ranked = d.with_columns(
         rk=pl.col(factor).rank("ordinal").over(date_col) / pl.col(factor).count().over(date_col)
     )
     hi = ranked.filter(pl.col("rk") > 1 - top)

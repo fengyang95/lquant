@@ -78,6 +78,57 @@ def test_gp_generator_feedback():
     assert isinstance(out, str) and out
 
 
+def test_run_session_tolerates_exhausted_proposals():
+    """有限提案生成器提前耗尽 = 提案用完了，不是错误 —— 不能把 n 估大了就崩。"""
+    from lquant.factors.engine import FactorEngine
+    from lquant.factors.mining.llm import make_generator as proposals_gen
+
+    panel = _panel()
+    eng = FactorEngine(panel.lazy())
+    gen = proposals_gen([{"expr": "Ts_Mean($close,5)"},
+                         {"expr": "-Ts_Return($close,10)"}])
+    res, _ = run_session(eng, panel, gen, agent="llm", n_candidates=10)
+    assert res.n_evaluated == 2
+
+
+def test_mine_proposals_requires_file(tmp_path):
+    """漏传 --proposals 必须给出可操作的报错，而不是 TypeError。"""
+    from click.testing import CliRunner
+
+    from lquant.cli.commands.factor import factor
+
+    r = CliRunner().invoke(factor, ["mine", "--generator", "proposals", "--n", "1"])
+    assert r.exit_code != 0
+    assert "--proposals" in r.output
+
+
+def test_mine_proposals_end_to_end(tmp_path, monkeypatch):
+    """提案 JSONL → mine 全链路：Agent 只出字符串，门禁与记账都由平台跑。"""
+    import json
+
+    from click.testing import CliRunner
+
+    from lquant.cli.commands.factor import factor
+    from lquant.data.store import parquet as pq
+    from lquant.factors.mining import submit
+
+    panel = _panel()
+    monkeypatch.setattr(pq, "read_daily", lambda *a, **k: panel.lazy())
+    monkeypatch.setattr(submit, "_panel_with_covs", lambda start=None: (panel, []))
+
+    prop = tmp_path / "props.jsonl"
+    prop.write_text('{"expr": "Ts_Mean($close,5)", "note": "短均线"}\n'
+                    '{"expr": "-Ts_Return($close,10)", "note": "10 日反转"}\n',
+                    encoding="utf-8")
+    r = CliRunner().invoke(factor, ["mine", "--generator", "proposals",
+                                    "--proposals", str(prop), "--n", "2"])
+    assert r.exit_code == 0, r.output
+    payload = json.loads(r.output.strip().splitlines()[-1])
+    assert payload["n_evaluated"] == 2
+    assert payload["agent"] == "gp-internal"
+    assert payload["run_id"]
+
+
 
 def test_eval_quota_ledger(tmp_path, monkeypatch):
     """方案 6.3 硬护栏 2：eval 按 Agent 记账，配额可见。"""

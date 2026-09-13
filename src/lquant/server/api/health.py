@@ -26,7 +26,8 @@ def health() -> dict:
 def _redis_status() -> dict:
     from lquant.server.jobs import _redis_available
 
-    ok = _redis_available()
+    # ttl=0：健康检查要的是「此刻」的真实依赖状态，不吃探测缓存
+    ok = _redis_available(ttl=0)
     return {"available": ok, "mode": "rq" if ok else "local-thread(降级)"}
 
 

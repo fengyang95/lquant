@@ -13,6 +13,20 @@ import polars as pl
 from lquant.data.capability import Capability
 
 
+def source_name(provider: object) -> str:
+    """Provider 的源名，用于血缘 source 字段。
+
+    优先 ``source``（yaml sources key），回落 ``name``；
+    FallbackProvider 上优先 ``last_source``（实际服务的那一个，
+    切源后血缘不能标成链头）。
+    """
+    for attr in ("last_source", "source", "name"):
+        v = getattr(provider, attr, None)
+        if isinstance(v, str) and v:
+            return v
+    return "unknown"
+
+
 class DataProvider(ABC):
     name: str = "base"
     # 子类声明支持的能力；路由层据此选源

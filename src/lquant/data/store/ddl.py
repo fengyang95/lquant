@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 DDL_DATA_QUALITY_ISSUE = """
 CREATE TABLE IF NOT EXISTS data_quality_issue (
     issue_id     VARCHAR PRIMARY KEY,
@@ -261,12 +263,36 @@ DDL_STATEMENTS: list[str] = [
     """,
 ]
 
-VIEWS: list[str] = [
+# 注意：daily_bar / minute_bar 两张 DuckDB 表是**遗留占位**。
+# 按设计（ARCHITECTURE §存储分工）日线/分钟线等大表只入 Parquet 湖，
+# 从没有任何写入路径写这两张表 —— 查它们会"成功"但恒空。
+# 读取一律走 store/parquet.py（read_daily / read_minute），
+# SQL 侧用 lake_glob() 交给 read_parquet。保留 DDL 仅为兼容旧库。
+def ensure_views(con, parquet_dir: str | Path | None = None) -> int:
+    """建 lake 视图 v_daily / v_minute，返回创建条数。
+
+    仅供即席 SQL 便利；Python 侧一律走 store/parquet.py 的读函数。
+    路径必须**解析成绝对路径**：DuckDB 视图是持久化 catalog 对象，
+    创建时的相对路径在进程 CWD 变化后会指向别处。
+
+    空湖跳过：DuckDB 在 CREATE VIEW 时就要解析 read_parquet 的 schema，
+    匹配不到文件直接报 IO Error —— 全新 checkout 不该因此建库失败。
     """
-    CREATE OR REPLACE VIEW v_daily AS
-    SELECT * FROM read_parquet('data/parquet/daily/**/*.parquet')
-    """
-]
+    if parquet_dir is None:
+        from lquant.core.config import get_settings  # noqa: PLC0415
+
+        parquet_dir = get_settings().parquet_dir
+    root = Path(parquet_dir).resolve()
+    n = 0
+    for name, kind in (("v_daily", "daily"), ("v_minute", "minute")):
+        glob = root / kind / "**" / "*.parquet"
+        if not any(root.glob(f"{kind}/**/*.parquet")):
+            continue
+        con.execute(
+            f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM read_parquet('{glob}')"
+        )
+        n += 1
+    return n
 
 
 def ensure_factor_def_columns(con) -> int:

@@ -10,6 +10,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # 版本与 uv.lock 里 dev extra 解析出的 ruff 对齐；升级 ruff 时两处一起改。
+      # 单独一个 job 是为了不排队等 Rust 编译，几十秒就能给出 lint 反馈。
+      - name: ruff check
+        run: uvx ruff@0.16.7 check src tests
+
   rust:
     name: Rust (cargo test)
     runs-on: ubuntu-latest
@@ -19,9 +30,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates
+      # cargo test（--no-default-features，即非 extension-module）需要链接 libpython
+      - name: Install libpython
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
       - name: cargo test
         working-directory: crates
-        run: cargo test --workspace
+        # --no-default-features 关闭 extension-module，让测试二进制链接 libpython
+        run: cargo test --workspace --no-default-features
 
   python:
     name: Python (pytest)

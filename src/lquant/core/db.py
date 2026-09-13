@@ -1,16 +1,41 @@
 """DuckDB 连接管理。
 
 硬约束：DuckDB 只允许单个写进程。
-所有写操作收敛到 writer()，读用 readonly()，两者不混用。
+所有写操作收敛到 writer()，读用 reader()，两者不混用。
 """
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 
 import duckdb
 
 from lquant.core.config import get_settings
+
+# 建连锁：同进程多线程同时首次 duckdb.connect() 同一文件会撞 instance cache
+# （Unique file handle conflict），建连阶段串行化。reader() 的建连同样需要它，
+# 所以这一层独立于下面的写锁。
+_connect_lock = threading.Lock()
+
+# 写串行锁：跨进程的单写者由 DuckDB 的 OS 文件锁兜底（第二个写进程会直接报错），
+# 但**同进程不同线程**并不受它保护 —— DuckDB 的并发控制是乐观的，两个连接各自
+# 对同一行读改写再提交时，后提交的那个会抛
+# `TransactionContext Error: Conflict on update!`。
+# 本仓库的写路径天然多线程：数据任务在后台线程按批 _progress_update，API 请求
+# 线程同时可能 claim_retry 同一行；因子挖掘任务写因子表的同时 API 也在写别的表。
+# 所以「同一时刻只有一个写者」不能只靠约定。用 RLock 以容忍同线程内的嵌套
+# （writer() 块里嵌 reader() 是明令禁止的，故只需防同线程嵌套 writer）。
+#
+# 不变量：写事务必须是**同步闭合**的 —— 不得在 async 函数里跨 await 持有
+# writer()。RLock 按线程重入，同一事件循环线程上的另一个协程会把锁再拿一次，
+# 互斥就失效了。当前 src/ 下 writer() 全部在同步函数内（有测试扫描守着）。
+_WRITE_LOCK = threading.RLock()
+
+
+def _connect() -> duckdb.DuckDBPyConnection:
+    with _connect_lock:
+        return duckdb.connect(_path())
 
 
 def _path() -> str:
@@ -21,13 +46,18 @@ def _path() -> str:
 
 @contextmanager
 def writer():
-    """写连接 —— 同一时刻只允许一个进程持有。"""
-    con = duckdb.connect(_path())
-    try:
-        yield con
-        con.commit()
-    finally:
-        con.close()
+    """写连接 —— 进程内串行；跨进程由 DuckDB 的 OS 文件锁保证单写。
+
+    锁必须罩住整个事务（含 connect 与 commit）：只锁建连挡不住乐观并发冲突 ——
+    「读到旧值 → 算 → 写回」中间那段窗口才是丢更新的地方。
+    """
+    with _WRITE_LOCK:
+        con = _connect()
+        try:
+            yield con
+            con.commit()
+        finally:
+            con.close()
 
 
 @contextmanager
@@ -39,7 +69,7 @@ def reader():
     （症状：写完立刻读不到 / 同进程读写不一致）。统一用同一配置，
     让所有连接共享同一实例，由 DuckDB 内部锁保证并发安全。
     """
-    con = duckdb.connect(_path())
+    con = _connect()
     try:
         yield con
     finally:
