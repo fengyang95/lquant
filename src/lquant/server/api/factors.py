@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
 from lquant.core.db import reader
-from lquant.data.store.catalog import upsert
+from lquant.data.store.catalog import IndexConsRepo, upsert
 from lquant.data.store.parquet import read_daily
 from lquant.factors.evaluate import evaluate, forward_return
 from lquant.factors.preprocess.pipeline import drop_nonfinite
@@ -44,6 +44,26 @@ class FactorIn(BaseModel):
     description: str = ""
 
 
+def _check_universe(v: str) -> str:
+    """universe 共享校验：all 放行，其余必须是可解析的池名/指数代码。"""
+    from lquant.factors.universe import resolve_index_code
+
+    if v != "all":
+        resolve_index_code(v)   # 未知池名 → 直接 ValueError
+    return v
+
+
+def _check_date(v: str | None) -> str | None:
+    """end 共享校验：None 放行；非空必须是 ISO 日期。"""
+    if v is None:
+        return v
+    try:
+        date.fromisoformat(v)
+    except (TypeError, ValueError):
+        raise ValueError("需为 YYYY-MM-DD 格式") from None
+    return v
+
+
 class EvaluateIn(BaseModel):
     factor: str = Field(default="mom20", max_length=64,
                         pattern=r"^[A-Za-z0-9_-]+")  # 报告名（防路径穿越）
@@ -61,6 +81,20 @@ class EvaluateIn(BaseModel):
                                         description="截面异常收益过滤阈值（|z| 上限，口径同 alphalens；None 不过滤）")
     event_window: list[int] = Field(default=[10, 15], min_length=2, max_length=2,
                                     description="事件式分层收益窗口 [before, after]（交易日）")
+    end: str | None = Field(default=None,
+                            description="评价区间终点 YYYY-MM-DD；None = 数据末端")
+    universe: str = Field(default="all",
+                          description="股票池：all = 全市场，或指数代码/别名（hs300/zz500/zz800/zz1000）")
+
+    @field_validator("universe")
+    @classmethod
+    def _validate_universe(cls, v: str) -> str:
+        return _check_universe(v)
+
+    @field_validator("end")
+    @classmethod
+    def _validate_end(cls, v: str | None) -> str | None:
+        return _check_date(v)
 
     @field_validator("event_window")
     @classmethod
@@ -92,7 +126,11 @@ def list_factors(
     limit: int | None = Query(default=None, ge=1, le=500),
     source: str | None = Query(default=None, description="按来源筛选: qlib/yaml/manual"),
 ) -> list[dict]:
-    """已注册因子（factor_def 表）。offset/limit 分页 + source 筛选。"""
+    """已注册因子（factor_def 表）。offset/limit 分页 + source 筛选。
+
+    category 输出口径：库里存了 category 用库里的；否则 qlib 内置因子
+    按 builtin family 推导（「alpha158·kbar」），其余归「自定义」。
+    """
     suffix = f"OFFSET {offset}" + (f" LIMIT {limit}" if limit else "")
     where = "WHERE d.source = ?" if source else ""
     order = "icn DESC NULLS LAST" if not source else "created_at DESC"
@@ -100,17 +138,29 @@ def list_factors(
         try:
             rows = con.execute(
                 "SELECT d.name, d.expression, d.description, d.source, d.factor_id, "
-                "i.ic_neutral AS icn, d.created_at FROM factor_def d "
+                "i.ic_neutral AS icn, d.created_at, d.category FROM factor_def d "
                 "LEFT JOIN factor_ic i ON i.factor = d.name "
                 f"{where} ORDER BY {order} {suffix}",
                 [source] if source else [],
             ).fetchall()
         except Exception:  # noqa: BLE001
             return []
-    return [{"name": r[0], "expression": r[1], "description": r[2],
-             "source": r[3], "factor_id": r[4], "ic_neutral": r[5],
-             "created_at": str(r[6])}
-            for r in rows]
+    builtin_family = {}
+    try:
+        from lquant.factors.qlib_alpha import list_builtin
+
+        builtin_family = {x["name"]: x["family"] for x in list_builtin()}
+    except Exception:  # noqa: BLE001   builtin 枚举失败不挡列表
+        pass
+    out = []
+    for r in rows:
+        cat = r[7] or None
+        if not cat and r[3] == "qlib" and r[0] in builtin_family:
+            cat = f"alpha158·{builtin_family[r[0]]}"
+        out.append({"name": r[0], "expression": r[1], "description": r[2],
+                    "source": r[3], "factor_id": r[4], "ic_neutral": r[5],
+                    "created_at": str(r[6]), "category": cat or "自定义"})
+    return out
 
 
 @router.post("")
@@ -129,6 +179,24 @@ def register_factor(f: FactorIn) -> dict:
         "description": f.description, "created_at": datetime.now(),
     }]))
     return {"registered": f.name, "rows": n}
+
+
+def _universe_symbols(universe: str | None) -> list[str] | None:
+    """股票池 → 成分股清单；all/None → 不过滤。
+
+    研究态口径：取该指数最新一次成分快照（IndexConsRepo 的当下口径，
+    与 get_index_stocks 一致）；成分表未同步时 503 提示先同步。
+    """
+    if not universe or universe == "all":
+        return None
+    from lquant.factors.universe import resolve_index_code
+
+    code = resolve_index_code(universe)
+    symbols = IndexConsRepo().latest_symbols(code)
+    if not symbols:
+        raise HTTPException(
+            503, f"指数 {code} 成分股为空，先在数据页同步指数成分（index_cons）")
+    return symbols
 
 
 def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
@@ -251,7 +319,8 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
     /evaluate 与 /evaluate/series 共用同一份计算（缺陷 #2：原先两端点
     各自全量重算，2 倍开销且两次结果可能不一致）。
     """
-    df = read_daily(start=req.start).collect()
+    df = read_daily(start=req.start, end=req.end,
+                    symbols=_universe_symbols(req.universe)).collect()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
     d = drop_nonfinite(_compute_factor(df, req.formula), "_factor")
@@ -503,6 +572,15 @@ def seed_yaml() -> dict:
     now = datetime.now()
     n = upsert("factor_def", pl.DataFrame([{**it, "created_at": now} for it in items]))
     return {"seeded": len(items), "rows_written": n}
+
+
+@router.get("/universes")
+def list_universes() -> list[dict]:
+    """股票池选项（评价/相关性/合成统一口径）。"""
+    from lquant.factors.universe import all_universe_options
+
+    return [{"key": k, "index_code": code, "label": label}
+            for k, code, label in all_universe_options()]
 
 
 @router.get("/sources")
@@ -787,7 +865,20 @@ def get_factor(name: str) -> dict:
 class AnalyzeIn(BaseModel):
     formulas: list[str] = Field(min_length=2, max_length=8)
     start: str = "2026-01-01"
+    end: str | None = Field(default=None, description="区间终点 YYYY-MM-DD；None = 数据末端")
+    universe: str = Field(default="all",
+                          description="股票池：all = 全市场，或指数代码/别名")
     threshold: float = Field(default=0.8, ge=0.5, le=1.0)
+
+    @field_validator("universe")
+    @classmethod
+    def _validate_universe(cls, v: str) -> str:
+        return _check_universe(v)
+
+    @field_validator("end")
+    @classmethod
+    def _validate_end(cls, v: str | None) -> str | None:
+        return _check_date(v)
 
 
 @router.post("/analyze")
@@ -795,7 +886,8 @@ def analyze(req: AnalyzeIn) -> dict:
     """多因子相关性 / 冗余分析（F6）。冗余因子不建议同时入库。"""
     from lquant.factors.analysis import correlation
 
-    df = read_daily(start=req.start).collect()
+    df = read_daily(start=req.start, end=req.end,
+                    symbols=_universe_symbols(req.universe)).collect()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
     try:
@@ -810,6 +902,14 @@ class SynthesizeIn(BaseModel):
     ic_horizon: int = Field(default=5, ge=1, le=20)
     n_groups: int = Field(default=5, ge=2, le=20)
     start: str = "2026-01-01"
+    end: str | None = Field(default=None, description="区间终点 YYYY-MM-DD；None = 数据末端")
+    universe: str = Field(default="all",
+                          description="股票池：all = 全市场，或指数代码/别名")
+
+    @field_validator("universe")
+    @classmethod
+    def _validate_universe(cls, v: str) -> str:
+        return _check_universe(v)
 
 
 @router.post("/synthesize")
@@ -817,7 +917,8 @@ def synthesize(req: SynthesizeIn) -> dict:
     """因子合成（F7）：等权 / IC 加权 → 全套评价 → 存报告。"""
     from lquant.factors import analysis as fa
 
-    df = read_daily(start=req.start).collect()
+    df = read_daily(start=req.start, end=req.end,
+                    symbols=_universe_symbols(req.universe)).collect()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
     try:

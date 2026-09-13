@@ -107,6 +107,22 @@ def basic_cmd(start: str, end: str | None, no_merge: bool) -> None:
     click.echo("basic done")
 
 
+@data.command("index-cons")
+@click.option("--indexes", default=None, help="逗号分隔指数代码（默认沪深300/中证500/800/1000）")
+def index_cons_cmd(indexes: str | None) -> None:
+    """同步指数成分快照（tushare index_weight → index_cons）。
+
+    因子评价/回测的股票池过滤（沪深300 等）依赖这张表。
+    """
+    from lquant.data.ingest.index_cons import sync_index_cons
+
+    codes = [c.strip() for c in indexes.split(",")] if indexes else None
+    out = sync_index_cons(codes)
+    for k, v in out.items():
+        click.echo(f"  {k}: {v}")
+    click.echo("index-cons done")
+
+
 @data.command()
 def status() -> None:
     """数据覆盖度一览。"""

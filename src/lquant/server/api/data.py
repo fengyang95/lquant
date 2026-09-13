@@ -324,6 +324,24 @@ def sync_reference_ep(req: ReferenceSyncIn) -> dict:
 
 # ---------- 数据任务（全量回填 / 每日增量，T4 执行器） ----------
 
+class IndexConsSyncIn(BaseModel):
+    indexes: list[str] | None = Field(default=None, description="指数代码清单，缺省 = 默认宽基")
+
+
+@router.post("/index-cons/sync")
+def sync_index_cons_ep(req: IndexConsSyncIn | None = None) -> dict:
+    """同步指数成分快照（沪深300/中证500/800/1000）→ index_cons。
+
+    因子评价股票池过滤依赖这张表；tushare index_weight 4 次请求，同步返回。
+    """
+    from lquant.data.ingest.index_cons import sync_index_cons
+
+    try:
+        return sync_index_cons(req.indexes if req else None)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"指数成分同步失败: {e}") from e
+
+
 @router.post("/tasks", status_code=202)
 def create_data_task(req: TaskIn) -> dict:
     """创建数据任务并入队执行 → 202 + task_id。
