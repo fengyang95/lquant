@@ -81,7 +81,8 @@ def _patch_quotes(monkeypatch, price=10.5, suspended=False):
 
 def test_tick_fills_pending_order_and_marks(monkeypatch):
     service.create_account("t1", 1_000_000)
-    o = service.submit_order("t1", "600000.SH", "buy", 1000, price=10.0)
+    # 限价 10.5：tick 快照价 10.5 触达限价 → 成交；若价 10.8 则保持挂单
+    o = service.submit_order("t1", "600000.SH", "buy", 1000, price=10.5)
     assert o["status"] == "pending"
     _patch_quotes(monkeypatch, price=10.5)
     res = service.tick("t1")
@@ -93,6 +94,17 @@ def test_tick_fills_pending_order_and_marks(monkeypatch):
     # intraday 净值已落库
     nav = store.nav_frame("t1", "intraday")
     assert len(nav) == 1 and nav["n_positions"][0] == 1
+
+
+def test_tick_limit_buy_not_filled_above_limit(monkeypatch):
+    """限价语义回归：快照价高于买限价 → 不成交，继续挂单（不是按市价吃单）。"""
+    service.create_account("t1b", 1_000_000)
+    service.submit_order("t1b", "600000.SH", "buy", 1000, price=10.0)
+    _patch_quotes(monkeypatch, price=10.5)
+    service.tick("t1b")
+    st = service.status("t1b")
+    assert st["pending_orders"], "高于限价必须保持挂单"
+    assert st["positions"] == []
 
 
 def test_tick_skips_suspended_keeps_pending(monkeypatch):
@@ -117,7 +129,7 @@ def _patch_daily(monkeypatch, close=10.5):
 
 def test_day_close_reconciles_ok(monkeypatch):
     service.create_account("t3", 1_000_000)
-    service.submit_order("t3", "600000.SH", "buy", 50_000, price=10.0)
+    service.submit_order("t3", "600000.SH", "buy", 50_000, price=10.5)
     _patch_quotes(monkeypatch, price=10.5)
     service.tick("t3")
     _patch_daily(monkeypatch, close=10.5)
@@ -136,9 +148,32 @@ def test_day_close_reconciles_ok(monkeypatch):
 
 def test_reconcile_flags_divergence(monkeypatch):
     service.create_account("t4", 1_000_000)
-    service.submit_order("t4", "600000.SH", "buy", 50_000, price=10.0)
+    service.submit_order("t4", "600000.SH", "buy", 50_000, price=10.5)
     _patch_quotes(monkeypatch, price=10.5)
     service.tick("t4")
     _patch_daily(monkeypatch, close=5.0)     # 官方价与盯市价严重背离
     rep = service.day_close("t4")["reconcile"]
     assert rep["verdict"] == "critical"
+
+
+# ---------- 撤单与策略白名单 ----------
+
+def test_cancel_pending_order(monkeypatch):
+    service.create_account("t5", 1_000_000)
+    o = service.submit_order("t5", "600000.SH", "buy", 1000, price=10.0)
+    out = service.cancel_order("t5", o["order_id"])
+    assert out["status"] == "cancelled"
+    assert service.status("t5")["pending_orders"] == []
+
+
+def test_resolve_strategy_rejects_non_whitelisted_module():
+    """HTTP 入口的 import 边界：白名单外模块直接拒绝，不进 importlib。"""
+    with pytest.raises(ValueError, match="白名单"):
+        service.resolve_strategy("os:system")
+
+
+def test_resolve_strategy_allows_lquant_module(monkeypatch):
+    inst = service.resolve_strategy("lquant.paper.service:_Manual")
+    assert callable(getattr(inst, "signals", None))
+    with pytest.raises(ValueError, match="白名单"):
+        service.resolve_strategy("subprocess:Popen")

@@ -157,6 +157,11 @@ class AccountOp(BaseModel):
     trade_date: str | None = None
 
 
+class CancelIn(BaseModel):
+    name: str
+    order_id: str
+
+
 @router.get("/accounts")
 def list_accounts() -> dict:
     """持久化模拟盘账户列表。"""
@@ -178,6 +183,17 @@ def submit_order(req: OrderIn) -> dict:
     try:
         return paper_service.submit_order(req.name, req.symbol, req.side,
                                           req.qty, req.price)
+    except paper_store.AccountNotFound as e:
+        raise HTTPException(404, f"账户不存在: {e}") from e
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+
+
+@router.post("/cancel")
+def cancel_order(req: CancelIn) -> dict:
+    """撤销挂单。"""
+    try:
+        return paper_service.cancel_order(req.name, req.order_id)
     except paper_store.AccountNotFound as e:
         raise HTTPException(404, f"账户不存在: {e}") from e
     except ValueError as e:

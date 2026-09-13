@@ -24,6 +24,8 @@ from lquant.factors.preprocess.pipeline import drop_nonfinite
 
 router = APIRouter(prefix="/factors", tags=["factors"])
 
+_MAX_EVENT_WINDOW = 250  # 与 event_study._MAX_WINDOW 同源；0 允许（只看前窗）
+
 
 def _save_report_atomic(html_str: str, path: Path) -> Path:
     """原子写报告：同因子名并发 evaluate 时不会互相截断损坏。"""
@@ -59,6 +61,13 @@ class EvaluateIn(BaseModel):
                                         description="截面异常收益过滤阈值（|z| 上限，口径同 alphalens；None 不过滤）")
     event_window: list[int] = Field(default=[10, 15], min_length=2, max_length=2,
                                     description="事件式分层收益窗口 [before, after]（交易日）")
+
+    @field_validator("event_window")
+    @classmethod
+    def _validate_event_window(cls, v: list[int]) -> list[int]:
+        if any(n < 0 or n > _MAX_EVENT_WINDOW for n in v):
+            raise ValueError(f"event_window 各元素须在 0~{_MAX_EVENT_WINDOW}（交易日）")
+        return v
 
     @field_validator("start")
     @classmethod
@@ -254,10 +263,11 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
     # 截面异常收益过滤（可选）：过滤一次，指标 / 序列 / 报告三处口径保持一致
     outlier_stats = None
     if req.filter_zscore is not None:
-        from lquant.factors.evaluate import filter_zscore, zscore_filter_stats
+        from lquant.factors.evaluate import zscore_filter_with_stats
 
-        outlier_stats = zscore_filter_stats(d, threshold=req.filter_zscore)
-        d = filter_zscore(d, threshold=req.filter_zscore)
+        # 只算一次：帧 + 统计一次算出（此前 filter_zscore 被全量算两遍，
+        # 面板大时这是评估链路里最贵的一步）
+        d, outlier_stats = zscore_filter_with_stats(d, threshold=req.filter_zscore)
 
     # ---- metrics（原 run_evaluate 计算体） ----
     res = evaluate(d, "_factor", ret_col=ret_col, n_groups=req.n_groups,
