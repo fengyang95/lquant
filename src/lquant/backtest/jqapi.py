@@ -88,6 +88,47 @@ class JQResult:
         } for f in self.trades], schema_overrides={"qty": pl.Float64, "amount": pl.Float64})
 
 
+# ---------- pandas 兼容层 ----------
+
+def _build_jq_pandas():
+    """聚宽沙箱用老版 pandas：``s[-1]`` 等负数下标按**位置**解释。
+
+    新版 pandas 对整数/字符串索引一律按标签查，社区策略的主流写法
+    ``attribute_history(...)['close'][-1]`` 会直接 KeyError。这里用
+    Series 子类恢复老语义（负 int 标量 → iloc），其余行为不变；
+    负数切片新版本就按位置处理，无需干预。
+    """
+    import pandas as pd
+
+    class _JQSeries(pd.Series):
+        @property
+        def _constructor(self):
+            return _JQSeries
+
+        def __getitem__(self, key):
+            # 老 pandas：非整数索引下，不在索引里的 int 键一律回退按位置取
+            if isinstance(key, int) and key not in self.index:
+                return self.iloc[key]
+            return super().__getitem__(key)
+
+    class _JQFrame(pd.DataFrame):
+        @property
+        def _constructor(self):
+            return _JQFrame
+
+        @property
+        def _constructor_sliced(self):
+            return _JQSeries
+
+    return _JQFrame
+
+
+try:
+    _JQFrame = _build_jq_pandas()
+except ImportError:                            # 无 pandas 环境：历史接口回退 dict/list
+    _JQFrame = None
+
+
 # ---------- 用户可见的辅助类型 ----------
 
 class FixedSlippage:
@@ -531,12 +572,12 @@ class JQRunner:
         f0 = fields[0]
         if len(fields) == 1:
             data = {s: [row.get(s, {}).get(f0) for row in rows] for s in secs}
-            return pd.DataFrame(data, index=index)
+            return _JQFrame(data, index=index)
         if len(secs) == 1:
             data = {f: [row.get(secs[0], {}).get(f) for row in rows] for f in fields}
-            return pd.DataFrame(data, index=index)
+            return _JQFrame(data, index=index)
         cols = pd.MultiIndex.from_product([secs, fields])
-        df = pd.DataFrame(index=index, columns=cols)
+        df = _JQFrame(index=index, columns=cols)
         for s in secs:
             for f in fields:
                 df[(s, f)] = [row.get(s, {}).get(f) for row in rows]
@@ -582,8 +623,8 @@ class JQRunner:
                 rows.append({"day": self._dates[j], **{f: self._bar_field(b, f) for f in fields}})
         if pd is None:
             return {f: [r[f] for r in rows] for f in fields}
-        return pd.DataFrame([{**r, "day": str(r["day"])} for r in rows]
-                            ).set_index("day") if rows else pd.DataFrame(columns=fields)
+        return _JQFrame([{**r, "day": str(r["day"])} for r in rows]
+                        ).set_index("day") if rows else _JQFrame(columns=fields)
 
     def _get_price(self, security, start_date=None, end_date=None,
                    fields=None, count=None):
@@ -609,7 +650,24 @@ class JQRunner:
                 if b:
                     row[s] = {f: self._bar_field(b, f) for f in fields}
             rows.append(row)
-        return self._history_df(secs, fields, rows)
+        # 聚宽语义：单标的 → 列=fields（history 才是单字段→列=证券，二者不同）；
+        # 多标的 → (标的, 字段) MultiIndex。
+        index = [r["day"] for r in rows]
+        if _JQFrame is not None:
+            import pandas as pd
+            if len(secs) == 1:
+                data = {f: [r.get(secs[0], {}).get(f) for r in rows] for f in fields}
+                return _JQFrame(data, index=index)
+            cols = pd.MultiIndex.from_product([secs, fields])
+            out = _JQFrame(index=index, columns=cols)
+            for s in secs:
+                for f in fields:
+                    out[(s, f)] = [r.get(s, {}).get(f) for r in rows]
+            return out
+        # 无 pandas：单标的 {field: [...]}, 多标的 {sec: {field: [...]}}
+        if len(secs) == 1:
+            return {f: [r.get(secs[0], {}).get(f) for r in rows] for f in fields}
+        return {s: {f: [r.get(s, {}).get(f) for r in rows] for f in fields} for s in secs}
 
     # ---- 下单 ----
 
@@ -785,7 +843,11 @@ class JQRunner:
                 try:
                     if bucket == "close" and fn is self._handle_data_fn:
                         continue               # handle_data 不重复在 close 跑
-                    fn(self.context) if fn.__code__.co_argcount else fn()
+                    if fn is self._handle_data_fn and fn.__code__.co_argcount >= 2:
+                        # 聚宽标准签名 handle_data(context, data) —— data 是当日 bar 视图
+                        fn(self.context, _DataProxy(self))
+                    else:
+                        fn(self.context) if fn.__code__.co_argcount else fn()
                 except Exception as e:        # noqa: BLE001
                     self.res.error = (f"{d} {self._bucket} 调度 {getattr(fn, '__name__', '?')} "
                                       f"异常: {e}\n{traceback.format_exc(limit=4)}")
