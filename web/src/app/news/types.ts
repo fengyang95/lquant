@@ -70,4 +70,6 @@ export type ItemFilter = {
   keyword?: string;
   limit?: number;
   offset?: number;
+  /** 前端重查触发器：仅参与依赖比较，不发给后端（采集完成后 +1 刷新列表） */
+  reload?: number;
 };

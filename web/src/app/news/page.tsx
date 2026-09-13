@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { useSWRConfig } from 'swr';
 import PageHeader from '@/components/PageHeader';
 import { Panel } from '@/components/Panel';
 import { Empty, ErrorNote, Loading } from '@/components/States';
@@ -8,6 +9,7 @@ import { NewsFeedList } from './NewsFeedList';
 import { useNewsFeed } from './useNewsFeed';
 import IndustryPanel from './IndustryPanel';
 import SymbolSearch from './SymbolSearch';
+import { CollectBar } from './CollectBar';
 import { fetchSources } from './lib';
 import type { ItemFilter } from './types';
 
@@ -18,10 +20,18 @@ const TABS = [
 ] as const;
 
 type TabKey = (typeof TABS)[number]['key'];
-type PageFilters = { source: string; keyword: string };
+type PageFilters = { source: string; keyword: string; reload: number };
 
 /** 来源过滤下拉：来源统计并集（0 计数来源也可选），加载失败静默降级为「全部来源」 */
-function SourceFilter({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+function SourceFilter({
+  value,
+  reload,
+  onChange,
+}: {
+  value: string;
+  reload: number;
+  onChange: (v: string) => void;
+}) {
   const [sources, setSources] = useState<{ source: string; count: number }[]>([]);
 
   useEffect(() => {
@@ -36,7 +46,7 @@ function SourceFilter({ value, onChange }: { value: string; onChange: (v: string
     return () => {
       alive = false;
     };
-  }, []);
+  }, [reload]);
 
   return (
     <select value={value} onChange={(e) => onChange(e.target.value)} className="input max-w-[180px]">
@@ -84,17 +94,29 @@ export default function NewsPage() {
   const [keyword, setKeyword] = useState('');
   const [debouncedKeyword, setDebouncedKeyword] = useState('');
   const [symbol, setSymbol] = useState('');
+  const [reload, setReload] = useState(0);
+  const { mutate } = useSWRConfig();
 
   useEffect(() => {
     const t = setTimeout(() => setDebouncedKeyword(keyword), 300);
     return () => clearTimeout(t);
   }, [keyword]);
 
-  const filters: PageFilters = { source, keyword: debouncedKeyword };
+  const filters: PageFilters = { source, keyword: debouncedKeyword, reload };
+
+  /** 采集完成后：资讯流靠 reload 重查，行业计数走 SWR 失效 */
+  const onCollected = () => {
+    setReload((n) => n + 1);
+    void mutate('/news/industries');
+  };
 
   return (
     <div className="space-y-4">
-      <PageHeader title="资讯" sub="行业与个股资讯流 · 电报/新闻/社媒/研报" />
+      <PageHeader
+        title="资讯"
+        sub="行业与个股资讯流 · 电报/新闻/社媒/研报"
+        actions={<CollectBar onDone={onCollected} />}
+      />
 
       {/* 过滤条 + tab 切换 */}
       <div className="flex flex-wrap items-center gap-3 border border-line bg-panel px-4 py-2.5">
@@ -118,7 +140,7 @@ export default function NewsPage() {
             placeholder="关键词过滤"
             className="input w-44"
           />
-          <SourceFilter value={source} onChange={setSource} />
+          <SourceFilter value={source} reload={reload} onChange={setSource} />
         </div>
       </div>
 

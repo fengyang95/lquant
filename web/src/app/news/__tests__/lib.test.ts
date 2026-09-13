@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  FAST_SOURCES,
   fetchIndustries,
   fetchItems,
   fetchSources,
@@ -23,6 +24,20 @@ describe('itemsQuery', () => {
   it('undefined/空串丢弃，数值转字符串', () => {
     expect(itemsQuery({ industry: 'bank', limit: 50 })).toBe('industry=bank&limit=50');
     expect(itemsQuery({ source: undefined, keyword: '' })).toBe('');
+  });
+
+  it('reload 只是前端重查触发器，不发给后端', () => {
+    expect(itemsQuery({ reload: 3, industry: 'bank' })).toBe('industry=bank');
+  });
+});
+
+describe('FAST_SOURCES', () => {
+  it('只含单请求来源（逐股的 em_news/em_research 走全量）', () => {
+    expect(FAST_SOURCES).not.toContain('em_news');
+    expect(FAST_SOURCES).not.toContain('em_research');
+    expect(FAST_SOURCES).toContain('em_global');
+    expect(FAST_SOURCES).toContain('cctv_news');
+    expect(FAST_SOURCES).toContain('baidu_hot');
   });
 });
 

@@ -11,3 +11,12 @@ industry_names:
 
 em_news:
   pool_limit: 200
+
+# 逐标的/限量来源的抓取范围（key 为采集器名，见 src/lquant/news/sources/tables.py）
+em_research:
+  pool_limit: 40
+  recent_days: 90   # 研报接口返回全部历史，只保留近 90 天
+em_notice:
+  limit: 300
+em_cjzc:
+  limit: 30
