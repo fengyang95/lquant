@@ -201,11 +201,16 @@ def _progress_update(task_id, phase, done, failed, rows) -> None:
         )
 
 
-def _finalize(task_id, total, failed_all, early, *, done_count=None, error=None) -> str:
-    """按结果定终态：早停/全失败/异常 → failed；有失败 → partial；否则 ok。"""
+def _finalize(task_id, total, failed_all, early, *, done_count=None, error=None,
+              canceled: bool = False) -> str:
+    """按结果定终态：取消 → interrupted；早停/全失败/异常 → failed；
+    有失败 → partial；否则 ok。"""
     failed_syms = sorted({f["symbol"] for f in failed_all})
     done_count = done_count if done_count is not None else total - len(failed_syms)
-    if error:
+    if canceled:
+        status = "interrupted"
+        msg = f"任务已取消：完成 {done_count}/{total}（可 retry 续传）"
+    elif error:
         status = "failed"
         msg = f"执行异常终止：{error}"
     elif early:
@@ -254,7 +259,7 @@ def _claim_running(task_id: str) -> None:
             f"任务 {task_id} 已被其他操作抢先（状态已不是可执行态）")
 
 
-def execute_task(task_id: str) -> dict:
+def execute_task(task_id: str, cancel_check: Any = None) -> dict:
     """执行任务：pending/interrupted/failed/partial → running → ok/partial/failed。"""
     task = get_task(task_id)
     if task is None:
@@ -262,11 +267,15 @@ def execute_task(task_id: str) -> dict:
     if task["status"] == "running":
         raise TaskConflictError(f"任务 {task_id} 正在运行中")
     _claim_running(task_id)
-    return _run_task(task_id)
+    return _run_task(task_id, cancel_check=cancel_check)
 
 
-def _run_task(task_id: str) -> dict:
-    """执行主体（状态已置 running）：跑池 → 收敛终态。"""
+def _run_task(task_id: str, cancel_check: Any = None) -> dict:
+    """执行主体（状态已置 running）：跑池 → 收敛终态。
+
+    cancel_check 非空时透传给池执行器批间轮询；被取消 → 终态 interrupted
+    （不是 failed —— 用户主动取消不是故障），可 retry 续传。
+    """
     task = get_task(task_id)
     params = task["params"]
     start = _parse_date(params["start"], "起始日期")
@@ -284,19 +293,23 @@ def _run_task(task_id: str) -> dict:
         "rows": 0,
     }
     early = False
+    canceled = False
     error: str | None = None
     try:
         for name in PHASES:
             remaining = [(s, e) for s, e in phases[name] if not cp.is_done(s)]
             if not remaining:
                 continue
+
             def cb(frame, _base=base, _name=name):
                 _progress_update(
                     task_id, _name, _base["done"] + frame["done"],
                     [*_base["failed"], *frame["failed"]],
                     _base["rows"] + frame["rows"])
+
             res = backfill_pool(remaining, start, end=end, on_progress=cb,
-                                cp_name=_CP_PREFIX + task_id)
+                                cp_name=_CP_PREFIX + task_id,
+                                cancel_check=cancel_check)
             failed_set = {f["symbol"] for f in base["failed"]} | {
                 f["symbol"] for f in res["failed"]}
             newly = [s for s, _ in remaining if s not in failed_set]
@@ -306,6 +319,9 @@ def _run_task(task_id: str) -> dict:
                 "failed": [*base["failed"], *res["failed"]],
                 "rows": base["rows"] + res["rows"],
             }
+            if res.get("canceled"):
+                canceled = True
+                break
             if res["early_stopped"]:
                 early = True
                 break
@@ -313,7 +329,7 @@ def _run_task(task_id: str) -> dict:
         error = f"{type(e).__name__}: {e}"
     done = sum(1 for s, _ in all_syms if cp.is_done(s))
     status = _finalize(task_id, total, base["failed"], early, done_count=done,
-                       error=error)
+                       error=error, canceled=canceled)
     if status in ("ok", "partial") and params.get("auto_crosscheck", True):
         _auto_crosscheck(task_id, start, end)
     return get_task(task_id)
@@ -394,12 +410,13 @@ def retry_task(task_id: str) -> dict:
     return _run_task(task_id)
 
 
-def run_claimed_task(task_id: str) -> dict:
+def run_claimed_task(task_id: str, cancel_check: Any = None) -> dict:
     """执行已认领（running）的任务 —— 端点 claim_retry 成功后由队列调用。
 
     与 execute_task 的区别：不做状态前置检查（认领即原子置 running）。
+    cancel_check 是协作式取消探针（jobs.enqueue 注入），批间轮询。
     """
-    return _run_task(task_id)
+    return _run_task(task_id, cancel_check=cancel_check)
 
 
 def mark_interrupted_on_startup() -> int:
@@ -417,6 +434,23 @@ def mark_interrupted_on_startup() -> int:
             "WHERE status IN ('pending', 'running')"
         )
         return len(stale)
+
+
+def mark_canceled_pending(task_id: str) -> bool:
+    """排队中（pending）任务被真取消（RQ queued job 被 cancel()）→ interrupted。
+
+    只动 pending：running 任务由探针协作收尾，状态机不在此越权。
+    返回是否命中（任务不存在/已不在 pending → False）。
+    """
+    with writer() as con:
+        _ensure_table(con)
+        res = con.execute(
+            "UPDATE data_task SET status='interrupted', finished_at=?, "
+            "message='任务已取消（排队中未执行）' "
+            "WHERE task_id=? AND status='pending'",
+            [datetime.now(), task_id],
+        ).fetchone()
+    return bool(res and res[0])
 
 
 def _row_to_task(row) -> dict:
