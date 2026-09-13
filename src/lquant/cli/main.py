@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import click
 
-from lquant.cli.commands import agent, backtest, data, factor, strategy
+from lquant.cli.commands import agent, backtest, data, factor, paper, strategy
 from lquant.cli.commands import worker as worker_cmd
 
 
@@ -18,6 +18,7 @@ cli.add_command(factor.factor)
 cli.add_command(agent.agent)
 cli.add_command(backtest.backtest)
 cli.add_command(strategy.strategy)
+cli.add_command(paper.paper)
 cli.add_command(worker_cmd.worker)
 
 

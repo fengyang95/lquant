@@ -137,9 +137,10 @@ class PaperBroker:
             total = pos.qty + o.qty
             pos.avg_cost = (pos.avg_cost * pos.qty + amount + fee) / total
             pos.qty = total
-            # T+N：n<=1 当日即可卖（ETF T+0），否则冻结待日终解冻
+            # T+N：仅 T+0（n<=0，如 QDII/黄金/债券 ETF）买入当日即可卖；
+            # n>=1 冻结，日终 on_day_close 解冻 → 次日起可卖（A 股 T+1）
             n = rules.sellable_after_days
-            if n <= 1:
+            if n <= 0:
                 pos.available += o.qty
             pos.last_price = price
         else:

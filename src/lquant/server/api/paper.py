@@ -1,8 +1,9 @@
-"""模拟盘：回放 / 持仓 / 净值 / 与回测对拍。
+"""模拟盘：回放 / 持仓 / 净值 / 与回测对拍 / 常驻账户（tick+对账）。
 
-进程内保存最近一次回放（session 级）。
-正式部署时模拟盘是常驻进程（盘中接行情推送），
-这里的 replay 接口用于链路验证与教学演示。
+两套用法并存：
+- replay：离线回放一段日线，链路验证与教学（进程内状态，重启即失）
+- account：持久化模拟盘账户（sqlite），盘中 tick、日终 close 对账 ——
+  这是「实时盯市 + 收盘官方重算」两段式净值的正式入口
 """
 from __future__ import annotations
 
@@ -13,6 +14,8 @@ from pydantic import BaseModel, Field
 from lquant.core.db import reader
 from lquant.data.store.parquet import read_daily
 from lquant.paper import PaperConfig, PaperEngine, compare_nav, compare_trades
+from lquant.paper import service as paper_service
+from lquant.paper import store as paper_store
 
 router = APIRouter(prefix="/paper", tags=["paper"])
 
@@ -132,3 +135,80 @@ def compare_with_backtest(req: CompareIn) -> dict:
     rep = compare_nav(bt_nav, _last["nav"])
     trades_cmp = compare_trades(bt_orders, _last["orders"])
     return {"nav_deviation": rep.as_dict(), "trade_comparison": trades_cmp}
+
+
+class AccountIn(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    initial_cash: float = Field(default=1_000_000, gt=0)
+    strategy: str = "manual"
+    universe: list[str] = Field(default_factory=list)
+
+
+class OrderIn(BaseModel):
+    name: str
+    symbol: str
+    side: str
+    qty: int = Field(gt=0)
+    price: float | None = Field(default=None, gt=0)
+
+
+class AccountOp(BaseModel):
+    name: str
+    trade_date: str | None = None
+
+
+@router.get("/accounts")
+def list_accounts() -> dict:
+    """持久化模拟盘账户列表。"""
+    return {"accounts": paper_store.list_accounts()}
+
+
+@router.post("/accounts")
+def create_account(req: AccountIn) -> dict:
+    try:
+        return paper_service.create_account(req.name, req.initial_cash,
+                                            req.strategy, req.universe)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+
+
+@router.post("/order")
+def submit_order(req: OrderIn) -> dict:
+    """人工下单；price 缺省取实时快照。"""
+    try:
+        return paper_service.submit_order(req.name, req.symbol, req.side,
+                                          req.qty, req.price)
+    except paper_store.AccountNotFound as e:
+        raise HTTPException(404, f"账户不存在: {e}") from e
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+
+
+@router.post("/tick")
+def tick(req: AccountOp) -> dict:
+    """盘中推进一次（拉快照 → 撮合 → 盯市 → intraday 净值）。"""
+    try:
+        return paper_service.tick(req.name)
+    except paper_store.AccountNotFound as e:
+        raise HTTPException(404, f"账户不存在: {e}") from e
+
+
+@router.post("/close")
+def day_close(req: AccountOp) -> dict:
+    """日终结算 + 官方日线对账（official 净值覆盖重算）。"""
+    try:
+        return paper_service.day_close(req.name, req.trade_date)
+    except paper_store.AccountNotFound as e:
+        raise HTTPException(404, f"账户不存在: {e}") from e
+    except (ValueError, TypeError) as e:
+        raise HTTPException(422, str(e)) from e
+
+
+@router.get("/nav/{name}")
+def nav_history(name: str, source: str | None = None) -> dict:
+    """净值曲线（source: intraday / official，缺省全部）。"""
+    try:
+        paper_store.get_account(name)
+    except paper_store.AccountNotFound as e:
+        raise HTTPException(404, f"账户不存在: {e}") from e
+    return {"account": name, "nav": paper_service.nav_history(name, source)}

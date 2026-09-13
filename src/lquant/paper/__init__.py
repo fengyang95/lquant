@@ -7,8 +7,10 @@
 """
 from __future__ import annotations
 
+from lquant.paper import reconcile, service, store  # noqa: F401
 from lquant.paper.alert import DeviationReport, compare_nav, compare_trades
 from lquant.paper.engine import PaperBroker, PaperConfig, PaperEngine, PaperOrder, PaperPosition
 
 __all__ = ["PaperEngine", "PaperBroker", "PaperConfig", "PaperOrder", "PaperPosition",
-           "compare_nav", "compare_trades", "DeviationReport"]
+           "compare_nav", "compare_trades", "DeviationReport",
+           "reconcile", "service", "store"]
