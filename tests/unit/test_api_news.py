@@ -77,7 +77,7 @@ def _seed_news(n: int = 1, **overrides) -> None:
     for i in range(n):
         items.append(NewsItem(
             source=overrides.get("source", "em_news"),
-            source_name=overrides.get("source_name", "em"),
+            source_name=overrides.get("source_name", "em_news"),
             external_id=overrides.get("external_id", f"ext-{i}"),
             title=overrides.get("title", f"标题{i}"),
             content=overrides.get("content", f"正文{i}"),

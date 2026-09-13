@@ -139,7 +139,10 @@ class TableSource:
     def _fetch_by_pool(self, day: date) -> list[NewsItem]:
         """逐标的拉取（研报类接口按股查询）。单标的失败不中断整个来源。"""
         items: list[NewsItem] = []
-        for symbol in get_active_pool(self._pool_size()):
+        pool = get_active_pool(self._pool_size())
+        if not pool:
+            logger.warning("%s 股票池为空（行情湖不可用或 pool_limit=0），本次产出 0 条", self.name)
+        for symbol in pool:
             code = symbol.split(".")[0] if self.pool_bare_code else symbol
             try:
                 df = self._call(day, {self.pool_arg: code})

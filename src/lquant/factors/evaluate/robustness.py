@@ -197,7 +197,7 @@ def param_sensitivity(df: pl.DataFrame, expr: str, ret_col: str = "fwd_ret_1", *
     n_slots = len(_window_slots(expr))
     if n_slots == 0:
         return {"baseline": base, "perturbations": [], "max_rel_change": float("nan"),
-                "threshold": max_rel_change, "passed": True,
+                "threshold": max_rel_change, "passed": False, "insufficient": True,
                 "hint": "表达式里没有窗口参数（无 ≥2 的整数字面量），跳过参数敏感性"}
     passed = bool(math.isfinite(worst) and worst < max_rel_change)
     return {

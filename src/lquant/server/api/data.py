@@ -9,10 +9,11 @@
 from __future__ import annotations
 
 import threading
+from datetime import date
 
 import polars as pl
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from lquant.core.db import reader
 from lquant.data.ingest import tasks as ingest_tasks
@@ -32,6 +33,9 @@ from lquant.server.jobs import enqueue
 
 router = APIRouter(prefix="/data", tags=["data"])
 
+# 全湖质量检查互斥锁：防并发双跑竞写 data_quality_issue
+_lake_check_lock = threading.Lock()
+
 
 class TaskIn(BaseModel):
     kind: str = Field(min_length=1, max_length=32)
@@ -43,6 +47,16 @@ class CrosscheckIn(BaseModel):
     end: str | None = Field(default=None, max_length=10)
     peers: list[str] | None = None
     limit: int = Field(default=200, ge=1, le=1000)
+
+    @field_validator("start", "end")
+    @classmethod
+    def _validate_date(cls, v: str | None) -> str | None:
+        if v:
+            try:
+                date.fromisoformat(v)
+            except (TypeError, ValueError):
+                raise ValueError(f"日期需为 YYYY-MM-DD 格式，收到 {v!r}") from None
+        return v
 
 
 class ResolveIn(BaseModel):
@@ -381,7 +395,7 @@ def run_lake_check_ep(req: LakeCheckIn) -> dict:
 
     issue 一律落 data_quality_issue（与 CLI/同步链路共用一张表）。
     同步端点：validators 全是向量化计算，百万行秒级。
-    422：日期格式非法。
+    422：日期格式非法；409：已有一次全湖检查在跑（防并发双跑竞写）。
     """
     from datetime import date as _date
 
@@ -392,9 +406,14 @@ def run_lake_check_ep(req: LakeCheckIn) -> dict:
             except ValueError as e:
                 raise HTTPException(422, f"{name} 日期非法: {val}") from e
 
-    from lquant.data.quality.pipeline import run_lake_checks
+    if not _lake_check_lock.acquire(blocking=False):
+        raise HTTPException(409, "已有全湖质量检查在执行中，请稍后再试")
+    try:
+        from lquant.data.quality.pipeline import run_lake_checks
 
-    issues = run_lake_checks(start=req.start, end=req.end)
+        issues = run_lake_checks(start=req.start, end=req.end)
+    finally:
+        _lake_check_lock.release()
     by_sev = {"fatal": 0, "error": 0, "warn": 0, "info": 0}
     for i in issues:
         by_sev[i.severity] = by_sev.get(i.severity, 0) + 1

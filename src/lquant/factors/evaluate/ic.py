@@ -15,6 +15,10 @@ import math
 
 import polars as pl
 
+# 零方差判定阈值：polars 常数序列的 std 是 ~7e-18（非 0），
+# 凡 std < STD_EPS 一律按零方差处理（t/IR 无定义，不能进显著性门槛）
+STD_EPS = 1e-9
+
 __all__ = ["ic_series", "ic_summary", "ic_by_year", "ic_decay_table", "newey_west_tstat",
            "ic_autocorr"]
 
@@ -63,8 +67,12 @@ def ic_series(
 
 
 def _t_stat(mean: float, std: float, n: int) -> float:
-    """t = mean / (std/√n)。std 为 0 或 n 过小时返回 nan。"""
-    if n < 2 or std <= 0 or not math.isfinite(std):
+    """t = mean / (std/√n)。std 为 0/近零或 n 过小时返回 nan。
+
+    近零判定用 STD_EPS：polars 对常数序列返回的 std 是 ~7e-18 而非 0，
+    不挡住的话近常数因子会算出 ~1e16 的 t 硬闯显著性门槛。
+    """
+    if n < 2 or std <= STD_EPS or not math.isfinite(std):
         return float("nan")
     return mean / (std / math.sqrt(n))
 
@@ -101,6 +109,8 @@ def newey_west_tstat(x, lags: int | None = None) -> float:
     lags = lags or int(4 * (n / 100) ** (2 / 9)) or 1
     a = s.to_numpy() - s.mean()
     s0 = float((a**2).sum()) / n
+    if s0 <= STD_EPS * STD_EPS:  # 近常数序列（std < 1e-9）：t 无定义，不能放行
+        return float("nan")
     lrv = s0
     for lag in range(1, lags + 1):
         w = 1.0 - lag / (lags + 1.0)  # Bartlett 核
@@ -135,7 +145,9 @@ def _summarize(series: pl.Series, annualize: bool = True, *, nw_lags: int | None
     std_raw = s.std()
     std = (float(std_raw) if std_raw is not None and math.isfinite(float(std_raw))
            else float("nan"))
-    ir = mean / std if std and std > 0 else float("nan")
+    # std <= STD_EPS 视为零方差（含 polars 常数序列的 ~7e-18 伪影）：
+    # IR 无定义 → nan，评级层再按「完美稳定」特殊处理
+    ir = mean / std if std and std > STD_EPS else float("nan")
     pos = float((s > 0).sum() / n)
     # 阈值胜率：与均值同向、且幅度过 0.02 有效线的占比 —— 比单纯胜率更挑剔
     thr = 0.02 if mean >= 0 else -0.02

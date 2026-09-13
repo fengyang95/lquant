@@ -162,8 +162,8 @@ def _benchmark_nav_aligned(run_dates: set, run_nav: dict) -> tuple[list[dict], s
 
 
 class BacktestIn(BaseModel):
-    factor: str = "mom_20"               # 因子列名（现算）
-    formula: str = "pct_change_20"       # 与 factors API 同一套公式
+    factor: str = "pct_change_20"        # 仅作展示标签；实际因子列由 formula 派生（formula.replace("_","")）
+    formula: str = "pct_change_20"       # 与 factors API 同一套公式：pct_change_{n} / rolling_std_{n}
     top_n: int = Field(default=5, ge=1, le=100)
     rebalance: str = Field(default="monthly", pattern="^(daily|weekly|monthly|none)$")
     initial_cash: float = Field(default=1_000_000, gt=0)

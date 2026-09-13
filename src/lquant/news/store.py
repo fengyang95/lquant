@@ -96,7 +96,9 @@ def query_news(  # noqa: PLR0917 — 接口按 brief 固定
         params.extend(values)
 
     if source is not None:
-        _add("source = ?", source)
+        # API 口径：source 参数指「来源名」（registry 的 em_global/cls/...），
+        # 落在 source_name 列；DB 的 source 列存的是 category（telegraph/news/...）
+        _add("source_name = ?", source)
     if industry is not None:
         _add("industry_code = ?", industry)
     if symbol is not None:
@@ -105,7 +107,12 @@ def query_news(  # noqa: PLR0917 — 接口按 brief 固定
         _add("CAST(published_at AS DATE) = CAST(? AS DATE)", day)
 
     if keyword is not None:
-        _add("(title LIKE ? OR content LIKE ?)", f"%{keyword}%", f"%{keyword}%")
+        # 转义 LIKE 通配符，避免用户输入 %/_ 变成通配（ESCAPE 指定转义符）
+        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        _add(
+            "(title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')",
+            f"%{escaped}%", f"%{escaped}%",
+        )
 
     where_clause = " WHERE " + " AND ".join(where) if where else ""
     total = con.execute(
@@ -139,5 +146,15 @@ def news_stats_by_source(con: DuckDBPyConnection) -> list[dict[str, Any]]:
         "SELECT source, source_name, count(*) AS count, "
         "max(collected_at) AS last_collected_at "
         "FROM news_item GROUP BY source, source_name ORDER BY count DESC"
+    )
+    return _rows_to_dicts(rows)
+
+
+def news_stats_by_source_name(con: DuckDBPyConnection) -> list[dict[str, Any]]:
+    """按来源名聚合（API /sources、/summary 的口径：source_name = registry key）。"""
+    rows = con.execute(
+        "SELECT source_name, count(*) AS count, "
+        "max(collected_at) AS last_collected_at "
+        "FROM news_item GROUP BY source_name ORDER BY count DESC"
     )
     return _rows_to_dicts(rows)

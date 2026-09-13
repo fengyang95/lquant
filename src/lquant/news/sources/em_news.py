@@ -95,7 +95,7 @@ def _map_df(df: pd.DataFrame, symbol: str) -> list[NewsItem]:
         items.append(
             NewsItem(
                 source="news",
-                source_name="em",
+                source_name="em_news",
                 external_id=external_id,
                 title=title,
                 content=_clean_str(row.get("新闻内容")),
@@ -122,6 +122,9 @@ class EmNewsSource:
         pool = self._pool if self._pool is not None else get_active_pool(
             _pool_limit()
         )
+        if not pool:
+            # 空池多半是行情湖不可用而非「今天真没新闻」，显式告警便于排查
+            logger.warning("em_news 股票池为空（行情湖不可用或配置 pool_limit=0），本次产出 0 条")
         items: list[NewsItem] = []
         for symbol in pool:
             try:

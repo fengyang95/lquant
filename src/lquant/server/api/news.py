@@ -128,10 +128,10 @@ def news_sources() -> list[dict]:
     stats = []
     with reader() as con:
         _ensure_schema()
-        from lquant.news.store import news_stats_by_source
+        from lquant.news.store import news_stats_by_source_name
 
-        stats = news_stats_by_source(con)
-    by_source = {r["source"]: r for r in stats}
+        stats = news_stats_by_source_name(con)
+    by_source = {r["source_name"]: r for r in stats}
     out: list[dict] = []
     for reg in _registry_rows():
         stat = by_source.pop(reg["source"], None)
@@ -143,7 +143,7 @@ def news_sources() -> list[dict]:
             out.append({**reg, "source_name": None, "count": 0,
                         "last_collected_at": None})
     # 库里有但注册表已下线的来源也保留（历史数据可查）
-    out.extend({**r, "category": None,
+    out.extend({**r, "source": r["source_name"], "category": None,
                 "last_collected_at": _ts(r.get("last_collected_at"))}
                for r in by_source.values())
     return out
@@ -243,8 +243,8 @@ def news_summary(day: str | None = Query(default=None)) -> dict:
     with reader() as con:
         _ensure_schema()
         rows = con.execute(
-            "SELECT source, count(*) FROM news_item"
-            " WHERE CAST(published_at AS DATE) = CAST(? AS DATE) GROUP BY source",
+            "SELECT source_name, count(*) FROM news_item"
+            " WHERE CAST(published_at AS DATE) = CAST(? AS DATE) GROUP BY source_name",
             [day],
         ).fetchall()
         ind_rows = con.execute(

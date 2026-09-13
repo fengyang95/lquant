@@ -112,6 +112,12 @@ def verify_and_register(spec: dict) -> tuple[bool, dict]:
     name = spec.get("name") or "cand_" + canonical_id(expr)
     g0 = g0_static(expr, allowed_fields=_daily_fields())
     payload = {"name": name, "expr": expr, "agent": spec.get("agent", "manual")}
+    # SKILL 铁律：无 rationale（研究动机/口径说明）不得入库 —— 缺失直接拒
+    if not (spec.get("rationale") or "").strip():
+        payload.update({"ok": False, "grade": "REJECTED", "stage": "G0",
+                        "reason_code": "MISSING_RATIONALE",
+                        "hint": "spec 缺少 rationale（研究动机/口径说明），拒绝入库"})
+        return False, payload
     if not g0.passed:
         payload.update({"ok": False, "grade": "REJECTED", "stage": "G0",
                         "reason_code": g0.reason_code, "hint": g0.hint})

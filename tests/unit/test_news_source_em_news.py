@@ -40,7 +40,7 @@ def test_em_news_maps_and_tags_symbol() -> None:
     first = items[0]
     assert isinstance(first, NewsItem)
     assert first.source == "news"
-    assert first.source_name == "em"
+    assert first.source_name == "em_news"  # source_name 与注册名统一
     assert first.symbols == ("000001.SZ",)
     # 来源精确关联,不打 bit4
     assert not (first.quality_flags & 4)

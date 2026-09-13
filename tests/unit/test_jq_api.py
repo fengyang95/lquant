@@ -253,7 +253,7 @@ def handle_data(context, data):
     assert list(single.columns) == ["close"], single.columns
     if len(single) < 5:
         return                                   # 历史不足，跳过
-    assert single.index[-1].isoformat() < context.current_dt.date().isoformat()  # 不含今日
+    assert single.index[-1] < context.current_dt.date().isoformat()  # 不含今日（索引为字符串日期）
     assert single["close"][-1] == 14.0           # 昨日收盘（负数下标按位置）
     multi = get_price(["600000.SH", "600519.SH"], count=3,
                       fields=["close", "open"])
