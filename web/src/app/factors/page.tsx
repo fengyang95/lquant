@@ -13,9 +13,13 @@ import { Panel, Stat } from '@/components/Panel';
 import PageHeader from '@/components/PageHeader';
 import { Empty, Msg } from '@/components/States';
 import { get, post } from '@/lib/api';
-import { C, SERIES_COLORS, axes, legend, tooltip } from '@/lib/chart';
+import { C, axes, legend, tooltip } from '@/lib/chart';
+import FactorLibrary from './FactorLibrary';
 
-type FactorRow = { name: string; expression: string; description: string; created_at: string };
+type FactorRow = {
+  name: string; expression: string; description: string; created_at: string;
+  source?: string; ic_neutral?: number | null; category?: string;
+};
 type TopNRow = {
   n: number; annual_return: number | null; annual_excess: number | null;
   excess_sharpe: number | null; max_drawdown: number | null; annual_turnover: number | null;
@@ -102,34 +106,30 @@ function corrColor(v: number): string {
 
 export default function FactorsPage() {
   const { data: factors, mutate } = useSWR<FactorRow[]>('/factors', get);
-  const [srcFilter, setSrcFilter] = useState<string | null>(null);
-  const shownFactors = (factors ?? []).filter(
-    (f) => !srcFilter || (f as unknown as { source?: string }).source === srcFilter);
   const { data: builtin } = useSWR<BuiltinItem[]>('/factors/builtin', get);
-  const [name, setName] = useState('mom20');
-  const [expression, setExpression] = useState('Rank(Ts_Mean($close,5)/$close-1)');
+  const { data: universes } = useSWR<{ key: string; index_code: string | null; label: string }[]>(
+    '/factors/universes', get);
+  const [tab, setTab] = useState<'eval' | 'lab' | 'library'>('eval');
   const [formula, setFormula] = useState('pct_change_20');
   const [evalRes, setEvalRes] = useState<EvalResult | null>(null);
   const [evalSeries, setEvalSeries] = useState<EvalSeries | null>(null);
   const [seriesError, setSeriesError] = useState<string | null>(null);
-  const [busy, setBusy] = useState<'' | 'reg' | 'eval' | 'corr' | 'syn' | 'seed'>('');
+  const [busy, setBusy] = useState<'' | 'eval' | 'corr' | 'syn'>('');
   const [msg, setMsg] = useState('');
+  // 评价范围：时间区间 + 股票池
+  const [evalStart, setEvalStart] = useState('2026-01-01');
+  const [evalEnd, setEvalEnd] = useState('');
+  const [evalUniverse, setEvalUniverse] = useState('all');
   // 相关性 / 合成
   const [picked, setPicked] = useState<string[]>(['pct_change_20', 'rolling_std_20']);
   const [corr, setCorr] = useState<CorrResult | null>(null);
   const [syn, setSyn] = useState<SynResult | null>(null);
-  const [builtinQuery, setBuiltinQuery] = useState('');
   const [customFormula, setCustomFormula] = useState('');
   const [corrStart, setCorrStart] = useState('2026-01-01');
+  const [corrEnd, setCorrEnd] = useState('');
+  const [corrUniverse, setCorrUniverse] = useState('all');
   const [corrThreshold, setCorrThreshold] = useState(0.8);
   const [zThreshold, setZThreshold] = useState('');
-
-  // 内置因子按族浏览 + 搜索（158 个）
-  const builtinShown = useMemo(() => {
-    if (!builtin) return [];
-    const q = builtinQuery.trim().toUpperCase();
-    return q ? builtin.filter((b) => b.name.includes(q)) : builtin.slice(0, 40);
-  }, [builtin, builtinQuery]);
 
   // —— 评价图表（依赖 evalSeries） ——
   const icOption = useMemo(() => {
@@ -310,26 +310,17 @@ export default function FactorsPage() {
     setCustomFormula('');
   }
 
-  async function register() {
-    setBusy('reg');
-    setMsg('');
-    try {
-      await post('/factors', { name, expression, description: '' });
-      setMsg('✓ 已注册');
-      mutate();
-    } catch (e) {
-      setMsg(`✗ ${e instanceof Error ? e.message : e}`);
-    } finally {
-      setBusy('');
-    }
-  }
-
   async function evaluate() {
     setBusy('eval');
     setMsg('');
     try {
       const params = {
-        factor: name || 'tmp', formula, n_groups: 5,
+        // 报告名仅允许字母数字下划线（后端防路径穿越校验），从公式派生并清洗
+        factor: (formula.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64) || 'tmp'),
+        n_groups: 5,
+        start: evalStart,
+        end: evalEnd.trim() ? evalEnd : null,
+        universe: evalUniverse,
         filter_zscore: zThreshold.trim() ? Number(zThreshold) : null,
         event_window: [10, 15],
       };
@@ -345,40 +336,15 @@ export default function FactorsPage() {
     }
   }
 
-  async function seedBuiltin() {
-    setBusy('seed');
-    setMsg('');
-    try {
-      const r = await post<{ seeded: number }>('/factors/seed-builtin', {});
-      setMsg(`✓ 已入库 ${r.seeded} 个 Qlib 内置因子`);
-      mutate();
-    } catch (e) {
-      setMsg(`✗ ${e instanceof Error ? e.message : e}`);
-    } finally {
-      setBusy('');
-    }
-  }
-
-  async function seedYaml() {
-    setBusy('seed');
-    setMsg('');
-    try {
-      const r = await post<{ seeded: number }>('/factors/seed-yaml', {});
-      setMsg(`✓ 已入库 ${r.seeded} 个 YAML 自定义因子`);
-      mutate();
-    } catch (e) {
-      setMsg(`✗ ${e instanceof Error ? e.message : e}`);
-    } finally {
-      setBusy('');
-    }
-  }
-
   async function analyze() {
     setBusy('corr');
     setMsg('');
     try {
       setCorr(await post<CorrResult>('/factors/analyze', {
-        formulas: picked, start: corrStart, threshold: corrThreshold,
+        formulas: picked, start: corrStart,
+        end: corrEnd.trim() ? corrEnd : null,
+        universe: corrUniverse,
+        threshold: corrThreshold,
       }));
     } catch (e) {
       setMsg(`✗ ${e instanceof Error ? e.message : e}`);
@@ -393,6 +359,8 @@ export default function FactorsPage() {
     try {
       setSyn(await post<SynResult>('/factors/synthesize', {
         formulas: picked, method, start: corrStart,
+        end: corrEnd.trim() ? corrEnd : null,
+        universe: corrUniverse,
       }));
     } catch (e) {
       setMsg(`✗ ${e instanceof Error ? e.message : e}`);
@@ -405,88 +373,112 @@ export default function FactorsPage() {
     <div className="space-y-5">
       <PageHeader
         title="因子"
-        sub={<>注册 DSL · 快速评价（IC / 分层 / 衰减）· 相关性与合成{builtin ? ` · 内置 Qlib Alpha158 ${builtin.length} 个` : ''}</>}
+        sub={<>快速评价（IC / 分层 / 衰减）· 相关性与合成 · 因子库（分类管理）{builtin ? ` · 内置 Qlib Alpha158 ${builtin.length} 个` : ''}</>}
       />
 
-      <div className="grid gap-5 lg:grid-cols-2">
-        <Panel title="注册因子（DSL）">
-          <div className="space-y-3">
-            <input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="因子名"
-              className="input w-full"
-            />
-            <textarea
-              value={expression}
-              onChange={(e) => setExpression(e.target.value)}
-              rows={3}
-              placeholder="Rank(Ts_Mean($close,5)/$close-1)"
-              className="input input-mono w-full"
-            />
-            <button
-              onClick={register}
-              disabled={busy === 'reg' || !name}
-              className="btn btn-primary"
-            >
-              {busy === 'reg' ? '注册中…' : '注册（AST 校验）'}
-            </button>
-          </div>
-        </Panel>
+      {/* 顶部 Tab：评价 / 相关性·合成 / 因子库 */}
+      <div className="flex flex-wrap items-center gap-1">
+        {([
+          ['eval', '快速评价'],
+          ['lab', '相关性 · 合成'],
+          ['library', '因子库'],
+        ] as const).map(([key, label]) => (
+          <button
+            key={key}
+            onClick={() => setTab(key)}
+            className={`tag ${tab === key ? 'tag-on' : ''}`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
 
-        <Panel title="快速评价" meta="IC / 分层 / 衰减 · 一次跑完">
-          <div className="space-y-3">
+      {tab === 'eval' && (
+      <Panel title="快速评价" meta="IC / 分层 / 衰减 · 一次跑完">
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center gap-2">
             <input
               value={formula}
               onChange={(e) => setFormula(e.target.value)}
               list="builtin-factors"
               placeholder="MA20 / RSV10 / ROC5 / KMID / pct_change_20 …"
-              className="input input-mono w-full"
+              className="input input-mono w-72"
             />
             <datalist id="builtin-factors">
               {(builtin ?? []).map((b) => <option key={b.name} value={b.name}>{b.formula}</option>)}
             </datalist>
-            <div className="flex flex-wrap gap-1">
-              {FORMULAS.slice(5).map((f) => (
-                <button
-                  key={f}
-                  onClick={() => setFormula(f)}
-                  className={`tag ${formula === f ? 'tag-on' : ''}`}
-                >
-                  {f}
-                </button>
-              ))}
-            </div>
-            <div className="flex items-center gap-2">
-              <input
-                value={zThreshold}
-                onChange={(e) => setZThreshold(e.target.value)}
-                placeholder="留空 = 不过滤"
-                inputMode="decimal"
-                className="input input-mono w-32"
-                title="截面异常收益过滤阈值（|z| 上限，口径同 alphalens）"
-              />
-              <span className="text-xs text-ink-faint">
-                截面异常收益过滤 |z| 上限（留空不过滤；20 为研报默认口径）
-              </span>
-            </div>
-            <button
-              onClick={evaluate}
-              disabled={busy === 'eval' || !formula}
-              className="btn btn-accent"
-            >
-              {busy === 'eval' ? '评价中…' : '运行评价'}
-            </button>
-            <p className="text-xs text-ink-faint">
-              输入任意内置因子名（如 BETA20、CORR60）或传统公式（pct_change_n / rolling_std_n / turnover）。
-            </p>
           </div>
-        </Panel>
-      </div>
+          <div className="flex flex-wrap gap-1">
+            {FORMULAS.slice(5).map((f) => (
+              <button
+                key={f}
+                onClick={() => setFormula(f)}
+                className={`tag ${formula === f ? 'tag-on' : ''}`}
+              >
+                {f}
+              </button>
+            ))}
+          </div>
+          {/* 时间范围 + 股票池 */}
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="flex items-center gap-1 text-xs text-ink-dim">
+              开始
+              <input type="date" value={evalStart} onChange={(e) => setEvalStart(e.target.value)}
+                className="input w-36 py-1 text-xs" />
+            </label>
+            <label className="flex items-center gap-1 text-xs text-ink-dim">
+              结束
+              <input type="date" value={evalEnd} onChange={(e) => setEvalEnd(e.target.value)}
+                className="input w-36 py-1 text-xs" />
+            </label>
+            <label className="flex items-center gap-1 text-xs text-ink-dim">
+              股票池
+              <select
+                value={evalUniverse}
+                onChange={(e) => setEvalUniverse(e.target.value)}
+                className="input w-32 py-1 text-xs"
+              >
+                {(universes ?? [{ key: 'all', index_code: null, label: '全市场' }]).map((u) => (
+                  <option key={u.key} value={u.key}>{u.label}</option>
+                ))}
+              </select>
+            </label>
+            {evalUniverse !== 'all' && (
+              <span className="text-xs text-ink-faint">
+                成分快照为最新一期（研究口径）；成分表为空时请先在数据页同步
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              value={zThreshold}
+              onChange={(e) => setZThreshold(e.target.value)}
+              placeholder="留空 = 不过滤"
+              inputMode="decimal"
+              className="input input-mono w-32"
+              title="截面异常收益过滤阈值（|z| 上限，口径同 alphalens）"
+            />
+            <span className="text-xs text-ink-faint">
+              截面异常收益过滤 |z| 上限（留空不过滤；20 为研报默认口径）
+            </span>
+          </div>
+          <button
+            onClick={evaluate}
+            disabled={busy === 'eval' || !formula}
+            className="btn btn-accent"
+          >
+            {busy === 'eval' ? '评价中…' : '运行评价'}
+          </button>
+          <p className="text-xs text-ink-faint">
+            输入任意内置因子名（如 BETA20、CORR60）或传统公式（pct_change_n / rolling_std_n / turnover）。
+          </p>
+        </div>
+      </Panel>
+      )}
 
       <Msg text={msg} />
 
-      {evalRes && (
+      {tab === 'eval' && evalRes && (
         <Panel
           title="评价结果"
           meta={<>{evalRes.factor} · 样本 {evalRes.n_samples}</>}
@@ -532,7 +524,7 @@ export default function FactorsPage() {
         </Panel>
       )}
 
-      {evalRes && (
+      {tab === 'eval' && evalRes && (
         <Panel
           title="超额与持仓收缩"
           meta={`基准：股票池等权 · 几何超额口径${evalRes.style_corr?.passed != null ? (evalRes.style_corr.passed ? ' · 风格相关性 ✓ 达标' : ' · 风格相关性 ⚠ 超阈值') : ''}`}
@@ -611,14 +603,14 @@ export default function FactorsPage() {
       )}
 
       {/* 图表加载失败显式提示（缺陷 #4：不再伪装成「样本不足」） */}
-      {seriesError && (
+      {tab === 'eval' && seriesError && (
         <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
           {seriesError}
         </div>
       )}
 
       {/* 评价图表：IC / 分层 / 衰减 */}
-      {evalSeries && (
+      {tab === 'eval' && evalSeries && (
         <div className="grid gap-5 lg:grid-cols-2">
           <Panel title="IC 序列与累计 IC">
             {icOption
@@ -751,7 +743,8 @@ export default function FactorsPage() {
         </div>
       )}
 
-      {/* 相关性 + 合成 */}
+      {/* 相关性 + 合成（lab Tab） */}
+      {tab === 'lab' && (
       <Panel
         title="相关性 / 合成"
         actions={
@@ -817,6 +810,20 @@ export default function FactorsPage() {
             起始日
             <input type="date" value={corrStart} onChange={(e) => setCorrStart(e.target.value)}
               className="input w-36 py-1 text-xs" />
+          </label>
+          <label className="flex items-center gap-1 text-xs text-ink-dim">
+            结束日
+            <input type="date" value={corrEnd} onChange={(e) => setCorrEnd(e.target.value)}
+              className="input w-36 py-1 text-xs" />
+          </label>
+          <label className="flex items-center gap-1 text-xs text-ink-dim">
+            股票池
+            <select value={corrUniverse} onChange={(e) => setCorrUniverse(e.target.value)}
+              className="input w-32 py-1 text-xs">
+              {(universes ?? [{ key: 'all', index_code: null, label: '全市场' }]).map((u) => (
+                <option key={u.key} value={u.key}>{u.label}</option>
+              ))}
+            </select>
           </label>
           <label className="flex items-center gap-1 text-xs text-ink-dim">
             冗余阈值
@@ -905,92 +912,15 @@ export default function FactorsPage() {
           </div>
         )}
       </Panel>
+      )}
 
-      <Panel
-        title="已注册因子"
-        meta={<>共 {shownFactors.length} 个 · Qlib Alpha158 内置因子可一键入库</>}
-        actions={
-          <>
-            <button
-              onClick={seedBuiltin}
-              disabled={busy === 'seed'}
-              className="btn btn-sm"
-            >
-              {busy === 'seed' ? '入库中…' : '一键入库内置因子'}
-            </button>
-            <button
-              onClick={seedYaml}
-              disabled={busy === 'seed'}
-              className="btn btn-sm"
-            >
-              导入 YAML 因子
-            </button>
-          </>
-        }
-      >
-        <div className="mb-3 flex flex-wrap items-center gap-1">
-          {['全部', 'qlib', 'yaml', 'manual'].map((src) => (
-            <button
-              key={src}
-              onClick={() => setSrcFilter(src === '全部' ? null : src)}
-              className={`tag ${(srcFilter ?? '全部') === src ? 'tag-on' : ''}`}
-            >
-              {src}
-            </button>
-          ))}
-        </div>
-        <div className="mb-4 flex flex-wrap items-center gap-1">
-          <input
-            value={builtinQuery}
-            onChange={(e) => setBuiltinQuery(e.target.value)}
-            placeholder="搜索内置因子，如 RSV / CORR / STD20"
-            className="input input-mono w-64 py-1 text-xs"
-          />
-          {builtinShown.slice(0, 24).map((b) => (
-            <button
-              key={b.name}
-              title={b.formula}
-              onClick={() => setFormula(b.name)}
-              className="tag"
-            >
-              {b.name}
-            </button>
-          ))}
-        </div>
-        {!factors?.length ? (
-          <Empty>暂无 —— 用上方表单注册第一个因子</Empty>
-        ) : (
-          <table className="table-dense">
-            <thead>
-              <tr>
-                <th className="text-left">名称</th>
-                <th className="text-left">表达式</th>
-                <th className="text-left">来源</th>
-                <th className="text-left">IC(中性化)</th>
-                <th className="text-left">注册时间</th>
-              </tr>
-            </thead>
-            <tbody>
-              {shownFactors.map((f) => {
-                const src = (f as unknown as { source?: string }).source;
-                const icn = (f as unknown as { ic_neutral?: number | null }).ic_neutral;
-                const icnDisplay = icn == null ? '—' : Number(icn).toFixed(4);
-                return (
-                  <tr key={f.name} className="hover:bg-white">
-                    <td className="font-medium">
-                      <a href={`/factors/${f.name}`} className="hover:underline">{f.name}</a>
-                    </td>
-                    <td className="font-mono text-xs text-ink-dim">{f.expression || '—'}</td>
-                    <td className="text-ink-faint">{src ?? 'manual'}</td>
-                    <td className="font-mono">{icnDisplay}</td>
-                    <td className="text-ink-faint">{f.created_at?.slice(0, 19)}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
-      </Panel>
+      {tab === 'library' && (
+      <FactorLibrary
+        factors={factors}
+        mutate={mutate}
+        onPickFormula={(n) => { setFormula(n); setTab('eval'); }}
+      />
+      )}
     </div>
   );
 }

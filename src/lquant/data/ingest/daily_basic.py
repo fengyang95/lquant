@@ -1,136 +1,187 @@
-"""tushare daily_basic 回填：市值/估值/股本，一天一请求覆盖全市场。
+"""tushare daily_basic 回填与日线湖合并。
 
-补日线湖 total_mv/float_mv/pe_ttm 等空缺列（baostock 不出总市值，
-daily 湖这些列常年 NULL）。两条入库路径：
-- daily_basic 湖（write_daily_basic）保留 tushare 原始口径，随时可重算；
-- merge 路径把市值/估值 coalesce 回日线湖：只填 NULL，不覆盖主源值。
+解决两个硬缺口：
+- total_mv / float_mv：baostock 日线根本不出市值，日线湖恒 NULL；
+- pe_ttm / pb_mrq / ps_ttm：2026 分区回填早于估值扩列（5bf569b），
+  整年为空——扩列修复之外，本模块可对任意区间做 null 填充。
 
-checkpoint 按天断点续传；单日失败不标记完成，重跑自动补。
+数据流：
+  1. backfill：交易日粒度调 pro.daily_basic（一天一请求覆盖全市场，
+     1 qps 限流下 ~640 交易日约 11 分钟），落 daily_basic 湖
+     （data/parquet/daily_basic/year=YYYY/），checkpoint 按天断点续传；
+  2. merge：把 daily_basic 湖 join 回日线湖，**只填 NULL，不覆盖已有值**
+     （baostock 已有的 pe_ttm 是主源，tushare 只做补洞；两源混写会导致
+     时间序列跳变，crosscheck 原则「比对不取值」同理）。
 """
 from __future__ import annotations
 
 from datetime import date
 
-import polars as pl
-
-from lquant.core.types import today_cn
 from lquant.data.ingest.checkpoint import Checkpoint
+from lquant.data.store.parquet import (
+    _daily_basic_path,
+    _daily_path,
+    read_daily,
+    read_daily_basic,
+    write_daily_basic,
+)
 
-# 合并回日线湖的列：只填 NULL，不覆盖主源（baostock pe/pb 等）。
-COALESCE_COLS = ("pe_ttm", "pb_mrq", "ps_ttm", "total_mv", "float_mv")
+# 日线湖允许由 daily_basic 填充的列（merge 时只填 NULL）
+FILL_COLS = ("pe_ttm", "pb_mrq", "ps_ttm", "total_mv", "float_mv")
 
-_DAILY_BASIC_LAKE = "daily_basic_lake"
+_CHUNK = 60  # 每写一次湖的最多天数：断点丢失有界，避免逐日重写年文件
 
 
-def coalesce_daily_basic(
-    daily: pl.DataFrame, basic: pl.DataFrame,
-) -> tuple[pl.DataFrame, dict[str, int]]:
-    """把 basic 的估值/市值列 coalesce 进 daily：daily 值为 NULL 才填。
+def _tushare_provider():
+    """从 Fallback 链里取 tushare 源（daily_basic 直连不走能力路由）。"""
+    from lquant.data.providers import get_provider
 
-    返回 (合并后帧, 各列实际填充行数)。纯函数，不改入参帧。
-    basic 辅助列以 `__` 前缀临时加入，返回前全部剔除。
-    """
-    filled = {c: 0 for c in COALESCE_COLS}
-    if basic.height == 0 or daily.height == 0:
-        return daily, filled
-
-    daily = daily.clone()
-    schema_daily = _schema()
-    for c in COALESCE_COLS:
-        if c not in daily.columns:
-            daily = daily.with_columns(
-                pl.lit(None, dtype=schema_daily[c]).alias(c)
-            )
-    j = basic.select(["symbol", "trade_date", *COALESCE_COLS]).with_columns(
-        pl.col(c).alias(f"__{c}") for c in COALESCE_COLS
+    chain = get_provider()
+    for p in chain.providers:
+        if p.name == "tushare":
+            return p
+    raise RuntimeError(
+        "tushare 源不可用：检查 TUSHARE_TOKEN（src/lquant/.env 或环境变量）"
     )
-    out = daily.join(j, on=["symbol", "trade_date"], how="left")
-    filled = dict(zip(COALESCE_COLS, out.select(
-        # 更新前先数：daily NULL 且 basic 非空的行数（更新后 col(c) 不再 NULL）
-        (pl.col(c).is_null() & pl.col(f"__{c}").is_not_null()).sum().alias(c)
-        for c in COALESCE_COLS
-    ).row(0), strict=True))
-    for c in COALESCE_COLS:
-        hit = pl.col(c).is_null() & pl.col(f"__{c}").is_not_null()
-        out = out.with_columns(
-            pl.when(hit).then(pl.col(f"__{c}")).otherwise(pl.col(c)).alias(c)
-        )
-    return out.drop([c for c in out.columns if c.startswith("__")]), filled
 
 
-def _schema() -> dict[str, pl.DataType]:
-    """惰性取 daily_bar schema（模块导入期避免循环依赖）。"""
-    from lquant.data.schema import SCHEMAS
-
-    return SCHEMAS["daily_bar"]
+def lake_trade_dates(start: date, end: date) -> list[date]:
+    """日线湖内 [start, end] 的去重交易日（merge 的 join 目标就是这些行）。"""
+    lf = read_daily(start=start, end=end)
+    days = (
+        lf.select("trade_date").unique().sort("trade_date").collect()
+        .get_column("trade_date").to_list()
+    )
+    return [d for d in days if isinstance(d, date)]
 
 
 def backfill_daily_basic(
-    start: str = "2024-01-01",
-    end: str | None = None,
+    start: date | str = "2024-01-01",
+    end: date | str | None = None,
     merge: bool = True,
 ) -> dict:
-    """按交易日回填 tushare daily_basic 并（可选）合并回日线湖。
-
-    返回统计 dict（CLI 逐行 echo）。
-    """
+    """回填 daily_basic 湖，可选合并回日线湖。返回统计 dict。"""
     from loguru import logger
 
-    from lquant.data.providers import get_provider
-    from lquant.data.store.catalog import TradeCalendarRepo
-    from lquant.data.store.parquet import write_daily_basic
+    from lquant.core.types import today_cn
 
-    start_d = date.fromisoformat(start)
-    end_d = date.fromisoformat(end) if end else today_cn()
-    dates = TradeCalendarRepo().range(start_d, end_d)
-    if not dates:
-        raise RuntimeError(
-            "trade_calendar 为空或区间无交易日 —— 先跑 `lq data reference` 建日历"
-        )
+    start_d = start if isinstance(start, date) else date.fromisoformat(start)
+    end_d = end if isinstance(end, date) else (date.fromisoformat(end) if end else today_cn())
 
-    cp = Checkpoint(_DAILY_BASIC_LAKE)
-    todo = [d for d in dates if not cp.is_done(d.isoformat())]
-    logger.info(f"daily_basic 回填 {len(todo)}/{len(dates)} 个交易日 {start_d}~{end_d}")
+    days = lake_trade_dates(start_d, end_d)
+    if not days:
+        raise RuntimeError(f"日线湖内 {start_d}~{end_d} 无数据，先跑日线回填")
+    cp = Checkpoint("daily_basic")
+    cp.set_meta(start=str(start_d), end=str(end_d))
+    todo = [d for d in days if d.isoformat() not in cp.done]
+    logger.info(f"daily_basic 回填 {len(todo)}/{len(days)} 个交易日 {start_d}~{end_d}")
 
-    ts = [p for p in get_provider().providers if p.name == "tushare"]
-    if not ts:
-        raise RuntimeError("tushare provider 不可用（缺 token 或未启用）")
-    provider = ts[0]
-
-    rows = 0
-    filled_total: dict[str, int] = {}
-    for d in todo:
+    provider = _tushare_provider()
+    fetched = 0
+    buf: list = []
+    for i, d in enumerate(todo, 1):
         df = provider.daily_basic(d)
         if len(df):
-            write_daily_basic(df)
-            rows += len(df)
-        cp.mark([d.isoformat()])  # 空结果也标记：非交易日/无数据日不必重拉
-        if merge and len(df):
-            filled = _merge_into_daily(df, d)
-            for k, v in filled.items():
-                filled_total[k] = filled_total.get(k, 0) + v
+            buf.append(df)
+            fetched += len(df)
+        cp.mark({d.isoformat()})
+        if len(buf) >= _CHUNK or i == len(todo):
+            if buf:
+                write_daily_basic(_concat(buf))
+                buf = []
+            logger.info(f"  daily_basic 进度 {i}/{len(todo)}（{d}）")
 
-    out = {
-        "days": len(todo),
-        "rows": rows,
-        "merge_filled": filled_total if merge else {},
-    }
-    logger.info(f"daily_basic 回填完成: {out}")
+    out = {"days": len(days), "fetched_days": len(todo), "rows": fetched}
+    if merge:
+        out.update(merge_daily_basic(start_d, end_d))
     return out
 
 
-def _merge_into_daily(df: pl.DataFrame, d: date) -> dict[str, int]:
-    """把单日 basic 合并进日线湖当日数据，返回各列填充行数。"""
-    from lquant.data.store.parquet import read_daily, write_daily
+def _concat(frames: list) -> object:
+    import polars as pl
 
-    daily = read_daily(start=d, end=d).collect()
-    if not len(daily):
-        return {c: 0 for c in COALESCE_COLS}
-    merged, filled = coalesce_daily_basic(daily, df)
-    changed = any(v > 0 for v in filled.values())
-    if changed:
-        write_daily(merged)
-    return filled
+    from lquant.data.schema import SCHEMAS
+
+    return pl.concat(frames, how="diagonal").select(list(SCHEMAS["daily_basic"]))
 
 
-__all__ = ["COALESCE_COLS", "backfill_daily_basic", "coalesce_daily_basic"]
+def coalesce_daily_basic(daily: object, basic: object) -> tuple[object, dict[str, int]]:
+    """把 daily_basic 按 (symbol, trade_date) 合入日线帧，**只填 NULL**。
+
+    纯函数（不触湖），便于单测。返回 (新日线帧, 每列实际填充的单元格数)。
+    """
+    import polars as pl
+
+    if not basic.height:
+        return daily, {c: 0 for c in FILL_COLS}
+    keys = ["symbol", "trade_date"]
+    for c in FILL_COLS:
+        if c not in daily.columns:  # 老年文件缺列：先补空列再 join
+            daily = daily.with_columns(pl.lit(None, dtype=pl.Float64).alias(c))
+    daily = daily.with_columns(pl.col(k).cast(pl.Utf8) if k == "symbol" else pl.col(k)
+                               for k in keys)
+    basic = basic.select(
+        *(pl.col(k).cast(daily.schema[k]) for k in keys),
+        *(pl.col(c) for c in FILL_COLS),
+    ).rename({c: f"__{c}" for c in FILL_COLS})
+    joined = daily.join(basic, on=keys, how="left")
+    filled: dict[str, int] = {}
+    exprs = []
+    for c in FILL_COLS:
+        n = joined.select(
+            (pl.col(c).is_null() & pl.col(f"__{c}").is_not_null()).sum()
+        ).item()
+        filled[c] = int(n or 0)
+        exprs.append(
+            pl.when(pl.col(c).is_null())
+            .then(pl.col(f"__{c}"))
+            .otherwise(pl.col(c))
+            .alias(c)
+        )
+    out = joined.with_columns(exprs).drop([f"__{c}" for c in FILL_COLS])
+    return out, filled
+
+
+def merge_daily_basic(start: date | str, end: date | str) -> dict:
+    """daily_basic 湖 → 日线湖合并（按年文件读改写，只填 NULL）。"""
+    import polars as pl
+    from loguru import logger
+
+    start_d = start if isinstance(start, date) else date.fromisoformat(start)
+    end_d = end if isinstance(end, date) else date.fromisoformat(end)
+
+    basic = read_daily_basic(start_d, end_d)
+    if not len(basic):
+        logger.warning("daily_basic 湖为空，跳过 merge")
+        return {"years": [], "filled": {}}
+    total: dict[str, int] = {c: 0 for c in FILL_COLS}
+    years: list[int] = []
+    for year in sorted(set(basic.get_column("trade_date").dt.year().to_list())):
+        dp, _bp = _daily_path(year), _daily_basic_path(year)
+        if not dp.exists():
+            continue
+        daily = pl.read_parquet(dp)
+        basic_y = basic.filter(pl.col("trade_date").dt.year() == year)
+        merged, filled = coalesce_daily_basic(daily, basic_y)
+        if not merged.height:
+            continue
+        merged = merged.sort(["symbol", "trade_date"])
+        from lquant.data.store.parquet import _atomic_write_parquet, _file_lock
+
+        with _file_lock(dp):
+            _atomic_write_parquet(merged, dp)
+        years.append(year)
+        for c, n in filled.items():
+            total[c] = total.get(c, 0) + n
+        logger.info(f"  merge year={year}: {filled}")
+    logger.info(f"merge 完成 {years}，填充 {total}")
+    return {"years": years, "filled": total}
+
+
+__all__ = [
+    "FILL_COLS",
+    "backfill_daily_basic",
+    "merge_daily_basic",
+    "coalesce_daily_basic",
+    "lake_trade_dates",
+]
