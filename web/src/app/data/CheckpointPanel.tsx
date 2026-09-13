@@ -23,7 +23,7 @@ function metaText(meta: Record<string, unknown>): string {
 /** 断点续传管理卡：查看 data/cache/checkpoints 下的断点（CLI 与前端任务共用），
  *  支持归档（重命名保留，不参与续传）—— 换日期区间回填前必须先清/归档同名断点。 */
 export default function CheckpointPanel() {
-  const { data: cps, mutate } = useSWR<CheckpointInfo[]>('/data/checkpoints', fetcher, {
+  const { data: cps, error, mutate } = useSWR<CheckpointInfo[]>('/data/checkpoints', fetcher, {
     refreshInterval: 30_000,
   });
   const [busy, setBusy] = useState('');
@@ -50,7 +50,9 @@ export default function CheckpointPanel() {
   return (
     <Panel title="断点续传" meta="CLI 与前端任务共用 · 归档 = 重命名保留，不再续传">
       <Msg text={msg} />
-      {!cps?.length ? (
+      {error ? (
+        <Empty>加载断点列表失败：{error instanceof Error ? error.message : String(error)}</Empty>
+      ) : !cps?.length ? (
         <Empty>暂无断点文件 —— 回填/批量补数运行后这里出现各任务的断点</Empty>
       ) : (
         <table className="table-dense">

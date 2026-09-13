@@ -26,7 +26,7 @@ def test_cls_maps_columns():
         mock_ak.stock_info_global_cls.return_value = fake
         items = ClsTelegraphSource().fetch(date(2026, 9, 10))
     assert items[0].source == "telegraph"
-    assert items[0].source_name == "cls"
+    assert items[0].source_name == "cls_telegraph"  # 与注册名统一
     assert "央行" in items[0].content
     assert items[0].external_id == "2026-09-1010:00:00"
     assert items[0].published_at is not None

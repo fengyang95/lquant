@@ -4,6 +4,8 @@ CLI stderr 带结构化淘汰原因码 —— Agent 读错误即自我修正。
 """
 from __future__ import annotations
 
+import math
+
 import click
 
 
@@ -124,6 +126,10 @@ def submit(spec_path: str) -> None:
     import yaml
 
     spec = yaml.safe_load(Path(spec_path).read_text())
+    if not isinstance(spec, dict) or not spec.get("expr"):
+        raise click.ClickException(
+            "spec 结构非法：需要 YAML mapping 且包含 expr 字段（如 {expr: ..., rationale: ...}）"
+        )
     from lquant.factors.mining.submit import verify_and_register
 
     ok, payload = verify_and_register(spec)
@@ -385,8 +391,10 @@ def audit(expr: str, start: str | None, n_groups: int, horizons: str, agent: str
     t_nw = (ic.get("rank_ic") or ic.get("ic") or {}).get("t_stat_nw")
     q = _quota(agent, expr, float(t_nw) if t_nw is not None else float("nan"))
     rating = factor_rating(ic, qs, n_trials=q["n_trials"])
-    oos = (oos_decay(_icir(ic), _icir(ic_val))
-           if len(val) and _icir(ic_val) is not None else None)
+    # val 段 ICIR 须为有限值才做 oos 对比（_icir 缺数据返回 nan，nan is not None 恒真）
+    icir_val = _icir(ic_val)
+    oos = (oos_decay(_icir(ic), icir_val)
+           if len(val) and math.isfinite(icir_val) else None)
 
     cat = next((c for c in ("cov_industry_sw1", "industry_sw1") if c in train.columns), None)
     attr = None

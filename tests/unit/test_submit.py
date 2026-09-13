@@ -25,7 +25,7 @@ def _panel(n_days=120, n_sym=8):
 def test_verify_rejects_static_fail():
     from lquant.factors.mining.submit import verify_and_register
 
-    ok, payload = verify_and_register({"name": "bad", "expr": "Ts_Mean($closs,5)"})
+    ok, payload = verify_and_register({"name": "bad", "expr": "Ts_Mean($closs,5)", "rationale": "动量效应检验"})
     assert not ok and payload["grade"] == "REJECTED"
     assert payload["reason_code"] == "STATIC_FAIL"
 
@@ -45,14 +45,27 @@ def test_verify_grades_claimed(monkeypatch, tmp_path):
     monkeypatch.setattr(sub, "_split_eval", fake_split)
     ok, payload = sub.verify_and_register({
         "name": "t_fine", "expr": "Ts_Mean($close,5)", "agent": "tester",
+        "rationale": "短期反转效应，train 段 IC 稳定",
         "claimed": {"ic_mean": 0.051},
     })
     assert ok and payload["grade"] == "A"
     ok2, p2 = sub.verify_and_register({
         "name": "t_flip", "expr": "Ts_Mean($close,5)",
+        "rationale": "方向对拍用例",
         "claimed": {"ic_mean": -0.05},
     })
     assert not ok2 and p2["grade"] == "D"
+
+
+def test_verify_rejects_missing_rationale():
+    """铁律：无 rationale 的 spec 不得入库 —— 缺失/空串都拒。"""
+    import lquant.factors.mining.submit as sub
+
+    for spec in ({"name": "t_nr", "expr": "Ts_Mean($close,5)"},
+                 {"name": "t_nr2", "expr": "Ts_Mean($close,5)", "rationale": "   "}):
+        ok, payload = sub.verify_and_register(spec)
+        assert not ok and payload["reason_code"] == "MISSING_RATIONALE"
+        assert payload["stage"] == "G0"
 
 
 def test_verify_rejects_nan_tstat(monkeypatch):
@@ -74,6 +87,7 @@ def test_verify_rejects_nan_tstat(monkeypatch):
     monkeypatch.setattr(sub, "_archive", lambda spec, payload: archived.append(payload))
     ok, payload = sub.verify_and_register({
         "name": "t_nan", "expr": "Ts_Mean($close,5)", "agent": "tester",
+        "rationale": "短期反转效应",
     })
     assert not ok and payload["reason_code"] == "LOW_TSTAT"
     assert "nan" in (payload.get("hint") or "") or "无法计算" in (payload.get("hint") or "")

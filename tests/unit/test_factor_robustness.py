@@ -97,10 +97,11 @@ def test_param_sensitivity_reports_structure():
 
 
 def test_param_sensitivity_skips_when_no_window():
-    """无窗口的表达式不该被判失败 —— 没得扰动不等于脆弱。"""
+    """无窗口的表达式归为 insufficient（跳过），不算通过也不算失败。"""
     df = _price_panel()
     res = param_sensitivity(df, "Rank(Log($close))")
-    assert res["passed"] is True
+    assert res["passed"] is False
+    assert res["insufficient"] is True
     assert res["perturbations"] == []
     assert "跳过" in res["hint"]
 

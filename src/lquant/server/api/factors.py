@@ -6,22 +6,32 @@
 """
 from __future__ import annotations
 
+import os
 import re
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import polars as pl
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from lquant.core.db import reader
 from lquant.data.store.catalog import upsert
 from lquant.data.store.parquet import read_daily
-from lquant.factors.evaluate import evaluate, forward_return, save_report
+from lquant.factors.evaluate import evaluate, forward_return
 from lquant.factors.preprocess.pipeline import drop_nonfinite
 
 router = APIRouter(prefix="/factors", tags=["factors"])
+
+
+def _save_report_atomic(html_str: str, path: Path) -> Path:
+    """原子写报告：同因子名并发 evaluate 时不会互相截断损坏。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    tmp.write_text(html_str, encoding="utf-8")
+    os.replace(tmp, path)  # 同文件系统原子替换
+    return path
 
 REPORT_DIR = Path("data/reports")
 
@@ -33,7 +43,8 @@ class FactorIn(BaseModel):
 
 
 class EvaluateIn(BaseModel):
-    factor: str = "mom20"                # 报告名
+    factor: str = Field(default="mom20", max_length=64,
+                        pattern=r"^[A-Za-z0-9_-]+")  # 报告名（防路径穿越）
     formula: str = "pct_change_20"       # 支持 pct_change_{n} / rolling_std_{n}
     n_groups: int = Field(default=5, ge=2, le=20)
     horizons: list[int] = Field(default=[1, 5, 10, 20], min_length=1, max_length=20,
@@ -45,6 +56,22 @@ class EvaluateIn(BaseModel):
     style_threshold: float = Field(default=0.14, ge=0.0, le=1.0,
                                    description="中性化后风格相关性阈值（max|ρ| 判定线）")
 
+    @field_validator("start")
+    @classmethod
+    def _validate_start(cls, v: str) -> str:
+        try:
+            date.fromisoformat(v)
+        except (TypeError, ValueError):
+            raise ValueError("start 需为 YYYY-MM-DD 格式") from None
+        return v
+
+    @field_validator("top_ns")
+    @classmethod
+    def _validate_top_ns(cls, v: list[int]) -> list[int]:
+        if any(n < 1 or n > 3000 for n in v):
+            raise ValueError("top_ns 元素需在 1..3000 内")
+        return sorted(set(v))
+
 
 @router.get("")
 def list_factors(
@@ -54,7 +81,7 @@ def list_factors(
 ) -> list[dict]:
     """已注册因子（factor_def 表）。offset/limit 分页 + source 筛选。"""
     suffix = f"OFFSET {offset}" + (f" LIMIT {limit}" if limit else "")
-    where = f"WHERE d.source = '{source}'" if source else ""
+    where = "WHERE d.source = ?" if source else ""
     order = "icn DESC NULLS LAST" if not source else "created_at DESC"
     with reader() as con:
         try:
@@ -62,7 +89,8 @@ def list_factors(
                 "SELECT d.name, d.expression, d.description, d.source, d.factor_id, "
                 "i.ic_neutral AS icn, d.created_at FROM factor_def d "
                 "LEFT JOIN factor_ic i ON i.factor = d.name "
-                f"{where} ORDER BY {order} {suffix}"
+                f"{where} ORDER BY {order} {suffix}",
+                [source] if source else [],
             ).fetchall()
         except Exception:  # noqa: BLE001
             return []
@@ -223,7 +251,7 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
     res = evaluate(d, "_factor", ret_col=ret_col, n_groups=req.n_groups,
                    horizons=req.horizons)
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = save_report(res["report"], REPORT_DIR / f"{req.factor}.html")
+    report_path = _save_report_atomic(res["report"], REPORT_DIR / f"{req.factor}.html")
     ic = res["ic"]["ic"]
     ls = res["quantile"]["long_short"]
     metrics = {
@@ -759,7 +787,7 @@ def synthesize(req: SynthesizeIn) -> dict:
     tag = "icw" if req.method == "ic_weighted" else "eq"
     name = f"syn_{len(req.formulas)}f_{tag}"
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    save_report(res["report"], REPORT_DIR / f"{name}.html")
+    _save_report_atomic(res["report"], REPORT_DIR / f"{name}.html")
     ic = res["ic"]["ic"]
     ls = res["quantile"]["long_short"]
     return {

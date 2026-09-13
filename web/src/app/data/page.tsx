@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import useSWR from 'swr';
 import PageHeader from '@/components/PageHeader';
 import { Panel, Stat } from '@/components/Panel';
@@ -38,6 +38,11 @@ export default function DataPage() {
   const { data: health } = useSWR<CollectHealth>('/market/collect-status', fetcher, {
     refreshInterval: 60_000,
   });
+  const reloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 卸载后不再触发延迟刷新，避免对已卸载组件调 mutate
+  useEffect(() => () => {
+    if (reloadTimer.current) clearTimeout(reloadTimer.current);
+  }, []);
   const [busy, setBusy] = useState<'' | 'demo' | 'live' | 'ref'>('');
   const [msg, setMsg] = useState('');
 
@@ -49,7 +54,7 @@ export default function DataPage() {
       setMsg(
         `✓ 标的清单同步已开始（含退市股${r.sync_details ? ' + 详情补齐' : ''}），后台执行中，可稍后刷新查看退市股是否入表`,
       );
-      setTimeout(() => mutate(), 30_000);
+      reloadTimer.current = setTimeout(() => mutate(), 30_000);
     } catch (e) {
       setMsg(`✗ ${e instanceof Error ? e.message : e}`);
     } finally {

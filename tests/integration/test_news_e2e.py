@@ -122,7 +122,7 @@ def test_news_e2e_collect_link_api(client, mock_akshare):
     assert resp.status_code == 200
     summary = resp.json()["data"]
     by_source = {r["source"]: r["count"] for r in summary["by_source"]}
-    assert by_source.get("telegraph") == 2
+    assert by_source.get("cls_telegraph") == 2  # by_source 按来源名聚合（source_name）
     top = {r["industry_code"]: r["count"] for r in summary["top_industries"]}
     assert top.get("BK103010") == 1
 

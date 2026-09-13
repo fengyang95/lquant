@@ -91,14 +91,18 @@ class JQResult:
 # ---------- pandas 兼容层 ----------
 
 def _build_jq_pandas():
-    """聚宽沙箱用老版 pandas：``s[-1]`` 等负数下标按**位置**解释。
+    """聚宽沙箱用老版 pandas：``s[-1]`` / ``s[-5:]`` 等负数下标按**位置**解释。
 
-    新版 pandas 对整数/字符串索引一律按标签查，社区策略的主流写法
-    ``attribute_history(...)['close'][-1]`` 会直接 KeyError。这里用
-    Series 子类恢复老语义（负 int 标量 → iloc），其余行为不变；
-    负数切片新版本就按位置处理，无需干预。
+    新版 pandas 对 DatetimeIndex 的 int 键（标量或切片端点）一律按标签查，
+    社区策略的主流写法 ``attribute_history(...)['close'][-1]``、``history(5)[-5:]``
+    会直接 KeyError/TypeError。这里用 Series/DataFrame 子类恢复老语义：
+    负 int 标量与含 int 端点的切片 → iloc，其余行为不变。
     """
     import pandas as pd
+
+    def _is_int_slice(key):
+        return (isinstance(key, slice)
+                and any(isinstance(b, int) for b in (key.start, key.stop)))
 
     class _JQSeries(pd.Series):
         @property
@@ -108,6 +112,8 @@ def _build_jq_pandas():
         def __getitem__(self, key):
             # 老 pandas：非整数索引下，不在索引里的 int 键一律回退按位置取
             if isinstance(key, int) and key not in self.index:
+                return self.iloc[key]
+            if _is_int_slice(key):
                 return self.iloc[key]
             return super().__getitem__(key)
 
@@ -119,6 +125,11 @@ def _build_jq_pandas():
         @property
         def _constructor_sliced(self):
             return _JQSeries
+
+        def __getitem__(self, key):
+            if _is_int_slice(key):
+                return self.iloc[key]
+            return super().__getitem__(key)
 
     return _JQFrame
 
@@ -479,7 +490,8 @@ class JQRunner:
         def get_price(security, start_date=None, end_date=None,
                       frequency: str = "daily", fields=None, count: int | None = None,
                       panel: bool = True):
-            return r._get_price(security, start_date, end_date, fields, count)
+            return r._get_price(security, start_date, end_date, fields, count,
+                                panel=panel)
 
         def get_current_user_query_result(*a, **kw):   # 未支持项给清晰报错
             raise NotImplementedError("该聚宽 API 未支持（当前兼容日频核心子集）")
@@ -557,7 +569,9 @@ class JQRunner:
 
         布局对齐聚宽：单字段 → 列=证券；单证券 → 列=字段；多证券多字段 → MultiIndex。
         """
-        index = [row["day"] for row in rows]
+        # 统一用字符串日期做索引（与 _attribute_history 一致），
+        # 否则 s['2026-01-05'] 在两个接口行为相反
+        index = [str(row["day"]) for row in rows]
         try:
             import pandas as pd
         except ImportError:
@@ -627,7 +641,7 @@ class JQRunner:
                         ).set_index("day") if rows else _JQFrame(columns=fields)
 
     def _get_price(self, security, start_date=None, end_date=None,
-                   fields=None, count=None):
+                   fields=None, count=None, panel: bool = True):
         secs = [security] if isinstance(security, str) else list(security)
         fields = list(fields or ["open", "close", "high", "low", "volume"])
         dates = self._dates
@@ -652,9 +666,19 @@ class JQRunner:
             rows.append(row)
         # 聚宽语义：单标的 → 列=fields（history 才是单字段→列=证券，二者不同）；
         # 多标的 → (标的, 字段) MultiIndex。
-        index = [r["day"] for r in rows]
+        index = [str(r["day"]) for r in rows]  # 与 history/attribute_history 统一为字符串日期
         if _JQFrame is not None:
             import pandas as pd
+            if not panel and len(secs) > 1:
+                # 老聚宽 panel=False 语义：行=(日期, 标的) MultiIndex，列=fields
+                flat = _JQFrame(
+                    [{f: r.get(s, {}).get(f) for f in fields}
+                     for r in rows for s in secs],
+                    index=pd.MultiIndex.from_product(
+                        [[str(r["day"]) for r in rows], secs],
+                        names=["day", "code"]),
+                )
+                return flat
             if len(secs) == 1:
                 data = {f: [r.get(secs[0], {}).get(f) for r in rows] for f in fields}
                 return _JQFrame(data, index=index)

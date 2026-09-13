@@ -103,7 +103,10 @@ def factor_rating(ic_summary: dict, quantile: dict | None = None, *,
     # IC 序列零方差（完美因子）时 IR 在数学上无定义（除以 0），但它的含义是
     # 「稳定到没有波动」，不是「没数据」。这种情况按无穷大处理 ——
     # 否则最强的那类因子反而会卡在 moderate，评级就反向了。
-    if (not math.isfinite(icir) and _f(base.get("std")) == 0.0
+    # 零方差判定用 STD_EPS：polars 常数序列的 std 是 ~7e-18 而非 0。
+    from lquant.factors.evaluate.ic import STD_EPS
+
+    if (not math.isfinite(icir) and abs(_f(base.get("std"))) < STD_EPS
             and math.isfinite(ic_mean) and ic_mean != 0.0):
         icir = math.copysign(math.inf, ic_mean)
     t_nw = _f(base.get("t_stat_nw"))

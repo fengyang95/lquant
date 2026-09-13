@@ -103,4 +103,22 @@ describe('CheckpointPanel 断点续传管理', () => {
     fireEvent.click((await screen.findAllByRole('button', { name: '归档' }))[0]);
     expect(await screen.findByText(/✗/)).toBeInTheDocument();
   });
+
+  it('加载失败：显式错误态，不误显为「暂无断点」', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/data/checkpoints')) {
+        return new Response(JSON.stringify({ detail: '内部错误' }), {
+          status: 500, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response('not found', { status: 404 });
+    }));
+    render(
+      <SWRConfig value={{ provider: () => new Map() }}>
+        <CheckpointPanel />
+      </SWRConfig>,
+    );
+    expect(await screen.findByText(/加载断点列表失败/)).toBeInTheDocument();
+    expect(screen.queryByText(/暂无断点文件/)).not.toBeInTheDocument();
+  });
 });

@@ -20,7 +20,7 @@ from lquant.news.model import NewsItem
 from lquant.news.sources.akcompat import ak_call
 from lquant.news.sources.base import register
 
-_CLS_SOURCE = "cls"
+_CLS_SOURCE = "cls_telegraph"  # 与注册名一致，否则 /sources 聚合与 source 过滤对不上
 _SINA_SOURCE = "sina_7x24"
 
 
