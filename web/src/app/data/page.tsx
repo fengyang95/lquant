@@ -9,6 +9,8 @@ import { fetcher, post } from '@/lib/api';
 import TasksPanel from './TasksPanel';
 import SourceConfigPanel from './SourceConfigPanel';
 import CrosscheckPanel from './CrosscheckPanel';
+import QualityPanel from './QualityPanel';
+import CheckpointPanel from './CheckpointPanel';
 import CoverageMonthlyChart from './CoverageMonthlyChart';
 
 type Cover = {
@@ -36,8 +38,24 @@ export default function DataPage() {
   const { data: health } = useSWR<CollectHealth>('/market/collect-status', fetcher, {
     refreshInterval: 60_000,
   });
-  const [busy, setBusy] = useState<'' | 'demo' | 'live'>('');
+  const [busy, setBusy] = useState<'' | 'demo' | 'live' | 'ref'>('');
   const [msg, setMsg] = useState('');
+
+  async function syncReference() {
+    setBusy('ref');
+    setMsg('');
+    try {
+      const r = await post<{ accepted: boolean; sync_details: boolean }>('/data/reference/sync', {});
+      setMsg(
+        `✓ 标的清单同步已开始（含退市股${r.sync_details ? ' + 详情补齐' : ''}），后台执行中，可稍后刷新查看退市股是否入表`,
+      );
+      setTimeout(() => mutate(), 30_000);
+    } catch (e) {
+      setMsg(`✗ ${e instanceof Error ? e.message : e}`);
+    } finally {
+      setBusy('');
+    }
+  }
 
   async function collect(demo: boolean) {
     setBusy(demo ? 'demo' : 'live');
@@ -70,6 +88,9 @@ export default function DataPage() {
         sub={`数据湖与采集表覆盖度 · 共 ${totalRows.toLocaleString()} 行`}
         actions={
           <>
+            <button onClick={syncReference} disabled={busy !== ''} className="btn">
+              {busy === 'ref' ? '同步中…' : '同步全市场清单（含退市）'}
+            </button>
             <button onClick={() => collect(true)} disabled={busy !== ''} className="btn">
               {busy === 'demo' ? '采集中…' : '采今日看板（demo）'}
             </button>
@@ -81,10 +102,12 @@ export default function DataPage() {
       />
       <Msg text={msg} />
 
-      {/* 日线数据补全：任务进度 / 数据源配置 / 跨源印证 */}
+      {/* 日线数据补全：任务进度 / 断点续传 / 数据源配置 / 跨源印证 / 全湖质量检查 */}
       <TasksPanel />
+      <CheckpointPanel />
       <SourceConfigPanel />
       <CrosscheckPanel />
+      <QualityPanel />
 
       <Panel title="日线数据湖" meta="Parquet">
         {lake?.rows ? (

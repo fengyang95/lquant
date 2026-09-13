@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 from datetime import date
 from unittest.mock import patch
 
-import duckdb
 import pandas as pd
 import pytest
 
@@ -101,49 +99,37 @@ def test_em_news_plain_value_error_is_per_symbol_failure() -> None:
     assert items[0].symbols == ("600000.SH",)
 
 
-def _seed_db(tmp_path):
-    db_path = tmp_path / "test.duckdb"
-    con = duckdb.connect(str(db_path))
-    con.execute(
-        "CREATE TABLE daily_bar(symbol VARCHAR, trade_date DATE, amount DOUBLE)"
-    )
-    con.execute(
-        "INSERT INTO daily_bar VALUES "
-        "('000001.SZ', DATE '2026-09-10', 100.0), "
-        "('600000.SH', DATE '2026-09-10', 200.0), "
-        "('000001.SZ', DATE '2026-09-09', 999.0)"
-    )
-    con.commit()
-    con.close()
-    return db_path
+def _seed_lake(tmp_path):
+    """在临时 parquet 湖里写两天的日线。
+
+    活跃池读的是湖（parquet），不是 DuckDB `daily_bar` 表 ——
+    那张表只有 DDL、没有写入路径，恒空（曾经这里就是按幽灵表造的假）。
+    最近日 top1 应为 600000.SH；历史日 000001.SZ 成交额更大，不该被选中。
+    """
+    import polars as pl
+
+    root = tmp_path / "lake"
+    p = root / "daily" / "year=2026" / "part-0.parquet"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": ["000001.SZ", "600000.SH", "000001.SZ"],
+        "trade_date": [date(2026, 9, 10), date(2026, 9, 10), date(2026, 9, 9)],
+        "amount": [100.0, 200.0, 999.0],
+    }).write_parquet(p)
+    return root
 
 
-def _reader_stub(db_path):
-    """替换 lquant.core.db.reader 的上下文管理器工厂。"""
+def test_get_active_pool_top_amount_last_date(tmp_path, monkeypatch) -> None:
+    import lquant.data.store.parquet as pq
 
-    @contextlib.contextmanager
-    def _reader():
-        yield duckdb.connect(str(db_path))
+    monkeypatch.setattr(pq, "_root", lambda: _seed_lake(tmp_path))
 
-    return _reader
+    assert get_active_pool(limit=1) == ["600000.SH"]  # 最近交易日 + 成交额 top1,非历史 999
 
 
-def test_get_active_pool_top_amount_last_date(tmp_path) -> None:
-    db_path = _seed_db(tmp_path)
+def test_get_active_pool_empty_lake_returns_empty(tmp_path, monkeypatch) -> None:
+    import lquant.data.store.parquet as pq
 
-    with patch(
-        "lquant.news.sources.em_news.reader", _reader_stub(db_path)
-    ):
-        pool = get_active_pool(limit=1)
+    monkeypatch.setattr(pq, "_root", lambda: tmp_path / "empty-lake")
 
-    assert pool == ["600000.SH"]  # 最近交易日 + 成交额 top1,非历史 999
-
-
-def test_get_active_pool_missing_table_returns_empty(tmp_path) -> None:
-    db_path = tmp_path / "empty.duckdb"
-    duckdb.connect(str(db_path)).close()
-
-    with patch(
-        "lquant.news.sources.em_news.reader", _reader_stub(db_path)
-    ):
-        assert get_active_pool(limit=5) == []
+    assert get_active_pool(limit=5) == []

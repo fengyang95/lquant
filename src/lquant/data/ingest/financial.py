@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import date
 
+from lquant.core.types import today_cn
 from lquant.data.ingest.checkpoint import Checkpoint
 from lquant.data.store.catalog import FinancialRepo
 
@@ -25,7 +26,7 @@ def backfill_financial(
     from lquant.data.providers import get_provider
 
     start_d = start if isinstance(start, date) else date.fromisoformat(start)
-    end_d = end if isinstance(end, date) else (date.fromisoformat(end) if end else date.today())
+    end_d = end if isinstance(end, date) else (date.fromisoformat(end) if end else today_cn())
 
     provider = get_provider()
     target = provider.providers[0] if hasattr(provider, "providers") else provider

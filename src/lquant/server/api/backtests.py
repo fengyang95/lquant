@@ -289,6 +289,12 @@ def run_jq_code(req: JQCodeIn) -> dict:
     同步执行（湖内数据量秒级）；代码异常返回 422 并带堆栈。
     """
     from lquant.backtest.jqapi import JQRunner
+    from lquant.backtest.validation import validate_source
+
+    # 这里是用户代码入口，静态闸先过一遍再 exec（此前直接进 JQRunner，白名单形同虚设）
+    errs = validate_source(req.code)
+    if errs:
+        raise HTTPException(422, "；".join(errs))
 
     df = read_daily(start=req.start, end=req.end).collect()
     if not len(df):

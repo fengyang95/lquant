@@ -14,7 +14,7 @@ from __future__ import annotations
 import numpy as np
 import polars as pl
 
-from lquant.core.types import now_cn
+from lquant.core.types import now_cn, today_cn
 from lquant.data.store.catalog import EtfMetaRepo, SecurityRepo, TradeCalendarRepo
 from lquant.data.store.parquet import write_daily
 
@@ -81,7 +81,7 @@ def generate_demo(start: str = "2024-01-01", end: str | None = None) -> dict:
 
     from loguru import logger
 
-    end = end or date.today().isoformat()
+    end = end or today_cn().isoformat()
     dates = _calendar(start, end)["trade_date"].to_list()
     logger.info(f"生成演示数据 {len(dates)} 个交易日 {start}~{end}")
 
@@ -105,7 +105,7 @@ def generate_demo(start: str = "2024-01-01", end: str | None = None) -> dict:
         "name": [n for _, n, _ in ETF_CODES],
         "track_index": [n for _, n, _ in ETF_CODES],
         "sellable_after_days": [t for _, _, t in ETF_CODES],
-        "as_of": date.today(),
+        "as_of": today_cn(),
         "source": "demo",
     })
     EtfMetaRepo().upsert(etfs)

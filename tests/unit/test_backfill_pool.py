@@ -1,4 +1,5 @@
 """backfill_pool / Checkpoint.unmark 单元测试（不联网，mock provider）。"""
+
 from __future__ import annotations
 
 from datetime import date
@@ -72,11 +73,13 @@ class FakeProvider:
 def _df(symbols: list[str], rows_per_sym: int) -> pl.DataFrame:
     if not rows_per_sym or not symbols:
         return pl.DataFrame()
-    return pl.DataFrame({
-        "symbol": [s for s in symbols for _ in range(rows_per_sym)],
-        "date": [date(2024, 1, 2)] * (len(symbols) * rows_per_sym),
-        "close": [1.0] * (len(symbols) * rows_per_sym),
-    })
+    return pl.DataFrame(
+        {
+            "symbol": [s for s in symbols for _ in range(rows_per_sym)],
+            "date": [date(2024, 1, 2)] * (len(symbols) * rows_per_sym),
+            "close": [1.0] * (len(symbols) * rows_per_sym),
+        }
+    )
 
 
 @pytest.fixture
@@ -84,9 +87,7 @@ def no_lake(monkeypatch):
     """绕开真实血缘/入湖：_stamp 恒等，write_daily 只记账。"""
     written: list[pl.DataFrame] = []
     monkeypatch.setattr("lquant.data.ingest.daily._stamp", lambda df, source="baostock": df)
-    monkeypatch.setattr(
-        "lquant.data.ingest.daily.write_daily", written.append
-    )
+    monkeypatch.setattr("lquant.data.ingest.daily.write_daily", written.append)
     return written
 
 
@@ -170,9 +171,7 @@ def test_early_stop_after_10_all_failed_batches(fake_settings, no_lake):
     p = FakeProvider([("raise", RuntimeError("down"))] * 30)
     # 250 只 ÷ batch_size=25 = 10 批，第 10 批失败即触发早停
     pool = _pool(250)
-    res = backfill_pool(
-        pool, date(2024, 1, 1), provider=p, batch_size=25
-    )
+    res = backfill_pool(pool, date(2024, 1, 1), provider=p, batch_size=25)
     assert res["early_stopped"] is True
     assert len(p.calls) == 10
     assert res["done"] == 0
@@ -218,9 +217,7 @@ def test_on_progress_failed_frame_is_snapshot(fake_settings, no_lake):
 
     frames = []
     # 3 批各 1 只：第 1、3 批失败
-    p = FakeProvider(
-        [("raise", RuntimeError("x")), ("ok", 1), ("raise", RuntimeError("y"))]
-    )
+    p = FakeProvider([("raise", RuntimeError("x")), ("ok", 1), ("raise", RuntimeError("y"))])
     pool = [(s, D) for s in ("a", "b", "c")]
     backfill_pool(pool, date(2024, 1, 1), provider=p, batch_size=1, on_progress=frames.append)
     assert [f["failed"] for f in frames] == [
@@ -238,7 +235,10 @@ def test_on_progress_early_stop_flag(fake_settings, no_lake):
     frames = []
     p = FakeProvider([("raise", RuntimeError("x"))] * 30)
     backfill_pool(
-        _pool(50), date(2024, 1, 1), provider=p, batch_size=5,
+        _pool(50),
+        date(2024, 1, 1),
+        provider=p,
+        batch_size=5,
         on_progress=frames.append,
     )
     assert frames[-1]["early_stopped"] is True
@@ -302,7 +302,7 @@ def test_backfill_daily_delegates(fake_settings, no_lake, monkeypatch):
     monkeypatch.setattr(daily_mod, "backfill_pool", fake_pool)
     monkeypatch.setattr(
         "lquant.data.store.catalog.SecurityRepo.active_symbols",
-        lambda self: ["sh.600000", "sz.000001"],
+        lambda self, **kw: ["sh.600000", "sz.000001"],
     )
     n = daily_mod.backfill_daily(full=True, start="2024-01-01", end="2024-01-31")
     assert n == 7
@@ -319,8 +319,10 @@ def test_cp_name_isolation(fake_settings, no_lake):
     Checkpoint("daily").mark(["sh.600000"])
     p = FakeProvider([("ok", 1), ("ok", 1)])
     res = backfill_pool(
-        [("sh.600000", D), ("sh.600001", D)], date(2024, 1, 1),
-        provider=p, cp_name="task1",
+        [("sh.600000", D), ("sh.600001", D)],
+        date(2024, 1, 1),
+        provider=p,
+        cp_name="task1",
     )
     assert res["done"] == 2
     assert Checkpoint("task1").done == {"sh.600000", "sh.600001"}

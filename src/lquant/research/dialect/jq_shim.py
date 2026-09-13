@@ -31,14 +31,142 @@ def attribute_history(security, count=1, unit="1d", fields=("open", "close"),
     return out.to_pandas() if df else out
 
 
+def _history_frame(secs: list[str], fields: list[str], count: int,
+                   current_dt: date, fq: str | None = "pre",
+                   skip_paused: bool = False):
+    """read_daily 窗口 → 聚宽布局 DataFrame（index=交易日）。
+
+    与回测口径一致：严格 trade_date <= current_dt，无未来函数。
+    fq="pre"：p × f / f_latest（窗口内最新因子归一）；
+    fq="post"：p × f；fq=None：原始价。
+    """
+    from lquant.data.store.parquet import lake_is_empty, read_daily
+
+    lf = read_daily(symbols=secs, end=current_dt)
+    df = (lf.sort(["symbol", "trade_date"])
+            .group_by("symbol", maintain_order=True).tail(count).collect())
+    if df.is_empty():
+        # 读函数对空湖返回的是「有 schema 的空帧」，所以「帧为空」既可能是
+        # 没同步过、也可能是窗口内确实没这只标的 —— 两者提示不同，需显式问
+        # 湖是否为空。只在失败路径探文件系统，history 热路径不付代价。
+        if lake_is_empty("daily"):
+            raise ValueError(
+                f"无日线数据（数据根目录为空，先同步数据），无法取 {secs} 截至 {current_dt}")
+        raise ValueError(f"{secs} 无日线数据（窗口 {count} 天，截至 {current_dt}）")
+
+    # 复权在取字段前完成：price 列 × adj_factor（pre 再除以窗口内最新因子）。
+    # 因子缺失的行保留原始价（回填滞后不应把价格变 null）；「最新因子」取
+    # 时间序上最后一条非空因子，而非 max（因子理论上单调，但数据修正不保证）。
+    price_cols = [c for c in ("open", "high", "low", "close") if c in df.columns]
+    if fq in ("pre", "post") and price_cols and "adj_factor" in df.columns:
+        latest = (df.filter(pl.col("adj_factor").is_not_null())
+                    .sort("trade_date").group_by("symbol").last()
+                    .select(["symbol", pl.col("adj_factor").alias("_f_latest")]))
+        df = df.join(latest, on="symbol", how="left")
+        filled = pl.col("adj_factor").forward_fill().over(
+            "symbol", order_by="trade_date")
+        ratio = (pl.col("adj_factor") / pl.col("_f_latest")).fill_null(1.0)
+        if fq == "pre":
+            df = df.with_columns(filled)
+            df = df.with_columns(
+                [(pl.col(c) * ratio).alias(c) for c in price_cols])
+        else:
+            df = df.with_columns(filled)
+            df = df.with_columns(
+                [(pl.col(c) * pl.col("adj_factor").fill_null(1.0)).alias(c)
+                 for c in price_cols])
+        df = df.drop("adj_factor", "_f_latest")
+
+    if "avg" in fields or "money" in fields:
+        derived = []
+        if "avg" in fields and {"open", "high", "low", "close"} <= set(df.columns):
+            derived.append(((pl.col("open") + pl.col("high")
+                             + pl.col("low") + pl.col("close")) / 4.0).alias("avg"))
+        if "money" in fields and "amount" in df.columns:
+            derived.append(pl.col("amount").alias("money"))
+        if derived:
+            df = df.with_columns(derived)
+
+    cells: dict[tuple[str, str], dict[date, float]] = {}
+    for s in secs:
+        sub = df.filter(pl.col("symbol") == s)
+        if skip_paused:
+            sub = sub.drop_nulls(subset=["close"])
+        for f in fields:
+            if f not in sub.columns:
+                raise ValueError(
+                    f"history 字段 {f!r} 未支持，可用：open/high/low/close/"
+                    "volume/money(=amount)/avg/turnover_rate/pe_ttm/...")
+            cells[(s, f)] = dict(zip(sub["trade_date"].to_list(),
+                                     sub[f].to_list(), strict=True))
+
+    day_index = sorted({d for m in cells.values() for d in m})
+
+    def _cell(s: str, f: str, d: date):
+        return cells[(s, f)].get(d)
+
+    try:
+        import pandas as pd
+    except ImportError:
+        if len(fields) == 1:
+            f = fields[0]
+            return {s: [_cell(s, f, d) for d in day_index] for s in secs}
+        if len(secs) == 1:
+            return {f: [_cell(secs[0], f, d) for d in day_index] for f in fields}
+        return {s: {f: [_cell(s, f, d) for d in day_index] for f in fields}
+                for s in secs}
+
+    if len(fields) == 1:
+        f = fields[0]
+        return pd.DataFrame({s: [_cell(s, f, d) for d in day_index]
+                             for s in secs}, index=day_index)
+    if len(secs) == 1:
+        return pd.DataFrame({f: [_cell(secs[0], f, d) for d in day_index]
+                             for f in fields}, index=day_index)
+    cols = pd.MultiIndex.from_product([secs, fields])
+    return pd.DataFrame({c: [_cell(c[0], c[1], d) for d in day_index]
+                         for c in cols}, index=day_index)
+
+
 def history(count=1, unit="1d", field="avg", security_list=None, df=True,
             skip_paused=False, fq="pre"):
-    raise NotImplementedError("M6b")
+    if unit != "1d":
+        raise ValueError(f"history 仅支持日频，收到 unit={unit!r}")
+    if not df:
+        raise ValueError("history 目前仅支持 df=True（聚宽研究环境默认即 df）")
+    fields = [field] if isinstance(field, str) else list(field or ["close"])
+    secs = [str(s) for s in (security_list or _ctx().universe)]
+    return _history_frame(secs, fields, int(count), _ctx().current_dt,
+                          fq=fq, skip_paused=skip_paused)
 
 
 def get_fundamentals(query, date=None):
-    """必须走 PIT：pub_date <= 当前日。"""
-    raise NotImplementedError("M6b：先实现 financial_pit 的 pub_date 过滤")
+    """聚宽 get_fundamentals：严格 PIT，pub_date <= 当前日。
+
+    query 由 lquant.research.dialect.fundamentals 构造
+    （query(valuation.pe_ratio, income.net_profit).filter(...)...）。
+    """
+    from datetime import date as _date
+
+    from lquant.research.dialect import fundamentals as _fd
+
+    if not isinstance(query, _fd.Query):
+        raise ValueError(
+            "get_fundamentals 需要 fundamentals.query(...) 构造的查询对象，"
+            f"收到 {type(query).__name__}")
+    if date is None:
+        day = _ctx().current_dt
+    else:
+        day = date if isinstance(date, _date) else _date.fromisoformat(str(date))
+    out = _fd.resolve(query, day)
+    try:
+        import importlib.util
+
+        if importlib.util.find_spec("pandas") is None:
+            return out
+        return out.to_pandas()
+    except ImportError:
+        return out
 
 
 def order_target_value(security, value):

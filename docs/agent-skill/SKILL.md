@@ -12,16 +12,33 @@
 5. **rationale 必填**：submit 的 spec 里 rationale 为空会被拒。
 6. **读淘汰原因码**：LOW_IC / REDUNDANT / SIZE_PROXY / OOS_FAIL 都带可操作提示 ——
    "与 mom_20 相关 0.82，建议换字段族"就是下一轮的方向。
+7. **评级前先看单调性**：`audit` 报 Strong 却 |IC|<0.02 时要怀疑前视，不是庆祝 ——
+   日频 A 股 |IC|>0.05 是极稀有事件，出现即复核数据与中性化口径。
 
 ## 操作面（CLI）
 
     lq data fields               # 字段白名单 + 覆盖率（先看数据里有什么）
-    lq factor check "<expr>"     # G0 静态校验（毫秒）
-    lq factor eval "<expr>"      # 平台算 IC + 中性化对照 + 校正门槛 + 剩余配额
+    lq factor check "<expr>"     # L0 静态校验（毫秒，永远第一步）
+    lq factor eval "<expr>"      # L1 平台算 IC + 中性化对照 + 校正门槛 + 剩余配额
     lq factor series "<expr>"    # 逐日 IC 序列（平台算）
     lq factor corr "<e1>" "<e2>" # 库内查重/自查（提交前必做）
+    lq factor audit "<expr>"     # L2 全量评估：IC/ICIR、分层、衰减、归因、评级、OOS
+    lq factor robust "<expr>"    # L3 稳健性：参数扰动 / 分段稳定 / 起点敏感 / 月度剔除
+    lq factor report "<expr>"    # 出一份 HTML 评估报告（--out，默认 data/reports/）
     lq factor submit spec.yaml   # ★ 唯一入库通道，服务端重验（A/B 级入库）
     lq agent list / show / test  # 接入验收：lq agent test <name> 必须通过
+
+## 评估阶梯（L0→L3，逐层加深、逐层变贵）
+
+| 层 | 命令 | 回答的问题 | 通过意味着 |
+|---|---|---|---|
+| L0 | `check` | 语法/算子/字段合法吗？窗口 ≥1？ | 能进 GPU 级快筛 |
+| L1 | `eval` | 有信号吗？扣掉市值/行业/换手还剩多少？ | \|IC\| 过筛且未被中性化吃光 |
+| L2 | `audit` | 单调吗？衰减多快？收益归给谁？评级？ | 分层单调、OOS 未崩、评级 ≥ Moderate |
+| L3 | `robust` | 换个窗口还成立吗？换个起点呢？ | verdict=robust（≥4/5 项通过） |
+
+L2/L3 的数字一律由平台算，Agent 只读 JSON。评级口径见 `config/factors/rating.yaml`，
+缺失即用内置兜底，不会因为读不到配置而失败。
 
 ## spec.yaml 最小样例
 

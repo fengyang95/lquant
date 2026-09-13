@@ -16,7 +16,6 @@ import akshare as ak
 import pandas as pd
 
 from lquant.core.config import load_yaml
-from lquant.core.db import reader
 from lquant.news.model import NewsItem
 from lquant.news.sources.base import register
 
@@ -40,17 +39,16 @@ def _pool_limit() -> int:
 
 
 def get_active_pool(limit: int = 200) -> list[str]:
-    """daily_bar 最近交易日成交额 top N;表缺失/查询异常返回 [](不 raise)。"""
-    sql = """
-        SELECT symbol FROM daily_bar
-        WHERE trade_date = (SELECT max(trade_date) FROM daily_bar)
-        ORDER BY amount DESC
-        LIMIT ?
+    """最近交易日成交额 top N 的活跃股票池；湖空/查询异常返回 []（不 raise）。
+
+    走 parquet 湖（`read_daily`）而不是 DuckDB `daily_bar` 表 ——
+    日线只入 parquet，那张表恒空，查询"成功"但永远返回空池，
+    新闻采集会静默拿到 0 只标的。
     """
     try:
-        with reader() as con:
-            rows = con.execute(sql, [limit]).fetchall()
-        return [str(r[0]) for r in rows]
+        from lquant.data.store.parquet import latest_top_by_amount
+
+        return latest_top_by_amount(limit)
     except Exception:  # noqa: BLE001 - 股票池不可用时降级为空池
         logger.warning("get_active_pool 查询失败,返回空股票池", exc_info=True)
         return []

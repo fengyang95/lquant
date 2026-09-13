@@ -56,8 +56,11 @@ def _p_industry(panel, industry_df=None):
         raise CovariateUnavailable("industry classify data not provided")
     ind = industry_df.filter(pl.col("std") == "SW").select(["symbol", "std_date", "code"]).sort("std_date")
     d = _panel_sorted(panel).select(["trade_date", "symbol"]).unique()
+    # check_sortedness=False：带 by 组时 polars 无法跨组校验排序，每次调用都会
+    # 刷一条 UserWarning 噪音。组内按 trade_date 有序由上面的 sort 保证。
     out = d.join_asof(ind.rename({"code": "industry_sw1", "std_date": "ind_date"}),
-                      left_on="trade_date", right_on="ind_date", by="symbol", strategy="backward")
+                      left_on="trade_date", right_on="ind_date", by="symbol",
+                      strategy="backward", check_sortedness=False)
     return out.select(["trade_date", "symbol", "industry_sw1"])
 
 

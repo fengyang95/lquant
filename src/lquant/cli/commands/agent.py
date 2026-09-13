@@ -68,23 +68,24 @@ def test(name: str) -> None:
 @click.option("--enable/--disable", default=None)
 def freeze(name: str, enable: bool | None) -> None:
     """冻结/解冻 Agent（enabled 开关写回 yaml）。"""
-    from pathlib import Path
+    import hashlib
 
     import yaml
 
+    from lquant.core.config import find_root
     from lquant.factors.agents import find_agent
 
     a = find_agent(name)
     if not a:
         raise click.ClickException(f"Agent 未注册: {name}")
-    import hashlib
 
-    fp = next(iter(Path("config/agents").glob(f"{name}.yaml")))
+    root = find_root()
+    fp = next(iter((root / "config/agents").glob(f"{name}.yaml")))
     raw = yaml.safe_load(fp.read_text()) or {}
     new_enabled = (not a.enabled) if enable is None else enable
     raw["enabled"] = new_enabled
     # 冻结快照含 SKILL.md hash（方案 6.4）：Agent 手册被篡改即可发现
-    skill_fp = Path("docs/agent-skill/SKILL.md")
+    skill_fp = root / "docs/agent-skill/SKILL.md"
     if skill_fp.exists():
         raw["skill_sha256"] = hashlib.sha256(skill_fp.read_bytes()).hexdigest()[:16]
     fp.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False))

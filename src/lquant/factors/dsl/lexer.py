@@ -1,4 +1,4 @@
-"""词法分析。支持 $close、数字、算子名、+-*/()、逗号。"""
+"""词法分析。支持 $close、数字、算子名、+-*/()、逗号、# 行内注释。"""
 from __future__ import annotations
 
 import re
@@ -9,6 +9,7 @@ TOKEN_RE = re.compile(
   | (?P<number>\d+\.?\d*(?:[eE][+-]?\d+)?)
   | (?P<name>[A-Za-z_][A-Za-z0-9_]*)
   | (?P<op>[-+*/(),<>])
+  | (?P<comment>\#[^\n]*)
   | (?P<ws>\s+)
     """,
     re.VERBOSE,
@@ -25,7 +26,7 @@ def tokenize(src: str) -> list[tuple[str, str]]:
         kind = m.lastgroup
         text = m.group()
         pos = m.end()
-        if kind == "ws":
+        if kind in ("ws", "comment"):
             continue
         tokens.append((kind or "op", text))
     return tokens

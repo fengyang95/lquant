@@ -12,10 +12,9 @@
 """
 from __future__ import annotations
 
-from datetime import date
-
 import polars as pl
 
+from lquant.core.types import today_cn
 from lquant.data.store.catalog import EtfMetaRepo, SecurityRepo
 
 
@@ -74,7 +73,7 @@ def enrich_from_akshare() -> int:
             out[dst] = pdf[src].values
     if "fund_size" in out.columns:
         out["fund_size"] = out["fund_size"] / 1e8      # 元 → 亿元
-    out["as_of"] = date.today()
+    out["as_of"] = today_cn()
     out["source"] = "akshare"
 
     df = pl.from_pandas(out)

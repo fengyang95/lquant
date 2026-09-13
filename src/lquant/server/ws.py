@@ -28,8 +28,8 @@ _MAX_CONSECUTIVE_FAILURES = 3
 async def job_progress(ws: WebSocket, job_id: str) -> None:
     await ws.accept()
     try:
+        loop = asyncio.get_running_loop()
         while True:
-            loop = asyncio.get_event_loop()
             job = await loop.run_in_executor(None, get_job, job_id)
             if job is None:
                 # 兜底：job 队列查不到（本地降级注册表丢失 / Redis 清空 / 进程重启），
@@ -102,7 +102,7 @@ async def market_ticks(ws: WebSocket, symbols: str = Query(default="", max_lengt
             await _close(ws)
         return
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         failures = 0
         while True:
             try:

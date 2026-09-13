@@ -31,9 +31,32 @@ def _import_all() -> None:
         importlib.import_module("lquant.market.providers.mootdx")
 
 
+def _reorder_by_settings(chain: list[DataProvider]) -> list[DataProvider]:
+    """按 SettingsStore.providers_order 重排 Fallback 链（前端「主源」即刻生效）。
+
+    设计契约（日线回填设计 §2.3）：主源 = providers_order 首位，执行器与对拍
+    都从 SettingsStore 读。此前只有 crosscheck 读了，回填/增量仍按 yaml 顺序取
+    链头 —— 前端改主源对回填任务无效。
+
+    设置里没列到的源保持原相对顺序、排在已列源之后；
+    设置读不到（表不可用等）→ 原序返回（yaml 顺序即默认）。
+    """
+    try:
+        from lquant.core.settings_store import SettingsStore  # noqa: PLC0415
+
+        items = {i["key"]: i["value"] for i in SettingsStore().all()}
+        order = [n for n in (items.get("providers_order") or []) if n]
+    except Exception:  # noqa: BLE001 - 设置不可用不该炸构建
+        return chain
+    if not order:
+        return chain
+    rank = {name: i for i, name in enumerate(order)}
+    return sorted(chain, key=lambda p: rank.get(p.name, len(rank)))
+
+
 @lru_cache(maxsize=1)
 def build_chain() -> FallbackProvider:
-    """按 config/providers.yaml 顺序构建 Fallback 链。
+    """按 config/providers.yaml 顺序构建 Fallback 链，再按运行时 providers_order 重排。
 
     构建前对 config/schema/*.yaml 全量静态校验：映射错误启动即抛
     （fail-fast），绝不带着坏映射静默取数。
@@ -66,7 +89,7 @@ def build_chain() -> FallbackProvider:
         chain.append(cls(qps=item.get("qps", 1), capability=caps))   # type: ignore[call-arg]
     if not chain:
         raise RuntimeError("没有启用任何 provider，检查 config/providers.yaml")
-    return FallbackProvider(chain, HealthTracker())
+    return FallbackProvider(_reorder_by_settings(chain), HealthTracker())
 
 
 def get_provider() -> FallbackProvider:

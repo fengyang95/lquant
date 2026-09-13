@@ -6,6 +6,8 @@ A/B 级入库，C/D 级落 factor_replication 表归档正确数字（D = 研报
 from __future__ import annotations
 
 import json
+import math
+import time
 
 import polars as pl
 
@@ -15,51 +17,89 @@ GRADE_TOL_A = 0.005
 GRADE_TOL_B = 0.02
 
 
+def _read_industry_df(retries: int = 3, delay: float = 0.5):
+    """读 PIT 行业分类表，带锁冲突重试 —— 重试耗尽必须报错，绝不静默降级。
+
+    e2e 实测：另一个进程持有 DuckDB 文件锁（常驻 uvicorn / 并行 CLI 都会）时，
+    reader() 抛 IOException: Conflicting lock。这里若吞掉异常，行业协变量会
+    「随机消失」—— 同一表达式 eval 报 3 个协变量、audit 报 2 个，中性化口径
+    分叉，IC 数字不可比且无人察觉。表不存在（未 init_db 的新环境）仍按
+    「无行业数据」处理，交给 CovariateUnavailable 显式上报 coverage=0。
+    """
+    import duckdb
+
+    from lquant.core.db import reader as db_reader
+
+    last: Exception | None = None
+    for attempt in range(retries):
+        try:
+            with db_reader() as con:
+                return con.execute(
+                    "SELECT symbol, std, code, std_date FROM industry_classify").pl()
+        except duckdb.CatalogException:
+            return None     # 新环境未建表：无行业数据（会被 coverage=0 显式暴露）
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if attempt < retries - 1:
+                time.sleep(delay)
+    raise RuntimeError(
+        f"industry_classify 读取失败（重试 {retries} 次）: {last}。"
+        "常见原因：另一个进程持有 DuckDB 文件锁（常驻 uvicorn 或并行 CLI）。"
+        "拒绝静默降级 —— 无行业协变量的中性化 IC 与有行业时不可比。"
+    ) from last
+
+
 def _panel_with_covs(start=None):
     """读日线 + 协变量（市值/行业/换手率），与挖掘/评价统一口径。"""
-    from lquant.core.db import reader as db_reader
     from lquant.data.store.parquet import read_daily
     from lquant.factors.covariates import build_covariates
 
     df = read_daily(start=start).collect()
-    try:
-        with db_reader() as con:
-            ind = con.execute("SELECT symbol, std, code, std_date FROM industry_classify").pl()
-    except Exception:  # noqa: BLE001
-        ind = None
+    ind = _read_industry_df()
     covs = ["market_cap", "industry_sw1", "turnover_1m"]
     df, report = build_covariates(df, covs, industry_df=ind)
     present = [f"cov_{r['covariate']}" for r in report if r["coverage"] > 0]
     return df, present
 
 
-def _split_eval(df, cov_cols, expr):
-    """train/val 切分 + 重算 train/val IC（含中性化）。"""
+def prepare_segment(df, cov_cols, expr, dates, *, horizons=(1, 5)):
+    """在给定交易日子集上算因子 → 前瞻收益 → 中性化，返回分析就绪的 df。
+
+    train/val 切分、submit 重验、``lq factor audit`` 深度校验、``lq factor robust``
+    鲁棒性检验共用这一条实现 —— 口径一旦分叉，「JSON 里的 ic_mean」和
+    「报告里的 ic_mean」就对不上，这种不一致最难查。
+    """
     from lquant.factors.analysis import compute_factor_col
     from lquant.factors.evaluate import forward_return
-    from lquant.factors.evaluate.ic import ic_series
-    from lquant.factors.mining.runner import split_dates
     from lquant.factors.preprocess.pipeline import drop_nonfinite
     from lquant.factors.preprocess.pipeline import run as pipeline_run
 
+    sub = df.filter(pl.col("trade_date").is_in(list(dates)))
+    sub = forward_return(sub.sort(["symbol", "trade_date"]), "close", periods=list(horizons))
+    d = drop_nonfinite(compute_factor_col(sub, expr, "f"), "f")
+    if "fwd_ret_1" in d.columns:
+        d = drop_nonfinite(d, "fwd_ret_1")
+    if cov_cols:
+        d = pipeline_run(d, "f", [
+            {"op": "winsorize", "method": "mad", "n": 5},
+            {"op": "standardize", "method": "zscore"},
+            {"op": "neutralize", "method": "ols", "factors": cov_cols},
+        ])
+    d = drop_nonfinite(d, "f")
+    return d
+
+
+def _split_eval(df, cov_cols, expr):
+    """train/val 切分 + 重算 train/val IC（含中性化）。"""
+    from lquant.factors.evaluate.ic import ic_series
+    from lquant.factors.mining.runner import split_dates
+
     dates = df["trade_date"].unique().to_list()
     train_d, val_d, _ = split_dates(dates)
-    out = {}
-    for label, dd in (("train", train_d), ("val", val_d)):
-        sub = df.filter(pl.col("trade_date").is_in(dd))
-        sub = forward_return(sub.sort(["symbol", "trade_date"]), "close", periods=[1, 5])
-        d = drop_nonfinite(compute_factor_col(sub, expr, "f"), "f")
-        d = drop_nonfinite(d, "fwd_ret_1")
-        if cov_cols:
-            d = pipeline_run(d, "f", [
-                {"op": "winsorize", "method": "mad", "n": 5},
-                {"op": "standardize", "method": "zscore"},
-                {"op": "neutralize", "method": "ols", "factors": cov_cols},
-            ])
-        d = drop_nonfinite(d, "f")
-        s = ic_series(d, "f", "fwd_ret_1")
-        out[label] = s
-    return out
+    return {
+        label: ic_series(prepare_segment(df, cov_cols, expr, dd), "f", "fwd_ret_1")
+        for label, dd in (("train", train_d), ("val", val_d))
+    }
 
 
 def verify_and_register(spec: dict) -> tuple[bool, dict]:
@@ -115,9 +155,14 @@ def verify_and_register(spec: dict) -> tuple[bool, dict]:
             spec.get("assumptions", []))
     except Exception:  # noqa: BLE001
         pass
-    if t_val is not None and abs(t_val) < thr:
-        payload.update({"ok": False, "reason_code": "LOW_TSTAT",
-                        "hint": f"|t_val|={abs(t_val):.2f} < 校正门槛 {thr:.2f}"})
+    # t_val 为 nan（val 段天数不足或 IC 方差为 0）时不能放行：
+    # abs(nan) < thr 恒为 False，claimed 缺省时会把没有样本外证据的因子放进库。
+    if t_val is None or not math.isfinite(t_val) or abs(t_val) < thr:
+        if t_val is None or not math.isfinite(t_val):
+            hint = "val 段 IC 无法计算 t（天数不足或方差为 0），拒绝入库"
+        else:
+            hint = f"|t_val|={abs(t_val):.2f} < 校正门槛 {thr:.2f}"
+        payload.update({"ok": False, "reason_code": "LOW_TSTAT", "hint": hint})
         _archive(spec, payload)
         return False, payload
     if grade in ("A", "B") or claimed is None:

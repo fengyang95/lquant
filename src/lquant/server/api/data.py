@@ -8,12 +8,16 @@
 """
 from __future__ import annotations
 
+import threading
+
 import polars as pl
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from lquant.core.db import reader
-from lquant.data.ingest.tasks import (
+from lquant.data.ingest import tasks as ingest_tasks
+from lquant.data.ingest.reference import sync_reference
+from lquant.data.ingest.tasks import (  # noqa: F401  execute_task/run_claimed_task 保留模块属性供测试打桩
     TaskConflictError,
     claim_retry,
     create_task,
@@ -268,6 +272,42 @@ def quote(symbol: str = Query(min_length=6, max_length=16)) -> dict:
     }
 
 
+# ---------- 参考数据（标的清单含退市）同步 ----------
+
+# 一次只允许一个参考数据同步在后台跑（详情慢路径要 20-40 分钟）
+_ref_lock = threading.Lock()
+
+
+class ReferenceSyncIn(BaseModel):
+    sync_details: bool = Field(
+        default=False,
+        description="是否顺带逐只补 list_date/delist_date（慢路径，约 20-40 分钟）")
+
+
+@router.post("/reference/sync", status_code=202)
+def sync_reference_ep(req: ReferenceSyncIn) -> dict:
+    """同步参考数据（日历/标的/退市名单，可选详情）→ 202 后台执行。
+
+    409：上一次同步尚未结束。完成后 security 表含退市股，
+    全量回填（full_backfill）的前置校验即可通过。
+    """
+    if not _ref_lock.acquire(blocking=False):
+        raise HTTPException(409, "上一次参考数据同步尚未结束，请稍后再试")
+
+    def _job() -> None:
+        try:
+            sync_reference(skip_details=not req.sync_details)
+        except Exception as e:  # noqa: BLE001 - 后台任务失败只记日志
+            from loguru import logger
+
+            logger.exception(f"参考数据同步失败: {e}")
+        finally:
+            _ref_lock.release()
+
+    enqueue("lquant-ingest", _job)
+    return {"accepted": True, "sync_details": req.sync_details}
+
+
 # ---------- 数据任务（全量回填 / 每日增量，T4 执行器） ----------
 
 @router.post("/tasks", status_code=202)
@@ -283,7 +323,7 @@ def create_data_task(req: TaskIn) -> dict:
         raise HTTPException(409, str(e)) from e
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
-    enqueue("lquant-ingest", execute_task, task["task_id"])
+    enqueue("lquant-ingest", ingest_tasks.execute_task, task["task_id"])
     return {"task_id": task["task_id"]}
 
 
@@ -313,6 +353,9 @@ def retry_data_task(task_id: str) -> dict:
     task = get_task(task_id)
     if task is None:
         raise HTTPException(404, f"任务不存在: {task_id}")
+    if task["status"] == "pending":
+        # 排队中的任务走任务中心重跑；本端点保留旧口径（pending → 409）
+        raise HTTPException(409, f"任务 {task_id} 排队中（pending），不可 retry")
     if task["status"] == "ok":
         raise HTTPException(422, f"任务 {task_id} 状态 ok 不可 retry")
     try:
@@ -321,8 +364,107 @@ def retry_data_task(task_id: str) -> dict:
         raise HTTPException(409, str(e)) from e
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
-    enqueue("lquant-ingest", run_claimed_task, task_id)
+    enqueue("lquant-ingest", ingest_tasks.run_claimed_task, task_id)
     return {"task_id": task_id}
+
+
+# ---------- 全湖质量检查（`lq data check` 的 HTTP 入口） ----------
+
+class LakeCheckIn(BaseModel):
+    start: str | None = Field(default=None, max_length=10)
+    end: str | None = Field(default=None, max_length=10)
+
+
+@router.post("/check")
+def run_lake_check_ep(req: LakeCheckIn) -> dict:
+    """全湖质量校验（涨跌停/覆盖度/僵尸/复权/日历）→ 同步返回摘要。
+
+    issue 一律落 data_quality_issue（与 CLI/同步链路共用一张表）。
+    同步端点：validators 全是向量化计算，百万行秒级。
+    422：日期格式非法。
+    """
+    from datetime import date as _date
+
+    for name, val in (("start", req.start), ("end", req.end)):
+        if isinstance(val, str) and val:
+            try:
+                _date.fromisoformat(val)
+            except ValueError as e:
+                raise HTTPException(422, f"{name} 日期非法: {val}") from e
+
+    from lquant.data.quality.pipeline import run_lake_checks
+
+    issues = run_lake_checks(start=req.start, end=req.end)
+    by_sev = {"fatal": 0, "error": 0, "warn": 0, "info": 0}
+    for i in issues:
+        by_sev[i.severity] = by_sev.get(i.severity, 0) + 1
+    # fatal/error 排前面 —— 前端表格第一屏就该看到要紧的
+    rank = {"fatal": 0, "error": 1, "warn": 2, "info": 3}
+    issues.sort(key=lambda i: rank.get(i.severity, 9))
+    return {
+        "summary": {"total": len(issues), **by_sev},
+        "issues": [{
+            "rule": i.rule, "severity": i.severity, "detail": i.detail,
+            "dataset": i.dataset, "symbol": i.symbol,
+            "trade_date": str(i.trade_date) if i.trade_date else None,
+            "count": i.count,
+        } for i in issues[:100]],
+    }
+
+
+# ---------- 断点（checkpoint）管理 ----------
+
+@router.get("/checkpoints")
+def list_checkpoints() -> list[dict]:
+    """断点续传文件列表：名称/已完成数/更新时间/元信息（含已归档 .done-*.json）。"""
+    import json
+    from pathlib import Path
+
+    from lquant.core.config import get_settings
+
+    d = Path(get_settings().cache_dir) / "checkpoints"
+    out: list[dict] = []
+    if not d.exists():
+        return out
+    for p in sorted(d.glob("*.json")):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - 坏文件跳过，不阻塞列表
+            continue
+        if not isinstance(data, dict):
+            continue
+        meta = data.get("meta") or {}
+        out.append({
+            "name": p.stem,
+            "done": len(data.get("done") or []),
+            "updated_at": data.get("updated_at"),
+            "meta": meta if isinstance(meta, dict) else {},
+        })
+    return out
+
+
+@router.delete("/checkpoints/{name}")
+def archive_checkpoint(name: str) -> dict:
+    """归档断点（重命名为 <name>.done-<ts>.json，保留数据可追溯）。
+
+    换日期区间回填前清断点用 —— 归档后该断点不再参与续传。
+    404：断点不存在；422：名称非法（防路径穿越）。
+    """
+    import time
+    from pathlib import Path
+
+    from lquant.core.config import get_settings
+
+    if (not name or "/" in name or "\\" in name or ".." in name
+            or name.startswith(".")):
+        raise HTTPException(422, f"断点名非法: {name!r}")
+    src = Path(get_settings().cache_dir) / "checkpoints" / f"{name}.json"
+    if not src.exists():
+        raise HTTPException(404, f"断点不存在: {name}")
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    dst = src.with_name(f"{name}.done-{ts}.json")
+    src.rename(dst)
+    return {"name": name, "archived_to": dst.name}
 
 
 # ---------- 跨源对拍 ----------

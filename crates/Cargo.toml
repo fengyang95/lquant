@@ -20,6 +20,8 @@ polars = { version = "0.55", features = ["lazy"] }
 polars-ops = { version = "0.55", features = ["object"] }
 polars-mem-engine = { version = "0.55", features = ["python"] }
 polars-stream = { version = "0.55", features = ["python"] }
-pyo3 = { version = "0.29", features = ["extension-module"] }
+# 注意：extension-module 不在此处开启——它会让测试二进制跳过链接 libpython
+# （undefined symbol: PyBytes_*）。各 crate 通过自有 feature 控制见各 Cargo.toml。
+pyo3 = { version = "0.29" }
 pyo3-polars = { version = "0.28", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

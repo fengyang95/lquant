@@ -1,0 +1,23 @@
+# 因子评级阈值（evaluate/rating.py 读取；缺文件/缺字段一律回退代码默认值）
+#
+# 这里放的是「一条因子够不够格」的口径 —— 改这里等于改全平台的评级标准，
+# 所以宁可显式写出来，也不要散在代码里各处魔法数字。
+#
+# 参考口径：A 股日频。|IC|>0.05 属于罕见（先怀疑数据错误或未来函数），
+# 0.02 是有效线，低于它基本是噪声。
+rating:
+  ic_strong: 0.03          # |IC| 强信号线（strong 的必要条件之一）
+  ic_moderate: 0.02        # |IC| 有效线（低于它直接 weak）
+
+  icir_strong: 0.5         # |ICIR| 强线（ICIR = IC 均值 / IC 标准差）
+  icir_moderate: 0.3
+
+  ls_sharpe_strong: 1.0    # 多空夏普
+  ls_sharpe_moderate: 0.5
+
+  monotonicity_strong: 0.8 # 分组收益与组序号的 Spearman 相关
+  monotonicity_moderate: 0.5
+
+  # >0 时作为附加 t 门槛，与「多重检验校正门槛 sqrt(2·ln n_trials)」取较大者。
+  # 保持 0 = 只信赖校正门槛 + ICIR 口径，不额外加固定 t 线。
+  t_stat_strong: 0.0

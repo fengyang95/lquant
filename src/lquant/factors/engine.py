@@ -42,6 +42,12 @@ class FactorEngine:
         if len(steps) > 1:
             inter = ([f"{pref}{i + 1}" for i in range(len(steps) - 1)]
                      + [f"__step{i + 1}" for i in range(len(steps))])
+            # rename 到已存在的列名会抛 DuplicateError —— 与单步路径的
+            # with_columns 覆盖语义不一致（robust 的 train 帧自带上一轮
+            # prepare_segment 算出的 f 列，正是这么崩的）。先丢旧列，保证
+            # 「同名列 = 覆盖重算」在两条路径上行为一致。
+            if name in out.columns:
+                out = out.drop(name)
             out = out.rename({f"{pref}{len(steps)}": name}).drop(inter)
         return out
 

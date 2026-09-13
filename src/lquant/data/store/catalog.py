@@ -3,6 +3,7 @@
 约定：所有 upsert 都按目标表列自动对齐 —— 上游 DataFrame 少列补 NULL，
 多列丢弃。这样 provider 换源时不必保证列完全一致（换源 80% 的坑在这里）。
 """
+
 from __future__ import annotations
 
 from datetime import date
@@ -41,8 +42,7 @@ def _upsert(table: str, df: pl.DataFrame, *, epoch_cols: tuple[str, ...] | None 
         con.register("_tmp", df)
         if has_pk:
             con.execute(
-                f'INSERT OR REPLACE INTO "{table}" '
-                f'SELECT {", ".join(projection)} FROM _tmp'
+                f'INSERT OR REPLACE INTO "{table}" SELECT {", ".join(projection)} FROM _tmp'
             )
         else:
             keys = epoch_cols or ("trade_date",)
@@ -51,8 +51,7 @@ def _upsert(table: str, df: pl.DataFrame, *, epoch_cols: tuple[str, ...] | None 
                 deps = ", ".join(keys)
                 sel = ", ".join(f"_tmp.{k}" for k in keys)
                 con.execute(
-                    f'DELETE FROM "{table}" WHERE ({deps}) IN '
-                    f'(SELECT DISTINCT {sel} FROM _tmp)'
+                    f'DELETE FROM "{table}" WHERE ({deps}) IN (SELECT DISTINCT {sel} FROM _tmp)'
                 )
             con.execute(f'INSERT INTO "{table}" SELECT {", ".join(projection)} FROM _tmp')
     return len(df)
@@ -84,12 +83,22 @@ class TradeCalendarRepo:
 
 
 class SecurityRepo:
-    def active_symbols(self) -> list[str]:
+    def active_symbols(self, *, exclude_index: bool = False) -> list[str]:
+        """未退市标的（按代码序）。
+
+        exclude_index=True：剔除指数 —— 指数点位超价格护栏、量纲不满足
+        close×volume≈amount，且 daily_bar 的 fill.sec_type=stock 对指数
+        语义就是错的；日线湖只收 stock/etf/lof。
+        """
+        # OR 必须加括号：否则 AND 只绑定右支，delist_date IS NULL 的行不受过滤
+        sql = (
+            "SELECT symbol FROM security WHERE (delist_date IS NULL OR delist_date > current_date)"
+        )
+        if exclude_index:
+            sql += " AND sec_type <> 'index'"
+        sql += " ORDER BY symbol"
         with reader() as con:
-            rows = con.execute(
-                "SELECT symbol FROM security WHERE delist_date IS NULL "
-                "OR delist_date > current_date ORDER BY symbol"
-            ).fetchall()
+            rows = con.execute(sql).fetchall()
         return [r[0] for r in rows]
 
     def all_symbols(self) -> list[str]:
@@ -106,8 +115,10 @@ class SecurityRepo:
 
     def pending_details(self, limit: int | None = None) -> list[str]:
         """还没补到 list_date 的标的 —— 增量补详情用。"""
-        sql = ("SELECT symbol FROM security WHERE list_date IS NULL "
-               "AND sec_type <> 'index' ORDER BY symbol")
+        sql = (
+            "SELECT symbol FROM security WHERE list_date IS NULL "
+            "AND sec_type <> 'index' ORDER BY symbol"
+        )
         if limit:
             sql += f" LIMIT {int(limit)}"
         with reader() as con:
@@ -214,8 +225,8 @@ class IndexConsRepo:
 
     def _batch_eff_date(self, con, index_code: str, d: date) -> date | None:
         row = con.execute(
-            "SELECT max(eff_date) FROM index_cons "
-            "WHERE index_code = ? AND eff_date <= ?", [index_code, d],
+            "SELECT max(eff_date) FROM index_cons WHERE index_code = ? AND eff_date <= ?",
+            [index_code, d],
         ).fetchone()
         return row[0] if row and row[0] is not None else None
 

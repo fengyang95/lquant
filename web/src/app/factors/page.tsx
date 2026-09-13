@@ -16,6 +16,14 @@ import { get, post } from '@/lib/api';
 import { C, SERIES_COLORS, axes, legend, tooltip } from '@/lib/chart';
 
 type FactorRow = { name: string; expression: string; description: string; created_at: string };
+type TopNRow = {
+  n: number; annual_return: number | null; annual_excess: number | null;
+  excess_sharpe: number | null; max_drawdown: number | null; annual_turnover: number | null;
+};
+type StyleRow = {
+  style: string; kind: string; corr_mean: number | null;
+  corr_abs_max: number | null; passed: boolean | null;
+};
 type EvalResult = {
   factor: string;
   n_samples: number;
@@ -25,6 +33,10 @@ type EvalResult = {
   monotonicity: number;
   half_life: number | null;
   suggested_rebalance: string;
+  excess: { annual_excess: number | null; excess_sharpe: number | null; excess_mdd: number | null };
+  annual_turnover: number | null;
+  top_n: TopNRow[];
+  style_corr: { max_abs: number | null; passed: boolean | null };
   report_url: string;
 };
 type EvalSeries = {
@@ -47,6 +59,9 @@ type EvalSeries = {
     rank_ic: (number | null)[];
     ir: (number | null)[];
   };
+  excess?: { dates: string[]; curves: Record<string, (number | null)[]>; benchmark: string };
+  top_n?: TopNRow[];
+  style_corr?: { styles: StyleRow[]; threshold: number; max_abs: number | null; passed: boolean | null };
 };
 type CorrResult = {
   factors: string[];
@@ -96,6 +111,9 @@ export default function FactorsPage() {
   const [corr, setCorr] = useState<CorrResult | null>(null);
   const [syn, setSyn] = useState<SynResult | null>(null);
   const [builtinQuery, setBuiltinQuery] = useState('');
+  const [customFormula, setCustomFormula] = useState('');
+  const [corrStart, setCorrStart] = useState('2026-01-01');
+  const [corrThreshold, setCorrThreshold] = useState(0.8);
 
   // 内置因子按族浏览 + 搜索（158 个）
   const builtinShown = useMemo(() => {
@@ -222,8 +240,36 @@ export default function FactorsPage() {
     };
   }, [evalSeries]);
 
+  const excessOption = useMemo(() => {
+    const ex = evalSeries?.excess;
+    if (!ex?.dates.length) return null;
+    const mk = (k: string, name: string, color: string, width: number) => ({
+      name, type: 'line' as const, data: ex.curves[k] ?? [], showSymbol: false,
+      lineStyle: { width, color }, itemStyle: { color },
+    });
+    return {
+      tooltip: { ...tooltip, valueFormatter: (v: number) => v?.toFixed(3) },
+      legend: legend({ top: 0 }),
+      grid: { left: 48, right: 20, top: 30, bottom: 24 },
+      dataZoom: [{ type: 'inside' as const }],
+      ...axes({ data: ex.dates }, { scale: true, name: '超额净值' }),
+      series: [
+        mk(`ex_q${evalSeries!.n_groups}`, '最高组超额', C.up, 2.5),
+        mk('ex_q1', '最低组超额', C.down, 1.5),
+        mk('ex_long_short', '多空相对强弱', C.indigo, 1.5),
+      ],
+    };
+  }, [evalSeries]);
+
   function toggle(f: string) {
     setPicked((p) => (p.includes(f) ? p.filter((x) => x !== f) : [...p, f]));
+  }
+
+  function addCustom() {
+    const f = customFormula.trim();
+    if (!f || picked.includes(f) || picked.length >= 8) return;
+    setPicked((p) => [...p, f]);
+    setCustomFormula('');
   }
 
   async function register() {
@@ -271,11 +317,27 @@ export default function FactorsPage() {
     }
   }
 
+  async function seedYaml() {
+    setBusy('seed');
+    setMsg('');
+    try {
+      const r = await post<{ seeded: number }>('/factors/seed-yaml', {});
+      setMsg(`✓ 已入库 ${r.seeded} 个 YAML 自定义因子`);
+      mutate();
+    } catch (e) {
+      setMsg(`✗ ${e instanceof Error ? e.message : e}`);
+    } finally {
+      setBusy('');
+    }
+  }
+
   async function analyze() {
     setBusy('corr');
     setMsg('');
     try {
-      setCorr(await post<CorrResult>('/factors/analyze', { formulas: picked }));
+      setCorr(await post<CorrResult>('/factors/analyze', {
+        formulas: picked, start: corrStart, threshold: corrThreshold,
+      }));
     } catch (e) {
       setMsg(`✗ ${e instanceof Error ? e.message : e}`);
     } finally {
@@ -287,7 +349,9 @@ export default function FactorsPage() {
     setBusy('syn');
     setMsg('');
     try {
-      setSyn(await post<SynResult>('/factors/synthesize', { formulas: picked, method }));
+      setSyn(await post<SynResult>('/factors/synthesize', {
+        formulas: picked, method, start: corrStart,
+      }));
     } catch (e) {
       setMsg(`✗ ${e instanceof Error ? e.message : e}`);
     } finally {
@@ -413,6 +477,77 @@ export default function FactorsPage() {
         </Panel>
       )}
 
+      {evalRes && (
+        <Panel
+          title="超额与持仓收缩"
+          meta={`基准：股票池等权 · 几何超额口径${evalRes.style_corr?.passed != null ? (evalRes.style_corr.passed ? ' · 风格相关性 ✓ 达标' : ' · 风格相关性 ⚠ 超阈值') : ''}`}
+        >
+          <div className="grid grid-cols-2 gap-y-4 divide-line md:grid-cols-5 md:divide-x">
+            <div className="pr-4">
+              <Stat label="年化超额(最高组)"
+                value={evalRes.excess?.annual_excess != null ? `${(evalRes.excess.annual_excess * 100).toFixed(2)}%` : '—'}
+                tone={(evalRes.excess?.annual_excess ?? 0) > 0 ? 'text-up' : 'text-down'} />
+            </div>
+            <div className="px-4">
+              <Stat label="超额夏普" value={evalRes.excess?.excess_sharpe ?? '—'} />
+            </div>
+            <div className="px-4">
+              <Stat label="超额最大回撤"
+                value={evalRes.excess?.excess_mdd != null ? `${(evalRes.excess.excess_mdd * 100).toFixed(2)}%` : '—'}
+                tone="text-down" />
+            </div>
+            <div className="px-4">
+              <Stat label="年化换手(多空)"
+                value={evalRes.annual_turnover != null ? `${(evalRes.annual_turnover * 100).toFixed(0)}%` : '—'} />
+            </div>
+            <div className="px-4">
+              <Stat label="风格相关 max|ρ|"
+                value={evalRes.style_corr?.max_abs != null ? evalRes.style_corr.max_abs.toFixed(3) : '—'}
+                hint="阈值 0.14" />
+            </div>
+          </div>
+          {(evalRes.top_n?.length ?? 0) > 0 && (
+            <div className="mt-5">
+              <div className="mb-2 text-xs text-ink-faint">
+                Top-N 持仓收缩测试：头部集中通常收益不升、波动加大 —— 头部靠数量而非强度时会露馅
+              </div>
+              <table className="table-dense">
+                <thead>
+                  <tr>
+                    <th className="text-left">持仓数</th>
+                    <th className="text-left">年化收益</th>
+                    <th className="text-left">年化超额</th>
+                    <th className="text-left">超额夏普</th>
+                    <th className="text-left">最大回撤</th>
+                    <th className="text-left">年化换手</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {evalRes.top_n.map((r) => (
+                    <tr key={r.n}>
+                      <td className="font-medium">Top {r.n}</td>
+                      <td className={`font-mono ${(r.annual_return ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
+                        {r.annual_return != null ? `${(r.annual_return * 100).toFixed(2)}%` : '—'}
+                      </td>
+                      <td className={`font-mono ${(r.annual_excess ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
+                        {r.annual_excess != null ? `${(r.annual_excess * 100).toFixed(2)}%` : '—'}
+                      </td>
+                      <td className="font-mono">{r.excess_sharpe ?? '—'}</td>
+                      <td className="font-mono text-down">
+                        {r.max_drawdown != null ? `${(r.max_drawdown * 100).toFixed(2)}%` : '—'}
+                      </td>
+                      <td className="font-mono">
+                        {r.annual_turnover != null ? `${(r.annual_turnover * 100).toFixed(0)}%` : '—'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Panel>
+      )}
+
       {/* 图表加载失败显式提示（缺陷 #4：不再伪装成「样本不足」） */}
       {seriesError && (
         <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
@@ -436,6 +571,11 @@ export default function FactorsPage() {
           <Panel title="分层净值曲线" meta={`${evalSeries.n_groups} 组 + 多空`}>
             {quantileOption
               ? <Chart option={quantileOption} height={280} />
+              : <Empty>样本不足</Empty>}
+          </Panel>
+          <Panel title="超额净值曲线" meta={`相对${evalSeries.excess?.benchmark ?? '股票池等权'}基准 · 稳定上行 = 真超额`}>
+            {excessOption
+              ? <Chart option={excessOption} height={280} />
               : <Empty>样本不足</Empty>}
           </Panel>
           <div className="space-y-5">
@@ -465,6 +605,43 @@ export default function FactorsPage() {
                     </div>
                   );
                 })}
+              </div>
+            ) : <Empty>协变量数据不足</Empty>}
+          </Panel>
+          <Panel
+            title="中性化后风格相关性"
+            meta={(evalSeries.style_corr?.styles?.length ?? 0) > 0
+              ? `市值+行业中性化残差 vs 风格 · 阈值 ${evalSeries.style_corr?.threshold ?? 0.14}`
+              : '市值+行业中性化残差 vs 风格'}
+          >
+            {(evalSeries.style_corr?.styles?.length ?? 0) > 0 ? (
+              <div className="space-y-1.5 px-1 py-2 text-xs">
+                {evalSeries.style_corr!.styles.map((s) => {
+                  const v = s.corr_abs_max;
+                  const ok = s.passed;
+                  return (
+                    <div key={s.style} className="flex items-center gap-2 rounded-sm px-1">
+                      <span className="w-32 truncate text-ink-dim" title={s.style}>
+                        {s.style.replace(/^cov_/, '')}{s.kind.startsWith('cat') ? ' (eta)' : ''}
+                      </span>
+                      <div className="h-3 flex-1 rounded-sm bg-ink-faint/10">
+                        {v != null && (
+                          <div className="h-3 rounded-sm"
+                            style={{ width: `${Math.min(v * 100, 100)}%`, background: ok ? 'var(--c-up, #1E7C55)' : 'var(--c-down, #C3352B)' }} />
+                        )}
+                      </div>
+                      <span className="w-14 text-right font-mono">{v != null ? v.toFixed(3) : '—'}</span>
+                      <span className="w-8 text-right">{ok == null ? '—' : ok ? '✓' : '⚠'}</span>
+                    </div>
+                  );
+                })}
+                {evalSeries.style_corr?.passed != null && (
+                  <div className={`px-1 pt-1 ${evalSeries.style_corr.passed ? 'text-up' : 'text-gold'}`}>
+                    {evalSeries.style_corr.passed
+                      ? '✓ 所有风格 max|ρ| 均在阈值内 —— 中性化后未偷风格暴露'
+                      : '⚠ 存在超阈值风格相关 —— alpha 可能是某个风格的马甲，继续加中性化或重设计'}
+                  </div>
+                )}
               </div>
             ) : <Empty>协变量数据不足</Empty>}
           </Panel>
@@ -531,6 +708,52 @@ export default function FactorsPage() {
         }
       >
         <div className="mb-4 flex flex-wrap gap-1">
+          {picked.map((f) => (
+            <button
+              key={f}
+              title="点击移除"
+              onClick={() => toggle(f)}
+              className={`tag ${FORMULAS.includes(f) ? 'tag-on' : ''}`}
+            >
+              {f} ×
+            </button>
+          ))}
+        </div>
+
+        <div className="mb-4 flex flex-wrap items-center gap-2">
+          <input
+            value={customFormula}
+            onChange={(e) => setCustomFormula(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') addCustom(); }}
+            list="builtin-factors"
+            placeholder="自定义公式 / DSL（如 $close/$open 或 CORR60），回车添加"
+            className="input input-mono w-72 py-1 text-xs"
+          />
+          <datalist id="builtin-factors-lab">
+            {(builtin ?? []).map((b) => <option key={b.name} value={b.name}>{b.formula}</option>)}
+            {['pct_change_5', 'pct_change_10', 'pct_change_20', 'rolling_std_20', 'turnover']
+              .map((f) => <option key={f} value={f} />)}
+          </datalist>
+          <button onClick={addCustom} disabled={!customFormula.trim()} className="btn btn-sm">
+            添加
+          </button>
+          <span className="text-xs text-ink-faint">
+            已选 {picked.length}/8 ·
+          </span>
+          <label className="flex items-center gap-1 text-xs text-ink-dim">
+            起始日
+            <input type="date" value={corrStart} onChange={(e) => setCorrStart(e.target.value)}
+              className="input w-36 py-1 text-xs" />
+          </label>
+          <label className="flex items-center gap-1 text-xs text-ink-dim">
+            冗余阈值
+            <input type="number" min={0.5} max={1} step={0.05} value={corrThreshold}
+              onChange={(e) => setCorrThreshold(Number(e.target.value))}
+              className="input w-20 py-1 text-xs" />
+          </label>
+        </div>
+
+        <div className="mb-4 flex flex-wrap gap-1">
           {FORMULAS.map((f) => (
             <button
               key={f}
@@ -545,7 +768,7 @@ export default function FactorsPage() {
         {corr && (
           <div className="mb-4 overflow-x-auto">
             <div className="mb-1 text-xs text-ink-faint">
-              横截面 Spearman 相关（{corr.n_dates} 日均值）· |ρ|≥0.8 判冗余
+              横截面 Spearman 相关（{corr.n_dates} 日均值）· |ρ|≥{corrThreshold} 判冗余
             </div>
             <table className="text-xs">
               <thead>
@@ -614,13 +837,22 @@ export default function FactorsPage() {
         title="已注册因子"
         meta={<>共 {shownFactors.length} 个 · Qlib Alpha158 内置因子可一键入库</>}
         actions={
-          <button
-            onClick={seedBuiltin}
-            disabled={busy === 'seed'}
-            className="btn btn-sm"
-          >
-            {busy === 'seed' ? '入库中…' : '一键入库内置因子'}
-          </button>
+          <>
+            <button
+              onClick={seedBuiltin}
+              disabled={busy === 'seed'}
+              className="btn btn-sm"
+            >
+              {busy === 'seed' ? '入库中…' : '一键入库内置因子'}
+            </button>
+            <button
+              onClick={seedYaml}
+              disabled={busy === 'seed'}
+              className="btn btn-sm"
+            >
+              导入 YAML 因子
+            </button>
+          </>
         }
       >
         <div className="mb-3 flex flex-wrap items-center gap-1">

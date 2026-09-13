@@ -18,8 +18,9 @@ const GROUPS: { label: string; items: { href: string; label: string }[] }[] = [
     label: '研究',
     items: [
       { href: '/factors', label: '因子' },
+      { href: '/factors/mine', label: '因子挖掘' },
+      { href: '/factors/reports', label: '因子报告' },
       { href: '/backtests', label: '回测' },
-      { href: '/strategies/editor', label: '策略编辑' },
       { href: '/paper', label: '模拟盘' },
     ],
   },
@@ -28,6 +29,8 @@ const GROUPS: { label: string; items: { href: string; label: string }[] }[] = [
     items: [
       { href: '/data', label: '数据总览' },
       { href: '/sync', label: '同步' },
+      { href: '/tasks', label: '任务管理' },
+      { href: '/monitor', label: '监控' },
     ],
   },
 ];

@@ -16,7 +16,7 @@ import polars as pl
 
 from lquant.factors.evaluate.attribution import attribution_summary, exposure
 from lquant.factors.evaluate.decay import decay_profile, decay_summary, half_life, suggest_rebalance
-from lquant.factors.evaluate.ic import ic_by_year, ic_series, ic_summary
+from lquant.factors.evaluate.ic import ic_autocorr, ic_by_year, ic_series, ic_summary
 from lquant.factors.evaluate.quantile import (
     add_quantile,
     group_returns,
@@ -24,15 +24,27 @@ from lquant.factors.evaluate.quantile import (
     quantile_nav,
     quantile_summary,
 )
+from lquant.factors.evaluate.rating import RatingThresholds, factor_rating, load_thresholds
 from lquant.factors.evaluate.report import factor_report, save_report
 from lquant.factors.evaluate.returns import forward_return, forward_return_matrix
+from lquant.factors.evaluate.robustness import (
+    best_month_removal,
+    oos_decay,
+    param_sensitivity,
+    robustness_summary,
+    start_date_sensitivity,
+    time_stability,
+)
 
 __all__ = [
     "forward_return", "forward_return_matrix",
-    "ic_series", "ic_summary", "ic_by_year",
+    "ic_series", "ic_summary", "ic_by_year", "ic_autocorr",
     "add_quantile", "group_returns", "quantile_nav", "long_short_nav", "quantile_summary",
     "decay_profile", "decay_summary", "half_life", "suggest_rebalance",
     "attribution_summary", "exposure",
+    "RatingThresholds", "factor_rating", "load_thresholds",
+    "param_sensitivity", "time_stability", "start_date_sensitivity",
+    "best_month_removal", "oos_decay", "robustness_summary",
     "factor_report", "save_report", "evaluate",
 ]
 

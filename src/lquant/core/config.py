@@ -37,8 +37,23 @@ def find_root() -> Path:
     return Path.cwd()
 
 
+BACKTEST_WORKERS_MAX = 4
+
+
+def clamp_backtest_workers(n: int) -> int:
+    return max(0, min(BACKTEST_WORKERS_MAX, int(n)))
+
+
 class AgentConfig(BaseModel):
     provider: str = "mock"
+    claude_path: str = "claude"
+    workspace_dir: str = "data/agent_workspace"
+    timeout_seconds: int = 300
+    # 无头 claude CLI 需要跳过交互式授权，否则会挂在确认提示上；
+    # 但那是「全自主」权限，等价于让 CLI 任意读写本机。
+    # 默认保持 True 以免破坏既有用法，service.py 启用时会打印告警。
+    # 只要不需要 CLI 落盘/执行命令，就设成 false。
+    skip_permissions: bool = True
 
 
 class Settings(BaseModel):
@@ -52,6 +67,12 @@ class Settings(BaseModel):
     ingest_concurrency: int = 4
     ingest_watchdog_sec: int = 120
     redis_url: str = "redis://localhost:6379/0"
+    monitor_enabled: bool = True
+    monitor_flush_interval_sec: int = 10
+    monitor_sample_interval_sec: int = 5
+    monitor_retention_days: int = 7
+    monitor_db_path: str = ""
+    backtest_workers: int = 2
     raw: dict[str, Any] = Field(default_factory=dict)
 
     @property
@@ -69,10 +90,11 @@ def get_settings() -> Settings:
 
     paths = raw.get("paths", {})
     ingest = raw.get("ingest", {})
+    agent = raw.get("agent", {})
     return Settings(
         root=root,
         env=raw.get("env", "dev"),
-        agent=AgentConfig(provider=raw.get("agent", {}).get("provider", "mock")),
+        agent=AgentConfig(**agent),
         timezone=raw.get("timezone", "Asia/Shanghai"),
         duckdb_path=str(paths.get("duckdb", "./data/duckdb/lquant.duckdb")),
         parquet_dir=str(paths.get("parquet", "./data/parquet")),
@@ -80,6 +102,22 @@ def get_settings() -> Settings:
         ingest_concurrency=int(ingest.get("concurrency", 4)),
         ingest_watchdog_sec=int(ingest.get("watchdog_sec", 120)),
         redis_url=os.getenv("LQ_REDIS_URL", "redis://localhost:6379/0"),
+        monitor_enabled=(
+            os.getenv("LQ_MONITOR_ENABLED") != "0"
+            if os.getenv("LQ_MONITOR_ENABLED") is not None
+            else bool((raw.get("monitor", {}) or {}).get("enabled", True))),
+        monitor_flush_interval_sec=int(
+            (raw.get("monitor", {}) or {}).get("flush_interval_sec", 10)),
+        monitor_sample_interval_sec=int(
+            (raw.get("monitor", {}) or {}).get("sample_interval_sec", 5)),
+        monitor_retention_days=int(
+            (raw.get("monitor", {}) or {}).get("retention_days", 7)),
+        monitor_db_path=os.getenv("LQ_MONITOR_DB", "") or str(
+            Path(str(paths.get("duckdb", "./data/duckdb/lquant.duckdb")))
+            .with_name("lquant.monitor.duckdb").resolve()),
+        backtest_workers=int(os.getenv(
+            "LQ_BACKTEST_WORKERS",
+            str((raw.get("monitor", {}) or {}).get("backtest_workers", 2)))),
         raw=raw,
     )
 
