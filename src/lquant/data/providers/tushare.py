@@ -140,18 +140,46 @@ class TushareProvider(MappingProvider):
             self._client = ts.pro_api(self._token)
         return self._client
 
+    # 瞬时错误关键词（小写匹配）：网络/超时/每分钟限流才重试，
+    # 参数错、数据形状错（pandas→polars 转换失败）重试也不会好。
+    _RETRY_KEYWORDS = (
+        "timeout", "timed out", "connection", "reset", "eof", "ssl",
+        "每分钟", "频率", "超过", "rate",
+    )
+    _RATE_LIMIT_KEYWORDS = ("每分钟", "频率", "rate")
+
     def _call(self, api_name: str, **kw: Any) -> pl.DataFrame:
-        """限流 + 调用 + pandas→polars；权限类报错转 SourceUnavailable。"""
-        self._bucket.acquire()
-        try:
-            api = getattr(self._pro(), api_name)
-            return _from_pandas(api(**kw))
-        except Exception as e:  # noqa: BLE001
-            if any(k in str(e) for k in _PERMISSION_KEYWORDS):
-                raise SourceUnavailable(
-                    self.name, f"{api_name} 权限不足（积分档位）: {e}"
-                ) from e
-            raise
+        """限流 + 调用 + pandas→polars；权限类报错转 SourceUnavailable。
+
+        瞬时错误重试：网络/超时退避 1-2-4s，每分钟限流类退避 20/60s
+        （tushare 分钟级窗口短退避没用）。
+        """
+        import time
+
+        from loguru import logger
+
+        attempts = 3
+        for attempt in range(attempts):
+            self._bucket.acquire()
+            try:
+                api = getattr(self._pro(), api_name)
+                return _from_pandas(api(**kw))
+            except Exception as e:  # noqa: BLE001
+                if any(k in str(e) for k in _PERMISSION_KEYWORDS):
+                    raise SourceUnavailable(
+                        self.name, f"{api_name} 权限不足（积分档位）: {e}"
+                    ) from e
+                msg = str(e).lower()
+                retryable = any(k in msg for k in self._RETRY_KEYWORDS)
+                if not retryable or attempt == attempts - 1:
+                    raise
+                delay = (20, 60)[attempt] if any(
+                    k in str(e) for k in self._RATE_LIMIT_KEYWORDS) else 2**attempt
+                logger.warning(
+                    f"tushare {api_name} 第 {attempt + 1} 次失败"
+                    f"（{type(e).__name__}: {e}），{delay}s 后重试"
+                )
+                time.sleep(delay)
 
     # ------------------------------------------------- MappingProvider 引擎
     def _fetch_raw(self, table: str, **params: Any) -> pl.DataFrame:
@@ -329,9 +357,11 @@ class TushareProvider(MappingProvider):
         end_date + ann_date 双日期天然 PIT；无 ann_date 的行丢弃
         （未来函数防护，宁可丢数据）。
         kinds 与 baostock 口径对齐：profit→income、balance→balancesheet、
-        cashflow→cashflow；dupont/growth/operation/indicator 统一落
-        fina_indicator（140+ 财务指标，含 ann_date；口径以 item 前缀
-        fina_indicator.* 区分，去重后只拉一次）。
+        cashflow→cashflow；dupont/growth/operation/indicator 统一拉
+        fina_indicator（140+ 财务指标，含 ann_date；去重后只拉一次）。
+        item 前缀落 indicator.*（对齐 get_fundamentals DSL 口径；
+        baostock 源的 dupont.*/growth.*/operation.* 前缀在本源不再保留，
+        DSL 字段名以 _KIND_PREFIX 映射为准）。
         """
         kind_to_api = {
             "profit": "income",

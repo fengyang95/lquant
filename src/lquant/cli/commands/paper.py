@@ -56,6 +56,15 @@ def tick_cmd(name: str) -> None:
 
 @paper.command()
 @click.argument("name")
+@click.option("--order-id", required=True, help="待撤委托单号（见 status 的 pending_orders）")
+def cancel(name: str, order_id: str) -> None:
+    """撤销挂单"""
+    from lquant.paper import service
+    click.echo(_dump(service.cancel_order(name, order_id)))
+
+
+@paper.command()
+@click.argument("name")
 @click.option("--date", "d", default=None, help="缺省为今天（北京时间）")
 def close(name: str, d: str | None) -> None:
     """日终结算：解冻 T+N + 官方日线对账重算 official 净值"""

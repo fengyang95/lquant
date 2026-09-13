@@ -78,11 +78,29 @@ def zscore_filter_stats(
     删掉的行数不是零就应该显式展示 —— 阈值调得太小会把因子结论
     变成"剔除异常值后的结论"，读者必须知道这件事。
     """
+    _, stats = zscore_filter_with_stats(df, cols, threshold, date_col=date_col)
+    return stats
+
+
+def zscore_filter_with_stats(
+    df: pl.DataFrame,
+    cols: list[str] | None = None,
+    threshold: float = 20.0,
+    *,
+    date_col: str = "trade_date",
+) -> tuple[pl.DataFrame, dict]:
+    """一次算出 (过滤后帧, 过滤统计)，供调用方「帧 + 统计」双需求。
+
+    filter_zscore + zscore_filter_stats 分开调会把最贵的截面 z-score
+    全量算两遍（API 评估路径此前正是这么写的）。
+    """
+    if threshold <= 0:
+        raise ValueError("threshold 必须为正数")
     cols = _resolve_cols(df, cols)
     n_in = len(df)
     kept = filter_zscore(df, cols, threshold, date_col=date_col)
     n_out = len(kept)
-    return {
+    return kept, {
         "threshold": float(threshold),
         "cols": cols,
         "n_in": n_in,
