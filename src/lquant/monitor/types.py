@@ -15,6 +15,17 @@ class ApiMetricPoint:
 
 
 @dataclass(frozen=True)
+class ApiErrorPoint:
+    ts: float                 # 采集时刻 epoch 秒
+    route: str
+    method: str
+    status: int
+    error_type: str | None    # 异常类名；HTTP 5xx 响应（无异常对象）时为 None
+    message: str | None       # 异常消息 / HTTP detail
+    traceback_tail: str | None  # 堆栈尾段（截断），响应路径无堆栈
+
+
+@dataclass(frozen=True)
 class ProcSample:
     ts: float
     proc_name: str            # http / general-0 / backtest-0..3

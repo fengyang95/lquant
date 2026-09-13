@@ -169,3 +169,75 @@ def test_retention_cleanup(mdb):
         fl.flush_once()
     n = duckdb.connect(mdb).execute("SELECT count(*) FROM metrics_api").fetchone()[0]
     assert n == 0
+
+
+def test_ensure_tables_contains_error_table(mdb):
+    con = duckdb.connect(mdb)
+    fl.ensure_tables(con)
+    names = {r[0] for r in con.execute(
+        "SELECT table_name FROM information_schema.tables").fetchall()}
+    con.close()
+    assert "metrics_api_error" in names
+
+
+def test_flush_error_points(mdb):
+    from lquant.monitor.ring import error_ring
+    from lquant.monitor.types import ApiErrorPoint
+
+    error_ring.drain()
+    error_ring.append(ApiErrorPoint(
+        ts=time.time(), route="/api/factors/evaluate", method="POST",
+        status=500, error_type="DSLParseError", message="表达式意外结束",
+        traceback_tail="Traceback ... DSLParseError: 表达式意外结束"))
+    out = fl.flush_once()
+    assert out["error"] == 1
+    con = duckdb.connect(mdb)
+    row = con.execute(
+        "SELECT route, status, error_type, message FROM metrics_api_error"
+    ).fetchone()
+    con.close()
+    assert row[0] == "/api/factors/evaluate" and row[1] == 500
+    assert row[2] == "DSLParseError" and row[3] == "表达式意外结束"
+    assert error_ring.snapshot() == ()
+
+
+def test_error_write_failure_keeps_pending(mdb, monkeypatch):
+    """错误日志写失败同样走 pending 重试，不丢数据。"""
+    from lquant.monitor.ring import error_ring
+    from lquant.monitor.types import ApiErrorPoint
+
+    error_ring.drain()
+    with fl._PENDING_LOCK:
+        fl._PENDING_ERRORS.clear()
+    error_ring.append(ApiErrorPoint(
+        ts=time.time(), route="/api/x", method="GET", status=500,
+        error_type="ValueError", message="boom", traceback_tail=None))
+    real = fl._write_errors
+    state = {"n": 0}
+
+    def flaky(con, pts):
+        if state["n"] == 0:
+            state["n"] += 1
+            raise RuntimeError("boom")
+        return real(con, pts)
+
+    with patch.object(fl, "_write_errors", side_effect=flaky):
+        fl.flush_once()
+    assert error_ring.snapshot() == ()  # 已 drain，由 pending 保留
+    out2 = fl.flush_once()
+    assert out2["error"] == 1
+    n = duckdb.connect(mdb).execute("SELECT count(*) FROM metrics_api_error").fetchone()[0]
+    assert n == 1
+
+
+def test_retention_cleanup_error_table(mdb):
+    con = duckdb.connect(mdb)
+    fl.ensure_tables(con)
+    old = __import__("datetime").datetime.fromtimestamp(time.time() - 30 * 86400)
+    con.execute("INSERT INTO metrics_api_error VALUES (?, 'r', 'GET', 500, 'T', 'm', NULL)",
+                [old])
+    con.close()
+    with patch.object(fl, "_should_cleanup_today", return_value=True):
+        fl.flush_once()
+    n = duckdb.connect(mdb).execute("SELECT count(*) FROM metrics_api_error").fetchone()[0]
+    assert n == 0

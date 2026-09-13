@@ -9,7 +9,7 @@ import time
 from datetime import date, datetime, timedelta
 
 from lquant.monitor.emit import EVENTS_KEY
-from lquant.monitor.ring import api_ring, local_events
+from lquant.monitor.ring import api_ring, error_ring, local_events
 
 _LOG = logging.getLogger(__name__)
 
@@ -25,6 +25,7 @@ _started = False  # 是否以启用状态启动过（决定 stop 时是否 final
 _PENDING_LOCK = threading.Lock()
 _PENDING_API: list = []
 _PENDING_TASK: list = []
+_PENDING_ERRORS: list = []
 
 
 def _redis_available() -> bool:
@@ -62,6 +63,10 @@ def ensure_tables(con) -> None:
         ts TIMESTAMP, proc_name VARCHAR, pid INTEGER, cpu_pct DOUBLE,
         mem_rss_mb DOUBLE, current_job VARCHAR,
         PRIMARY KEY (ts, proc_name))""")
+    con.execute("""CREATE TABLE IF NOT EXISTS metrics_api_error (
+        ts TIMESTAMP, route VARCHAR, method VARCHAR, status INTEGER,
+        error_type VARCHAR, message VARCHAR, traceback_tail VARCHAR,
+        PRIMARY KEY (ts, route, method, status, error_type))""")
 
 
 def _ts(v: float | None) -> datetime | None:
@@ -158,6 +163,18 @@ def _write_sys(con, samples) -> int:
     return len(samples)
 
 
+def _write_errors(con, pts) -> int:
+    if not pts:
+        return 0
+    # PK 列不可为 NULL（error_type 在 5xx 响应路径无异常对象时为 None，
+    # 直接写会 NOT NULL 炸整批 → 毒丸 pending）；统一 coalesce 为占位串。
+    con.executemany("INSERT OR IGNORE INTO metrics_api_error VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [(_ts(p.ts), p.route or "unmatched", p.method or "GET",
+                      p.status, p.error_type or "-", p.message,
+                      p.traceback_tail) for p in pts])
+    return len(pts)
+
+
 def _should_cleanup_today() -> bool:
     """只判断不更新状态；清理成功后由 _mark_cleanup_done 记账。"""
     return _CLEANUP_STATE["last"] != date.today()
@@ -173,6 +190,7 @@ def _cleanup(con, retention_days: int, now: float | None = None) -> None:
     con.execute("DELETE FROM metrics_api WHERE ts < ?", [cutoff])
     con.execute("DELETE FROM metrics_task WHERE event_ts < ?", [cutoff])
     con.execute("DELETE FROM metrics_sys WHERE ts < ?", [cutoff])
+    con.execute("DELETE FROM metrics_api_error WHERE ts < ?", [cutoff])
 
 
 def _stash(api: list, task: list) -> None:
@@ -190,9 +208,22 @@ def _take_pending() -> tuple[list, list]:
         return api, task
 
 
+def _stash_errors(errors: list) -> None:
+    """错误日志写失败时暂存，下个周期优先重写。"""
+    with _PENDING_LOCK:
+        _PENDING_ERRORS.extend(errors)
+
+
+def _take_pending_errors() -> list:
+    with _PENDING_LOCK:
+        out = list(_PENDING_ERRORS)
+        _PENDING_ERRORS.clear()
+        return out
+
+
 def flush_once(now: float | None = None) -> dict:
     """单周期：返回各表写入行数；失败时数据暂存/回队，待重试不丢弃。"""
-    out = {"api": 0, "task": 0, "sys": 0}
+    out = {"api": 0, "task": 0, "sys": 0, "error": 0}
     from lquant.core.config import get_settings
 
     if not get_settings().monitor_enabled:
@@ -212,8 +243,10 @@ def flush_once(now: float | None = None) -> dict:
         ensure_tables(con)
         # 先取出全部数据到本地（此后源已被消费，失败必须归还）
         pend_api, pend_task = _take_pending()
+        pend_errors = _take_pending_errors()
         api = pend_api + list(api_ring.drain())
         task = pend_task + list(local_events.drain())
+        errors = pend_errors + list(error_ring.drain())
         popped: list[str] = []
         if r is not None:
             popped = _pop_redis_events(r)
@@ -222,6 +255,7 @@ def flush_once(now: float | None = None) -> dict:
         try:
             out["api"] = _write_api(con, api)
             out["task"] = _write_task(con, task)
+            out["error"] = _write_errors(con, errors)
             if r is not None:
                 out["sys"] = _write_sys(con, samples)
             from lquant.core.config import get_settings
@@ -233,6 +267,7 @@ def flush_once(now: float | None = None) -> dict:
             con.commit()
         except Exception:
             _stash(api, task)  # 未落盘数据暂存待重试
+            _stash_errors(errors)
             _requeue_redis_events(r, popped)  # Redis 侧按 FIFO 回队
             raise
     except Exception:  # noqa: BLE001
