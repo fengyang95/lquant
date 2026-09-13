@@ -65,18 +65,28 @@ def minute_cmd(symbols: str | None, start: str, end: str | None, freq: str) -> N
 
 
 @data.command()
-@click.option("--symbols", required=True, help="逗号分隔；财务接口无批量，全市场会跑几天")
+@click.option("--symbols", default=None, help="逗号分隔；与 --all 二选一")
+@click.option("--all", "use_all", is_flag=True,
+              help="全市场股票（含退市，防幸存者偏差）；tushare 下约 0.7s/只×4 接口")
 @click.option("--start", default="2016-01-01")
 @click.option("--end", default=None)
 @click.option("--provider", "provider_name", default=None,
               type=click.Choice(["baostock", "tushare"]),
               help="缺省自动选 tushare（基本面统一源），缺 token 退回 baostock")
-def financial(symbols: str, start: str, end: str | None, provider_name: str | None) -> None:
+def financial(symbols: str | None, use_all: bool, start: str, end: str | None,
+              provider_name: str | None) -> None:
     """PIT 财务回填（stat_date + pub_date，防未来函数）。"""
     from lquant.data.ingest.financial import backfill_financial
+    from lquant.data.store.catalog import SecurityRepo
 
-    n = backfill_financial(symbols.split(","), start=start, end=end,
-                           provider_name=provider_name)
+    if use_all:
+        syms = SecurityRepo().stock_symbols()
+    elif symbols:
+        syms = symbols.split(",")
+    else:
+        raise click.UsageError("--symbols 与 --all 必须给一个")
+
+    n = backfill_financial(syms, start=start, end=end, provider_name=provider_name)
     click.echo(f"done {n}")
 
 
