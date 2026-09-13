@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """复杂策略对拍测试：JQRunner 与独立参照实现的交叉验证。
 
 场景均先在 data/jq_complex_check.py 里与逐笔对拍参照实现验证通过，
@@ -109,7 +108,7 @@ def test_rotation_matches_independent_reference():
            for t in res.trades]
     ref = [(d, s, side, q, round(p, 6)) for d, s, side, q, p in ref_trades]
     assert eng == ref
-    nav_diff = max(abs(a - b) for (_, a), b in zip(res.nav, ref_nav))
+    nav_diff = max(abs(a - b) for (_, a), b in zip(res.nav, ref_nav, strict=True))
     assert nav_diff <= 0.02
 
 

@@ -203,8 +203,9 @@ def test_syntax_error_raises():
 
 def test_handle_data_two_arg_signature():
     """聚宽标准签名 handle_data(context, data)：data 是当日 bar 视图，可下单。"""
-    import polars as pl
     from datetime import date, timedelta
+
+    import polars as pl
     rows = []
     for i in range(6):
         d = date(2026, 1, 5) + timedelta(days=i)
@@ -224,7 +225,6 @@ def handle_data(context, data):
         order_value("600000.SH", 50000)
         g.seen = 1
 '''
-    from datetime import date as _date
     res = JQRunner(code.replace("date(2026, 1, 7)", "__import__('datetime').date(2026, 1, 7)"),
                    initial_cash=1_000_000).run(df)
     assert res.error is None, res.error
@@ -234,7 +234,6 @@ def handle_data(context, data):
 
 def test_get_price_layout_matches_jq():
     """get_price 单标的返回列=fields（聚宽语义）；多标的返回 (标的,字段) MultiIndex。"""
-    import pandas as pd
     from datetime import date, timedelta
     rows = []
     for i in range(6):
