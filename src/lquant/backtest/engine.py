@@ -266,20 +266,28 @@ class Engine:
                 continue
             # 成交量约束：单只最多吃掉 participation 比例的当日成交量
             max_qty = bar.volume * self.cfg.participation if bar.volume > 0 else None
-            fill = self.broker.match(order, bar, d, max_qty=max_qty)
+            # 买单带现金约束：跳高开时按可用资金截断，防现金变负（隐性杠杆）
+            cash = self.account.cash if order.side == Side.BUY else None
+            fill = self.broker.match(order, bar, d, max_qty=max_qty, cash=cash)
             if fill is None:
                 res.rejected.append((str(d), order.symbol, order.reason or "未成交"))
-            else:
-                self.account.apply_fill(fill)
-                res.trades.append(fill)
+                continue
+            self.account.apply_fill(fill)
+            res.trades.append(fill)
         self._pending = []
 
     def _schedule_rebalance(self, bars: dict[str, Bar], d: date, res: BacktestResult) -> None:
         ctx = Context(account=self.account, trade_date=d,
                       rules=self._rules, params=self.strategy.params)
-        targets = self.strategy.on_bar(ctx, bars) or []
-        targets = [(s, w) for s, w in targets if s in self._rules and w > 0]
-        if not targets:
+        raw = self.strategy.on_bar(ctx, bars) or []
+        if not raw:
+            # 空列表 = 无操作（保留持仓）。这是因子策略「当日无信号」的常态。
+            return
+        # 权重 <= 0 的显式目标 = 清仓该标的。择时策略（双均线/动量轮动）表达
+        # 「空仓」的唯一途径 —— 若不支持，这类策略在信号转负时只能干瞪眼持仓。
+        zero_out = {s for s, w in raw if s in self._rules and w <= 0}
+        targets = [(s, w) for s, w in raw if s in self._rules and w > 0]
+        if not targets and not zero_out:
             return
 
         prices = {s: b.close for s, b in bars.items()}
@@ -287,56 +295,66 @@ class Engine:
         if nav <= 0:
             return
 
-        # 权重归一化 + 单标的上限
-        total = sum(w for _, w in targets)
-        targets = [(s, min(w / total, self.cfg.max_position_weight)) for s, w in targets]
+        # 权重语义：目标市值 / NAV 的**绝对占比**（残差留在现金），单标的上限封顶。
+        # 不做归一化 —— 归一化会把「0.5 半仓」放大成「1.0 满仓」，直接破坏
+        # 网格 / ATR 定仓这类绝对仓位策略（验证时由 backtrader 对账暴露）。
+        # 因子 TopN 等权策略本身权重和恰为 1，两种语义下行为一致。
+        if targets:
+            targets = [(s, min(w, self.cfg.max_position_weight)) for s, w in targets]
 
         orders: list[Order] = []
-        # 先卖：目标是 0 或减仓的
-        for sym, w in targets:
-            pos = self.account.positions.get(sym)
-            held = pos.qty if pos else 0.0
-            px = prices.get(sym)
-            if px is None or px <= 0:
-                continue
-            want_value = nav * w
-            have_value = held * px
-            delta_value = want_value - have_value
-            if abs(delta_value) < self.cfg.min_order_value:
-                continue
-            if delta_value < 0:
-                qty = self._sell_qty(sym, -delta_value / px, d)
-                if qty > 0:
-                    orders.append(self._order(sym, Side.SELL, qty))
-        # 后买：用当前现金（含卖出释放的预期资金）
-        for sym, w in targets:
-            pos = self.account.positions.get(sym)
-            held = pos.qty if pos else 0.0
-            px = prices.get(sym)
-            if px is None or px <= 0:
-                continue
-            want_value = nav * w
-            have_value = held * px
-            delta_value = want_value - have_value
-            if delta_value <= self.cfg.min_order_value:
-                continue
-            cash = self.account.cash * (1 - self.cfg.cash_buffer)
-            qty = min(delta_value, cash) / px
-            qty = self._round_lot(sym, qty, floor=True)
-            if qty > 0:
-                orders.append(self._order(sym, Side.BUY, qty))
+        planned_proceeds = 0.0     # 本轮卖出在 T+1 释放的资金（按 T 收盘价预估）
 
-        # 清仓：不在目标里的持仓全卖
-        target_set = {s for s, _ in targets}
-        for sym, pos in self.account.positions.items():
-            if sym in target_set or pos.qty <= 0:
-                continue
-            px = prices.get(sym)
-            if px is None or px <= 0:
-                continue
-            qty = self._sell_qty(sym, pos.qty, d)
+        def _plan_sell(sym: str, qty: float, px: float) -> None:
+            nonlocal planned_proceeds
             if qty > 0:
                 orders.append(self._order(sym, Side.SELL, qty))
+                planned_proceeds += qty * px
+
+        # 先卖（减仓 + 清仓都必须在买单之前 —— 换仓时新买单依赖旧持仓的卖出资金）
+        if targets:
+            for sym, w in targets:
+                pos = self.account.positions.get(sym)
+                held = pos.qty if pos else 0.0
+                px = prices.get(sym)
+                if px is None or px <= 0:
+                    continue
+                want_value = nav * w
+                have_value = held * px
+                delta_value = want_value - have_value
+                if abs(delta_value) < self.cfg.min_order_value:
+                    continue
+                if delta_value < 0:
+                    _plan_sell(sym, self._sell_qty(sym, -delta_value / px, d), px)
+        # 清仓：不在买入目标里的持仓（含显式 w<=0 的清仓目标）
+        buy_set = {s for s, _ in targets}
+        for sym, pos in self.account.positions.items():
+            if sym in buy_set or pos.qty <= 0:
+                continue
+            px = prices.get(sym)
+            if px is None or px <= 0:
+                continue
+            _plan_sell(sym, self._sell_qty(sym, pos.qty, d), px)
+        # 后买：现金 + 卖出释放的预期资金（A 股卖出资金当日可用，
+        # 与聚宽「先卖后买」撮合语义一致）。买与卖都在 T+1 开盘成交，
+        # 两边按同一开盘价缩放，预估缺口只在「现金残余 × 跳空幅度」量级。
+        if targets:
+            for sym, w in targets:
+                pos = self.account.positions.get(sym)
+                held = pos.qty if pos else 0.0
+                px = prices.get(sym)
+                if px is None or px <= 0:
+                    continue
+                want_value = nav * w
+                have_value = held * px
+                delta_value = want_value - have_value
+                if delta_value <= self.cfg.min_order_value:
+                    continue
+                cash = (self.account.cash + planned_proceeds) * (1 - self.cfg.cash_buffer)
+                qty = min(delta_value, cash) / px
+                qty = self._round_lot(sym, qty, floor=True)
+                if qty > 0:
+                    orders.append(self._order(sym, Side.BUY, qty))
 
         if self.cfg.price_mode in ("next_open", "next_vwap", "next_close"):
             # T 日收盘生成信号，推迟到 T+1 按对应成交价撮合 —— 防未来函数
@@ -362,7 +380,8 @@ class Engine:
                     res.rejected.append((str(d), o.symbol, o.reason))
                     continue
                 max_qty = bar.volume * self.cfg.participation if bar.volume > 0 else None
-                f = self.broker.match(o, bar, d, max_qty=max_qty)
+                f = self.broker.match(o, bar, d, max_qty=max_qty,
+                                      cash=self.account.cash if o.side == Side.BUY else None)
                 if f is None:
                     res.rejected.append((str(d), o.symbol, o.reason or "未成交"))
                 else:

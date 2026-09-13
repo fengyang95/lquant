@@ -542,6 +542,68 @@ def compare_runs(ids: str) -> dict:
     }
 
 
+@router.get("/validation")
+def validation_report() -> dict:
+    """引擎自检报告：手算金标准 + 性质测试逐项 pass/fail + 基准策略元数据。
+
+    前端「基准验证」tab 与 CI 之外的线上健康巡检共用 ——
+    检查项实现见 lquant.backtest.selfcheck（与单测同源，一处修改两处生效）。
+    """
+    from lquant.backtest.benchmarks import BENCHMARK_META
+    from lquant.backtest.selfcheck import run_selfcheck
+
+    checks = run_selfcheck()
+    return {"checks": checks,
+            "all_passed": all(c["passed"] for c in checks),
+            "benchmarks": BENCHMARK_META}
+
+
+class BenchmarkRunIn(BaseModel):
+    key: str = Field(min_length=2, max_length=40)
+    start: str = Field(default="2024-01-01", pattern=r"^\d{4}-\d{2}-\d{2}$")
+    end: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    initial_cash: float = Field(default=1_000_000, gt=0)
+    symbols: list[str] = Field(default_factory=list, max_length=10)
+    params: dict = Field(default_factory=dict)
+
+
+@router.post("/run-benchmark")
+def run_benchmark(req: BenchmarkRunIn) -> dict:
+    """运行内置基准策略（公开出处可查证的复杂策略），落库并返回 run_id。
+
+    基准策略内部累积 bar 历史，固定 rebalance="daily"（策略文档约束）。
+    """
+    from lquant.backtest.benchmarks import BENCHMARK_META, make_benchmark
+
+    meta = BENCHMARK_META.get(req.key)
+    if meta is None:
+        raise HTTPException(404, f"未知基准策略 {req.key}，可选: {sorted(BENCHMARK_META)}")
+    symbols = [s for s in (req.symbols or meta["symbols"]) if s.strip()]
+    if not symbols:
+        raise HTTPException(422, "标的列表为空")
+
+    df = read_daily(symbols=symbols, start=req.start, end=req.end).collect()
+    if not len(df):
+        raise HTTPException(503, f"{symbols} 在 {req.start} 之后无日线数据，先同步数据")
+
+    strategy = make_benchmark(req.key, **req.params)
+    run_id = uuid.uuid4().hex[:12]
+    res = Engine(strategy,
+                 config=EngineConfig(initial_cash=req.initial_cash, rebalance="daily")).run(df)
+
+    _persist_result(run_id, f"benchmark:{req.key}",
+                    {"benchmark": req.key, "label": meta["label"],
+                     "symbols": symbols, "start": req.start, "end": req.end,
+                     "initial_cash": req.initial_cash,
+                     "reference": meta["reference"], **req.params}, res)
+
+    m = res.metrics
+    return {"run_id": run_id, "label": meta["label"], "symbols": symbols,
+            "metrics": {k: (round(v, 4) if isinstance(v, float) else v)
+                        for k, v in m.items() if not isinstance(v, dict)},
+            "n_nav_points": len(res.nav), "n_trades": m.get("n_trades", 0)}
+
+
 @router.get("/{run_id}")
 def get_run(run_id: str) -> dict:
     """回测详情 + 可视化数据包：

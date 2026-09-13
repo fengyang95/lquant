@@ -17,6 +17,7 @@ import EditorPane from './workspace/EditorPane';
 import ResultPane from './workspace/ResultPane';
 import QuickRunPanel from './workspace/QuickRunPanel';
 import HistoryPanel from './workspace/HistoryPanel';
+import ValidationPanel from './workspace/ValidationPanel';
 import {
   buildRunPayload,
   isDirty,
@@ -81,12 +82,13 @@ const PARAMS_DEFAULT: EditorParams = {
   formulas: FACTOR_DEFAULT,
 };
 
-type TabId = 'workspace' | 'quick' | 'history';
+type TabId = 'workspace' | 'quick' | 'history' | 'validation';
 
 const TABS: { id: TabId; label: string }[] = [
   { id: 'workspace', label: '策略回测' },
   { id: 'quick', label: '快速回测' },
   { id: 'history', label: '历史与对比' },
+  { id: 'validation', label: '引擎验证' },
 ];
 
 function BacktestWorkspace() {
@@ -353,6 +355,7 @@ function BacktestWorkspace() {
           }
         />
       )}
+      {tab === 'validation' && <ValidationPanel />}
     </div>
   );
 }

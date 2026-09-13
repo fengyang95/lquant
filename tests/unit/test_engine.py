@@ -117,29 +117,37 @@ def test_engine_rebalance_none_freezes_portfolio():
 def _match_mode_panel() -> pl.DataFrame:
     """单标的 600000；day2 的 open/close/vwap 互不相同，便于断言各撮合模式的成交价。
 
-    所有价格都落在 pre_close±10% 涨停带内（A 股物理约束），否则撮合价检查
-    会把「涨超涨停」的成交判为不可成交，测试数据本身就失真。
+    所有价格都落在 pre_close±10% 涨停带内（A 股物理约束），且 day2 开盘
+    不跳空 —— 资金充足性护栏会把「T 收盘定价、跳高开成交」的买单作废，
+    测试数据若跳空，断言的就不是撮合模式本身的成交价了。
     """
     return make_single([
         # day1 收盘生成信号；vwap=amount/volume
         {"trade_date": date(2026, 1, 5), "symbol": "600000", "open": 10.0,
          "high": 10.2, "low": 9.8, "close": 10.0, "pre_close": 9.9,
          "volume": 100000.0, "amount": 1_000_000.0},
-        # day2 pre_close=10.0（day1 收盘）；open=10.5, close=10.8,
-        # vwap=2_150_000/200000=10.75 —— 三价互不相同且在 [9.0,11.0] 内
-        {"trade_date": date(2026, 1, 6), "symbol": "600000", "open": 10.5,
-         "high": 10.9, "low": 10.4, "close": 10.8, "pre_close": 10.0,
-         "volume": 200000.0, "amount": 2_150_000.0},
-        {"trade_date": date(2026, 1, 7), "symbol": "600000", "open": 10.9,
-         "high": 11.0, "low": 10.5, "close": 10.9, "pre_close": 10.8,
-         "volume": 100000.0, "amount": 1_090_000.0},
+        # day2 pre_close=10.0（day1 收盘）；open=10.0（平开）, close=10.2,
+        # vwap=2_050_000/200000=10.25 —— 三价互不相同且在 [9.0,11.0] 内
+        {"trade_date": date(2026, 1, 6), "symbol": "600000", "open": 10.0,
+         "high": 10.3, "low": 9.9, "close": 10.2, "pre_close": 10.0,
+         "volume": 200000.0, "amount": 2_050_000.0},
+        {"trade_date": date(2026, 1, 7), "symbol": "600000", "open": 10.2,
+         "high": 10.4, "low": 10.1, "close": 10.3, "pre_close": 10.2,
+         "volume": 100000.0, "amount": 1_030_000.0},
     ])
 
 
 def _first_fill_price(mode: str) -> tuple[float, date]:
     df = _match_mode_panel()
-    # 无滑点：断言的是撮合模式本身的成交价，不应被默认 pct 滑点污染
-    eng = Engine(AllInOne(), config=EngineConfig(price_mode=mode, participation=1.0),
+    # 无滑点：断言的是撮合模式本身的成交价，不应被默认 pct 滑点污染。
+    # 半仓目标：留出资金余量，避免资金护栏把「T 收盘定价、次日微幅波动」
+    # 的正常成交误杀 —— 本测试只关心成交价，不关心资金边界。
+
+    class Half(Strategy):
+        def on_bar(self, ctx, bars):
+            return [("600000", 0.5)]
+
+    eng = Engine(Half(), config=EngineConfig(price_mode=mode, participation=1.0),
                  slippage=NoSlippage())
     res = eng.run(df)
     trades = res.trades_frame()
@@ -150,19 +158,19 @@ def _first_fill_price(mode: str) -> tuple[float, date]:
 
 def test_match_mode_next_open_fills_t1_open():
     price, d = _first_fill_price("next_open")
-    assert price == pytest.approx(10.5)          # T+1 开盘
+    assert price == pytest.approx(10.0)          # T+1 开盘（平开）
     assert d == date(2026, 1, 6)
 
 
 def test_match_mode_next_vwap_fills_t1_vwap():
     price, d = _first_fill_price("next_vwap")
-    assert price == pytest.approx(2_150_000.0 / 200_000.0)   # T+1 amount/volume
+    assert price == pytest.approx(2_050_000.0 / 200_000.0)   # T+1 amount/volume
     assert d == date(2026, 1, 6)
 
 
 def test_match_mode_next_close_fills_t1_close():
     price, d = _first_fill_price("next_close")
-    assert price == pytest.approx(10.8)          # T+1 收盘
+    assert price == pytest.approx(10.2)          # T+1 收盘
     assert d == date(2026, 1, 6)
 
 
@@ -273,3 +281,155 @@ def test_engine_suspended_day_order_rejected():
     assert all(f.trade_date != date(2026, 1, 6) for f in res.trades)
     suspended_rejects = [r for r in res.rejected if r[2] == "suspended"]
     assert suspended_rejects, "停牌日订单应被拒且 reason='suspended'"
+
+
+# ---------- 补充：调仓频率 / 公司行为 / 成交量约束 ----------
+
+def _zf_ruleset():
+    from lquant.backtest.rules.model import RuleSet
+    base = {
+        "commission": {"rate": 0.0, "min": 0.0, "per_order": True},
+        "tax": {"rate": 0.0}, "transfer_fee": {"rate": 0.0},
+        "lot_size": 1, "t_plus": 1,
+        "price_limit": {"mode": "by_board", "values": {"main": 0.10}},
+    }
+    return RuleSet(market="CN", currency="CNY", default=dict(base),
+                   etf=dict(base), exceptions={})
+
+
+def _bars_df():
+    """10 个交易日单标的线性价格，open=close=前收（无跳空）。"""
+    from datetime import date, timedelta
+    import polars as pl
+    d0 = date(2026, 1, 5)
+    rows = []
+    closes = [10 + i * 0.1 for i in range(10)]
+    pre = closes[0]
+    for i, c in enumerate(closes):
+        rows.append({"trade_date": d0 + timedelta(days=i), "symbol": "600000.SH",
+                     "open": pre, "high": c * 1.001, "low": c * 0.999,
+                     "close": c, "pre_close": pre, "volume": 2e9, "amount": 2e9 * c})
+        pre = c
+    return pl.DataFrame(rows).with_columns(pl.col("trade_date").cast(pl.Date))
+
+
+class _Always(Strategy):
+    def on_bar(self, ctx, bars):
+        return [("600000.SH", 1.0)]
+
+
+def test_weekly_rebalance_only_first_day_of_week():
+    cfg = EngineConfig(initial_cash=100_000, slippage="none", cash_buffer=0.0,
+                       min_order_value=100, rebalance="weekly")
+    res = Engine(_Always(), ruleset=_zf_ruleset(), config=cfg).run(_bars_df())
+    # 2026-01-05 是周一：只有周一调仓 → 全程只有 1 笔买入
+    buys = [t for t in res.trades if t.side.value == "buy"]
+    assert len(buys) == 1
+
+
+def test_monthly_rebalance_only_first_trading_day():
+    cfg = EngineConfig(initial_cash=100_000, slippage="none", cash_buffer=0.0,
+                       min_order_value=100, rebalance="monthly")
+    res = Engine(_Always(), ruleset=_zf_ruleset(), config=cfg).run(_bars_df())
+    buys = [t for t in res.trades if t.side.value == "buy"]
+    # 信号在首个交易日生成，次日开盘成交 → 全月唯一一笔，成交日是第 2 个交易日
+    assert len(buys) == 1 and buys[0].trade_date.day == 6
+
+
+def test_rebalance_none_never_trades():
+    cfg = EngineConfig(initial_cash=100_000, slippage="none", cash_buffer=0.0,
+                       min_order_value=100, rebalance="none")
+    res = Engine(_Always(), ruleset=_zf_ruleset(), config=cfg).run(_bars_df())
+    assert res.trades == []
+
+
+def test_participation_cap_limits_qty():
+    """单日成交量 300 股、participation=0.5 → 单笔最多 150 股。"""
+    import polars as pl
+    from datetime import date, timedelta
+    d0 = date(2026, 1, 5)
+    rows = []
+    for i in range(3):
+        c = 10.0 + i
+        rows.append({"trade_date": d0 + timedelta(days=i), "symbol": "600000.SH",
+                     "open": c, "high": c * 1.001, "low": c * 0.999, "close": c,
+                     "pre_close": c, "volume": 300.0, "amount": 300.0 * c})
+    df = pl.DataFrame(rows).with_columns(pl.col("trade_date").cast(pl.Date))
+    cfg = EngineConfig(initial_cash=100_000, slippage="none", cash_buffer=0.0,
+                       min_order_value=0.0, participation=0.5, rebalance="daily")
+    res = Engine(_Always(), ruleset=_zf_ruleset(), config=cfg).run(df)
+    assert res.trades and all(t.qty <= 150 for t in res.trades)
+
+
+def test_corporate_action_adjusts_position():
+    """复权因子跳变日：持仓份额按因子比放大，总市值连续（分红再投资口径）。"""
+    import polars as pl
+    from datetime import date, timedelta
+    d0 = date(2026, 1, 5)
+    rows = []
+    # day3 因子 1.0 → 2.0（10送10），价格减半、收盘不涨不跌
+    data = [(1.0, 10.0, 10.0), (2.0, 5.0, 5.0), (2.0, 5.0, 5.0)]
+    pre = 10.0
+    for i, (af, o, c) in enumerate(data):
+        rows.append({"trade_date": d0 + timedelta(days=i), "symbol": "600000.SH",
+                     "open": o, "high": max(o, c) * 1.001, "low": min(o, c) * 0.999,
+                     "close": c, "pre_close": pre, "volume": 2e9, "amount": 2e9 * c,
+                     "adj_factor": af})
+        pre = c
+    df = pl.DataFrame(rows).with_columns(pl.col("trade_date").cast(pl.Date))
+    eng = Engine(_Always(), ruleset=_zf_ruleset(),
+                 config=EngineConfig(initial_cash=100_000, slippage="none",
+                                     cash_buffer=0.0, min_order_value=100))
+    res = eng.run(df)
+    pos_day2 = res.positions[d0 + timedelta(days=2)]
+    assert pos_day2["600000.SH"] == pytest.approx(100_000 / 10 * 2, rel=1e-6)  # 2万股
+    # 市值连续性：除权日收盘市值 ≈ 除权前一日（价格减半、股数翻倍，无真实涨跌）
+    assert res.nav[2][1] == pytest.approx(res.nav[1][1], rel=0.01)
+
+
+def test_unknown_symbol_target_ignored():
+    """目标里含无行情标的：被忽略，不产生委托也不炸。"""
+
+    class Bad(Strategy):
+        def on_bar(self, ctx, bars):
+            return [("NOPE.SH", 0.5), ("600000.SH", 0.5)]
+
+    res = Engine(Bad(), ruleset=_zf_ruleset(),
+                 config=EngineConfig(initial_cash=100_000, slippage="none",
+                                     cash_buffer=0.0, min_order_value=100)).run(_bars_df())
+    assert all(t.symbol == "600000.SH" for t in res.trades)
+
+
+def test_buy_rejected_on_gap_up_cash_shortfall():
+    """跳高开：T 收盘定价的买单金额超出 T+1 可用现金 → 整单作废
+    （与 backtrader / 真实券商「资金不足废单」语义一致），现金绝不变负。"""
+    import polars as pl
+    from datetime import date, timedelta
+    d0 = date(2026, 1, 5)
+    rows = [
+        # day1: close 10 → 信号全仓（按 10 元估 100,000 股）
+        {"trade_date": d0, "symbol": "600000.SH", "open": 10.0, "high": 10.1,
+         "low": 9.9, "close": 10.0, "pre_close": 10.0, "volume": 2e9, "amount": 2e9 * 10},
+        # day2: 跳空高开 9% → 实际成本约 1,090,000 > 现金 1,000,000
+        # （开盘不能正好是涨停价 11.0，否则先触发涨跌停拒单）
+        {"trade_date": d0 + timedelta(days=1), "symbol": "600000.SH", "open": 10.9,
+         "high": 10.95, "low": 10.8, "close": 10.9, "pre_close": 10.0,
+         "volume": 2e9, "amount": 2e9 * 10.9},
+    ]
+    df = pl.DataFrame(rows).with_columns(pl.col("trade_date").cast(pl.Date))
+    eng = Engine(_Always(), ruleset=_zf_ruleset(),
+                 config=EngineConfig(initial_cash=1_000_000, slippage="none",
+                                     cash_buffer=0.0, min_order_value=100))
+    res = eng.run(df)
+    assert res.trades == [], "资金不足必须整单作废"
+    assert any("资金不足" in r[2] for r in res.rejected)
+    assert eng.account.cash == 1_000_000, "现金不能变负"
+    # day2 若价格回落，后续信号正常成交
+    rows.append({"trade_date": d0 + timedelta(days=2), "symbol": "600000.SH",
+                 "open": 10.0, "high": 10.1, "low": 9.9, "close": 10.0,
+                 "pre_close": 10.9, "volume": 2e9, "amount": 2e9 * 10})
+    df2 = pl.DataFrame(rows).with_columns(pl.col("trade_date").cast(pl.Date))
+    res2 = Engine(_Always(), ruleset=_zf_ruleset(),
+                  config=EngineConfig(initial_cash=1_000_000, slippage="none",
+                                      cash_buffer=0.0, min_order_value=100)).run(df2)
+    assert any(t.side.value == "buy" for t in res2.trades)
