@@ -17,7 +17,8 @@ from datetime import date
 from lquant.core.db import reader, writer
 from lquant.data.store.ddl import DDL_DATA_QUALITY_ISSUE as _DDL
 
-__all__ = ["Issue", "save_issues", "latest_issues", "resolve_issue", "ensure_table"]
+__all__ = ["Issue", "save_issues", "latest_issues", "query_issues",
+           "resolve_issue", "resolve_issues", "ensure_table"]
 
 
 @dataclass(frozen=True)
@@ -88,11 +89,45 @@ def latest_issues(limit: int = 200, resolved: bool = False) -> list[dict]:
     } for r in rows]
 
 
+def query_issues(
+    severity: str | None = None,
+    dataset: str | None = None,
+    resolved: bool = False,
+    limit: int = 100,
+) -> list[dict]:
+    """质量问题检索（按 severity / dataset / resolved 过滤）。
+
+    latest_issues 的超集：/data/crosscheck/issues 与 /data/issues 共用，
+    检索口径只此一份，避免两处 SQL 漂移。
+    """
+    rows = latest_issues(limit=100_000, resolved=resolved)
+    if severity:
+        rows = [r for r in rows if r["severity"] == severity]
+    if dataset:
+        rows = [r for r in rows if r["dataset"] == dataset]
+    return rows[:limit]
+
+
 def resolve_issue(issue_id: str) -> bool:
     with writer() as con:
         ensure_table(con)
         con.execute("UPDATE data_quality_issue SET resolved = TRUE WHERE issue_id = ?", [issue_id])
     return True
+
+
+def resolve_issues(issue_ids: list[str]) -> int:
+    """批量标记已解决；返回实际标记的条数（不存在的 id 自动跳过）。"""
+    if not issue_ids:
+        return 0
+    n = 0
+    with writer() as con:
+        ensure_table(con)
+        for iid in issue_ids:
+            n += con.execute(
+                "UPDATE data_quality_issue SET resolved = TRUE WHERE issue_id = ?",
+                [iid],
+            ).fetchone()[0] or 0
+    return n
 
 
 def pl_from_rows(rows: list[dict]):

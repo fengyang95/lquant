@@ -212,6 +212,61 @@ def read_daily(symbols: list[str] | None = None, start=None, end=None) -> pl.Laz
     return lf
 
 
+def delete_daily(
+    symbols: list[str] | None = None,
+    start: date | str | None = None,
+    end: date | str | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """从日线湖删除数据（按标的 / 日期区间过滤后重写文件）。
+
+    - dry_run=True 只统计将删行数，不落盘（用于确认前预览）；
+    - 读 → 过滤 → 写回/unlink 整体在 _file_lock 内（与写入路径互斥）；
+      注意：锁只保护**同进程**线程并发，跨进程不安全 —— 调用方（HTTP
+      purge 端点 / CLI）负责保证不与其他进程并发删同一份湖；
+    - 过滤后为空的文件直接删除，不留空 parquet；
+    - 返回 {rows_matched, files_scanned, files: [{file, rows_matched}]}。
+
+    删除不可逆，调用方负责互斥锁（/data/purge 与 /data/check 共用
+    _lake_check_lock）与审计日志。
+    """
+    if isinstance(start, str):
+        start = date.fromisoformat(start)
+    if isinstance(end, str):
+        end = date.fromisoformat(end)
+    root = _root() / "daily"
+    files = sorted(root.rglob("*.parquet")) if _has_parquet(root) else []
+    total = 0
+    touched: list[dict] = []
+    for p in files:
+        with _file_lock(p):
+            df = pl.read_parquet(p)
+            mask = pl.lit(True)
+            if symbols:
+                mask = pl.col("symbol").is_in(symbols)
+            if start is not None:
+                mask = mask & (pl.col("trade_date") >= start)
+            if end is not None:
+                mask = mask & (pl.col("trade_date") <= end)
+            matched = int(df.select(mask.sum().fill_null(0)).item())
+            if not matched:
+                continue
+            total += matched
+            from loguru import logger
+
+            logger.info(f"purge {'(dry_run) ' if dry_run else ''}"
+                        f"{p.name}: {matched} 行{'（预览，未落盘）' if dry_run else ''}")
+            touched.append({"file": str(p), "rows_matched": matched})
+            if dry_run:
+                continue
+            kept = df.filter(~mask)
+            if kept.height:
+                _atomic_write_parquet(kept, p)
+            else:
+                p.unlink()  # 整文件清空 → 删文件，留空 parquet 徒增扫描成本
+    return {"rows_matched": total, "files_scanned": len(files), "files": touched}
+
+
 def daily_range() -> tuple[date | None, date | None]:
     """湖内日线的最小 / 最大交易日（空湖 → (None, None)）。
 
