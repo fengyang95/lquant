@@ -55,6 +55,10 @@ class EvaluateIn(BaseModel):
                               description="Top-N 持仓收缩测试的 N 列表")
     style_threshold: float = Field(default=0.14, ge=0.0, le=1.0,
                                    description="中性化后风格相关性阈值（max|ρ| 判定线）")
+    filter_zscore: float | None = Field(default=None, ge=1.0, le=100.0,
+                                        description="截面异常收益过滤阈值（|z| 上限，口径同 alphalens；None 不过滤）")
+    event_window: list[int] = Field(default=[10, 15], min_length=2, max_length=2,
+                                    description="事件式分层收益窗口 [before, after]（交易日）")
 
     @field_validator("start")
     @classmethod
@@ -247,9 +251,18 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
     if ret_col not in d.columns:
         raise HTTPException(500, f"前瞻收益列缺失: {ret_col}")
 
+    # 截面异常收益过滤（可选）：过滤一次，指标 / 序列 / 报告三处口径保持一致
+    outlier_stats = None
+    if req.filter_zscore is not None:
+        from lquant.factors.evaluate import filter_zscore, zscore_filter_stats
+
+        outlier_stats = zscore_filter_stats(d, threshold=req.filter_zscore)
+        d = filter_zscore(d, threshold=req.filter_zscore)
+
     # ---- metrics（原 run_evaluate 计算体） ----
     res = evaluate(d, "_factor", ret_col=ret_col, n_groups=req.n_groups,
-                   horizons=req.horizons)
+                   horizons=req.horizons, outlier_stats=outlier_stats,
+                   event_window=(req.event_window[0], req.event_window[1]))
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     report_path = _save_report_atomic(res["report"], REPORT_DIR / f"{req.factor}.html")
     ic = res["ic"]["ic"]
@@ -413,6 +426,30 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
         "ir": [_jf(v, 3) for v in rwin["ir"].to_list()] if len(rwin) else [],
     }
 
+    # 7) 事件式分层收益（±N 日）：事前发散=描述既成趋势，事后发散=预测性信号
+    event_study = {}
+    try:
+        from lquant.factors.evaluate.event_study import event_study_summary
+
+        es = event_study_summary(d, "_factor", "close", n_groups=req.n_groups,
+                                 before=req.event_window[0], after=req.event_window[1])
+        event_study = {
+            "rel_periods": es["rel_periods"],
+            "curves": {k: [_jf(v) for v in v_list] for k, v_list in es["curve"].items()},
+            "spread": [_jf(v) for v in es["spread"]],
+            "look_ahead_ratio": _jf(es["look_ahead_ratio"], 3),
+            "before": es["before"], "after": es["after"], "demeaned": es["demeaned"],
+        }
+    except Exception:  # noqa: BLE001
+        event_study = {}
+
+    metrics["outlier"] = (
+        {"threshold": outlier_stats["threshold"],
+         "n_dropped": outlier_stats["n_dropped"],
+         "dropped_rate": round(outlier_stats["dropped_rate"], 5)}
+        if outlier_stats else None
+    )
+
     series = {
         "factor": req.factor, "formula": req.formula,
         "n_groups": req.n_groups, "n_samples": len(d),
@@ -425,6 +462,7 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
         "excess": {"dates": ex_dates, "curves": ex_curves, "benchmark": "股票池等权"},
         "top_n": top_n_rows,
         "style_corr": style_corr,
+        "event_study": event_study,
     }
     return metrics, series
 

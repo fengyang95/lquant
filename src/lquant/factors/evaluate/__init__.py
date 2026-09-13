@@ -16,11 +16,14 @@ import polars as pl
 
 from lquant.factors.evaluate.attribution import attribution_summary, exposure
 from lquant.factors.evaluate.decay import decay_profile, decay_summary, half_life, suggest_rebalance
+from lquant.factors.evaluate.event_study import event_study, event_study_summary
 from lquant.factors.evaluate.ic import ic_autocorr, ic_by_year, ic_series, ic_summary
+from lquant.factors.evaluate.outliers import filter_zscore, zscore_filter_stats
 from lquant.factors.evaluate.quantile import (
     add_quantile,
     group_returns,
     long_short_nav,
+    pivot_group_returns,
     quantile_nav,
     quantile_summary,
 )
@@ -40,6 +43,8 @@ __all__ = [
     "forward_return", "forward_return_matrix",
     "ic_series", "ic_summary", "ic_by_year", "ic_autocorr",
     "add_quantile", "group_returns", "quantile_nav", "long_short_nav", "quantile_summary",
+    "pivot_group_returns", "filter_zscore", "zscore_filter_stats",
+    "event_study", "event_study_summary",
     "decay_profile", "decay_summary", "half_life", "suggest_rebalance",
     "attribution_summary", "exposure",
     "RatingThresholds", "factor_rating", "load_thresholds",
@@ -68,7 +73,8 @@ def evaluate(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
         out["report"] = factor_report(df, factor, ret_col, n_groups=n_groups,
                                       horizons=horizons, **_pick(kw, "price_col", "date_col",
                                                                  "symbol_col", "cat_col",
-                                                                 "universe"))
+                                                                 "universe", "filter_zscore",
+                                                                 "outlier_stats", "event_window"))
     return out
 
 

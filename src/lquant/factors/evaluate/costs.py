@@ -21,48 +21,62 @@ def factor_turnover(df: pl.DataFrame, factor: str, n_groups: int = 10, *,
     turnover = 1 - |当日组 ∩ 上日组| / |当日组|（以当日组为基数）。
     返回列：date, turnover_long, turnover_short, turnover_avg。
     首日无上一日持仓可比，直接不计入（输出从第 2 个交易日起）。
+
+    实现：把「昨日会员」拼到当日行上做 inner join 数重合，全流程向量化。
+    旧版按日 python 循环 + set 交（全市场 160 天要跑几秒），现在是一次 join。
     """
     top = top or n_groups
     bottom = bottom or 1
     d = add_quantile(df, factor, n_groups, date_col=date_col)
-    d = d.select([date_col, "q"] + (["symbol"] if "symbol" in d.columns else []))
     if "symbol" not in d.columns:
         raise KeyError("factor_turnover 需要 symbol 列标识会员")
-    d = d.drop_nulls(subset=["q"])
+    d = (d.select([date_col, "q", "symbol"])
+         .drop_nulls(subset=["q"])
+         .unique(subset=[date_col, "symbol"]))   # 同日同标的只算一个会员（与旧版 set 口径一致）
 
     date_dtype = df[date_col].dtype
     empty = pl.DataFrame(schema={"date": date_dtype,
                                  "turnover_long": pl.Float64,
                                  "turnover_short": pl.Float64,
                                  "turnover_avg": pl.Float64})
-    n_dates = d[date_col].n_unique()
-    if n_dates < 2:
+    if d[date_col].n_unique() < 2:
         return empty
 
-    def _members(sub: pl.DataFrame, q: int) -> set:
-        return set(sub.filter(pl.col("q") == q)["symbol"].to_list())
+    # 交易日 → 下一交易日 的映射（有序日期序列前移一位）
+    cal = d.select(pl.col(date_col).unique().sort()).with_columns(
+        pl.col(date_col).shift(-1).alias("_next"))
 
-    prev_long: set | None = None
-    prev_short: set | None = None
-    rows = []
-    for dt_raw, day_raw in d.group_by(date_col, maintain_order=True):
-        dt = dt_raw[0] if isinstance(dt_raw, (list, tuple)) else dt_raw
-        day = day_raw.sort("symbol")
-        cur_long = _members(day, top)
-        cur_short = _members(day, bottom)
-        if prev_long is None:      # 首日无可比持仓，不产生换手记录
-            prev_long, prev_short = cur_long, cur_short
-            continue
-        # 某端当日为空（如股票数 < n_groups）时记 null（不用 NaN，避免毒化均值），avg 只对有效端取均值
-        tl = 1.0 - len(cur_long & prev_long) / len(cur_long) if cur_long else None
-        ts = 1.0 - len(cur_short & prev_short) / len(cur_short) if cur_short else None
-        vals = [v for v in (tl, ts) if v is not None]
-        avg = sum(vals) / len(vals) if vals else None
-        rows.append({date_col: dt, "turnover_long": tl, "turnover_short": ts,
-                     "turnover_avg": avg})
-        prev_long, prev_short = cur_long, cur_short
-    out = pl.DataFrame(rows).rename({date_col: "date"}).sort("date")
-    return out.select(["date", "turnover_long", "turnover_short", "turnover_avg"])
+    out = (cal.filter(pl.col("_next").is_not_null())
+           .select(pl.col("_next"))
+           .rename({"_next": date_col}))
+
+    for side, q in (("long", top), ("short", bottom)):
+        # 先把范围收窄到该端组再 join 日历：全市场 300 万行直接 join 太贵，
+        # 十分位组只有 ~1/10 行，下推后 join 成本随组规模而不是总量走
+        sub = d.filter(pl.col("q") == q).join(cal, on=date_col, how="left")
+        sizes = sub.group_by(date_col).agg(pl.len().alias(f"n_{side}"))
+        prev = sub.select(["_next", "symbol"]).drop_nulls("_next")
+        overlap = (prev.join(sub.select([date_col, "symbol"]),
+                             left_on=["_next", "symbol"],
+                             right_on=[date_col, "symbol"], how="inner")
+                   .group_by("_next").agg(pl.len().alias(f"ov_{side}"))
+                   .rename({"_next": date_col}))
+        out = out.join(sizes, on=date_col, how="left").join(overlap, on=date_col, how="left")
+        # 当日该端为空 → 记 null（不用 0，避免污染均值）；旧版同样不产生记录
+        out = out.with_columns(
+            pl.when(pl.col(f"n_{side}") > 0)
+            .then(1.0 - pl.col(f"ov_{side}").fill_null(0) / pl.col(f"n_{side}"))
+            .otherwise(None)
+            .alias(f"turnover_{side}")
+        )
+    out = out.with_columns(
+        pl.when(pl.col("turnover_long").is_null()).then(pl.col("turnover_short"))
+        .when(pl.col("turnover_short").is_null()).then(pl.col("turnover_long"))
+        .otherwise((pl.col("turnover_long") + pl.col("turnover_short")) / 2.0)
+        .alias("turnover_avg")
+    )
+    return out.rename({date_col: "date"}).select(
+        ["date", "turnover_long", "turnover_short", "turnover_avg"]).sort("date")
 
 
 def cost_adjusted_nav(ls_nav: pl.DataFrame, turnover_df: pl.DataFrame,

@@ -101,28 +101,36 @@ def quantile_excess_nav(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1
     ex_long_short = ex_qN / ex_q1 —— 多空两端的相对强弱，比绝对多空更贴近
     「多头组合能否跑赢空头组合」的实盘直觉。
     """
-    from lquant.factors.evaluate.quantile import group_returns
+    from lquant.factors.evaluate.quantile import group_returns, pivot_group_returns
 
     g = group_returns(df, factor, ret_col, n_groups, date_col=date_col)
     if not len(g):
         return g
     if bench is None:
         bench = benchmark_series(df, ret_col, date_col=date_col)
-    g = g.join(bench, on=date_col, how="inner").sort([date_col, "q"])
+    piv = pivot_group_returns(g, n_groups, date_col=date_col)
+    piv = piv.join(bench, on=date_col, how="inner").sort(date_col)
 
-    dates = g.filter(pl.col("q") == 1).sort(date_col)[date_col].to_list()
-    out = pl.DataFrame({date_col: dates})
-    bench_nav = np_cumprod(g.filter(pl.col("q") == 1).sort(date_col)["bench"].to_numpy())
+    bn = (pl.col("bench").fill_null(0.0) + 1.0).cum_prod()
+    exprs = []
     for q in range(1, n_groups + 1):
-        sub = g.filter(pl.col("q") == q).sort(date_col)
-        if len(sub) != len(dates):        # 空分位组：超额净值记 NaN，不毒化曲线
-            out = out.with_columns(pl.Series(f"ex_q{q}", [float("nan")] * len(dates)))
-            continue
-        nav_g = np_cumprod(sub["ret"].to_numpy())
-        out = out.with_columns(pl.Series(
-            f"ex_q{q}", [a / b for a, b in zip(nav_g, bench_nav, strict=False)]))
-    out = out.with_columns((pl.col(f"ex_q{n_groups}") / pl.col("ex_q1")).alias("ex_long_short"))
-    return out
+        # 空分位组（该组某日无成员）→ 整列记 null，不毒化曲线（与旧实现口径一致）
+        exprs.append(
+            pl.when(pl.col(str(q)).is_null().any())
+            .then(pl.lit(None, dtype=pl.Float64))
+            .otherwise(_cum_nav_col(str(q)) / bn)
+            .alias(f"ex_q{q}")
+        )
+    out = piv.with_columns(exprs).select(
+        [date_col] + [f"ex_q{q}" for q in range(1, n_groups + 1)]
+    )
+    return out.with_columns(
+        (pl.col(f"ex_q{n_groups}") / pl.col("ex_q1")).alias("ex_long_short")
+    )
+
+
+def _cum_nav_col(col: str) -> pl.Expr:
+    return (pl.col(col).fill_null(0.0) + 1.0).cum_prod()
 
 
 def np_cumprod(arr) -> list[float]:

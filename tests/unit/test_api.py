@@ -248,6 +248,46 @@ def test_evaluate_excess_topn_style_payload(client):
     assert sc["passed"] in (True, False, None)
 
 
+def test_evaluate_event_study_and_outlier_payload(client):
+    """事件式分层收益 + 截面异常收益过滤（移植自 alphalens/ferric 的两个算子）。"""
+    r = client.post("/api/factors/evaluate", json={
+        "factor": "MA20e", "formula": "MA20", "n_groups": 5, "start": "2024-06-01",
+        "filter_zscore": 5.0, "event_window": [3, 5]})
+    assert r.status_code == 200
+    body = r.json()
+
+    # 过滤统计回传（阈值 + 删除行数在报告里要交代清楚）
+    out = body["outlier"]
+    assert out is not None
+    assert out["threshold"] == 5.0
+    assert 0 <= out["dropped_rate"] <= 1
+    assert int(out["n_dropped"]) <= body["n_samples"]
+
+    # 事件式曲线：x 轴从 -before 到 +after，各组曲线等长，事件日必然过 0
+    es = body["series"]["event_study"]
+    assert es["before"] == 3 and es["after"] == 5
+    assert es["rel_periods"][0] == -3 and es["rel_periods"][-1] == 5
+    assert set(es["curves"]) == {f"q{i}" for i in range(1, 6)}
+    for key in es["curves"]:
+        assert len(es["curves"][key]) == len(es["rel_periods"])
+        assert len(es["spread"]) == len(es["rel_periods"])
+    zero = es["rel_periods"].index(0)
+    assert abs(es["curves"]["q1"][zero]) < 1e-6
+    assert es["look_ahead_ratio"] is None or es["look_ahead_ratio"] >= 0
+
+
+def test_evaluate_without_filter_returns_null_outlier(client):
+    """默认不过滤：outlier 为 null，不能悄悄改变既有口径。"""
+    r = client.post("/api/factors/evaluate/series", json={
+        "factor": "MA20n", "formula": "MA20", "n_groups": 5, "start": "2024-06-01"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["event_study"]["rel_periods"]           # 默认窗口仍在算
+    m = client.post("/api/factors/evaluate", json={
+        "factor": "MA20n2", "formula": "MA20", "n_groups": 5, "start": "2024-06-01"})
+    assert m.json()["outlier"] is None
+
+
 # ---------- backtests ----------
 
 def test_backtest_run_list_detail_compare(client):

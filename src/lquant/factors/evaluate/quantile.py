@@ -14,7 +14,7 @@ import polars as pl
 from lquant.backtest.metrics import perf_from_returns
 
 __all__ = ["add_quantile", "group_returns", "quantile_nav", "quantile_summary",
-           "long_short_nav"]
+           "long_short_nav", "pivot_group_returns"]
 
 
 def add_quantile(df: pl.DataFrame, factor: str, n_groups: int = 10,
@@ -46,6 +46,29 @@ def group_returns(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
     )
 
 
+def pivot_group_returns(g: pl.DataFrame, n_groups: int = 10, *,
+                        date_col: str = "trade_date") -> pl.DataFrame:
+    """把 group_returns 的长表一次性转成宽表（date + 1..N 列）。
+
+    之前每个分位组都要 filter 一次长表，10 组就是 10 次全表扫描；
+    pivot 一次成宽表后，所有下游计算（净值、汇总、多空）都退化成列运算。
+    缺失的 (date, q) 组合补 null —— 该日该组无人，收益视为不参与累计。
+    """
+    if not len(g):
+        return g
+    piv = g.pivot(on="q", index=date_col, values="ret",
+                  aggregate_function="first").sort(date_col)
+    for q in range(1, n_groups + 1):
+        if str(q) not in piv.columns:
+            piv = piv.with_columns(pl.lit(None, dtype=pl.Float64).alias(str(q)))
+    return piv.select([date_col] + [str(q) for q in range(1, n_groups + 1)])
+
+
+def _cum_nav(col: str) -> pl.Expr:
+    """(1+r) 累乘成净值；空值按 0 收益处理（净值原地踏步）。"""
+    return (pl.col(col).fill_null(0.0) + 1.0).cum_prod()
+
+
 def quantile_nav(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
                  n_groups: int = 10, *, date_col: str = "trade_date") -> pl.DataFrame:
     """各组净值曲线。返回宽表：date + q1..qN + long_short。
@@ -56,15 +79,11 @@ def quantile_nav(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
     g = group_returns(df, factor, ret_col, n_groups, date_col=date_col)
     if not len(g):
         return g
-    navs = {}
-    for q in range(1, n_groups + 1):
-        sub = g.filter(pl.col("q") == q).sort(date_col)
-        navs[f"q{q}"] = np_cumprod(sub["ret"].to_numpy())
-    out = pl.DataFrame({date_col: g.filter(pl.col("q") == 1).sort(date_col)[date_col].to_list()})
-    for k, v in navs.items():
-        out = out.with_columns(pl.Series(k, v))
-    out = out.with_columns((pl.col(f"q{n_groups}") - pl.col("q1")).alias("long_short"))
-    return out
+    piv = pivot_group_returns(g, n_groups, date_col=date_col)
+    out = piv.with_columns(
+        [_cum_nav(str(q)).alias(f"q{q}") for q in range(1, n_groups + 1)]
+    ).select([date_col] + [f"q{q}" for q in range(1, n_groups + 1)])
+    return out.with_columns((pl.col(f"q{n_groups}") - pl.col("q1")).alias("long_short"))
 
 
 def np_cumprod(arr) -> list[float]:
@@ -83,25 +102,22 @@ def long_short_nav(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
     """
     top = top or n_groups
     bottom = bottom or 1
+    for name, q in (("top", top), ("bottom", bottom)):
+        if not 1 <= q <= n_groups:
+            raise ValueError(f"{name}={q} 超出分组范围 1..{n_groups}")
     g = group_returns(df, factor, ret_col, n_groups, date_col=date_col)
     if not len(g):
         return g
-    dates = sorted(g[date_col].unique().to_list())
-    hi, lo = {}, {}
-    for d in dates:
-        sub = g.filter(pl.col(date_col) == d)
-        hi_d = sub.filter(pl.col("q") == top)
-        lo_d = sub.filter(pl.col("q") == bottom)
-        hi[d] = float(hi_d["ret"][0]) if len(hi_d) else 0.0
-        lo[d] = float(lo_d["ret"][0]) if len(lo_d) else 0.0
-    ls = [hi[d] - lo[d] for d in dates]
-    return pl.DataFrame({
-        date_col: dates,
-        "ret_long": [hi[d] for d in dates],
-        "ret_short": [lo[d] for d in dates],
-        "ret_long_short": ls,
-        "nav_long_short": np_cumprod(ls),
-    })
+    piv = pivot_group_returns(g, n_groups, date_col=date_col)
+    return (
+        piv.select([
+            date_col,
+            pl.col(str(top)).fill_null(0.0).alias("ret_long"),
+            pl.col(str(bottom)).fill_null(0.0).alias("ret_short"),
+        ])
+        .with_columns((pl.col("ret_long") - pl.col("ret_short")).alias("ret_long_short"))
+        .with_columns(_cum_nav("ret_long_short").alias("nav_long_short"))
+    )
 
 
 def quantile_summary(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
@@ -112,25 +128,29 @@ def quantile_summary(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
     if not len(g):
         return {"factor": factor, "n_groups": n_groups, "groups": []}
 
+    piv = pivot_group_returns(g, n_groups, date_col=date_col)
     groups = []
     for q in range(1, n_groups + 1):
-        sub = g.filter(pl.col("q") == q).sort(date_col)
-        # 股票数 < n_groups 时部分分位组可能为空 —— mean 为 None，按 NaN 处理
-        m = sub["ret"].mean()
-        r = sub["ret"].to_numpy() if len(sub) else []
-        p = perf_from_returns(r, periods_per_year=periods_per_year) if len(sub) else {}
+        s = piv[str(q)].drop_nulls()
+        # 股票数 < n_groups 时部分分位组可能为空 —— 该列全 null，按 NaN 处理
+        m = s.mean()
+        r = s.to_numpy() if len(s) else []
+        p = perf_from_returns(r, periods_per_year=periods_per_year) if len(s) else {}
         groups.append({
             "q": q,
             "mean_ret": float(m) if m is not None else float("nan"),
             "annual_return": p.get("annual_return", float("nan")),
             "sharpe": p.get("sharpe", float("nan")),
             "max_drawdown": p.get("max_drawdown", float("nan")),
-            "n_periods": len(sub),
+            "n_periods": len(s),
         })
 
-    ls = long_short_nav(df, factor, ret_col, n_groups, date_col=date_col)
-    ls_perf = perf_from_returns(ls["ret_long_short"].to_numpy(),
-                                periods_per_year=periods_per_year) if len(ls) else {}
+    ls = piv.select(
+        (pl.col(str(n_groups)).fill_null(0.0) - pl.col("1").fill_null(0.0))
+        .alias("ret_long_short")
+    )["ret_long_short"]
+    ls_perf = perf_from_returns(ls.to_numpy(), periods_per_year=periods_per_year) \
+        if len(ls) else {}
 
     # 空分位组的 mean_ret 是 NaN —— 只用有效组算单调性与 spread，否则 NaN 毒化结果
     pairs = [(g["q"], g["mean_ret"]) for g in groups
