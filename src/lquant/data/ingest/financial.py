@@ -21,8 +21,16 @@ def backfill_financial(
     kinds: tuple[str, ...] = (
         "profit", "balance", "cashflow", "dupont", "growth", "operation",
     ),
+    provider_name: str | None = None,
     batch: int = 20,
 ) -> int:
+    """PIT 财务回填。
+
+    provider_name=None 走 Fallback 链头（默认 baostock，六张季表全支持）；
+    指定 "tushare" 时用 tushare pro（income/balancesheet/cashflow/
+    fina_indicator 四类，天然 ann_date），适合与 baostock 互为补充/对拍。
+    checkpoint 键含源名：换源重跑不会误跳过。
+    """
     from loguru import logger
 
     from lquant.data.providers import get_provider
@@ -30,12 +38,20 @@ def backfill_financial(
     start_d = start if isinstance(start, date) else date.fromisoformat(start)
     end_d = end if isinstance(end, date) else (date.fromisoformat(end) if end else today_cn())
 
-    provider = get_provider()
-    target = provider.providers[0] if hasattr(provider, "providers") else provider
+    chain = get_provider()
+    if provider_name:
+        matches = [p for p in chain.providers if p.name == provider_name]
+        if not matches:
+            raise RuntimeError(f"provider {provider_name} 不可用（未启用或缺 token）")
+        target = matches[0]
+        cp_name = f"financial_pit_{provider_name}"
+    else:
+        target = chain.providers[0] if hasattr(chain, "providers") else chain
+        cp_name = "financial_pit"
 
-    cp = Checkpoint("financial_pit")
+    cp = Checkpoint(cp_name)
     todo = cp.remaining(list(symbols))
-    logger.info(f"财务回填 {len(todo)} 只（已完成 {len(cp)}）{start_d}~{end_d}")
+    logger.info(f"财务回填[{target.name}] {len(todo)} 只（已完成 {len(cp)}）{start_d}~{end_d}")
 
     repo = FinancialRepo()
     done = 0

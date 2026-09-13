@@ -323,3 +323,78 @@ def test_build_chain_skips_unregistered_provider(
     finally:
         pv.PROVIDERS._items["sina"] = saved
         pv.reset_chain()
+
+
+# ---------------- daily_basic ----------------
+
+_DAILY_BASIC = pd.DataFrame({
+    "ts_code": ["600000.SH", "000001.SZ"],
+    "trade_date": ["20260827", "20260827"],
+    "close": [10.2, 12.3],
+    "turnover_rate": [0.5, 0.9],
+    "pe_ttm": [5.5, 6.6],
+    "pb": [0.6, 0.7],
+    "ps_ttm": [1.1, 1.2],
+    "dv_ttm": [3.0, 4.0],
+    "total_mv": [2_000_000.0, 3_000_000.0],   # 万元
+    "circ_mv": [1_500_000.0, 2_500_000.0],    # 万元
+    "total_share": [300_000.0, 400_000.0],    # 万股
+    "float_share": [250_000.0, 350_000.0],    # 万股
+})
+
+
+def test_daily_basic_mapping_and_units(
+    provider: TushareProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pro = _install_fake_ts(monkeypatch, {"daily_basic": lambda **kw: _DAILY_BASIC})
+    out = provider.daily_basic(date(2026, 8, 27))
+    api, kw = pro.calls[0]
+    assert api == "daily_basic"
+    assert kw["trade_date"] == "20260827"   # 一天一请求覆盖全市场
+    assert out.columns == list(SCHEMAS["daily_basic"])
+    row = out.filter(pl.col("symbol") == "600000.SH").row(0, named=True)
+    assert row["trade_date"] == date(2026, 8, 27)
+    assert row["pb_mrq"] == 0.6             # pb → pb_mrq 对齐日线湖列名
+    assert row["total_mv"] == 2_000_000.0 * 1e4   # 万元 → 元
+    assert row["float_mv"] == 1_500_000.0 * 1e4
+    assert row["total_share"] == 300_000.0 * 1e4  # 万股 → 股
+    assert row["source"] == "tushare"
+
+
+def test_daily_basic_empty_returns_schema(
+    provider: TushareProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_fake_ts(monkeypatch, {"daily_basic": lambda **kw: pd.DataFrame()})
+    out = provider.daily_basic(date(2026, 8, 27))
+    assert out.height == 0
+    assert out.columns == list(SCHEMAS["daily_basic"])
+
+
+def test_financial_pit_indicator_kind_uses_fina_indicator(
+    provider: TushareProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """indicator kind → fina_indicator（140+ 财务指标，含 ann_date）。"""
+    fina = pd.DataFrame({
+        "ts_code": ["600000.SH"],
+        "end_date": ["20240331"],
+        "ann_date": ["20240426"],
+        "roe": [12.5],
+        "grossprofit_margin": [40.0],
+    })
+    pro = _install_fake_ts(monkeypatch, {"fina_indicator": lambda **kw: fina})
+    out = provider.financial_pit(
+        ["600000.SH"], date(2024, 1, 1), date(2024, 6, 30), kinds=("indicator",)
+    )
+    api, kw = pro.calls[0]
+    assert api == "fina_indicator"
+    assert out["item"].to_list() == ["fina_indicator.roe", "fina_indicator.grossprofit_margin"]
+    assert out["report_type"].to_list() == ["2024Q1", "2024Q1"]
+
+
+def test_financial_pit_unsupported_kinds_short_circuit(provider: TushareProvider) -> None:
+    """tushare 没有 dupont/growth/operation：全不支持的 kinds 应空返回不触网。"""
+    out = provider.financial_pit(
+        ["600000.SH"], date(2024, 1, 1), date(2024, 6, 30),
+        kinds=("dupont", "growth", "operation"),
+    )
+    assert out.height == 0

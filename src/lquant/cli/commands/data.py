@@ -68,12 +68,33 @@ def minute_cmd(symbols: str | None, start: str, end: str | None, freq: str) -> N
 @click.option("--symbols", required=True, help="逗号分隔；财务接口无批量，全市场会跑几天")
 @click.option("--start", default="2016-01-01")
 @click.option("--end", default=None)
-def financial(symbols: str, start: str, end: str | None) -> None:
+@click.option("--provider", "provider_name", default=None,
+              type=click.Choice(["baostock", "tushare"]),
+              help="指定源；缺省走链头（baostock）。tushare 含 fina_indicator 指标表")
+def financial(symbols: str, start: str, end: str | None, provider_name: str | None) -> None:
     """PIT 财务回填（stat_date + pub_date，防未来函数）。"""
     from lquant.data.ingest.financial import backfill_financial
 
-    n = backfill_financial(symbols.split(","), start=start, end=end)
+    n = backfill_financial(symbols.split(","), start=start, end=end,
+                           provider_name=provider_name)
     click.echo(f"done {n}")
+
+
+@data.command("basic")
+@click.option("--start", default="2024-01-01", help="回填区间起点（默认日线湖起点可传 2024）")
+@click.option("--end", default=None)
+@click.option("--no-merge", is_flag=True, help="只落 daily_basic 湖，不合并回日线")
+def basic_cmd(start: str, end: str | None, no_merge: bool) -> None:
+    """tushare daily_basic 回填（市值/估值/股本），并合并回日线湖空缺列。
+
+    一天一请求覆盖全市场；checkpoint 按天断点续传；merge 只填 NULL 不覆盖主源。
+    """
+    from lquant.data.ingest.daily_basic import backfill_daily_basic
+
+    out = backfill_daily_basic(start=start, end=end, merge=not no_merge)
+    for k, v in out.items():
+        click.echo(f"  {k}: {v}")
+    click.echo("basic done")
 
 
 @data.command()

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 import polars as pl
@@ -120,6 +121,11 @@ class TushareProvider(MappingProvider):
         qps: float = 1,
         capability: frozenset[Capability] | None = None,
     ) -> None:
+        from lquant.core.env import load_env_files
+
+        # 直接构造（绕过 build_chain）时也能找到 .env 里的 token
+        load_env_files(Path.cwd() / ".env",
+                       Path(__file__).resolve().parent.parent / ".env")
         self._token = token or os.environ.get("TUSHARE_TOKEN", "")
         self._bucket = TokenBucket(qps)
         self.capability = capability or self.capability
@@ -280,6 +286,39 @@ class TushareProvider(MappingProvider):
             "symbol", "trade_date", "factor", pl.lit("tushare").alias("source")
         )
 
+    def daily_basic(self, trade_date: date) -> pl.DataFrame:
+        """pro.daily_basic：一个交易日全市场一行（市值/估值/股本）。
+
+        单位换算与 DAILY_BAR 注释口径一致：total_mv/circ_mv 万元 → 元，
+        total_share/float_share 万股 → 股；pb → pb_mrq 对齐日线湖列名。
+        """
+        from lquant.data.schema import SCHEMAS
+
+        df = self._call("daily_basic", trade_date=trade_date.strftime("%Y%m%d"))
+        if df.is_empty():
+            return pl.DataFrame(schema=SCHEMAS["daily_basic"])
+        df = _to_date_col(df, "trade_date").with_columns(
+            pl.col(["close", "turnover_rate", "pe_ttm", "pb", "ps_ttm", "dv_ttm",
+                    "total_mv", "circ_mv", "total_share", "float_share"])
+            .cast(pl.Float64),
+        )
+        out = df.select(
+            pl.col("ts_code").alias("symbol"),
+            "trade_date",
+            "close",
+            "turnover_rate",
+            "pe_ttm",
+            pl.col("pb").alias("pb_mrq"),
+            "ps_ttm",
+            (pl.col("total_mv") * 1e4).alias("total_mv"),
+            (pl.col("circ_mv") * 1e4).alias("float_mv"),
+            "dv_ttm",
+            (pl.col("total_share") * 1e4).alias("total_share"),
+            (pl.col("float_share") * 1e4).alias("float_share"),
+            pl.lit("tushare").alias("source"),
+        )
+        return normalize_symbols(out)
+
     def financial_pit(
         self, symbols: list[str], start: date, end: date,
         kinds: tuple[str, ...] = ("profit", "balance", "cashflow"),
@@ -289,9 +328,15 @@ class TushareProvider(MappingProvider):
         end_date + ann_date 双日期天然 PIT；无 ann_date 的行丢弃
         （未来函数防护，宁可丢数据）。
         kinds 与 baostock 口径对齐：profit→income、balance→balancesheet、
-        cashflow→cashflow；dupont/growth/operation 等暂无对应接口，fail-soft 跳过。
+        cashflow→cashflow、indicator→fina_indicator（140+ 财务指标，
+        含 ann_date）；dupont/growth/operation 暂无对应接口，fail-soft 跳过。
         """
-        kind_to_api = {"profit": "income", "balance": "balancesheet", "cashflow": "cashflow"}
+        kind_to_api = {
+            "profit": "income",
+            "balance": "balancesheet",
+            "cashflow": "cashflow",
+            "indicator": "fina_indicator",
+        }
         apis = tuple(dict.fromkeys(kind_to_api[k] for k in kinds if k in kind_to_api))
         if not apis:
             return pl.DataFrame()

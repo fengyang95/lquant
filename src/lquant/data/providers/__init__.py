@@ -62,8 +62,10 @@ def build_chain() -> FallbackProvider:
     （fail-fast），绝不带着坏映射静默取数。
     """
     from lquant.core.config import get_settings  # noqa: PLC0415
+    from lquant.core.env import load_env  # noqa: PLC0415
     from lquant.data.mapping import validate_all_mappings  # noqa: PLC0415
 
+    load_env()  # .env 里可能有 TUSHARE_TOKEN 等，必须在 token 门控之前
     validate_all_mappings(get_settings().config_dir)
     _import_all()
     cfg = load_providers()

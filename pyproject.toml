@@ -35,6 +35,7 @@ sources = [
   "akshare>=1.16",
   "efinance>=0.5",
   "mootdx>=0.10",
+  "tushare>=1.4",
 ]
 # 因子 / 组合
 factors = [

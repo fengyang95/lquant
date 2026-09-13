@@ -116,6 +116,54 @@ def _daily_path(year: int) -> Path:
     return _root() / "daily" / f"year={year}" / "part-0.parquet"
 
 
+def _daily_basic_path(year: int) -> Path:
+    return _root() / "daily_basic" / f"year={year}" / "part-0.parquet"
+
+
+def write_daily_basic(df: pl.DataFrame) -> list[Path]:
+    """daily_basic 湖按年单文件，覆盖语义与 write_daily 一致。"""
+    if not len(df):
+        return []
+    out: list[Path] = []
+    for year, g in df.with_columns(pl.col("trade_date").dt.year().alias("y")).group_by("y"):
+        y = year[0]
+        p = _daily_basic_path(y)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        g = g.drop("y")
+        with _file_lock(p):
+            if p.exists():
+                g = _overlay(pl.read_parquet(p), g, ["symbol", "trade_date"])
+            g = g.sort(["symbol", "trade_date"])
+            _atomic_write_parquet(g, p)
+        out.append(p)
+    return out
+
+
+def read_daily_basic(start=None, end=None) -> pl.DataFrame:
+    """读 daily_basic 湖（区间过滤，空湖返回带 schema 的空帧）。"""
+    from datetime import date as _date
+
+    root = _root() / "daily_basic"
+    if not _has_parquet(root):
+        return _empty_frame("daily_basic")
+    if isinstance(start, str):
+        start = _date.fromisoformat(start)
+    if isinstance(end, str):
+        end = _date.fromisoformat(end)
+    df = (
+        pl.scan_parquet(
+            str(root / "**" / "*.parquet"),
+            missing_columns="insert",
+            extra_columns="ignore",
+        ).collect()
+    )
+    if start is not None:
+        df = df.filter(pl.col("trade_date") >= start)
+    if end is not None:
+        df = df.filter(pl.col("trade_date") <= end)
+    return df
+
+
 def write_daily(df: pl.DataFrame) -> list[Path]:
     if not len(df):
         return []
