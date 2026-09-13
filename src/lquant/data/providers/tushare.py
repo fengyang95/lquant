@@ -359,6 +359,11 @@ class TushareProvider(MappingProvider):
                     continue
                 df = _to_date_col(df, "end_date")
                 df = _to_date_col(df, "ann_date")
+                # PIT 防线：公告日早于报告期的行是源数据异常（实测
+                # fina_indicator 个别报告 ann_date 提前数十天），宁可丢数据
+                df = df.filter(
+                    pl.col("ann_date").is_null() | (pl.col("ann_date") >= pl.col("end_date"))
+                )
                 # item 前缀对齐 get_fundamentals DSL 口径：fina_indicator
                 # 落成 indicator.*（_KIND_PREFIX["indicator"]="indicator"）
                 long = _wide_to_long(

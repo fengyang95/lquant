@@ -410,3 +410,20 @@ def test_financial_pit_baostock_kinds_map_to_fina_indicator(
     api_calls = [a for a, _ in pro.calls]
     assert api_calls == ["fina_indicator"]   # 去重：三 kind 只拉一次
     assert out["item"].to_list() == ["indicator.roe"]
+
+
+def test_financial_pit_drops_ann_date_before_period(
+    provider: TushareProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ann_date 早于 end_date 的行是源数据异常 → 整行丢弃（PIT 防线）。"""
+    fina = pd.DataFrame({
+        "ts_code": ["603400.SH", "603400.SH"],
+        "end_date": ["20260630", "20260331"],
+        "ann_date": ["20260422", "20260422"],   # 第一行比报告期早 69 天
+        "roe": [12.5, 13.0],
+    })
+    _install_fake_ts(monkeypatch, {"fina_indicator": lambda **kw: fina})
+    out = provider.financial_pit(
+        ["603400.SH"], date(2026, 1, 1), date(2026, 6, 30), kinds=("indicator",)
+    )
+    assert out["stat_date"].unique().to_list() == [date(2026, 3, 31)]
