@@ -122,6 +122,8 @@ class TableSource:
     pool_bare_code: bool = True  # 池内 600519.SH → 600519
     limit: int | None = None  # 单次最多产出条数
     recent_days: int | None = None  # 只保留请求日往前 N 天内的条目（研报接口会返回多年历史）
+    fallback_url: str = ""  # 上游无链接列时的兜底链接（保证每条资讯可点击）
+
 
     # ---------- 抓取 ----------
 
@@ -216,7 +218,11 @@ class TableSource:
         published_at = _parse_time(row.get(time_col)) if time_col else None
         if published_at is None and self.default_publish_time:
             published_at = datetime.combine(day, time.fromisoformat(self.default_publish_time))
-        url = _clean(row.get(url_col)) if url_col else ""
+        # 先按"真实 url"算 external_id，再应用兜底链接 —— 否则同一兜底 URL
+        # 会让同日全部条目共享同一 sha1(url) 去重键而被误合并
+        real_url = _clean(row.get(url_col)) if url_col else ""
+        external_id = self._external_id(title, content, real_url, published_at, day)
+        url = real_url or self._fallback_url(day)
 
         result_symbols = tuple(symbols)
         code_col = resolved["code"]
@@ -228,7 +234,7 @@ class TableSource:
         return NewsItem(
             source=self.category,
             source_name=self.source_name,
-            external_id=self._external_id(title, content, url, published_at, day),
+            external_id=external_id,
             title=title,
             content=content,
             url=url,
@@ -239,6 +245,10 @@ class TableSource:
     def _derive_title(self, title: str, content: str, row: dict[str, Any]) -> str:
         """标题派生钩子（榜单类来源用它补上榜单名/涨跌幅）。"""
         return title
+
+    def _fallback_url(self, day: date) -> str:
+        """无链接列时的兜底链接钩子（cctv 覆写为当日列表页）。"""
+        return self.fallback_url
 
     def _derive_content(self, content: str, row: dict[str, Any]) -> str:
         """正文派生钩子（研报/公告类用它把多个字段拼成摘要）。"""
@@ -322,6 +332,11 @@ class CctvNewsSource(TableSource):
     cols = Cols(title=("title",), content=("content",))
     day_arg = "date"
     default_publish_time = "19:00:00"  # 联播播出时刻，替代缺失的时间列
+    fallback_url = "https://tv.cctv.com/lm/xwlb/"  # 兜底 = 新闻联播栏目页
+
+    def _fallback_url(self, day: date) -> str:
+        # 接口只有 date/title/content：兜底链接用当日列表页，天然逐日唯一
+        return f"https://tv.cctv.com/lm/xwlb/day/{day:%Y%m%d}.shtml"
 
 
 # ---------- report：研报 / 公告 ----------
@@ -387,6 +402,7 @@ class BaiduHotSource(TableSource):
     kwargs = {"symbol": "A股"}
     day_arg = "date"
     cols = Cols(title=("名称/代码",))
+    fallback_url = "https://gushitong.baidu.com/"  # 热搜榜无单条链接 → 百度股市通首页
 
     def _derive_title(self, title: str, content: str, row: dict[str, Any]) -> str:
         pct = _clean(row.get("涨跌幅"))

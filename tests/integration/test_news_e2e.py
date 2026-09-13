@@ -75,6 +75,11 @@ def _cls_df() -> pd.DataFrame:
 def mock_akshare(monkeypatch):
     """akshare 全 mock：电报采集 + securities 词表。"""
     monkeypatch.setattr(ak, "stock_info_global_cls", _cls_df)
+    # 直连源站的 _http_json 一并打桩为失败 → 走 akshare 回退路径（同单测约定）
+    monkeypatch.setattr(
+        "lquant.news.sources.telegraph._http_json",
+        lambda *a, **k: (_ for _ in ()).throw(ConnectionError("stubbed")),
+    )
 
     class _FakeProvider:
         def securities(self):  # noqa: ANN201, ANN001

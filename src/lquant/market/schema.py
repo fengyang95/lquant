@@ -62,6 +62,7 @@ MARKET_TABLES: dict[str, str] = {
             trade_date      DATE,
             sector_code     VARCHAR,
             sector_name     VARCHAR,
+            kind            VARCHAR,
             change_pct      DOUBLE,
             turnover_rate   DOUBLE,
             amount          DOUBLE,
@@ -152,7 +153,8 @@ TABLE_COLUMNS: dict[str, list[str]] = {
     "money_flow": ["trade_date", "symbol", "name", "close", "change_pct", "main_net_inflow",
                    "main_net_ratio", "super_large_net", "large_net", "medium_net",
                    "small_net", "collected_at"],
-    "sector_daily": ["trade_date", "sector_code", "sector_name", "change_pct", "turnover_rate",
+    "sector_daily": ["trade_date", "sector_code", "sector_name", "kind", "change_pct",
+                     "turnover_rate",
                      "amount", "main_net_inflow", "leader_symbol", "leader_name",
                      "leader_change", "up_count", "down_count", "collected_at"],
     "sentiment_daily": ["trade_date", "limit_up_count", "limit_down_count", "broken_count",
@@ -183,6 +185,16 @@ def ensure_market_tables(con: Any) -> int:
     """
     n = 0
     for table, sql in MARKET_TABLES.items():
+        # 加列迁移：新增可空列时优先 ALTER（保留历史数据），不动 drop-rebuild 路径
+        if table == "sector_daily":
+            try:
+                existing_cols = {r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()}
+                if existing_cols and "kind" not in existing_cols:
+                    con.execute(
+                        "ALTER TABLE sector_daily ADD COLUMN kind VARCHAR DEFAULT 'industry'")
+                    print("[migrate] sector_daily 加列 kind（历史行默认 industry）")
+            except Exception as e:  # noqa: BLE001  表可能不存在，走下面正常建表
+                print(f"[migrate] sector_daily kind 列检查跳过: {e}")
         required = [c for c in TABLE_COLUMNS.get(table, []) if c != "collected_at"]
         try:
             existing = {r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()}

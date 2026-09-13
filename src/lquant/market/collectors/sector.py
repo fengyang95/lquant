@@ -17,7 +17,7 @@ import polars as pl
 from lquant.core.types import now_cn, parse_symbol
 from lquant.market.em_client import em_get
 
-__all__ = ["fetch_sectors", "fetch_concepts", "SECTOR_FS"]
+__all__ = ["fetch_sectors", "fetch_concepts", "fetch_areas", "SECTOR_FS"]
 
 _PUSH2 = "https://push2.eastmoney.com/api/qt/clist/get"
 SECTOR_FS = {"industry": "m:90+t:2", "concept": "m:90+t:3", "area": "m:90+t:1"}
@@ -73,6 +73,7 @@ def fetch_sectors(trade_date=None, kind: str = "industry", *, top: int = 100,
             "trade_date": today,
             "sector_code": str(it.get("f12")),
             "sector_name": it.get("f14"),
+            "kind": kind,
             "change_pct": _num(it.get("f3")),
             "turnover_rate": _num(it.get("f8")),
             "amount": 0.0,
@@ -93,9 +94,14 @@ def fetch_concepts(trade_date=None, *, top: int = 200, demo: bool = False) -> pl
     return fetch_sectors(trade_date, "concept", top=top, demo=demo)
 
 
+def fetch_areas(trade_date=None, *, top: int = 60, demo: bool = False) -> pl.DataFrame:
+    return fetch_sectors(trade_date, "area", top=top, demo=demo)
+
+
 def _empty() -> pl.DataFrame:
     return pl.DataFrame(schema={
         "trade_date": pl.Date, "sector_code": pl.Utf8, "sector_name": pl.Utf8,
+        "kind": pl.Utf8,
         "change_pct": pl.Float64, "turnover_rate": pl.Float64, "amount": pl.Float64,
         "main_net_inflow": pl.Float64, "leader_symbol": pl.Utf8, "leader_name": pl.Utf8,
         "leader_change": pl.Float64, "up_count": pl.Int64, "down_count": pl.Int64,
@@ -104,18 +110,26 @@ def _empty() -> pl.DataFrame:
 
 def _demo_sectors(d, kind: str) -> pl.DataFrame:
     import random
-    random.seed((d.toordinal(), kind).__hash__() % 10000)
-    names = (["半导体", "电力设备", "医药生物", "证券", "食品饮料", "电子", "计算机",
-              "通信", "汽车", "机械设备", "化工", "有色金属", "银行", "房地产",
-              "建筑装饰", "公用事业", "交通运输", "传媒", "纺织服饰", "家用电器"]
-             if kind == "industry" else
-             ["人工智能", "储能", "光伏", "机器人", "芯片", "算力", "国企改革",
-              "锂电池", "鸿蒙", "创新药", "华为汽车", "数据中心", "虚拟现实"])
+    random.seed(hash((d.toordinal(), kind)) % 10000)
+    if kind == "industry":
+        names = ["半导体", "电力设备", "医药生物", "证券", "食品饮料", "电子", "计算机",
+                 "通信", "汽车", "机械设备", "化工", "有色金属", "银行", "房地产",
+                 "建筑装饰", "公用事业", "交通运输", "传媒", "纺织服饰", "家用电器"]
+    elif kind == "concept":
+        names = ["人工智能", "储能", "光伏", "机器人", "芯片", "算力", "国企改革",
+                 "锂电池", "鸿蒙", "创新药", "华为汽车", "数据中心", "虚拟现实"]
+    else:
+        names = ["北京", "上海", "深圳", "杭州", "广州", "江苏", "浙江",
+                 "山东", "四川", "福建", "湖南", "湖北", "陕西"]
+    # 各 kind 独立代码段：sector_daily 主键 (trade_date, sector_code)，
+    # 同天三种 kind 一起写入时不能撞主键互相覆盖
+    code_base = {"industry": 1000, "concept": 2000, "area": 3000}[kind]
     rows = []
     for i, n in enumerate(names):
         chg = round(random.uniform(-5, 8), 2)
         rows.append({
-            "trade_date": d, "sector_code": f"BK{1000 + i:04d}", "sector_name": n,
+            "trade_date": d, "sector_code": f"BK{code_base + i:04d}", "sector_name": n,
+            "kind": kind,
             "change_pct": chg, "turnover_rate": round(random.uniform(0.3, 5), 2),
             "amount": round(random.uniform(1e9, 8e10), 2),
             "main_net_inflow": round(random.uniform(-2e9, 3e9), 2),
