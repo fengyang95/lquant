@@ -17,9 +17,12 @@ import polars as pl
 from lquant.factors.evaluate.attribution import attribution_summary
 from lquant.factors.evaluate.costs import cost_matrix, factor_turnover
 from lquant.factors.evaluate.decay import decay_profile, half_life, suggest_rebalance
+from lquant.factors.evaluate.event_study import event_study_summary
 from lquant.factors.evaluate.group_ic import ic_by_group
 from lquant.factors.evaluate.ic import ic_by_year, ic_series, ic_summary
-from lquant.factors.evaluate.quantile import quantile_summary
+from lquant.factors.evaluate.outliers import filter_zscore as filter_zscore_df
+from lquant.factors.evaluate.outliers import zscore_filter_stats
+from lquant.factors.evaluate.quantile import quantile_nav, quantile_summary
 from lquant.factors.evaluate.rolling import rolling_ic
 
 __all__ = ["factor_report", "save_report"]
@@ -108,6 +111,83 @@ def _svg_bars(labels: list, values: list, w: int = 640, h: int = 200) -> str:
             f'stroke="#BBBBBB" stroke-width="0.8"/></svg>')
 
 
+def _palette(n: int) -> list[str]:
+    """分位组配色：从绿（低分位）到红（高分位）的渐变，符合 A 股涨红跌绿直觉。"""
+    if n <= 1:
+        return [LINE]
+    out = []
+    for i in range(n):
+        # 色相 140°（绿）→ 8°（红）
+        hue = 140 - 132 * i / (n - 1)
+        out.append(f"hsl({hue:.0f},58%,45%)")
+    return out
+
+
+def _svg_multi(xs: list, series: dict[str, list], w: int = 640, h: int = 240,
+               *, colors: list[str] | None = None, label: str = "",
+               mark_x: float | None = None, mark_label: str = "") -> str:
+    """多序列内联 SVG 折线图（带图例）。
+
+    series 为 {名称: 值列表}，与 xs 等长；mark_x 处画一条竖虚线
+    （事件式收益图用它标出事件日 0）。
+    """
+    if not xs or not series:
+        return f'<div class="empty">数据不足：{_esc(label)}</div>'
+    vals = [v for ys in series.values() for v in ys if v is not None and math.isfinite(v)]
+    if not vals:
+        return f'<div class="empty">数据不足：{_esc(label)}</div>'
+    lo, hi = min(vals), max(vals)
+    if hi - lo < 1e-12:
+        lo, hi = lo - 0.01, hi + 0.01
+    span = hi - lo
+    pad_l, pad_r, pad_t, pad_b = 46, 10, 12, 26
+    iw, ih = w - pad_l - pad_r, h - pad_t - pad_b
+    colors = colors or _palette(len(series))
+
+    def px(i: int) -> float:
+        return pad_l + (iw * i / max(len(xs) - 1, 1))
+
+    def py(v) -> float:
+        if v is None or not math.isfinite(v):
+            return float("nan")
+        return pad_t + ih * (1 - (v - lo) / span)
+
+    parts = []
+    for k, (_name, ys) in enumerate(series.items()):
+        segs, cur = [], []
+        for i, v in enumerate(ys):
+            y = py(v)
+            if math.isfinite(y):
+                cur.append(f"{px(i):.1f},{y:.1f}")
+            elif cur:
+                segs.append(" ".join(cur))
+                cur = []
+        if cur:
+            segs.append(" ".join(cur))
+        for s in segs:
+            parts.append(f'<polyline points="{s}" fill="none" stroke="{colors[k % len(colors)]}" '
+                         f'stroke-width="1.5"/>')
+    if mark_x is not None:
+        parts.append(f'<line x1="{mark_x:.1f}" y1="{pad_t}" x2="{mark_x:.1f}" y2="{pad_t+ih}" '
+                     f'stroke="#999" stroke-width="0.9" stroke-dasharray="4 3"/>')
+    parts.append(f'<line x1="{pad_l}" y1="{py(hi):.1f}" x2="{w-pad_r}" y2="{py(hi):.1f}" '
+                 f'stroke="#EEE" stroke-width="0.6"/>')
+    parts.append(f'<text x="{pad_l-6}" y="{pad_t+4}" font-size="11" fill="#888" '
+                 f'text-anchor="end">{_fmt(hi, nd=3)}</text>')
+    parts.append(f'<text x="{pad_l-6}" y="{pad_t+ih}" font-size="11" fill="#888" '
+                 f'text-anchor="end">{_fmt(lo, nd=3)}</text>')
+    parts.append(f'<text x="{pad_l}" y="{h-8}" font-size="11" fill="#888">{_esc(xs[0])}</text>')
+    parts.append(f'<text x="{w-pad_r}" y="{h-8}" font-size="11" fill="#888" '
+                 f'text-anchor="end">{_esc(xs[-1])}</text>')
+    legend = "".join(
+        f'<span class="lg"><i style="background:{colors[k % len(colors)]}"></i>{_esc(name)}</span>'
+        for k, name in enumerate(series)
+    )
+    return (f'<svg viewBox="0 0 {w} {h}" width="100%" height="{h}" role="img">'
+            + "".join(parts) + f'</svg><div class="legend">{legend}</div>'
+            + (f'<div class="hint">{_esc(mark_label)}</div>' if mark_label else ""))
+
+
 def _table(df: pl.DataFrame, limit: int = 20, pct_cols: tuple[str, ...] = ()) -> str:
     if df is None or not len(df):
         return '<div class="empty">无数据</div>'
@@ -127,14 +207,36 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
                   cat_col: str | None = None,
                   group_col: str | None = None,
                   bps_list: list[float] | None = None,
-                  universe: str = "") -> str:
+                  universe: str = "",
+                  filter_zscore: float | None = None,
+                  outlier_stats: dict | None = None,
+                  event_window: tuple[int, int] | None = (10, 15)) -> str:
     """生成因子研究报告 HTML。
 
     group_col 提供且列存在时输出「分组 IC」节（识破市值/行业暴露）；
-    bps_list 提供时输出「成本敏感性」表（net = gross 扣双边换手成本）。
+    bps_list 提供时输出「成本敏感性」表（net = gross 扣双边换手成本）；
+    filter_zscore 提供时先做截面异常收益过滤（口径同 alphalens），
+    并在报告里显式交代删掉了多少行；outlier_stats 用于「调用方已过滤」
+    的场景（如 API 端先过滤再评价），只展示统计不再重复过滤；
+    event_window=(before, after) 输出事件式分层收益图，None 则跳过。
     """
     if factor not in df.columns:
         raise KeyError(f"因子列不存在: {factor}")
+
+    outlier_html = ""
+    stats = None
+    if filter_zscore is not None:
+        stats = zscore_filter_stats(df, threshold=filter_zscore, date_col=date_col)
+        df = filter_zscore_df(df, threshold=filter_zscore, date_col=date_col)
+    elif outlier_stats is not None:
+        stats = outlier_stats
+    if stats is not None:
+        outlier_html = (
+            f'<h2>样本过滤</h2><p class="hint">已按 |z| &gt; {_fmt(stats.get("threshold"), nd=1)} '
+            f'做逐日截面异常收益剔除：{stats.get("n_dropped", 0)} / {stats.get("n_in", 0)} 行'
+            f'（{_fmt(stats.get("dropped_rate"), pct=True)}）。'
+            f'阈值调小可当敏感性测试用 —— 若结论立刻反转，说明因子靠的是少数异常票。</p>'
+        )
 
     ic = ic_summary(df, factor, ret_col, date_col=date_col)
     qs = quantile_summary(df, factor, ret_col, n_groups, date_col=date_col)
@@ -190,6 +292,47 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
 
     year_labels = [str(y) for y in yearly["year"].to_list()] if len(yearly) else []
     year_ic = yearly["ic_mean"].to_list() if len(yearly) else []
+
+    # 分层净值曲线：一次 pivot 出所有组，不再逐组 filter
+    qnav = quantile_nav(df, factor, ret_col, n_groups, date_col=date_col)
+    nav_xs, nav_series, nav_html = [], {}, ""
+    if len(qnav):
+        nav_xs = [str(x) for x in qnav[date_col].to_list()]
+        nav_series = {f"Q{q}": qnav[f"q{q}"].to_list() for q in range(1, n_groups + 1)}
+        ls_end = qnav["long_short"].to_list()[-1]
+        nav_html = (
+            f'<h2>分层净值曲线</h2>'
+            f'<p class="hint">Q1 为因子值最低组、Q{n_groups} 为最高组；曲线是否"扇形张开"'
+            f'比单看多空年化更能说明单调性。末端多空强弱差 {_fmt(ls_end, nd=3)}</p>'
+            f'<div class="chart">{_svg_multi(nav_xs, nav_series)}</div>'
+        )
+
+    # 事件式分层收益（alphalens 标志图）：curve 的 x 轴是相对交易日
+    es_html = ""
+    if event_window:
+        before, after = event_window
+        try:
+            es = event_study_summary(df, factor, price_col, n_groups=n_groups,
+                                     before=before, after=after,
+                                     date_col=date_col, symbol_col=symbol_col)
+        except (KeyError, ValueError):
+            es = None
+        if es and es["curve"]:
+            rel = [str(x) for x in es["rel_periods"]]
+            zero_px = None
+            if 0 in es["rel_periods"]:
+                idx = es["rel_periods"].index(0)
+                w, pad_l, pad_r = 640, 46, 10
+                zero_px = pad_l + ((w - pad_l - pad_r) * idx / max(len(rel) - 1, 1))
+            es_html = (
+                f'<h2>事件式分层收益（±{after} 交易日）</h2>'
+                f'<p class="hint">以各交易日为事件日，横轴为事件日前后相对天数，'
+                f'纵轴为各组平均累计收益（已减当日全市场截面均值）。'
+                f'虚线左侧就张开 → 因子在描述既成趋势（滞后）；'
+                f'左侧收敛、右侧发散 → 才是干净的预测信号。'
+                f'事前/事后发散度比 {_fmt(es["look_ahead_ratio"], nd=2)}</p>'
+                f'<div class="chart">{_svg_multi(rel, es["curve"], mark_x=zero_px, mark_label="虚线 = 事件日（因子截面日）")}</div>'
+            )
 
     attr_html = ""
     if attr is not None and len(attr["industry_exposure"]):
@@ -248,6 +391,9 @@ th,td{{padding:8px 10px;text-align:right;border-bottom:1px solid #F0F0EE}}
 th{{background:#FAFAF8;font-weight:600;color:#555;text-align:right}}
 th:first-child,td:first-child{{text-align:left}}
 .chart{{background:#fff;border:1px solid #E3E3DF;border-radius:10px;padding:8px;margin:8px 0}}
+.legend{{display:flex;flex-wrap:wrap;gap:10px;padding:2px 6px 6px;font-size:12px;color:#666}}
+.lg{{display:inline-flex;align-items:center;gap:4px}}
+.lg i{{width:10px;height:3px;border-radius:2px;display:inline-block}}
 .hint{{color:#777;font-size:12px;margin:4px 0}}
 .empty{{color:#999;font-size:13px;padding:16px;background:#fff;
 border:1px dashed #DDD;border-radius:8px}}
@@ -256,6 +402,8 @@ footer{{margin-top:40px;color:#999;font-size:12px}}
 <h1>因子研究报告 · {_esc(factor)}</h1>
 <div class="sub">股票池 {_esc(universe or "全部")} · 前瞻收益 {_esc(ret_col)} ·
 生成于 {datetime.now().strftime("%Y-%m-%d %H:%M")}</div>
+
+{outlier_html}
 
 <h2>核心指标</h2>
 <div class="cards">
@@ -286,6 +434,10 @@ footer{{margin-top:40px;color:#999;font-size:12px}}
 <div class="chart">{_svg_bars(q_labels, q_rets)}</div>
 {_table(pl.DataFrame(groups) if groups else None,
         pct_cols=("mean_ret", "annual_return", "max_drawdown"))}
+
+{nav_html}
+
+{es_html}
 
 <h2>IC 衰减</h2>
 <div class="chart">{_svg_line(prof["horizon"].to_list() if len(prof) else [],

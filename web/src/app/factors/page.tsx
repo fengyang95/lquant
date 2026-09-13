@@ -37,6 +37,7 @@ type EvalResult = {
   annual_turnover: number | null;
   top_n: TopNRow[];
   style_corr: { max_abs: number | null; passed: boolean | null };
+  outlier?: { threshold: number; n_dropped: number; dropped_rate: number } | null;
   report_url: string;
 };
 type EvalSeries = {
@@ -62,6 +63,13 @@ type EvalSeries = {
   excess?: { dates: string[]; curves: Record<string, (number | null)[]>; benchmark: string };
   top_n?: TopNRow[];
   style_corr?: { styles: StyleRow[]; threshold: number; max_abs: number | null; passed: boolean | null };
+  event_study?: {
+    rel_periods: number[];
+    curves: Record<string, (number | null)[]>;
+    spread: (number | null)[];
+    look_ahead_ratio: number | null;
+    before: number; after: number; demeaned: boolean;
+  };
 };
 type CorrResult = {
   factors: string[];
@@ -114,6 +122,7 @@ export default function FactorsPage() {
   const [customFormula, setCustomFormula] = useState('');
   const [corrStart, setCorrStart] = useState('2026-01-01');
   const [corrThreshold, setCorrThreshold] = useState(0.8);
+  const [zThreshold, setZThreshold] = useState('');
 
   // 内置因子按族浏览 + 搜索（158 个）
   const builtinShown = useMemo(() => {
@@ -261,6 +270,35 @@ export default function FactorsPage() {
     };
   }, [evalSeries]);
 
+  const eventOption = useMemo(() => {
+    const es = evalSeries?.event_study;
+    if (!es?.rel_periods.length) return null;
+    const keys = Object.keys(es.curves).sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)));
+    const zeroIdx = es.rel_periods.indexOf(0);
+    return {
+      tooltip: { ...tooltip, valueFormatter: (v: number) => v?.toFixed(3) },
+      legend: legend({ top: 0, data: [...keys.map((k) => `第${k.slice(1)}组`), '最高-最低'] }),
+      grid: { left: 52, right: 20, top: 30, bottom: 24 },
+      ...axes({ data: es.rel_periods.map((p) => `${p > 0 ? '+' : ''}${p}`) }, { scale: true, name: '累计收益' }),
+      series: [
+        ...keys.map((k, i) => ({
+          name: `第${k.slice(1)}组`, type: 'line' as const, data: es.curves[k],
+          showSymbol: false, lineStyle: { width: 1, color: Q_COLORS[i % Q_COLORS.length] },
+          itemStyle: { color: Q_COLORS[i % Q_COLORS.length] },
+          markLine: i === 0 && zeroIdx >= 0 ? {
+            silent: true, symbol: 'none',
+            lineStyle: { color: C.inkDim, type: 'dashed' as const },
+            data: [{ xAxis: zeroIdx }],
+          } : undefined,
+        })),
+        {
+          name: '最高-最低', type: 'line' as const, data: es.spread, showSymbol: false,
+          lineStyle: { width: 2.5, color: C.up }, itemStyle: { color: C.up }, z: 5,
+        },
+      ],
+    };
+  }, [evalSeries]);
+
   function toggle(f: string) {
     setPicked((p) => (p.includes(f) ? p.filter((x) => x !== f) : [...p, f]));
   }
@@ -290,7 +328,11 @@ export default function FactorsPage() {
     setBusy('eval');
     setMsg('');
     try {
-      const params = { factor: name || 'tmp', formula, n_groups: 5 };
+      const params = {
+        factor: name || 'tmp', formula, n_groups: 5,
+        filter_zscore: zThreshold.trim() ? Number(zThreshold) : null,
+        event_window: [10, 15],
+      };
       const r = await post<EvalResult & { series?: EvalSeries }>('/factors/evaluate', params);
       setEvalRes(r);
       // 图表数据包随主评价一次返回（后端已合并计算）
@@ -415,6 +457,19 @@ export default function FactorsPage() {
                 </button>
               ))}
             </div>
+            <div className="flex items-center gap-2">
+              <input
+                value={zThreshold}
+                onChange={(e) => setZThreshold(e.target.value)}
+                placeholder="留空 = 不过滤"
+                inputMode="decimal"
+                className="input input-mono w-32"
+                title="截面异常收益过滤阈值（|z| 上限，口径同 alphalens）"
+              />
+              <span className="text-xs text-ink-faint">
+                截面异常收益过滤 |z| 上限（留空不过滤；20 为研报默认口径）
+              </span>
+            </div>
             <button
               onClick={evaluate}
               disabled={busy === 'eval' || !formula}
@@ -505,6 +560,13 @@ export default function FactorsPage() {
                 value={evalRes.style_corr?.max_abs != null ? evalRes.style_corr.max_abs.toFixed(3) : '—'}
                 hint="阈值 0.14" />
             </div>
+            <div className="px-4">
+              <Stat label="异常收益剔除"
+                value={evalRes.outlier ? `${evalRes.outlier.n_dropped}` : '—'}
+                hint={evalRes.outlier
+                  ? `|z|>${evalRes.outlier.threshold} · 占 ${(evalRes.outlier.dropped_rate * 100).toFixed(3)}%`
+                  : '未开启过滤'} />
+            </div>
           </div>
           {(evalRes.top_n?.length ?? 0) > 0 && (
             <div className="mt-5">
@@ -576,6 +638,17 @@ export default function FactorsPage() {
           <Panel title="超额净值曲线" meta={`相对${evalSeries.excess?.benchmark ?? '股票池等权'}基准 · 稳定上行 = 真超额`}>
             {excessOption
               ? <Chart option={excessOption} height={280} />
+              : <Empty>样本不足</Empty>}
+          </Panel>
+          <Panel
+            title="事件式分层收益"
+            meta={evalSeries.event_study?.rel_periods.length
+              ? `事件日 ±${evalSeries.event_study.after} 日 · 事前/事后发散比 ${
+                evalSeries.event_study.look_ahead_ratio?.toFixed(2) ?? '—'}（<1 才是预测信号）`
+              : '事件日前后各 N 日'}
+          >
+            {eventOption
+              ? <Chart option={eventOption} height={280} />
               : <Empty>样本不足</Empty>}
           </Panel>
           <div className="space-y-5">
