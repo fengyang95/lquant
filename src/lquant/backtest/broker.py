@@ -64,7 +64,8 @@ class Broker:
                 p = self.slippage.apply(p, side)
         return p
 
-    def match(self, order: Order, bar: Bar, d: date, max_qty: float | None = None) -> Fill | None:
+    def match(self, order: Order, bar: Bar, d: date, max_qty: float | None = None,
+              cash: float | None = None) -> Fill | None:
         r = self.rules.get(order.symbol)
         if r is None:
             order.status = OrderStatus.REJECTED
@@ -100,6 +101,7 @@ class Broker:
         # next_close/next_vwap 的成交价是收盘/VWAP —— 一只平开但收盘封板的票，
         # 在 next_close 里就会以涨停价成交，现实中买不进去。上一处 open 检查
         # 只拦「开盘即封板」，这里补齐其余撮合模式的成交价边界。
+        # 市场约束（涨跌停）优先于资金约束判定。
         if order.side == Side.BUY and price >= bar.pre_close * (1 + limit) - 1e-9:
             order.status = OrderStatus.REJECTED
             order.reason = "涨停不可买"
@@ -108,6 +110,18 @@ class Broker:
             order.status = OrderStatus.REJECTED
             order.reason = "跌停不可卖"
             return None
+
+        # 资金充足性：买单成交额+费用不得超过可用现金，不足整单作废。
+        # 换仓按 T 收盘价预估资金，T+1 跳空可能让实际所需超出可用资金 ——
+        # 与 backtrader / 真实券商（开盘集合竞价资金不足废单）语义一致；
+        # 绝不能让现金悄悄变负（隐性杠杆）。
+        if order.side == Side.BUY and cash is not None:
+            a = qty * price
+            c = max(r.commission.min, a * r.commission.rate)
+            if a + c + a * r.transfer_fee_rate > cash:
+                order.status = OrderStatus.REJECTED
+                order.reason = "资金不足"
+                return None
 
         amount = qty * price
         transfer = amount * r.transfer_fee_rate
