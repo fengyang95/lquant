@@ -18,7 +18,9 @@ def backfill_financial(
     symbols: list[str],
     start: date | str = "2016-01-01",
     end: date | str | None = None,
-    kinds: tuple[str, ...] = ("profit", "balance", "cashflow"),
+    kinds: tuple[str, ...] = (
+        "profit", "balance", "cashflow", "dupont", "growth", "operation",
+    ),
     batch: int = 20,
 ) -> int:
     from loguru import logger

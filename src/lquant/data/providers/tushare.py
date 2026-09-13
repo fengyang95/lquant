@@ -281,16 +281,23 @@ class TushareProvider(MappingProvider):
         )
 
     def financial_pit(
-        self, symbols: list[str], start: date, end: date
+        self, symbols: list[str], start: date, end: date,
+        kinds: tuple[str, ...] = ("profit", "balance", "cashflow"),
     ) -> pl.DataFrame:
         """PIT 财务：三大报表宽表 → 长表，item 带 f"{接口名}.{列名}" 前缀。
 
         end_date + ann_date 双日期天然 PIT；无 ann_date 的行丢弃
         （未来函数防护，宁可丢数据）。
+        kinds 与 baostock 口径对齐：profit→income、balance→balancesheet、
+        cashflow→cashflow；dupont/growth/operation 等暂无对应接口，fail-soft 跳过。
         """
+        kind_to_api = {"profit": "income", "balance": "balancesheet", "cashflow": "cashflow"}
+        apis = tuple(dict.fromkeys(kind_to_api[k] for k in kinds if k in kind_to_api))
+        if not apis:
+            return pl.DataFrame()
         out: list[pl.DataFrame] = []
         for sym in symbols:
-            for api in _FINANCIAL_APIS:
+            for api in apis:
                 df = self._call(
                     api,
                     ts_code=sym,
