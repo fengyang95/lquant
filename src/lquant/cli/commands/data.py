@@ -65,15 +65,46 @@ def minute_cmd(symbols: str | None, start: str, end: str | None, freq: str) -> N
 
 
 @data.command()
-@click.option("--symbols", required=True, help="逗号分隔；财务接口无批量，全市场会跑几天")
+@click.option("--symbols", default=None, help="逗号分隔；与 --all 二选一")
+@click.option("--all", "use_all", is_flag=True,
+              help="全市场股票（含退市，防幸存者偏差）；tushare 下约 0.7s/只×4 接口")
 @click.option("--start", default="2016-01-01")
 @click.option("--end", default=None)
-def financial(symbols: str, start: str, end: str | None) -> None:
+@click.option("--provider", "provider_name", default=None,
+              type=click.Choice(["baostock", "tushare"]),
+              help="缺省自动选 tushare（基本面统一源），缺 token 退回 baostock")
+def financial(symbols: str | None, use_all: bool, start: str, end: str | None,
+              provider_name: str | None) -> None:
     """PIT 财务回填（stat_date + pub_date，防未来函数）。"""
     from lquant.data.ingest.financial import backfill_financial
+    from lquant.data.store.catalog import SecurityRepo
 
-    n = backfill_financial(symbols.split(","), start=start, end=end)
+    if use_all:
+        syms = SecurityRepo().stock_symbols()
+    elif symbols:
+        syms = symbols.split(",")
+    else:
+        raise click.UsageError("--symbols 与 --all 必须给一个")
+
+    n = backfill_financial(syms, start=start, end=end, provider_name=provider_name)
     click.echo(f"done {n}")
+
+
+@data.command("basic")
+@click.option("--start", default="2024-01-01", help="回填区间起点（默认日线湖起点可传 2024）")
+@click.option("--end", default=None)
+@click.option("--no-merge", is_flag=True, help="只落 daily_basic 湖，不合并回日线")
+def basic_cmd(start: str, end: str | None, no_merge: bool) -> None:
+    """tushare daily_basic 回填（市值/估值/股本），并合并回日线湖空缺列。
+
+    一天一请求覆盖全市场；checkpoint 按天断点续传；merge 只填 NULL 不覆盖主源。
+    """
+    from lquant.data.ingest.daily_basic import backfill_daily_basic
+
+    out = backfill_daily_basic(start=start, end=end, merge=not no_merge)
+    for k, v in out.items():
+        click.echo(f"  {k}: {v}")
+    click.echo("basic done")
 
 
 @data.command()

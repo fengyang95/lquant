@@ -197,7 +197,7 @@ def _bs_trade_dates(start: str, end: str) -> list[list[str]]:  # pragma: no cove
 def _bs_report(
     kind: str, code: str, year: int, quarter: int
 ) -> list[list[str]]:  # pragma: no cover
-    """季频报表，首行为字段名。kind: profit | balance | cashflow | dupont。"""
+    """季频报表，首行为字段名。kind: profit | balance | cashflow | dupont | growth | operation。"""
     bs = _bs_login()
     try:
         fn = {
@@ -205,6 +205,8 @@ def _bs_report(
             "balance": bs.query_balance_data,
             "cashflow": bs.query_cash_flow_data,
             "dupont": bs.query_dupont_data,
+            "growth": bs.query_growth_data,
+            "operation": bs.query_operation_data,
         }[kind]
         rs = fn(code=code, year=year, quarter=quarter)
         if rs.error_code != "0":
@@ -671,7 +673,7 @@ class BaoStockProvider(MappingProvider):
         symbols: list[str],
         start: date,
         end: date,
-        kinds: tuple[str, ...] = ("profit", "balance", "cashflow"),
+        kinds: tuple[str, ...] = ("profit", "balance", "cashflow", "dupont", "growth", "operation"),
     ) -> pl.DataFrame:
         """PIT 财务：stat_date（报告期）+ pub_date（公告日）双日期。
 

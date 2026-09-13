@@ -85,8 +85,9 @@ def _peer_daily(name: str, symbols: list[str], start: date, end: date) -> pl.Dat
     """实例化 peer，拉日线；不支持/缺失 → 返回空 df。"""
     try:
         from lquant.data.capability import Capability
-        from lquant.data.providers import PROVIDERS
+        from lquant.data.providers import PROVIDERS, _import_all
 
+        _import_all()  # 直连路径可能从未构过链：注册表还是空的
         cls = PROVIDERS.get(name)
         if cls is None:
             return pl.DataFrame()

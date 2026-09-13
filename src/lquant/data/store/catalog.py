@@ -106,6 +106,18 @@ class SecurityRepo:
             rows = con.execute("SELECT symbol FROM security ORDER BY symbol").fetchall()
         return [r[0] for r in rows]
 
+    def stock_symbols(self, *, include_delisted: bool = True) -> list[str]:
+        """股票标的（财务回填用）。
+
+        缺省含退市股：PIT 回测要防幸存者偏差，退市股的财务历史同样入库。
+        """
+        sql = "SELECT symbol FROM security WHERE sec_type = 'stock'"
+        if not include_delisted:
+            sql += " AND (delist_date IS NULL OR delist_date > current_date)"
+        sql += " ORDER BY symbol"
+        with reader() as con:
+            return [r[0] for r in con.execute(sql).fetchall()]
+
     def etf_symbols(self) -> list[str]:
         with reader() as con:
             rows = con.execute(

@@ -26,6 +26,8 @@ _KIND_PREFIX = {
     "balance": "balance",
     "cashflow": "cashflow",
     "indicator": "indicator",
+    "growth": "growth",
+    "operation": "operation",
 }
 
 # JQ valuation 字段 → 日线列
@@ -76,8 +78,10 @@ income = _Table("income")
 balance = _Table("balance")
 cashflow = _Table("cashflow")
 indicator = _Table("indicator")
+growth = _Table("growth")
+operation = _Table("operation")
 
-TABLES = (fundamentals, valuation, income, balance, cashflow, indicator)
+TABLES = (fundamentals, valuation, income, balance, cashflow, indicator, growth, operation)
 
 
 @dataclass(frozen=True)

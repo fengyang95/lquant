@@ -134,7 +134,11 @@ def classify_divergence(primary: pl.DataFrame, peer: pl.DataFrame,
             rows.append({**{k: r[k] for k in key}, "field": f,
                          "primary": a, "peer": b, "rel_diff": d,
                          "missing": None, "level": lvl})
-    return pl.DataFrame(rows) if rows else _empty_issues()
+    # schema 显式给定：前 100 行 missing 全为 None 时 polars 会把该列推断成
+    # Null 类型，后续行出现 "peer"/"primary" 字符串即 ComputeError（真实数据
+    # 首屏全是正常比对行，单测的小样本反而测不出来）
+    return (pl.DataFrame(rows, schema=_empty_issues().schema)
+            if rows else _empty_issues())
 
 
 def _empty_issues() -> pl.DataFrame:

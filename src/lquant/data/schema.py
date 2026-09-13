@@ -117,8 +117,28 @@ MARKET_SNAPSHOT = {
     "source": pl.Utf8,
 }
 
+# ---- daily_basic（tushare 每日指标，全市场一行/交易日）----
+# 用途：补日线湖 total_mv/float_mv 空洞 + pe/pb/ps 备援；市值单位统一为**元**
+# （tushare 源头是万元，入库前 ×1e4，与 DAILY_BAR 注释口径一致）。
+DAILY_BASIC = {
+    "symbol": pl.Utf8,
+    "trade_date": pl.Date,
+    "close": pl.Float64,
+    "turnover_rate": pl.Float64,   # %，换手率（自由流通口径 turnover_rate_f 不存）
+    "pe_ttm": pl.Float64,
+    "pb_mrq": pl.Float64,          # 源字段 pb
+    "ps_ttm": pl.Float64,
+    "total_mv": pl.Float64,        # 元（源 total_mv 万元 ×1e4）
+    "float_mv": pl.Float64,        # 元（源 circ_mv 万元 ×1e4）
+    "dv_ttm": pl.Float64,          # %，滚动股息率
+    "total_share": pl.Float64,     # 股（源万股 ×1e4）
+    "float_share": pl.Float64,     # 股（源万股 ×1e4）
+    "source": pl.Utf8,
+}
+
 SCHEMAS = {
     "daily_bar": DAILY_BAR,
+    "daily_basic": DAILY_BASIC,
     "minute_bar": MINUTE_BAR,
     "financial_pit": FINANCIAL_PIT,
     "security": SECURITY,

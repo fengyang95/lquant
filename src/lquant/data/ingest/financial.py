@@ -18,9 +18,20 @@ def backfill_financial(
     symbols: list[str],
     start: date | str = "2016-01-01",
     end: date | str | None = None,
-    kinds: tuple[str, ...] = ("profit", "balance", "cashflow"),
+    kinds: tuple[str, ...] = (
+        "profit", "balance", "cashflow", "dupont", "growth", "operation",
+    ),
+    provider_name: str | None = None,
     batch: int = 20,
 ) -> int:
+    """PIT 财务回填。
+
+    基本面统一 tushare（2026-09-13 起约定）：provider_name=None 时优先
+    取链中 tushare（income/balancesheet/cashflow + fina_indicator 全指标，
+    天然 ann_date；dupont/growth/operation 口径并入 indicator），缺 token
+    或未注册时退回链头（baostock，六张季表）。
+    checkpoint 键含源名：换源重跑不会误跳过。
+    """
     from loguru import logger
 
     from lquant.data.providers import get_provider
@@ -28,12 +39,21 @@ def backfill_financial(
     start_d = start if isinstance(start, date) else date.fromisoformat(start)
     end_d = end if isinstance(end, date) else (date.fromisoformat(end) if end else today_cn())
 
-    provider = get_provider()
-    target = provider.providers[0] if hasattr(provider, "providers") else provider
+    chain = get_provider()
+    if provider_name:
+        matches = [p for p in chain.providers if p.name == provider_name]
+        if not matches:
+            raise RuntimeError(f"provider {provider_name} 不可用（未启用或缺 token）")
+        target = matches[0]
+    else:
+        ts = [p for p in chain.providers if p.name == "tushare"]
+        target = ts[0] if ts else (
+            chain.providers[0] if hasattr(chain, "providers") else chain)
+    cp_name = f"financial_pit_{target.name}"
 
-    cp = Checkpoint("financial_pit")
+    cp = Checkpoint(cp_name)
     todo = cp.remaining(list(symbols))
-    logger.info(f"财务回填 {len(todo)} 只（已完成 {len(cp)}）{start_d}~{end_d}")
+    logger.info(f"财务回填[{target.name}] {len(todo)} 只（已完成 {len(cp)}）{start_d}~{end_d}")
 
     repo = FinancialRepo()
     done = 0

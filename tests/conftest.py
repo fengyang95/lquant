@@ -5,6 +5,16 @@ import polars as pl
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _skip_env_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    """全局禁用 .env 加载：单测绝不读开发者本地 src/lquant/.env（token）。
+
+    需要 .env 行为的测试自行 monkeypatch.delenv("LQ_ENV_SKIP") 或直接
+    构造临时文件 + 显式路径调用。
+    """
+    monkeypatch.setenv("LQ_ENV_SKIP", "1")
+
+
 def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
     """收尾：关掉 agent service 单例持有的 aiosqlite 连接。
 
