@@ -21,7 +21,6 @@ import json
 import subprocess
 import sys
 import tempfile
-from datetime import date
 from pathlib import Path
 
 import polars as pl
@@ -29,12 +28,14 @@ import polars as pl
 REPO = Path(__file__).resolve().parents[2]     # worktree 根
 sys.path.insert(0, str(REPO / "src"))
 
-from lquant.backtest.benchmarks import (GridTradingStrategy,          # noqa: E402
-                                        MomentumRotationStrategy,
-                                        SmaCrossStrategy,
-                                        TurtleDonchianStrategy)
-from lquant.backtest.engine import Engine, EngineConfig                # noqa: E402
-from lquant.backtest.rules.model import RuleSet                        # noqa: E402
+from lquant.backtest.benchmarks import (  # noqa: E402
+    GridTradingStrategy,
+    MomentumRotationStrategy,
+    SmaCrossStrategy,
+    TurtleDonchianStrategy,
+)
+from lquant.backtest.engine import Engine, EngineConfig  # noqa: E402
+from lquant.backtest.rules.model import RuleSet  # noqa: E402
 
 BT_RUNNER = Path(__file__).resolve().parent / "bt_runner.py"
 
@@ -125,9 +126,9 @@ def run_backtrader(bt_python: str, task: str, df: pl.DataFrame, etf: bool,
 
 
 def compare(lq: dict, bt: dict) -> dict:
-    bt_nav = {d: n / bt["nav"][0] for d, n in zip(bt["dates"], bt["nav"])}
+    bt_nav = {d: n / bt["nav"][0] for d, n in zip(bt["dates"], bt["nav"], strict=False)}
     diffs = []
-    for d, n in zip(lq["dates"][1:], lq["nav"][1:]):
+    for d, n in zip(lq["dates"][1:], lq["nav"][1:], strict=False):
         b = bt_nav.get(d)
         if b and lq["nav"][0]:
             diffs.append(abs(n / lq["nav"][0] - b))

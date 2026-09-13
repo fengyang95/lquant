@@ -15,9 +15,14 @@ from datetime import date, timedelta
 import polars as pl
 import pytest
 
-from lquant.backtest.benchmarks import (BENCHMARK_META, GridTradingStrategy,
-                                        MomentumRotationStrategy, SmaCrossStrategy,
-                                        TurtleDonchianStrategy, make_benchmark)
+from lquant.backtest.benchmarks import (
+    BENCHMARK_META,
+    GridTradingStrategy,
+    MomentumRotationStrategy,
+    SmaCrossStrategy,
+    TurtleDonchianStrategy,
+    make_benchmark,
+)
 from lquant.backtest.engine import Engine, EngineConfig
 from lquant.backtest.rules.model import RuleSet
 from lquant.backtest.strategy import STRATEGIES
@@ -57,7 +62,6 @@ class TestSmaCross:
     def test_signal_sequence_hand_computed(self):
         """5/20 均线：前 20 天无信号；构造 V 型行情检查金叉/死叉目标。"""
         s = SmaCrossStrategy(symbol="600000.SH", fast=2, slow=4)  # 小窗口便于手算
-        d0 = date(2026, 1, 5)
         # close: 10,10,10,10, 9,8（下行→死叉目标0），… 12（上行→金叉目标1）
         closes = [10, 10, 10, 10, 9, 8, 12, 13]
         for i, c in enumerate(closes):
@@ -100,7 +104,6 @@ class TestMomentumRotation:
         s = MomentumRotationStrategy(symbols=["A", "B"], window=3)
         closes_a = [10, 11, 12, 13, 14, 8]
         closes_b = [20, 20, 19, 18, 17, 16]
-        d0 = date(2026, 1, 5)
         for i in range(len(closes_a)):
             bar = {"A": type("B", (), {"close": closes_a[i], "high": closes_a[i], "low": closes_a[i]})(),
                    "B": type("B", (), {"close": closes_b[i], "high": closes_b[i], "low": closes_b[i]})()}
@@ -170,7 +173,7 @@ class TestTurtleDonchian:
                                    atr_window=3, daily_risk=0.01)
         closes = [10.0, 10.0, 10.0, 15.0, 16.0, 8.0]
         last = None
-        for i, c in enumerate(closes):
+        for c in closes:
             hi, lo = c + 0.5, c - 0.5
             bar = {"600000.SH": type("B", (), {"close": c, "high": hi, "low": lo})()}
             last = s.on_bar(None, bar)

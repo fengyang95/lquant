@@ -19,8 +19,13 @@ from lquant.backtest.broker import Broker
 from lquant.backtest.engine import Engine, EngineConfig
 from lquant.backtest.events import Bar, Order, Side
 from lquant.backtest.metrics import max_drawdown
-from lquant.backtest.rules.model import (Commission, InstrumentRules, PriceLimit,
-                                         RuleSet, TaxSchedule)
+from lquant.backtest.rules.model import (
+    Commission,
+    InstrumentRules,
+    PriceLimit,
+    RuleSet,
+    TaxSchedule,
+)
 from lquant.backtest.strategy.base import Context, Strategy
 
 __all__ = ["run_selfcheck"]
@@ -88,7 +93,7 @@ def run_selfcheck() -> list[dict]:
         expect = [(date(2026, 1, 5), 1_000_000.0), (date(2026, 1, 6), 1_110_000.0),
                   (date(2026, 1, 7), 1_160_000.0), (date(2026, 1, 8), 1_090_000.0)]
         ok = len(res.nav) == 4 and all(
-            d == ed and abs(v - ev) < 1e-6 for (d, v), (ed, ev) in zip(res.nav, expect))
+            d == ed and abs(v - ev) < 1e-6 for (d, v), (ed, ev) in zip(res.nav, expect, strict=False))
         return ok, f"净值序列 {[(str(d), round(v, 2)) for d, v in res.nav]}"
 
     add("金标准净值（手算逐日对账，零费率）", _golden)

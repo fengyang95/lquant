@@ -300,6 +300,7 @@ def _zf_ruleset():
 def _bars_df():
     """10 个交易日单标的线性价格，open=close=前收（无跳空）。"""
     from datetime import date, timedelta
+
     import polars as pl
     d0 = date(2026, 1, 5)
     rows = []
@@ -345,8 +346,9 @@ def test_rebalance_none_never_trades():
 
 def test_participation_cap_limits_qty():
     """单日成交量 300 股、participation=0.5 → 单笔最多 150 股。"""
-    import polars as pl
     from datetime import date, timedelta
+
+    import polars as pl
     d0 = date(2026, 1, 5)
     rows = []
     for i in range(3):
@@ -363,8 +365,9 @@ def test_participation_cap_limits_qty():
 
 def test_corporate_action_adjusts_position():
     """复权因子跳变日：持仓份额按因子比放大，总市值连续（分红再投资口径）。"""
-    import polars as pl
     from datetime import date, timedelta
+
+    import polars as pl
     d0 = date(2026, 1, 5)
     rows = []
     # day3 因子 1.0 → 2.0（10送10），价格减半、收盘不涨不跌
@@ -403,8 +406,9 @@ def test_unknown_symbol_target_ignored():
 def test_buy_rejected_on_gap_up_cash_shortfall():
     """跳高开：T 收盘定价的买单金额超出 T+1 可用现金 → 整单作废
     （与 backtrader / 真实券商「资金不足废单」语义一致），现金绝不变负。"""
-    import polars as pl
     from datetime import date, timedelta
+
+    import polars as pl
     d0 = date(2026, 1, 5)
     rows = [
         # day1: close 10 → 信号全仓（按 10 元估 100,000 股）
