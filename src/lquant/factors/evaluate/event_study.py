@@ -151,6 +151,10 @@ def event_study_summary(
         df, factor, price_col, n_groups=n_groups, before=before, after=after,
         demeaned=demeaned, date_col=date_col, symbol_col=symbol_col,
     )
+    # 事件数在清洗后的帧上数：原始帧里 price/factor 为 NULL 的行不参与
+    # 事件构造，用原始帧数会虚报支撑曲线的事件数
+    clean = df.drop_nulls([price_col, factor])
+    n_events = clean[date_col].n_unique() if date_col in clean.columns else 0
     pre = curve.filter(pl.col("rel_period") < 0)
     post = curve.filter(pl.col("rel_period") > 0)
     # 事前发散度 vs 事后发散度：事前就张开说明因子在描述既有趋势（滞后）
@@ -162,7 +166,7 @@ def event_study_summary(
         "before": before,
         "after": after,
         "demeaned": demeaned,
-        "n_events": df[date_col].n_unique() if date_col in df.columns else 0,
+        "n_events": n_events,
         "pre_spread": pre_spread,
         "post_spread": post_spread,
         "look_ahead_ratio": pre_spread / post_spread if post_spread and post_spread > 0

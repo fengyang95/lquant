@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
@@ -97,6 +98,37 @@ def _conn():
 
 class AccountNotFound(KeyError):
     pass
+
+
+# 账户级读-改-写串行锁：load_broker → mutate → save_broker 的整段周期
+# 必须互斥，否则两个并发调用（如 uvicorn 线程池里 order 与 tick 同时进来）
+# 各自 load 同一状态、后 save 的把先 save 的成交/现金整个冲掉。
+# sqlite 只串行化单条写，不保护跨语句的 RMW 周期。
+# 两层：线程 RLock 管同进程（uvicorn 线程池），flock 文件锁管跨进程
+# （CLI tick 进程与常驻 server 并发，sqlite busy_timeout 挡不住 RMW）。
+_ACCOUNT_LOCKS_GUARD = threading.Lock()
+_ACCOUNT_LOCKS: dict[str, threading.RLock] = {}
+
+
+@contextmanager
+def account_lock(name: str):
+    with _ACCOUNT_LOCKS_GUARD:
+        lock = _ACCOUNT_LOCKS.get(name)
+        if lock is None:
+            lock = threading.RLock()
+            _ACCOUNT_LOCKS[name] = lock
+    with lock:
+        import fcntl
+
+        lock_path = db_path().with_name(f"{db_path().name}.{name}.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
 
 def create_account(name: str, initial_cash: float, strategy: str = "",
