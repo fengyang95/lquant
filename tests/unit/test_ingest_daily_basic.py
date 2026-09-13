@@ -106,17 +106,30 @@ class _FakeBasicProvider:
     """daily_basic(trade_date) 每次返回两行（两标的），记录调用日期。"""
 
     def __init__(self) -> None:
+        self.name = "tushare"
         self.calls: list = []
 
     def daily_basic(self, trade_date):
         self.calls.append(trade_date)
-        return pl.DataFrame({
+        from lquant.data.schema import SCHEMAS
+
+        # 按 daily_basic 全 schema 出帧（main 版 _concat 会 select 全列）
+        row = {
             "symbol": ["600000.SH", "000001.SZ"],
             "trade_date": [trade_date] * 2,
             "close": [10.0, 12.0],
+            "turnover_rate": [0.5, 0.9],
             "pe_ttm": [5.5, 6.6],
+            "pb_mrq": [0.6, 0.7],
+            "ps_ttm": [1.1, 1.2],
+            "total_mv": [2.0e10, 3.0e10],
+            "float_mv": [1.5e10, 2.5e10],
+            "dv_ttm": [3.0, 4.0],
+            "total_share": [3.0e9, 4.0e9],
+            "float_share": [2.5e9, 3.5e9],
             "source": ["tushare", "tushare"],
-        })
+        }
+        return pl.DataFrame(row).select(list(SCHEMAS["daily_basic"]))
 
 
 def test_backfill_daily_basic_stub_provider(tmp_path, monkeypatch):
@@ -127,22 +140,34 @@ def test_backfill_daily_basic_stub_provider(tmp_path, monkeypatch):
     get_settings.cache_clear()
     try:
         _seed_calendar("2026-08-03", "2026-08-07")  # 5 个工作日
+        # main 版实现从日线湖取交易日 → 需先铺 5 天日线湖
+        from lquant.data.store.parquet import write_daily
+
+        write_daily(pl.DataFrame({
+            "symbol": ["600000.SH"] * 5,
+            "trade_date": [date(2026, 8, 3 + i) for i in range(5)],
+            "close": [10.0] * 5,
+        }, schema_overrides={"trade_date": pl.Date}))
         from lquant.data.ingest import daily_basic as mod
 
         fake = _FakeBasicProvider()
-        monkeypatch.setattr(mod, "_provider", lambda: fake)
+
+        class _Chain:
+            providers = [fake]
+
+        monkeypatch.setattr("lquant.data.providers.get_provider",
+                            lambda *a, **k: _Chain())
 
         out = mod.backfill_daily_basic(start="2026-08-03", end="2026-08-07",
                                        merge=False)
         assert len(fake.calls) == 5  # 每个开市日一请求
         assert out["days"] == 5
         assert out["rows"] == 10
-        assert out["merged"] is None  # merge=False 不合并
 
         # 断点续传：重跑同区间 → 跳过已完成，0 次新调用
         out2 = mod.backfill_daily_basic(start="2026-08-03", end="2026-08-07",
                                         merge=False)
-        assert out2["days"] == 0 and len(fake.calls) == 5
+        assert out2["fetched_days"] == 0 and len(fake.calls) == 5
 
         from lquant.data.store.parquet import read_daily_basic
 
@@ -172,11 +197,16 @@ def test_backfill_daily_basic_merge_fills_daily_lake(tmp_path, monkeypatch):
         from lquant.data.ingest import daily_basic as mod
 
         fake = _FakeBasicProvider()
-        monkeypatch.setattr(mod, "_provider", lambda: fake)
+
+        class _Chain:
+            providers = [fake]
+
+        monkeypatch.setattr("lquant.data.providers.get_provider",
+                            lambda *a, **k: _Chain())
 
         out = mod.backfill_daily_basic(start="2026-08-03", end="2026-08-03",
                                        merge=True)
-        assert out["merged"] is not None
+        assert out["filled"]["pe_ttm"] == 1  # NULL 被填 1 处
         after = read_daily().collect()
         row = after.filter(pl.col("symbol") == "600000.SH")
         assert row["pe_ttm"][0] == 5.5  # NULL 被填
