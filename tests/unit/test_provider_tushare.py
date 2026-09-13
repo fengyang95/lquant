@@ -387,14 +387,26 @@ def test_financial_pit_indicator_kind_uses_fina_indicator(
     )
     api, kw = pro.calls[0]
     assert api == "fina_indicator"
-    assert out["item"].to_list() == ["fina_indicator.roe", "fina_indicator.grossprofit_margin"]
+    # item 前缀对齐 DSL：fina_indicator 落成 indicator.*
+    assert out["item"].to_list() == ["indicator.roe", "indicator.grossprofit_margin"]
     assert out["report_type"].to_list() == ["2024Q1", "2024Q1"]
 
 
-def test_financial_pit_unsupported_kinds_short_circuit(provider: TushareProvider) -> None:
-    """tushare 没有 dupont/growth/operation：全不支持的 kinds 应空返回不触网。"""
+def test_financial_pit_baostock_kinds_map_to_fina_indicator(
+    provider: TushareProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """基本面统一 tushare：dupont/growth/operation 并入 fina_indicator，只拉一次。"""
+    fina = pd.DataFrame({
+        "ts_code": ["600000.SH"],
+        "end_date": ["20240331"],
+        "ann_date": ["20240426"],
+        "roe": [12.5],
+    })
+    pro = _install_fake_ts(monkeypatch, {"fina_indicator": lambda **kw: fina})
     out = provider.financial_pit(
         ["600000.SH"], date(2024, 1, 1), date(2024, 6, 30),
         kinds=("dupont", "growth", "operation"),
     )
-    assert out.height == 0
+    api_calls = [a for a, _ in pro.calls]
+    assert api_calls == ["fina_indicator"]   # 去重：三 kind 只拉一次
+    assert out["item"].to_list() == ["indicator.roe"]

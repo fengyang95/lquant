@@ -70,7 +70,7 @@ def minute_cmd(symbols: str | None, start: str, end: str | None, freq: str) -> N
 @click.option("--end", default=None)
 @click.option("--provider", "provider_name", default=None,
               type=click.Choice(["baostock", "tushare"]),
-              help="指定源；缺省走链头（baostock）。tushare 含 fina_indicator 指标表")
+              help="缺省自动选 tushare（基本面统一源），缺 token 退回 baostock")
 def financial(symbols: str, start: str, end: str | None, provider_name: str | None) -> None:
     """PIT 财务回填（stat_date + pub_date，防未来函数）。"""
     from lquant.data.ingest.financial import backfill_financial

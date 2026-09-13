@@ -123,9 +123,10 @@ class TushareProvider(MappingProvider):
     ) -> None:
         from lquant.core.env import load_env_files
 
-        # 直接构造（绕过 build_chain）时也能找到 .env 里的 token
+        # 直接构造（绕过 build_chain）时也能找到 .env 里的 token：
+        # 包目录 = providers.py 上三级（src/lquant/）
         load_env_files(Path.cwd() / ".env",
-                       Path(__file__).resolve().parent.parent / ".env")
+                       Path(__file__).resolve().parents[2] / ".env")
         self._token = token or os.environ.get("TUSHARE_TOKEN", "")
         self._bucket = TokenBucket(qps)
         self.capability = capability or self.capability
@@ -328,14 +329,19 @@ class TushareProvider(MappingProvider):
         end_date + ann_date 双日期天然 PIT；无 ann_date 的行丢弃
         （未来函数防护，宁可丢数据）。
         kinds 与 baostock 口径对齐：profit→income、balance→balancesheet、
-        cashflow→cashflow、indicator→fina_indicator（140+ 财务指标，
-        含 ann_date）；dupont/growth/operation 暂无对应接口，fail-soft 跳过。
+        cashflow→cashflow；dupont/growth/operation/indicator 统一落
+        fina_indicator（140+ 财务指标，含 ann_date；口径以 item 前缀
+        fina_indicator.* 区分，去重后只拉一次）。
         """
         kind_to_api = {
             "profit": "income",
             "balance": "balancesheet",
             "cashflow": "cashflow",
             "indicator": "fina_indicator",
+            # baostock 口径的衍生季表在 tushare 统一并入 fina_indicator
+            "dupont": "fina_indicator",
+            "growth": "fina_indicator",
+            "operation": "fina_indicator",
         }
         apis = tuple(dict.fromkeys(kind_to_api[k] for k in kinds if k in kind_to_api))
         if not apis:
@@ -353,7 +359,10 @@ class TushareProvider(MappingProvider):
                     continue
                 df = _to_date_col(df, "end_date")
                 df = _to_date_col(df, "ann_date")
-                long = _wide_to_long(df, api)
+                # item 前缀对齐 get_fundamentals DSL 口径：fina_indicator
+                # 落成 indicator.*（_KIND_PREFIX["indicator"]="indicator"）
+                long = _wide_to_long(
+                    df, "indicator" if api == "fina_indicator" else api)
                 if not long.is_empty():
                     out.append(long)
         if not out:

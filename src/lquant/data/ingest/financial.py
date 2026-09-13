@@ -26,9 +26,10 @@ def backfill_financial(
 ) -> int:
     """PIT 财务回填。
 
-    provider_name=None 走 Fallback 链头（默认 baostock，六张季表全支持）；
-    指定 "tushare" 时用 tushare pro（income/balancesheet/cashflow/
-    fina_indicator 四类，天然 ann_date），适合与 baostock 互为补充/对拍。
+    基本面统一 tushare（2026-09-13 起约定）：provider_name=None 时优先
+    取链中 tushare（income/balancesheet/cashflow + fina_indicator 全指标，
+    天然 ann_date；dupont/growth/operation 口径并入 indicator），缺 token
+    或未注册时退回链头（baostock，六张季表）。
     checkpoint 键含源名：换源重跑不会误跳过。
     """
     from loguru import logger
@@ -44,10 +45,11 @@ def backfill_financial(
         if not matches:
             raise RuntimeError(f"provider {provider_name} 不可用（未启用或缺 token）")
         target = matches[0]
-        cp_name = f"financial_pit_{provider_name}"
     else:
-        target = chain.providers[0] if hasattr(chain, "providers") else chain
-        cp_name = "financial_pit"
+        ts = [p for p in chain.providers if p.name == "tushare"]
+        target = ts[0] if ts else (
+            chain.providers[0] if hasattr(chain, "providers") else chain)
+    cp_name = f"financial_pit_{target.name}"
 
     cp = Checkpoint(cp_name)
     todo = cp.remaining(list(symbols))
