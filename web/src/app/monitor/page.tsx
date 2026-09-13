@@ -42,6 +42,11 @@ type DataPulls = {
   recent: DataPull[];
   by_job: { job: string; count: number; avg_duration_ms: number | null; failed: number }[];
 };
+type ErrorLog = {
+  ts: string; route: string; method: string; status: number;
+  error_type: string | null; message: string | null; traceback_tail: string | null;
+};
+type ErrorLogs = { items: ErrorLog[]; total: number };
 
 const RANGES = ['1h', '6h', '24h', '7d'] as const;
 type Range = (typeof RANGES)[number];
@@ -94,6 +99,12 @@ export default function MonitorPage() {
   const { data: apiLat } = useSWR<ApiLatency>(`/monitor/api-latency?range=${range}`, fetcherData);
   const { data: tasks } = useSWR<{ series: TaskBucket[] }>(`/monitor/tasks?range=${range}`, fetcherData);
   const { data: pulls } = useSWR<DataPulls>('/monitor/data-pulls', fetcherData, { refreshInterval: 60_000 });
+  const { data: errLogs } = useSWR<ErrorLogs>(`/monitor/error-logs?range=${range}&limit=100`, fetcherData, { refreshInterval: 30_000 });
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const errItems = errLogs?.items ?? [];
+  const expandedRow = expanded
+    ? errItems.find((e, i) => `${e.ts}-${e.route}-${i}` === expanded)
+    : undefined;
 
   const procs = sum?.procs ?? [];
   const queues = sum?.queues ?? [];
@@ -274,6 +285,50 @@ export default function MonitorPage() {
               ))}
             </tbody>
           </table>
+        )}
+      </Panel>
+
+      {/* 错误日志 */}
+      <Panel title="错误日志" meta={`${errLogs?.total ?? 0} 条 · range ${range} · 每 30s 刷新`}>
+        {!errLogs?.items?.length ? (
+          <Empty>近端无错误 —— 服务运行正常</Empty>
+        ) : (
+          <div className="max-h-96 overflow-auto">
+            <table className="table-dense">
+              <thead className="sticky top-0 bg-panel">
+                <tr>
+                  <th className="text-left">时间</th>
+                  <th className="text-left">路由</th>
+                  <th className="text-right">状态</th>
+                  <th className="text-left">错误类型</th>
+                  <th className="text-left">信息</th>
+                </tr>
+              </thead>
+              <tbody>
+                {errLogs.items.map((e, i) => {
+                  const key = `${e.ts}-${e.route}-${i}`;
+                  const isOpen = expanded === key;
+                  return (
+                    <tr
+                      key={key}
+                      className={`cursor-pointer hover:bg-white ${isOpen ? 'bg-white' : ''}`}
+                      onClick={() => setExpanded(isOpen ? null : key)}
+                      title={e.traceback_tail ? '点击展开堆栈' : undefined}
+                    >
+                      <td className="text-xs tabular-nums">{e.ts?.slice(5, 19)}</td>
+                      <td className="font-mono text-xs">{e.method} {e.route}</td>
+                      <td className="text-right tabular-nums text-up">{e.status}</td>
+                      <td className="text-xs font-medium text-up">{e.error_type ?? '—'}</td>
+                      <td className="max-w-[24rem] truncate text-xs text-ink-dim" title={e.message ?? ''}>{e.message ?? '—'}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            {expandedRow?.traceback_tail && (
+              <pre className="mt-2 max-h-56 overflow-auto rounded bg-ink-weak p-3 text-xs leading-5">{expandedRow.traceback_tail}</pre>
+            )}
+          </div>
         )}
       </Panel>
 

@@ -69,8 +69,7 @@ class EvaluateIn(BaseModel):
                         pattern=r"^[A-Za-z0-9_-]+")  # 报告名（防路径穿越）
     formula: str = "pct_change_20"       # 支持 pct_change_{n} / rolling_std_{n}
     n_groups: int = Field(default=5, ge=2, le=20)
-    horizons: list[int] = Field(default=[1, 5, 10, 20], min_length=1, max_length=20,
-                                ge=1, le=250)
+    horizons: list[int] = Field(default=[1, 5, 10, 20], min_length=1, max_length=20)
     start: str = "2026-01-01"
     window: int = Field(default=60, ge=20, le=250)  # 滚动窗口（交易日）
     top_ns: list[int] = Field(default=[50, 100], min_length=1, max_length=5,
@@ -110,6 +109,13 @@ class EvaluateIn(BaseModel):
             date.fromisoformat(v)
         except (TypeError, ValueError):
             raise ValueError("start 需为 YYYY-MM-DD 格式") from None
+        return v
+
+    @field_validator("horizons")
+    @classmethod
+    def _validate_horizons(cls, v: list[int]) -> list[int]:
+        if any(h < 1 or h > 250 for h in v):
+            raise ValueError("horizons 元素需在 1..250 内")
         return v
 
     @field_validator("top_ns")
@@ -207,9 +213,13 @@ def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
     if has_factor(formula):
         return qlib_compute(df, formula)
     if "$" in formula:                     # DSL 表达式 —— 统一走 FactorEngine
+        from lquant.core.errors import FactorError
         from lquant.factors.analysis import compute_factor_col
 
-        return compute_factor_col(df, formula, "_factor")
+        try:
+            return compute_factor_col(df, formula, "_factor")
+        except FactorError as e:  # DSL 语法/算子/字段错误 → 客户端 422，而非 500
+            raise HTTPException(422, f"DSL 计算失败: {e}") from e
     if formula.startswith("pct_change_") and formula.rsplit("_", 1)[1].isdigit():
         n = int(formula.rsplit("_", 1)[1])
         return df.with_columns(pl.col("close").pct_change(n).over("symbol").alias("_factor"))
