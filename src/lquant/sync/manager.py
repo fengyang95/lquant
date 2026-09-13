@@ -4,6 +4,7 @@
 - collect    : 跑市场采集器组（params.schedule = close/evening/preopen，缺省全跑）
 - daily      : 日线增量回填（params.days = 回看天数，只补哨兵池）
 - adj_factor : 复权因子增量刷新（params.days = 回看天数）
+- backfill   : 大盘看板表缺失检查与补齐（params.days = 回看天数，见 market.backfill）
 
 调度语义（刻意简单，不上 cron）：
 - schedule_time「HH:MM」，weekdays「1,2,3,4,5」（ISO，周一=1；空 = 每天）
@@ -50,6 +51,9 @@ DEFAULT_JOBS: list[dict] = [
     {"sync_id": "preopen", "name": "盘前采集（校验与补采）",
      "kind": "collect", "schedule_time": "09:00", "weekdays": "1,2,3,4,5",
      "params": {"schedule": "preopen"}, "enabled": False},
+    {"sync_id": "backfill", "name": "盘前缺口补齐（指数日线缺失检查）",
+     "kind": "backfill", "schedule_time": "09:10", "weekdays": "1,2,3,4,5",
+     "params": {"days": 90}},
     {"sync_id": "daily", "name": "日线增量同步（全市场）",
      "kind": "daily", "schedule_time": "18:30", "weekdays": "1,2,3,4,5",
      "params": {"days": 10, "market": "all"}},
@@ -113,7 +117,7 @@ def upsert_job(sync_id: str, name: str, kind: str, schedule_time: str,
                enabled: bool = True) -> dict:
     """新建/更新作业（按 sync_id 覆盖；时间格式 HH:MM 校验）。"""
     datetime.strptime(schedule_time, "%H:%M")
-    if kind not in ("collect", "daily", "adj_factor"):
+    if kind not in ("collect", "daily", "adj_factor", "backfill"):
         raise ValueError(f"未知作业类型: {kind}")
     if kind == "daily" and (params or {}).get("market") not in (
             None, "all", "sentinel"):
@@ -196,6 +200,12 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
             from lquant.data.ingest.adj import refresh_adj_factors
 
             rows = refresh_adj_factors(days=int(params.get("days", 120)))
+        elif kind == "backfill":
+            from lquant.market.backfill import ensure_market_coverage
+
+            res = ensure_market_coverage(days=int(params.get("days", 90)))
+            rows = int(res.get("persisted") or 0)
+            detail = res
         else:
             status = "failed"
             detail = {"error": f"未知作业类型 {kind}"}

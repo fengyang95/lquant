@@ -49,6 +49,20 @@ describe('NewsFeedList', () => {
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
   });
 
+  it('每条资讯标题都可点击（url 存在 → 原文链接，target=_blank）', () => {
+    const items = [
+      item({ news_id: 'a', title: '财联社电报条目', url: 'https://www.cls.cn/detail/1' }),
+      item({ news_id: 'b', title: '新浪快讯条目', url: 'https://finance.sina.com.cn/7x24/' }),
+    ];
+    render(<NewsFeedList items={items} total={2} limit={50} offset={0} />);
+    const links = screen.getAllByRole('link');
+    expect(links).toHaveLength(2);
+    for (const l of links) {
+      expect(l).toHaveAttribute('target', '_blank');
+      expect(l.getAttribute('href')).toMatch(/^https:/);
+    }
+  });
+
   it('offset+已载 < total 时出现加载更多，点击回调', () => {
     const onLoadMore = vi.fn();
     render(
