@@ -27,7 +27,6 @@ def _run(tmp_path, monkeypatch, fail_symbols):
 
     get_settings.cache_clear()
     try:
-        from lquant.data.providers import get_provider
 
         fake = _FlakyMinuteProvider(fail_symbols)
         monkeypatch.setattr("lquant.data.providers.get_provider",
