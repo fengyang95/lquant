@@ -21,9 +21,9 @@ TOP_N, EXIT_N = 20, 50
 # 上市不满 60 个交易日不入选。
 MIN_LISTED_DAYS = 60
 
-# 净利润同比字段:financial_pit 的 growth kind item(BaoStock growth 列 YOYNI)。
-# Task 4 实跑时用 DISTINCT item 查询确认,若命名不符在此回填。
-NET_PROFIT_YOY_ITEM = "growth.YOYNI"
+# 净利润同比字段:financial_pit 的 item(tushare fina_indicator netprofit_yoy,
+# 归一化匹配 indicator 前缀)。Task 4 实跑前用 DISTINCT item 查询确认。
+NET_PROFIT_YOY_ITEM = "indicator.netprofit_yoy"
 
 
 def _zscore(s: pl.Series) -> pl.Series:
@@ -61,8 +61,8 @@ def composite_score(pe: pl.DataFrame, yoy: pl.DataFrame, mom: pl.DataFrame,
 
 def _sandbox_score_source() -> str:
     """STRATEGY_CODE 内嵌评分函数的源码(与 composite_score 同构的纯 python 版)。"""
-    yoy_attr = NET_PROFIT_YOY_ITEM.split(".", 1)[1]
-    yoy_field = yoy_attr          # 沙箱返回列名即 query 属性名(如 YOYNI)
+    yoy_table, yoy_attr = NET_PROFIT_YOY_ITEM.split(".", 1)
+    yoy_field = yoy_attr          # 沙箱返回列名即 query 属性名(如 netprofit_yoy)
     return f'''
 
 def _zscore_xs(values):
@@ -102,9 +102,9 @@ def initialize(context):
 
 
 def rebalance(context):
-    # 1) 基本面:pe_ratio(valuation)+ 净利润同比(growth.{yoy_attr})。
+    # 1) 基本面:pe_ratio(valuation)+ 净利润同比({yoy_table}.{yoy_attr})。
     #    不传 date,由沙箱绑定当日交易日 → PIT(pub_date <= t)由 resolve 保证。
-    fund = get_fundamentals(query(valuation.pe_ratio, growth.{yoy_attr}))
+    fund = get_fundamentals(query(valuation.pe_ratio, {yoy_table}.{yoy_attr}))
     pe_map = {{}}
     yoy_map = {{}}
     if fund is not None and len(fund) > 0:

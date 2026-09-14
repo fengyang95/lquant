@@ -52,3 +52,6 @@ web/tsconfig.tsbuildinfo
 
 # OMC 会话状态
 .omc/
+
+# worktree 内指向主仓数据的符号链接
+data

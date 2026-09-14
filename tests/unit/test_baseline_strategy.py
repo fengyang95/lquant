@@ -401,8 +401,9 @@ def test_strategy_uses_declared_factors_and_no_date_override():
     assert FACTOR_FORMULAS == ["pct_change_20", "rolling_std_20"]
     assert "get_fundamentals(query(" in STRATEGY_CODE
     assert "date=" not in STRATEGY_CODE          # 不覆盖交易日 → 不可绕开 PIT
-    assert NET_PROFIT_YOY_ITEM.startswith("growth.")
-    assert f"growth.{NET_PROFIT_YOY_ITEM.split('.')[1]}" in STRATEGY_CODE
+    assert NET_PROFIT_YOY_ITEM.count(".") == 1
+    _tbl, _attr = NET_PROFIT_YOY_ITEM.split(".")
+    assert f"{_tbl}.{_attr}" in STRATEGY_CODE
 
 
 def test_strategy_runs_in_jq_sandbox(tmp_catalog, bars_file):
