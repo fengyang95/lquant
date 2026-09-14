@@ -100,6 +100,12 @@ def backfill_pool(
             df, grp_failed = _pull_group(provider, syms, start, end_d)
             batch_rows += len(df)
             batch_failed.update(grp_failed)
+            # 源站静默丢标的（无异常但零行）此前被当成功标 done —— 整段
+            # 历史缺失且不可发现。显式标 empty_response，重跑自动重试。
+            got = set(df["symbol"].to_list()) if len(df) else set()
+            for sym in syms:
+                if sym not in got and sym not in batch_failed:
+                    batch_failed[sym] = "empty_response: 源零行返回"
             if len(df):
                 try:
                     write_daily(_stamp(df, _provider_source(provider)))
