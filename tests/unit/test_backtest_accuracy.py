@@ -168,6 +168,182 @@ def test_nav_halted_position_uses_last_close_not_avg_cost():
     ]
 
 
+# ---------- 除权/停牌复牌：份额调整法净值连续性金标准 ----------
+
+def _ca_df(price_map: dict[str, dict[date, tuple[float, float, float]]]) -> pl.DataFrame:
+    """构造带 adj_factor 的行情长表。
+
+    price_map: {symbol: {date: (open, close, adj_factor)}}。
+    pre_close 自动按「除权日 = 除权调整后昨收」的市场惯例生成：
+    即昨收 × (今日 adj_factor / 昨日 adj_factor)，与 tushare 前收盘价口径一致，
+    保证真实数据下涨跌停判定不会被除权跳空误触发。
+    """
+    rows = []
+    for sym, series in price_map.items():
+        prev_adj = None
+        prev_close = None
+        for d in sorted(series):
+            o, c, adj = series[d]
+            if prev_close is None:
+                pre = o
+            else:
+                ratio = adj / prev_adj if prev_adj else 1.0
+                pre = prev_close * ratio
+            rows.append({"trade_date": d, "symbol": sym,
+                         "open": o, "high": max(o, c) * 1.001, "low": min(o, c) * 0.999,
+                         "close": c, "pre_close": pre,
+                         "volume": 2e9, "amount": 2e9 * c,
+                         "adj_factor": adj})
+            prev_close, prev_adj = c, adj
+    return pl.DataFrame(rows).with_columns(pl.col("trade_date").cast(pl.Date))
+
+
+def _run_ca(df: pl.DataFrame, strategy=None) -> tuple[Engine, object]:
+    cfg = EngineConfig(initial_cash=1_000_000, slippage="none", cash_buffer=0.0,
+                       min_order_value=50_000, participation=0.5, price_mode="same_close")
+    eng = Engine(strategy or BuyA(), ruleset=zero_fee_ruleset(), config=cfg)
+    return eng, eng.run(df)
+
+
+def test_nav_continuous_across_adj_factor_jump():
+    """除权日份额调整法净值连续性（engine._apply_corporate_actions 手算锁定）。
+
+    场景：d1 以收盘价 10.0 全仓买入 100,000 股；d2 除权，adj_factor 1.0 → 2.0，
+    原始价跳空 10 → 5（10 送 10 的典型形态，close 5.5 = 除权后涨 10%）。
+
+    份额调整法语义（分红默认再投资）：d2 步骤 0 持仓调整
+      qty:    100,000 → 200,000（× ratio=2）
+      avg_cost: 10.0 → 5.0（÷ ratio，总成本 1,000,000 不变）
+    NAV 手算：
+      d1: 100,000 × 10.0 = 1,000,000
+      d2: 200,000 × 5.5 = 1,100,000（等价于未复权口径 100,000 × 11.0，无跳变，
+          当日收益恰为市场价格变动 5.5/5.0 − 1 = 10%）
+      d3: 200,000 × 5.5 = 1,100,000
+    若实现漏调（qty 不放大），d2 NAV = 100,000 × 5.5 = 550,000，单日虚假亏损 45%。
+    """
+    d = [date(2026, 1, 5) + timedelta(days=i) for i in range(3)]
+    df = _ca_df({"600000.SH": {d[0]: (10.0, 10.0, 1.0),
+                               d[1]: (5.0, 5.5, 2.0),
+                               d[2]: (5.5, 5.5, 2.0)}})
+    eng, res = _run_ca(df)
+
+    assert [(dd, pytest.approx(v, abs=1e-6)) for dd, v in res.nav] == [
+        (d[0], 1_000_000.0),
+        (d[1], 1_100_000.0),   # 除权日：份额翻倍 × 价格减半，净值无跳变
+        (d[2], 1_100_000.0),
+    ]
+    # 持仓份额快照：d1 = 100,000，d2 起 = 200,000
+    assert res.positions[d[0]] == {"600000.SH": 100_000}
+    assert res.positions[d[1]] == {"600000.SH": 200_000}
+    # 成本口径：总成本 qty × avg_cost = 1,000,000 严格不变（份额调整法不变量）
+    pos = eng.account.positions["600000.SH"]
+    assert pos.qty == pytest.approx(200_000)
+    assert pos.avg_cost == pytest.approx(5.0)
+    assert pos.qty * pos.avg_cost == pytest.approx(1_000_000, abs=1e-6)
+    # 除权本身不产生任何成交
+    assert len(res.trades) == 1 and res.trades[0].trade_date == d[0]
+
+
+def test_nav_continuous_non_integer_ratio():
+    """非整数除权比（10 送 3，ratio=1.3）同样连续：份额 ×1.3，成本 ÷1.3。
+
+    手算：d1 买入 100,000 股 @10（NAV 1,000,000）；d2 除权 close 8.0，
+    等价昨收 = 10 × 1.3 = 13（10/1.3 ≈ 7.6923 原始价跳空）。
+      d2 NAV = 130,000 × 8.0 = 1,040,000 = 未复权口径 100,000 × 10.4。
+    """
+    d = [date(2026, 2, 2) + timedelta(days=i) for i in range(2)]
+    df = _ca_df({"600000.SH": {d[0]: (10.0, 10.0, 1.0),
+                               d[1]: (7.7, 8.0, 1.3)}})
+    eng, res = _run_ca(df)
+
+    assert [(dd, pytest.approx(v, abs=1e-6)) for dd, v in res.nav] == [
+        (d[0], 1_000_000.0),
+        (d[1], 1_040_000.0),
+    ]
+    pos = eng.account.positions["600000.SH"]
+    assert pos.qty == pytest.approx(130_000)
+    assert pos.avg_cost == pytest.approx(10.0 / 1.3)
+    assert pos.qty * pos.avg_cost == pytest.approx(1_000_000, abs=1e-6)
+
+
+def test_halted_resumption_catches_up_cumulative_factor():
+    """停牌复牌：停牌日无 bar 不调整，复牌日按累计因子比一次性补齐。
+
+    场景：600000.SH d1/d2 有 bar（adj_factor 1.0），d3/d4 停牌无 bar，
+    d5 复牌，adj_factor 累计跳到 2.0，原始价 10 → 6（复权等价昨收 12，
+    复牌日跌 50% —— 停牌期间两次除权的典型形态）。
+
+    手算：d1 收盘买入 100,000 股 @10。
+      d1~d4: NAV = 1,000,000（停牌按最近可见 close=10 估值，无 bar 不调整）。
+      d5: ratio = 2.0 / 1.0 = 2.0 一次性补齐 → qty 200,000，avg_cost 5.0。
+          NAV = 200,000 × 6.0 = 1,200,000。
+    若实现把停牌日因子跳变漏掉或分日重复调整，d5 qty/NAV 必然对不上。
+    """
+    d = [date(2026, 3, 2) + timedelta(days=i) for i in range(5)]
+
+    class BuyAHold(Strategy):
+        def on_bar(self, ctx: Context, bars):
+            return [("600000.SH", 1.0)]
+
+    df = _ca_df({
+        "600000.SH": {d[0]: (10.0, 10.0, 1.0),
+                      d[1]: (10.0, 10.0, 1.0),
+                      # d3/d4 停牌：数据中直接缺席
+                      d[4]: (6.0, 6.0, 2.0)},
+        "000001.SZ": {dd: (20.0, 20.0, 1.0) for dd in d},
+    })
+    eng, res = _run_ca(df, BuyAHold())
+
+    assert [(dd, pytest.approx(v, abs=1e-6)) for dd, v in res.nav] == [
+        (d[0], 1_000_000.0),
+        (d[1], 1_000_000.0),
+        (d[2], 1_000_000.0),   # 停牌日：最近可见 close=10 估值
+        (d[3], 1_000_000.0),
+        (d[4], 1_200_000.0),   # 复牌日：ratio=2.0 一次补齐后 200,000 × 6
+    ]
+    assert res.positions[d[3]] == {"600000.SH": 100_000}
+    assert res.positions[d[4]] == {"600000.SH": 200_000}
+    pos = eng.account.positions["600000.SH"]
+    assert pos.qty == pytest.approx(200_000)
+    assert pos.avg_cost == pytest.approx(5.0)
+    assert pos.qty * pos.avg_cost == pytest.approx(1_000_000, abs=1e-6)
+    assert len(res.trades) == 1 and res.trades[0].trade_date == d[0]
+
+
+def test_account_position_corporate_action_hand_computed():
+    """Account 层单测：Position.apply_corporate_action 手算锁定。
+
+    ratio=2.0：qty 100→200，avg_cost 10→5，lots 份额翻倍、买入价与日期不变
+    （总成本口径一致，T+N 可卖约束不受影响）。
+    """
+    from lquant.backtest.account import Position
+
+    bd = date(2026, 1, 5)
+    pos = Position(symbol="600000.SH", qty=100, avg_cost=10.0,
+                   lots=[(bd, 60.0, 10.0), (bd + timedelta(days=1), 40.0, 10.0)])
+    pos.apply_corporate_action(2.0)
+    assert pos.qty == pytest.approx(200)
+    assert pos.avg_cost == pytest.approx(5.0)
+    assert pos.lots == [(bd, 120.0, 10.0), (bd + timedelta(days=1), 80.0, 10.0)]
+    assert pos.qty * pos.avg_cost == pytest.approx(1_000, abs=1e-9)
+    assert sum(q for _, q, _ in pos.lots) == pytest.approx(pos.qty)
+
+    # 非整数比 1.5：qty 200→300，avg_cost 5→10/3，总成本不变
+    pos.apply_corporate_action(1.5)
+    assert pos.qty == pytest.approx(300)
+    assert pos.avg_cost == pytest.approx(10.0 / 3.0)
+    assert pos.qty * pos.avg_cost == pytest.approx(1_000, abs=1e-9)
+
+
+def test_account_corporate_action_ignores_missing_symbol():
+    """Account 层：无持仓的 symbol 除权应安全忽略，不抛异常。"""
+    from lquant.backtest.account import Account
+
+    acct = Account(cash=1_000_000)
+    acct.apply_corporate_action("600000.SH", 2.0)   # 不应抛
+    assert acct.nav({}) == pytest.approx(1_000_000)
+
+
 # ---------- L2 会计恒等式 ----------
 
 def test_cash_conservation_zero_fee():
