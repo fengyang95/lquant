@@ -496,6 +496,17 @@ class JQRunner:
         def get_current_user_query_result(*a, **kw):   # 未支持项给清晰报错
             raise NotImplementedError("该聚宽 API 未支持（当前兼容日频核心子集）")
 
+        # 基本面：get_fundamentals + query DSL 表对象（import 放函数内，
+        # 避免模块级循环依赖；PIT 语义见 jq_fundamentals.make_get_fundamentals）
+        from lquant.backtest.jq_fundamentals import make_get_fundamentals
+        from lquant.research.dialect import fundamentals as _fd
+
+        ns["get_fundamentals"] = make_get_fundamentals()
+        for _t in ("fundamentals", "valuation", "income", "balance", "cashflow",
+                   "indicator", "growth", "operation"):
+            ns[_t] = getattr(_fd, _t)
+        ns["query"] = _fd.query
+
         ns.update(
             set_benchmark=set_benchmark, set_option=set_option, set_universe=set_universe,
             set_order_cost=set_order_cost, set_slippage=set_slippage,
@@ -851,6 +862,10 @@ class JQRunner:
             self._today = d
             self._day_index = i
             self._bars_today = bars_by_day[d]
+            # 每日执行策略前绑定 get_fundamentals 的当日交易日与股票池
+            from lquant.backtest import jq_fundamentals as _jf
+
+            _jf.set_day(d, sorted(self._bars_today))
             self.context.current_dt = datetime.combine(d, dtime(9, 30))
             self.context.previous_date = self._dates[i - 1] if i > 0 else None
 
