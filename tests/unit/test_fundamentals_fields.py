@@ -9,7 +9,7 @@ import polars as pl
 import pytest
 
 from lquant.data.store import catalog
-from lquant.research.dialect.fundamentals import income, query
+from lquant.research.dialect.fundamentals import cashflow, income, query
 
 duckdb = pytest.importorskip("duckdb")
 pytest.importorskip("pandas")
@@ -115,6 +115,32 @@ def test_unknown_financial_field_raises():
 
     with pytest.raises(ValueError, match="income"):
         get_fundamentals(query(income.not_a_real_field), date=_DAY)
+
+
+def test_same_tail_multi_columns_all_filled(tmp_catalog):
+    """Critical 回归:同查询两列映射到同一 tushare 尾段,两列都不得丢数。"""
+    from lquant.research.dialect.jq_shim import get_fundamentals
+
+    _seed_financial([_row("600519.SH", "income.n_income_attr_p", 42.0)])
+    df = get_fundamentals(
+        query(income.net_profit, income.nparent_netprofit), date=_DAY)
+    assert df["net_profit"].tolist() == [42.0]
+    assert df["nparent_netprofit"].tolist() == [42.0]
+
+
+def test_cashflow_operate_flow_resolves(tmp_catalog):
+    from lquant.research.dialect.jq_shim import get_fundamentals
+
+    _seed_financial([_row("600519.SH", "cashflow.n_cashflow_act", 12.5)])
+    df = get_fundamentals(query(cashflow.net_operate_cash_flow), date=_DAY)
+    assert df["net_operate_cash_flow"].tolist() == [12.5]
+
+
+def test_unknown_cashflow_field_raises():
+    from lquant.research.dialect.jq_shim import get_fundamentals
+
+    with pytest.raises(ValueError, match="未知字段"):
+        get_fundamentals(query(cashflow.made_up_field), date=_DAY)
 
 
 def test_legacy_profit_prefix_still_resolves(tmp_catalog):

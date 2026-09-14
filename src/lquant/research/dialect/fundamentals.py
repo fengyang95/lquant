@@ -60,6 +60,14 @@ FIELD_MAP: dict[str, dict[str, str]] = {
         "adjusted_profit": "op_income",
         "net_profit_growth_rate": "netprofit_yoy",
     },
+    "cashflow": {
+        "net_operate_cash_flow": "n_cashflow_act",
+        "net_invest_cash_flow": "n_cashflow_inv_act",
+        "net_finance_cash_flow": "n_cash_flows_fnc_act",
+        "net_increase_cash": "n_incr_cash_cash_equ",
+        "cash_end_period": "c_cash_equ_end_period",
+        "free_cashflow": "free_cashflow",
+    },
 }
 
 # JQ valuation 字段 → 日线列
@@ -199,20 +207,20 @@ def _financial_frame(items: dict[Column, str], symbols: list[str] | None,
             best[key] = (stat_d, pub_d, value)
     # 归一化匹配：item 尾段（tushare 列名或历史 camelCase）↔ JQ 字段名。
     # 匹配顺序：1) FIELD_MAP（JQ 名 → tushare 尾段）；2) _norm 直配（tushare
-    # 原生名直查）。键带表前缀（含 legacy 前缀）：income 与 cashflow 的同名
-    # 尾段不互相污染。
-    norm_items: dict[tuple[str, str], Column] = {}
+    # 原生名直查）。同一尾段可被多个列映射到（如 net_profit 与
+    # nparent_netprofit → n_income_attr_p），命中时全部填充，不得丢列。
+    # 键带表前缀（含 legacy 前缀）：income 与 cashflow 的同名尾段不互相污染。
+    norm_items: dict[tuple[str, str], list[Column]] = {}
     for c in items:
-        for p in ({_KIND_PREFIX[c.table], _LEGACY_PREFIX.get(c.table)}
-                  - {None}):
-            norm_items[(p, _norm(c.name))] = c
-            for tail in FIELD_MAP.get(c.table, {}).values():
-                norm_items[(p, _norm(tail))] = c
+        keys = {_norm(c.name), *(_norm(v) for v in
+                                  FIELD_MAP.get(c.table, {}).values())}
+        for p in {_KIND_PREFIX[c.table], _LEGACY_PREFIX.get(c.table)} - {None}:
+            for t in keys:
+                norm_items.setdefault((p, t), []).append(c)
     out: dict[Column, dict[str, tuple]] = {c: {} for c in items}
     for (sym, item), (stat_d, _pub_d, value) in best.items():
         prefix, tail = item.split(".", 1)
-        target = norm_items.get((prefix, _norm(tail)))
-        if target is not None:
+        for target in norm_items.get((prefix, _norm(tail)), ()):
             out[target][sym] = (stat_d, value)
     return out
 
@@ -295,6 +303,8 @@ def resolve(q: Query, day: _date) -> pl.DataFrame:
         if c.name == "code":
             continue
         fmap = FIELD_MAP.get(c.table)
+        # growth/operation 尚无映射：暂留 permissive（Task 2 扩 FIELD_MAP 时
+        # 收紧为白名单），避免本任务把这两个表全部字段变成报错。
         if fmap is not None:
             allowed = ({_norm(k) for k in fmap}
                        | {_norm(v) for v in fmap.values()})
