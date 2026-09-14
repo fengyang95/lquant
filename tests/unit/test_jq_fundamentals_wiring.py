@@ -119,3 +119,58 @@ def test_strategy_can_call_get_fundamentals(tmp_catalog, tmp_path, monkeypatch):
     res = JQRunner(CODE, initial_cash=1_000_000).run(_make_df())
     assert res.error is None
     assert any(v > 0 for _, v in res.records.get("n_picked", []))   # 策略内确实查到了财务行
+
+
+CAPTURE_CODE = '''
+def initialize(context):
+    run_monthly(pick, time="open")
+
+def pick(context):
+    df = get_fundamentals(query(income.net_profit))
+    for v in df["net_profit"]:
+        record(net_profit=v)
+'''
+
+
+def test_future_pub_date_never_leaks_into_sandbox(tmp_catalog, tmp_path, monkeypatch):
+    """防前视判别:pub_date > 交易日的行即便 stat_date 更新也不可见。
+
+    只有这条测试同时 seed「窗口前已公告」与「pub_date 晚于交易日」两行,
+    实现若错用 stat_date<=t 或去掉 pub_date 过滤,999.0 就会漏进来。
+    """
+    bars = pl.DataFrame({
+        "symbol": ["600000.SH"] * 6,
+        "trade_date": [date.fromordinal(date(2026, 1, 5).toordinal() + i)
+                       for i in range(6)],
+        "open": [100.0] * 6,
+        "high": [101.0] * 6,
+        "low": [99.0] * 6,
+        "close": [100.0] * 6,
+        "volume": [1e8] * 6,
+        "amount": [1e10] * 6,
+        "adj_factor": [1.0] * 6,
+        "pe_ttm": [30.0] * 6,
+        "pb_mrq": [5.0] * 6,
+        "total_mv": [1e10] * 6,
+        "float_mv": [8e9] * 6,
+    })
+    root = tmp_path / "data" / "daily" / "year=2026"
+    root.mkdir(parents=True)
+    bars.write_parquet(root / "part-0.parquet")
+    monkeypatch.setattr("lquant.data.store.parquet._root", lambda: tmp_path / "data")
+
+    _seed_financial([
+        {"symbol": "600000.SH", "stat_date": date(2025, 12, 31),
+         "pub_date": date(2025, 12, 20), "report_type": "2025Q4",
+         "item": "profit.netProfit", "value": 42.0},
+        {"symbol": "600000.SH", "stat_date": date(2026, 1, 31),
+         "pub_date": date(2026, 1, 10), "report_type": "2026Q1",
+         "item": "profit.netProfit", "value": 999.0},   # pub_date > 全部交易日
+    ])
+
+    from lquant.backtest.jqapi import JQRunner
+
+    res = JQRunner(CAPTURE_CODE, initial_cash=1_000_000).run(_make_df())
+    assert res.error is None
+    seen = {v for _, v in res.records.get("net_profit", [])}
+    assert seen == {42.0}            # 只见已公告行；未来公告的 999.0 绝不可见
