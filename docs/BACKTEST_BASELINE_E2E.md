@@ -113,6 +113,10 @@ financial_pit 中与"同比/yoy"相关的 DISTINCT item:['indicator.cfps_yoy', '
 | G8 | T+1 语义口径裁定:计划文本"信号日下单次日开盘成交"与引擎/聚宽口径(当日开盘撮合 + T+1 可卖 `sellable_after_days`)冲突,按引擎/聚宽口径执行;若裁定错误需重审撮合时点 | 回测正确性 | `tests/unit/test_baseline_strategy.py::test_baseline_t_plus_one_fill` | P2(复核撮合时点口径) | 否 |
 | G9 | jq_shim 模块级 `_STATE` + 全局上下文绑定,同进程多 runner 并发会互相污染(当前无此用法) | 回测正确性(工程健壮性) | Task 1 review deferred;同进程构造两个 JQRunner 交替 run 可复现 | P2 | 否 |
 | G10 | NaN 因子穿透评分:沙箱纯 Python 版 `or 0.0` 与 polars 版 `fill_null` 均接不住真实 NaN,一个 NaN 污染全截面 z 分数,NaN 行降序排第一先入池。**已在 P0 修复**(纯 Python `isnan` 归零;polars `fill_nan(0.0)` 后合成) | 回测正确性 | `tests/unit/test_baseline_strategy.py::test_composite_score_real_nan_never_ranks_first` / `::test_sandbox_score_real_nan_isolated_and_deterministic` | 已闭环 | 否(曾阻塞,已修) |
+| G11 | `attribute_history`/`history` 的字段参数传字符串被 `list(str)` 拆成单字符列(`'close'` → `['c','l','o','s','e']`),触发迷惑的 `KeyError('close')`。聚宽原生 fields 为 list/tuple,字符串报错路径应显式。**复现:`scripts/probe_attr_history.py`** | 兼容面 | `PYTHONPATH=src python scripts/probe_attr_history.py`(LOG 显示 cols=['c','l','o','s','e'] + REPRO KeyError) | P1 | 是(复杂策略 E2E 因此中断) |
+| G12 | 复杂策略 E2E(`scripts/run_complex_e2e.py`)所需 2025 全年+2026 实跑:复用 G2 数据回填后已具备(日线湖 2024-01~2026-09,247k bars×600 标的) | 数据层 | `PYTHONPATH=src python scripts/run_complex_e2e.py` | 已闭环 | 否 |
+| G13 | 全市场 `get_fundamentals` 单次 ~170s(financial_pit 72M 行,无日期/标的缓存;每日调用 = E2E 20h)。热帧:duckdb 全表扫描 | 回测正确性(性能) | `python - <<EOF` 计时复现:单次 172s/168s/167s ×3 | P1(性能专项) | 是(复杂策略每日盘前选股不可用) |
+| G14 | 复杂策略 E2E 实跑完成(2025-01-02~2026-09-11,600 标的×411 交易日,月度调仓 top15 等权+止损止盈):总收益 +9.51%,336 笔成交/6 笔拒单(拒单原因分布合理:涨停不可买/跌停不可卖/资金不足一手),**审计 PASS**(停牌日无成交、无 T+1 双向成交、无涨停买入/跌停卖出)。耗时 3831s(大头是 14 次 monthly get_fundamentals×170s,即 G13) | 回测正确性 | `PYTHONPATH=src python scripts/run_complex_e2e.py` | 已闭环 | 否 |
 
 ## 人工补注
 
