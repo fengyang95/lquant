@@ -65,6 +65,17 @@ def test_error_logs_missing_db_degrades_empty(mdb):
     assert out == {"items": [], "total": 0}
 
 
+def test_error_logs_unwritable_db_degrades_empty(tmp_path, monkeypatch):
+    """db 连接失败（路径不可写）也降级空集，不炸 500 —— _con() 须在 try 内。"""
+    monkeypatch.setenv("LQ_MONITOR_DB", str(tmp_path / "no-such-dir" / "x.duckdb"))
+    from lquant.core.config import get_settings
+
+    get_settings.cache_clear()
+    out = q.error_logs("1h")
+    get_settings.cache_clear()
+    assert out == {"items": [], "total": 0}
+
+
 def test_error_logs_endpoint(mdb):
     _seed_errors(mdb)
     import os

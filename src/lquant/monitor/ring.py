@@ -18,15 +18,15 @@ class ApiRing[T]:
         self._lock = threading.Lock()
         self._items: deque[T] = deque(maxlen=maxlen)
 
-    def append(self, point: ApiMetricPoint) -> None:
+    def append(self, point: T) -> None:
         with self._lock:
             self._items.append(point)
 
-    def snapshot(self) -> tuple[ApiMetricPoint, ...]:
+    def snapshot(self) -> tuple[T, ...]:
         with self._lock:
             return tuple(self._items)
 
-    def drain(self) -> tuple[ApiMetricPoint, ...]:
+    def drain(self) -> tuple[T, ...]:
         with self._lock:
             out = tuple(self._items)
             self._items.clear()

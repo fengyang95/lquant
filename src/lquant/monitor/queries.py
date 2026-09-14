@@ -242,8 +242,9 @@ def error_logs(range_name: str, route: str | None = None,
     DuckDB 不可用/表不存在时降级返回空集（首次运行尚无错误表属正常态）。
     """
     rs = range_sec(range_name)
-    con = _con()
+    con = None
     try:
+        con = _con()  # 连接失败同样降级为空集（此前在 try 外会炸 500）
         params: list = []
         where = f"WHERE ts > cast(now() as timestamp) - INTERVAL {rs} SECOND"
         if route:
@@ -261,7 +262,8 @@ def error_logs(range_name: str, route: str | None = None,
         _LOG.warning("error_logs 查询失败，降级为空集", exc_info=True)
         return {"items": [], "total": 0}
     finally:
-        con.close()
+        if con is not None:
+            con.close()
     items = [{"ts": str(r[0]), "route": r[1], "method": r[2], "status": r[3],
               "error_type": r[4], "message": r[5], "traceback_tail": r[6]}
              for r in rows]
