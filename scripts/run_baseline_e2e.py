@@ -230,6 +230,28 @@ financial_pit 中与"同比/yoy"相关的 DISTINCT item:{yoy_items or "(无)"}�
 """
 
 
+MANUAL_NOTES_HEADING = "## 人工补注"
+
+
+def extract_manual_notes(doc: str) -> str:
+    """提取文档中的"人工补注"段(到文末);没有则返回空串。"""
+    idx = doc.find(MANUAL_NOTES_HEADING)
+    if idx < 0:
+        return ""
+    return doc[idx:].rstrip() + "\n"
+
+
+def merge_manual_notes(new_doc: str, old_doc: str) -> str:
+    """重跑时保留旧文档的人工补注段,避免脚本整体覆盖抹掉人工内容。"""
+    notes = extract_manual_notes(old_doc)
+    if not notes:
+        return new_doc
+    # 旧补注已含同名段时不再重复追加(幂等)。
+    if MANUAL_NOTES_HEADING in new_doc:
+        return new_doc
+    return new_doc.rstrip() + "\n\n" + notes
+
+
 def main() -> None:
     args = _parse_args()
     t0 = time.time()
@@ -271,6 +293,8 @@ def main() -> None:
         )
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
+        if out.exists():
+            doc = merge_manual_notes(doc, out.read_text(encoding="utf-8"))
         out.write_text(doc, encoding="utf-8")
         print(f"[written] {out}")
 
