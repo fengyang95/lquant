@@ -68,6 +68,7 @@ def refresh_adj_factors(*, symbols: list[str] | None = None,
     # 入湖前门禁：主键去重 + 因子正值断言（adj_factor 最易出错：静默坏
     # 因子会被 _overlay 覆盖湖内好数据，且 gate_daily 只挂在日线 _stamp）。
     from lquant.core.errors import DataQualityError
+    from lquant.data import lineage
     from lquant.data.quality.asserts import assert_no_dup
 
     assert_no_dup(rows, ["symbol", "trade_date"])
@@ -80,7 +81,11 @@ def refresh_adj_factors(*, symbols: list[str] | None = None,
         )
     rows = rows.with_columns(
         ingested_at=pl.lit(datetime.now().replace(tzinfo=None), dtype=pl.Datetime),
-        data_version=pl.lit(datetime.now().strftime("%Y%m%d")),
+        # 血缘登记：湖内 data_version 必须能对上 data_version 表，
+        # 否则因子缓存失效锚点是死的（与 daily._stamp 同一约定）
+        data_version=pl.lit(lineage.new_version()),
     )
+    lineage.register(version=str(rows["data_version"][0]),
+                     dataset="daily_bar", row_count=len(rows))
     write_daily(rows)
     return len(rows)
