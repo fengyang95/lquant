@@ -265,8 +265,9 @@ def test_capability_set(provider: TushareProvider) -> None:
 def test_real_yaml_loads() -> None:
     dm = load_table_mapping("daily_bar", "tushare")
     assert dm.rename["ts_code"] == "symbol"
-    assert "vol * 100" in dm.derive["volume"].expr
-    assert "amount * 1000" in dm.derive["amount"].expr
+    assert dm.rename["vol"] == "volume"
+    # 日线单位换算已迁到 provider fetch 侧（scale_unit），yaml 不再 derive
+    assert "volume" not in dm.derive and "amount" not in dm.derive
     assert dm.fill["source"] == "tushare"
     mm = load_table_mapping("minute_bar", "tushare")
     assert "vol * 100" in mm.derive["volume"].expr

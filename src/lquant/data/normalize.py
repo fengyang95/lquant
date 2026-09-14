@@ -22,7 +22,11 @@ ALIASES = {
     "昨收": "pre_close", "preClose": "pre_close", "pre_close": "pre_close",
 }
 
-UNIT_TO_YUAN = {"元": 1.0, "万元": 1e4, "亿": 1e8, "亿元": 1e8, "百万元": 1e6}
+UNIT_TO_YUAN = {"元": 1.0, "千元": 1e3, "万元": 1e4, "亿": 1e8, "亿元": 1e8, "百万元": 1e6}
+
+# volume 归一目标单位 = 股（schema 注释 "volume: pl.Float64, # 股"）。
+# 各 provider 源单位考证结论写在其模块级常量 VOLUME_UNIT / AMOUNT_UNIT 注释里。
+VOLUME_TO_SHARES = {"股": 1.0, "手": 100.0, "万手": 1e6}
 
 
 def rename_columns(df: pl.DataFrame) -> pl.DataFrame:
@@ -58,6 +62,20 @@ def to_yuan(df: pl.DataFrame, col: str, unit: str) -> pl.DataFrame:
     factor = UNIT_TO_YUAN.get(unit)
     if factor is None:
         raise DataQualityError("unit_normalize", f"未知金额单位: {unit}")
+    return df.with_columns((pl.col(col) * factor).alias(col))
+
+
+def scale_unit(df: pl.DataFrame, *, col: str, unit: str) -> pl.DataFrame:
+    """把源单位换算到湖内标准单位（volume → 股 / amount → 元）。
+
+    纯函数（返回新 df，不 mutate）；volume 系数表 VOLUME_TO_SHARES、
+    amount 系数表 UNIT_TO_YUAN。0 / None / 负值按乘法自然透传，不炸。
+    """
+    factor = {**VOLUME_TO_SHARES, **UNIT_TO_YUAN}.get(unit)
+    if factor is None:
+        raise DataQualityError("unit_normalize", f"未知单位: {unit}")
+    if df.is_empty() or col not in df.columns:
+        return df
     return df.with_columns((pl.col(col) * factor).alias(col))
 
 

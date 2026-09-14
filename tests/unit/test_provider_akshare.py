@@ -315,7 +315,8 @@ def test_real_yaml_loads() -> None:
     dm = load_table_mapping("daily_bar", "akshare")
     assert dm.rename["股票代码"] == "symbol"
     assert dm.rename["日期"] == "trade_date"
-    assert "volume" in dm.derive
+    # 日线单位换算已迁到 provider 侧（_select_daily + scale_unit）
+    assert "volume" not in dm.derive
     assert dm.fill["source"] == "akshare"
     mm = load_table_mapping("minute_bar", "akshare")
     assert mm.fill["freq"] == "1min"
