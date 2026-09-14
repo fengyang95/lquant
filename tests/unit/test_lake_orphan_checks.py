@@ -35,8 +35,8 @@ def _prep(tmp_path, monkeypatch, lake: pl.DataFrame) -> None:
 def test_lake_checks_surface_adj_anomaly(tmp_path, monkeypatch) -> None:
     """close 翻倍而 adj_factor 不变 → run_lake_checks 检出 ADJ_ANOMALY 并落库。"""
     _prep(tmp_path, monkeypatch, _lake_frame((100.0, 200.0)))
-    from lquant.data.quality.pipeline import run_lake_checks
     from lquant.data.quality.issues import latest_issues
+    from lquant.data.quality.pipeline import run_lake_checks
 
     found = run_lake_checks()
     assert any(i.rule == "ADJ_ANOMALY" for i in found), \
