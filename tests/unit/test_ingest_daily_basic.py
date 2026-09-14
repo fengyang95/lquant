@@ -271,7 +271,6 @@ def test_daily_basic_failure_day_not_marked(tmp_path, monkeypatch) -> None:
     _prep_lake_5days(tmp_path, monkeypatch)
     try:
         from lquant.data.ingest import daily_basic as mod
-        from lquant.data.providers import get_provider
 
         fake = _FlakyBasicProvider({date(2026, 8, 5)}, set())
 
@@ -299,7 +298,6 @@ def test_daily_basic_empty_day_not_marked(tmp_path, monkeypatch) -> None:
     _prep_lake_5days(tmp_path, monkeypatch)
     try:
         from lquant.data.ingest import daily_basic as mod
-        from lquant.data.providers import get_provider
 
         fake = _FlakyBasicProvider(set(), {date(2026, 8, 5)})
 
