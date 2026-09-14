@@ -51,7 +51,7 @@ def composite_score(pe: pl.DataFrame, yoy: pl.DataFrame, mom: pl.DataFrame,
     expr = z
     sign = {"pe": -1.0, "yoy": 1.0, "mom": 1.0, "vol": -1.0}
     for c in ("pe", "yoy", "mom", "vol"):
-        filled = pl.col(c).cast(pl.Float64, strict=False).fill_null(0.0)
+        filled = pl.col(c).cast(pl.Float64, strict=False).fill_nan(0.0).fill_null(0.0)
         df = df.with_columns(filled.alias(c))
     for c in ("pe", "yoy", "mom", "vol"):
         expr = expr + pl.lit(sign[c]) * pl.col(c).map_batches(_zscore, return_dtype=pl.Float64)
@@ -77,13 +77,22 @@ def _zscore_xs(values):
     return [(v - mean) / std for v in values]
 
 
+def _safe_val(v):
+    """缺失/None/NaN 一律归 0(NaN 不是 None,`or 0.0` 接不住)。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0 if f != f else f
+
+
 def _composite_score_xs(codes, pe_map, yoy_map, mom_map, vol_map):
     """与模块级 composite_score 同构:缺失因子按 0,z 分数加权合成。"""
     universe = list(codes)
-    pe_vals = [pe_map.get(c, 0.0) or 0.0 for c in universe]
-    yoy_vals = [yoy_map.get(c, 0.0) or 0.0 for c in universe]
-    mom_vals = [mom_map.get(c, 0.0) or 0.0 for c in universe]
-    vol_vals = [vol_map.get(c, 0.0) or 0.0 for c in universe]
+    pe_vals = [_safe_val(pe_map.get(c)) for c in universe]
+    yoy_vals = [_safe_val(yoy_map.get(c)) for c in universe]
+    mom_vals = [_safe_val(mom_map.get(c)) for c in universe]
+    vol_vals = [_safe_val(vol_map.get(c)) for c in universe]
     z_pe = _zscore_xs(pe_vals)
     z_yoy = _zscore_xs(yoy_vals)
     z_mom = _zscore_xs(mom_vals)

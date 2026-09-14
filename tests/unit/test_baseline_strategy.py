@@ -1,6 +1,7 @@
 """基准多因子策略测试:评分函数单测 + 沙箱源码执行 + 防前视断言。"""
 from __future__ import annotations
 
+import math
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
@@ -129,6 +130,44 @@ def test_composite_score_all_nan_factor_zeroed():
     out = composite_score(pe, yoy, mom, vol)
     assert out["score"].null_count() == 0
     assert out["score"].is_sorted(descending=True)
+
+
+def test_composite_score_real_nan_never_ranks_first():
+    """G10:真实 pandas NaN(不是 null)不得穿透评分。
+
+    fill_null 接不住 NaN:NaN 会让全截面 z 分数变 NaN,sort(descending)
+    时 NaN 排第一 → 缺数据的股票最先入池。修复后 NaN 因子按 0 计。
+    """
+    codes = ["A", "B", "C"]
+    pe = pl.DataFrame({"code": codes, "pe": [10.0, float("nan"), 5.0]})
+    yoy = pl.DataFrame({"code": codes, "yoy": [0.3, 0.1, 0.2]})
+    mom = pl.DataFrame({"code": codes, "mom": [0.3, 0.0, 0.1]})
+    vol = pl.DataFrame({"code": codes, "vol": [0.1, 0.4, 0.2]})
+    out = composite_score(pe, yoy, mom, vol)
+    assert out["score"].null_count() == 0
+    assert all(math.isfinite(s) for s in out["score"])
+    # NaN pe 按 0 计后 B 其余因子也差 → B 排最后,不得因 NaN 排第一
+    assert out["code"][0] == "A"
+    assert out["code"][-1] == "B"
+    assert out["score"].is_sorted(descending=True)
+
+
+def test_sandbox_score_real_nan_isolated_and_deterministic():
+    """G10 沙箱路径:`or 0.0` 接不住 NaN,一个 NaN 会污染全截面 z 分数。"""
+    ns = _exec_sandbox()
+    scored = ns["_composite_score_xs"](
+        ["A", "B", "C"],
+        {"A": 10.0, "B": float("nan"), "C": 5.0},
+        {"A": 0.1, "B": 0.2, "C": 0.3},
+        {"A": 0.1, "B": 0.2, "C": 0.3},
+        {"A": 0.1, "B": 0.2, "C": 0.3},
+    )
+    scores = dict(scored)
+    assert all(math.isfinite(s) for s in scores.values())
+    # NaN pe 按 0 计 → 可手算:score A=-2.0、B=C=1.0(稳定排序保持 B、C 原序)
+    assert [c for c, _ in scored] == ["B", "C", "A"]
+    assert scores["A"] == pytest.approx(-2.0, abs=1e-9)
+    assert scores["B"] == pytest.approx(1.0, abs=1e-9)
 
 
 # ---------- 合成小样本全语义单测:PIT / 剔除 / 调仓 / T+1 ----------
