@@ -279,11 +279,8 @@ def test_baseline_excludes_halted(tmp_catalog, tmp_path: Path, monkeypatch):
     assert "600003.SH" in res.positions.get(date(2025, 10, 1), {})
 
 
-@pytest.mark.xfail(reason="gap: JQRunner 的 get_current_data()[sym].is_st 恒为 False,"
-                          "不读 security 表 → ST 剔除不生效",
-                   strict=True)
 def test_baseline_excludes_st(tmp_catalog, bars_flat_130):
-    """security 表 is_st 标记的股票不得进入持仓(引擎缺口 → xfail)。"""
+    """security 表 is_st 标记的股票不得进入持仓(G1 接线已修复)。"""
     syms = [f"60000{i}.SH" for i in range(4)]
     _seed_financial([_fin_row(s, date(2025, 7, 31), date(2025, 7, 20), 0.10)
                      for s in syms])

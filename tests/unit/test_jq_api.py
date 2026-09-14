@@ -261,3 +261,138 @@ def handle_data(context, data):
 '''
     res = JQRunner(code, initial_cash=1_000_000).run(df)
     assert res.error is None, res.error
+
+
+# ---------- G1 接线：security 表 is_st ----------
+
+from lquant.data.store import catalog  # noqa: E402
+
+duckdb = pytest.importorskip("duckdb")
+
+
+@pytest.fixture()
+def tmp_catalog(tmp_path, monkeypatch):
+    """隔离 duckdb catalog（同 test_baseline_strategy 模式），seed security 表。"""
+    from contextlib import contextmanager
+
+    db = tmp_path / "lq.duckdb"
+    con = duckdb.connect(str(db))
+    from lquant.data.store.ddl import DDL_STATEMENTS
+    for stmt in DDL_STATEMENTS:
+        con.execute(stmt)
+    con.close()
+
+    @contextmanager
+    def _writer():
+        c = duckdb.connect(str(db))
+        try:
+            yield c
+            c.commit()
+        finally:
+            c.close()
+
+    @contextmanager
+    def _reader():
+        c = duckdb.connect(str(db))
+        try:
+            yield c
+        finally:
+            c.close()
+
+    monkeypatch.setattr(catalog, "writer", _writer)
+    monkeypatch.setattr(catalog, "reader", _reader)
+
+
+def test_is_st_wired_from_security_table(tmp_catalog):
+    """security 表 is_st=TRUE → get_current_data()[sym].is_st 为真（G1 接线金标准）。
+
+    修复前 _sec_data 不传 is_st，恒 False。
+    """
+    with catalog.writer() as con:
+        con.execute("INSERT INTO security VALUES "
+                    "('600000.SH', '*ST测试', 'stock', 'main', "
+                    "DATE '2020-01-01', NULL, TRUE, 'test', now())")
+    code = '''
+def initialize(context):
+    run_daily(trade, time="open")
+
+def trade(context):
+    cd = get_current_data()
+    record(st_flag=1 if cd["600000.SH"].is_st else 0)
+'''
+    res = JQRunner(code, initial_cash=1_000_000).run(make_df())
+    assert res.error is None, res.error
+    assert res.records["st_flag"], "record 无输出"
+    assert all(v == 1 for _, v in res.records["st_flag"])
+
+
+def test_is_st_default_empty_when_no_security_rows(tmp_catalog):
+    """security 表存在但无 ST 行 → is_st 恒 False，回测正常不报错。"""
+    code = """
+def initialize(context):
+    run_daily(trade, time="open")
+
+def trade(context):
+    record(st_flag=1 if get_current_data()["600000.SH"].is_st else 0)
+"""
+    res = JQRunner(code, initial_cash=1_000_000).run(make_df())
+    assert res.error is None, res.error
+    assert res.records["st_flag"], "record 无输出"
+    assert all(v == 0 for _, v in res.records["st_flag"])
+
+
+def test_st_price_limit_5pct(tmp_catalog):
+    """ST 股 +7% 高开（> 5% 涨停价）→ 每日买入委托全部涨停拒单。
+
+    对照 test_non_st_7pct_gap_fills：同行情非 ST 可成交。
+    """
+    rows = []
+    for i in range(4):
+        d = date(2026, 1, 5 + i)
+        rows.append(dict(trade_date=d, symbol="600000.SH", open=107.0,
+                         high=107.0 * 1.005, low=107.0 * 0.995, close=107.0,
+                         pre_close=100.0, volume=1e8, amount=107.0 * 1e8))
+    df = pl.DataFrame(rows)
+    code = '''
+def initialize(context):
+    set_order_cost(type="stock", open_tax=0, close_tax=0,
+                   open_commission=0, close_commission=0, min_commission=0)
+    run_daily(trade, time="open")
+
+def trade(context):
+    if context.portfolio.positions["600000.SH"].total_amount == 0:
+        order_target_value("600000.SH", 500000)
+'''
+    runner = JQRunner(code, initial_cash=1_000_000,
+                      security_meta={"600000.SH": {"is_st": True}})
+    res = runner.run(df)
+    assert res.error is None, res.error
+    assert res.trades == [], f"ST +7% 高开不应成交: {res.trades}"
+    st_rejects = [r for r in res.rejected if "涨停" in r[2]]
+    assert st_rejects, f"预期 ST 5% 涨停拒单，实际 {res.rejected}"
+
+
+def test_non_st_7pct_gap_fills(tmp_catalog):
+    """同行情非 ST 股（无 meta 注入）+7% 高开可成交 —— 10% 板内对照组。"""
+    rows = []
+    for i in range(4):
+        d = date(2026, 1, 5 + i)
+        p = 100.0 if i == 0 else 107.0
+        rows.append(dict(trade_date=d, symbol="600000.SH", open=p, high=p * 1.005,
+                         low=p * 0.995, close=p, pre_close=100.0,
+                         volume=1e8, amount=p * 1e8))
+    df = pl.DataFrame(rows)
+    code = '''
+def initialize(context):
+    set_order_cost(type="stock", open_tax=0, close_tax=0,
+                   open_commission=0, close_commission=0, min_commission=0)
+    run_daily(trade, time="open")
+
+def trade(context):
+    if context.portfolio.positions["600000.SH"].total_amount == 0:
+        order_target_value("600000.SH", 500000)
+'''
+    res = JQRunner(code, initial_cash=1_000_000).run(df)
+    assert res.error is None, res.error
+    assert len(res.trades) == 1, res.trades          # day0 买入后不再下单
+    assert not [r for r in res.rejected if "涨停" in r[2]]

@@ -349,19 +349,39 @@ class _Log:
 
 # ---------- 运行器 ----------
 
+def _load_security_meta() -> dict[str, dict]:
+    """从 security 表读 is_st 元数据（只取 ST 行）。
+
+    任何异常（表不存在 / 无库连接）与空表都返回 {} —— JQRunner 必须能
+    在无 security 表的沙箱数据上照常回测，绝不因元数据缺失而抛错。
+    """
+    try:
+        from lquant.data.store import catalog
+        with catalog.reader() as con:
+            rows = con.execute(
+                "SELECT symbol, is_st FROM security WHERE is_st").fetchall()
+        return {str(r[0]): {"is_st": bool(r[1])} for r in rows}
+    except Exception:                     # noqa: BLE001 - 元数据缺失不致命
+        return {}
+
+
 class JQRunner:
     """加载用户代码并提供聚宽日频 API。执行前先跑一遍语法/运行时冒烟。"""
 
     def __init__(self, code: str, *, initial_cash: float = 1_000_000.0,
                  benchmark: str = "000300.SH", rebalance: str = "none",
                  participation: float = 0.1, ruleset=None,
-                 factor_formulas: list[str] | None = None) -> None:
+                 factor_formulas: list[str] | None = None,
+                 security_meta: dict[str, dict] | None = None) -> None:
         self.code = code
         self.initial_cash = initial_cash
         self.default_benchmark = benchmark
         self._ruleset = ruleset
         self._participation = participation
         self._factor_formulas = [str(f) for f in (factor_formulas or [])]
+        # security 表 is_st 元数据：参数注入优先，缺省 run() 时自查 security 表。
+        self._security_meta = security_meta
+        self._security_meta_resolved: dict[str, dict] = {}
 
         # 运行期状态
         self.account = Account(cash=initial_cash)
@@ -573,7 +593,8 @@ class JQRunner:
         return self.account.nav(self._prices_map())
 
     def _sec_data(self, sym: str) -> _SecData:
-        return _SecData(self._bars_today.get(sym), self._ref_price(sym))
+        return _SecData(self._bars_today.get(sym), self._ref_price(sym),
+                        is_st=self._security_meta_resolved.get(sym, {}).get("is_st", False))
 
     def _history_df(self, secs: list[str], fields: list[str], rows: list[dict]) -> object:
         """rows 为时间升序窗口 [{sec: {field: v}, 'day': d}]；优先 pandas。
@@ -855,7 +876,12 @@ class JQRunner:
             ruleset.default["commission"] = {"rate": fo["comm_rate"], "min": fo["min"],
                                              "per_order": True}
             ruleset.default["tax"] = {"rate": fo["tax_rate"]}
-        self._rules = build_rules(symbols, ruleset)
+        # is_st 元数据同源：注入优先，否则自查 security 表；驱动
+        # get_current_data()[sym].is_st 与涨跌停 5% 两条路径。
+        self._security_meta_resolved = (
+            dict(self._security_meta) if self._security_meta is not None
+            else _load_security_meta())
+        self._rules = build_rules(symbols, ruleset, self._security_meta_resolved)
         self._broker = Broker(self._rules, self._slippage)
 
         for i, d in enumerate(self._dates):
