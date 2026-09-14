@@ -213,3 +213,15 @@ def test_backfill_daily_basic_merge_fills_daily_lake(tmp_path, monkeypatch):
         assert row["close"][0] == 10.0  # 主源不动
     finally:
         get_settings.cache_clear()
+
+
+def test_coalesce_basic_missing_some_target_cols() -> None:
+    """basic 帧缺部分目标列（老文件/部分源）→ 缺列不填不炸，fill 计 0。"""
+    df = _daily_frame()
+    basic = _basic_frame().drop("ps_ttm", "total_mv")
+    out, filled = coalesce_daily_basic(df, basic)
+    pa = out.filter(pl.col("symbol") == "000001.SZ")
+    assert pa["pe_ttm"][0] == 6.6          # basic 有的列照常填
+    assert pa["ps_ttm"][0] is None         # 缺列不填
+    assert filled["ps_ttm"] == 0 and filled["total_mv"] == 0
+    assert filled["pe_ttm"] == 1
