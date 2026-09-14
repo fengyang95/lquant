@@ -592,7 +592,7 @@ class JQRunner:
         return {s: self._ref_price(s) for s in self._bars_today}
 
     def _nav_now(self) -> float:
-        return self.account.nav(self._prices_map())
+        return self.account.nav(self._prices_map(), self._last_close)
 
     def _sec_data(self, sym: str) -> _SecData:
         return _SecData(self._bars_today.get(sym), self._ref_price(sym),
@@ -881,6 +881,7 @@ class JQRunner:
         symbols = sorted({s for b in bars_by_day.values() for s in b})
         self.account = Account(cash=self.initial_cash)
         self._seq = 0
+        self._last_close: dict[str, float] = {}   # 每只股票最近一次有 bar 的 close
 
         # initialize 先跑：set_order_cost / set_benchmark 要在规则构建前生效
         if self._initialize_fn:
@@ -961,7 +962,8 @@ class JQRunner:
         """收盘估值 + 持仓快照。"""
         self._bucket = "close"
         prices = {s: b.close for s, b in self._bars_today.items()}
-        nav = self.account.nav(prices)
+        self._last_close.update(prices)
+        nav = self.account.nav(prices, self._last_close)
         if nav > 0:
             self.res.nav.append((d, nav))
         self.res.positions[d] = {

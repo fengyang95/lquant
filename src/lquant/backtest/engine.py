@@ -187,6 +187,7 @@ class Engine:
         self.broker = Broker(self._rules, self.slippage, price_mode=self.cfg.price_mode)
         self.account = Account(cash=self.cfg.initial_cash)
         self._last_factor = {}
+        self._last_close: dict[str, float] = {}   # 每只股票最近一次有 bar 的 close
 
         res = BacktestResult()
 
@@ -198,6 +199,8 @@ class Engine:
             for s, b in bars.items():
                 if b.adj_factor > 0:
                     self._last_factor[s] = b.adj_factor
+                # 停牌估值口径：记录每只股票最近一次有 bar 的 close
+                self._last_close[s] = b.close
 
             # 1) 撮合上一日挂单（用今日开盘价，防未来函数）
             if self._pending:
@@ -209,7 +212,7 @@ class Engine:
 
             # 3) 按收盘价估值
             prices = {s: b.close for s, b in bars.items()}
-            nav = self.account.nav(prices)
+            nav = self.account.nav(prices, self._last_close)
             if nav <= 0:
                 # NAV 非正说明账目已出问题（现金不足扣费/杠杆漏洞），继续算收益率只会出 NaN
                 raise ValueError(
@@ -291,7 +294,7 @@ class Engine:
             return
 
         prices = {s: b.close for s, b in bars.items()}
-        nav = self.account.nav(prices)
+        nav = self.account.nav(prices, self._last_close)
         if nav <= 0:
             return
 

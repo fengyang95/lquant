@@ -124,6 +124,50 @@ def test_golden_metrics_hand_formula():
     assert m["total_fee"] == pytest.approx(0.0)
 
 
+def test_nav_halted_position_uses_last_close_not_avg_cost():
+    """停牌（当日无 bar）持仓按「最近可见收盘价」估值，而不是 avg_cost。
+
+    手算：600000.SH 首日收盘信号，次日开盘 10.0 买入 100,000 股（avg_cost=10）。
+      d2: close=12 → NAV = 0 + 100,000×12 = 1,200,000。
+      d3~d5: 600000.SH 停牌无 bar（数据中直接缺席）。
+        旧行为：prices 无此股 → 回退 avg_cost=10 → NAV = 1,000,000（失真）。
+        正确：回退最近可见 close=12 → NAV = 1,200,000。
+    """
+
+    class BuyAHold(Strategy):
+        def on_bar(self, ctx: Context, bars):
+            return [("600000.SH", 1.0)]
+
+    rows = []
+    d0 = date(2026, 1, 5)
+    # 600000.SH 只有 d1、d2 有 bar；000001.SZ 全程有 bar，让 d3~d5 成为交易日
+    px = {
+        "600000.SH": {d0: (10.0, 10.0), d0 + timedelta(days=1): (10.0, 12.0)},
+        "000001.SZ": {d0 + timedelta(days=i): (20.0, 20.0) for i in range(5)},
+    }
+    for sym, series in px.items():
+        pre = 20.0 if sym == "000001.SZ" else 10.0
+        for d, (o, c) in sorted(series.items()):
+            rows.append({"trade_date": d, "symbol": sym,
+                         "open": o, "high": max(o, c) * 1.001, "low": min(o, c) * 0.999,
+                         "close": c, "pre_close": pre,
+                         "volume": 2e9, "amount": 2e9 * c})
+            pre = c
+    df = pl.DataFrame(rows).with_columns(pl.col("trade_date").cast(pl.Date))
+
+    cfg = EngineConfig(initial_cash=1_000_000, slippage="none", cash_buffer=0.0,
+                       min_order_value=50_000, participation=0.5)
+    res = Engine(BuyAHold(), ruleset=zero_fee_ruleset(), config=cfg).run(df)
+
+    assert [(d, pytest.approx(v, abs=1e-6)) for d, v in res.nav] == [
+        (date(2026, 1, 5), 1_000_000.0),
+        (date(2026, 1, 6), 1_200_000.0),
+        (date(2026, 1, 7), 1_200_000.0),   # 停牌日：按最近可见 close=12 估值
+        (date(2026, 1, 8), 1_200_000.0),
+        (date(2026, 1, 9), 1_200_000.0),
+    ]
+
+
 # ---------- L2 会计恒等式 ----------
 
 def test_cash_conservation_zero_fee():
