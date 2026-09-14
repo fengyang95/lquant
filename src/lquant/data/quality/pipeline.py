@@ -11,8 +11,11 @@ from datetime import timedelta
 import polars as pl
 
 from lquant.core.errors import DataQualityError
+from lquant.core.logging import get_logger
 from lquant.data.quality import adjustment, asserts, universe, validators
 from lquant.data.quality.issues import Issue, save_issues
+
+log = get_logger(__name__)
 
 __all__ = ["gate_daily", "run_lake_checks"]
 
@@ -146,6 +149,7 @@ def _try_load_security() -> pl.DataFrame | None:
         with reader() as con:
             return con.execute("SELECT symbol, board, is_st FROM security").pl()
     except Exception:
+        log.exception("security 快照加载失败，board/is_st 检查降级跳过")
         return None
 
 
@@ -154,4 +158,5 @@ def _try_load_calendar(df: pl.DataFrame) -> list:
         from lquant.data.store.catalog import TradeCalendarRepo
         return TradeCalendarRepo().range(df["trade_date"].min(), df["trade_date"].max())
     except Exception:
+        log.exception("交易日历加载失败，涨跌停检查降级跳过")
         return []

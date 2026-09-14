@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import json
 import time
-import uuid
 from datetime import datetime, timedelta
 
 from lquant.core.db import reader, writer
+from lquant.core.logging import get_logger, run_scope
+
+log = get_logger(__name__)
 
 __all__ = ["DEFAULT_JOBS", "seed_defaults", "list_jobs", "upsert_job", "delete_job",
            "set_enabled", "run_job", "tick", "loop_forever"]
@@ -162,128 +164,130 @@ def set_enabled(sync_id: str, enabled: bool) -> None:
 
 def run_job(job: dict, *, demo: bool | None = None) -> dict:
     """执行一个作业并记录 sync_run / 更新 sync_job 状态。失败不抛出。"""
-    started = datetime.now()
-    params = job.get("params") or {}
-    kind = job["kind"]
-    rows, detail, status = 0, {}, "ok"
-    try:
-        if kind == "collect":
-            from lquant.market.scheduler import collect_and_save
+    with run_scope() as run_id:
+        started = datetime.now()
+        params = job.get("params") or {}
+        kind = job["kind"]
+        rows, detail, status = 0, {}, "ok"
+        try:
+            if kind == "collect":
+                from lquant.market.scheduler import collect_and_save
 
-            d = params.get("demo", False) if demo is None else demo
-            res = collect_and_save(schedule=params.get("schedule"),
-                                   trade_date=started.date(), demo=d)
-            rows = sum(res.get("persisted", {}).values())
-            detail = {"collected": res.get("collected", {}), "errors": res.get("errors", {})}
-            if res.get("errors"):
-                status = "partial"
-        elif kind == "daily":
-            market = params.get("market", "all")
-            if market not in (None, "all", "sentinel"):
-                raise ValueError(
-                    f"daily 作业 params.market 只接受 all/sentinel，收到: {market!r}")
-            if market == "sentinel":
-                # 兼容旧路径：哨兵池增量（不建 data_task）
-                from lquant.data.ingest.daily import backfill_daily
-
-                rows = backfill_daily(
-                    full=False,
-                    start=(started.date()
-                           - timedelta(days=int(params.get("days", 10)))).isoformat())
-            else:
-                # 全市场增量：建 data_task（历史可查）后走执行器
-                from lquant.data.ingest import tasks as data_tasks
-
-                # auto_crosscheck 透传 job params（缺省 True），运维可在 sync_job 里配置关闭
-                t = data_tasks.create_task(
-                    "daily_update", {"days": int(params.get("days", 10)),
-                                     "auto_crosscheck": params.get("auto_crosscheck", True)})
-                task = data_tasks.execute_task(t["task_id"])
-                rows = int(task.get("rows_written") or 0)
-                detail = {"task_id": t["task_id"], "task_status": task["status"],
-                          "message": task.get("message")}
-                if task["status"] == "partial":
+                d = params.get("demo", False) if demo is None else demo
+                res = collect_and_save(schedule=params.get("schedule"),
+                                       trade_date=started.date(), demo=d)
+                rows = sum(res.get("persisted", {}).values())
+                detail = {"collected": res.get("collected", {}), "errors": res.get("errors", {})}
+                if res.get("errors"):
                     status = "partial"
-                elif task["status"] == "failed":
-                    status = "failed"
-        elif kind == "adj_factor":
-            from lquant.data.ingest.adj import refresh_adj_factors
+            elif kind == "daily":
+                market = params.get("market", "all")
+                if market not in (None, "all", "sentinel"):
+                    raise ValueError(
+                        f"daily 作业 params.market 只接受 all/sentinel，收到: {market!r}")
+                if market == "sentinel":
+                    # 兼容旧路径：哨兵池增量（不建 data_task）
+                    from lquant.data.ingest.daily import backfill_daily
 
-            rows = refresh_adj_factors(days=int(params.get("days", 120)))
-        elif kind == "reference":
-            from lquant.data.ingest.reference import sync_reference
+                    rows = backfill_daily(
+                        full=False,
+                        start=(started.date()
+                               - timedelta(days=int(params.get("days", 10)))).isoformat())
+                else:
+                    # 全市场增量：建 data_task（历史可查）后走执行器
+                    from lquant.data.ingest import tasks as data_tasks
 
-            res = sync_reference(
-                skip_details=bool(params.get("skip_details", False)))
-            detail = res if isinstance(res, dict) else {"result": str(res)}
-            rows = int(sum(v for v in detail.values() if isinstance(v, int))) \
-                if isinstance(res, dict) else 0
-        elif kind == "daily_basic":
-            from lquant.data.ingest.daily_basic import backfill_daily_basic
+                    # auto_crosscheck 透传 job params（缺省 True），运维可在 sync_job 里配置关闭
+                    t = data_tasks.create_task(
+                        "daily_update", {"days": int(params.get("days", 10)),
+                                         "auto_crosscheck": params.get("auto_crosscheck", True)})
+                    task = data_tasks.execute_task(t["task_id"])
+                    rows = int(task.get("rows_written") or 0)
+                    detail = {"task_id": t["task_id"], "task_status": task["status"],
+                              "message": task.get("message")}
+                    if task["status"] == "partial":
+                        status = "partial"
+                    elif task["status"] == "failed":
+                        status = "failed"
+            elif kind == "adj_factor":
+                from lquant.data.ingest.adj import refresh_adj_factors
 
-            res = backfill_daily_basic(
-                start=(started.date()
-                       - timedelta(days=int(params.get("days", 14)))).isoformat(),
-                merge=bool(params.get("merge", True)))
-            rows = int(res.get("rows", 0))
-            detail = res if isinstance(res, dict) else {}
-        elif kind == "financial":
-            from lquant.data.ingest.financial import backfill_financial
-            from lquant.data.store.catalog import SecurityRepo
+                rows = refresh_adj_factors(days=int(params.get("days", 120)))
+            elif kind == "reference":
+                from lquant.data.ingest.reference import sync_reference
 
-            syms = SecurityRepo().stock_symbols(include_delisted=False)
-            rows = backfill_financial(
-                symbols=syms,
-                start=(started.date()
-                       - timedelta(days=int(params.get("days", 90)))).isoformat())
-            detail = {"symbols": len(syms)}
-        elif kind == "backfill":
-            from lquant.market.backfill import ensure_market_coverage
+                res = sync_reference(
+                    skip_details=bool(params.get("skip_details", False)))
+                detail = res if isinstance(res, dict) else {"result": str(res)}
+                rows = int(sum(v for v in detail.values() if isinstance(v, int))) \
+                    if isinstance(res, dict) else 0
+            elif kind == "daily_basic":
+                from lquant.data.ingest.daily_basic import backfill_daily_basic
 
-            res = ensure_market_coverage(days=int(params.get("days", 90)))
-            # 日线湖覆盖度对账：日历×标的×湖内日期差集，缺口落 issue 并
-            # 自动建 daily_update 补齐任务（此前只有 index_daily 有对账）。
-            from lquant.data.quality.coverage import scan_coverage
+                res = backfill_daily_basic(
+                    start=(started.date()
+                           - timedelta(days=int(params.get("days", 14)))).isoformat(),
+                    merge=bool(params.get("merge", True)))
+                rows = int(res.get("rows", 0))
+                detail = res if isinstance(res, dict) else {}
+            elif kind == "financial":
+                from lquant.data.ingest.financial import backfill_financial
+                from lquant.data.store.catalog import SecurityRepo
 
-            cov = scan_coverage(days=int(params.get("coverage_days", 30)),
-                                repair=True)
-            res["coverage"] = cov
-            rows = int(res.get("persisted") or 0)
-            detail = res
-            if cov.get("repair", {}).get("created"):
-                status = "partial"
-        else:
+                syms = SecurityRepo().stock_symbols(include_delisted=False)
+                rows = backfill_financial(
+                    symbols=syms,
+                    start=(started.date()
+                           - timedelta(days=int(params.get("days", 90)))).isoformat())
+                detail = {"symbols": len(syms)}
+            elif kind == "backfill":
+                from lquant.market.backfill import ensure_market_coverage
+
+                res = ensure_market_coverage(days=int(params.get("days", 90)))
+                # 日线湖覆盖度对账：日历×标的×湖内日期差集，缺口落 issue 并
+                # 自动建 daily_update 补齐任务（此前只有 index_daily 有对账）。
+                from lquant.data.quality.coverage import scan_coverage
+
+                cov = scan_coverage(days=int(params.get("coverage_days", 30)),
+                                    repair=True)
+                res["coverage"] = cov
+                rows = int(res.get("persisted") or 0)
+                detail = res
+                if cov.get("repair", {}).get("created"):
+                    status = "partial"
+            else:
+                status = "failed"
+                detail = {"error": f"未知作业类型 {kind}"}
+                log.error(f"未知作业类型 kind={kind} sync_id={job.get('sync_id')}")
+        except Exception as e:  # noqa: BLE001
+            log.exception(f"sync 作业执行失败 kind={kind} sync_id={job.get('sync_id')}")
             status = "failed"
-            detail = {"error": f"未知作业类型 {kind}"}
-    except Exception as e:  # noqa: BLE001
-        status = "failed"
-        detail = {"error": f"{type(e).__name__}: {e}"}
+            detail = {"error": f"{type(e).__name__}: {e}"}
 
-    finished = datetime.now()
-    # 告警：终态非 ok → 监控错误环（monitor 错误环 → error_logs 可查）
-    if status != "ok":
-        _emit_sync_error(job, kind, status, detail)
-    # 0 行不算健康：日线/采集类作业空返回记 partial，避免静默缺口被掩盖
-    if rows == 0 and kind in ("daily", "collect", "adj_factor") and status == "ok":
-        status = "partial"
-        detail = {**detail, "zero_rows": True}
-    run_id = uuid.uuid4().hex[:12]
-    try:
-        with writer() as con:
-            _ensure_tables(con)
-            con.execute(
-                "INSERT OR REPLACE INTO sync_run VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [run_id, job.get("sync_id"), job.get("name"), kind,
-                 started, finished, rows, status, json.dumps(detail, default=str)])
-            con.execute(
-                "UPDATE sync_job SET last_run_at = ?, last_status = ?, last_rows = ?, "
-                "updated_at = ? WHERE sync_id = ?",
-                [finished, status, rows, finished, job.get("sync_id")])
-    except Exception as e:  # noqa: BLE001  记录失败不影响主流程
-        print(f"[warn] sync_run 记录失败: {e}")
-    return {"run_id": run_id, "status": status, "rows": rows,
-            "elapsed_sec": round((finished - started).total_seconds(), 1),
-            "detail": detail}
+        finished = datetime.now()
+        # 告警：终态非 ok → 监控错误环（monitor 错误环 → error_logs 可查）
+        if status != "ok":
+            _emit_sync_error(job, kind, status, detail)
+        # 0 行不算健康：日线/采集类作业空返回记 partial，避免静默缺口被掩盖
+        if rows == 0 and kind in ("daily", "collect", "adj_factor") and status == "ok":
+            status = "partial"
+            detail = {**detail, "zero_rows": True}
+        try:
+            with writer() as con:
+                _ensure_tables(con)
+                con.execute(
+                    "INSERT OR REPLACE INTO sync_run VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [run_id, job.get("sync_id"), job.get("name"), kind,
+                     started, finished, rows, status, json.dumps(detail, default=str)])
+                con.execute(
+                    "UPDATE sync_job SET last_run_at = ?, last_status = ?, last_rows = ?, "
+                    "updated_at = ? WHERE sync_id = ?",
+                    [finished, status, rows, finished, job.get("sync_id")])
+        except Exception:  # noqa: BLE001  记录失败不影响主流程
+            log.exception(f"sync_run 记录失败 sync_id={job.get('sync_id')} run_id={run_id}")
+        return {"run_id": run_id, "status": status, "rows": rows,
+                "elapsed_sec": round((finished - started).total_seconds(), 1),
+                "detail": detail}
 
 
 def _emit_sync_error(job: dict, kind: str, status: str, detail: dict) -> None:
@@ -305,7 +309,9 @@ def _emit_sync_error(job: dict, kind: str, status: str, detail: dict) -> None:
             message=(str(err)[:500] if err else f"{kind} {status}"),
             traceback_tail=None))
     except Exception:  # noqa: BLE001 - 告警失败不影响主流程
-        pass
+        # 静默降级但留痕：ring 不可用/构造失败在日志里可见，排查告警断链时有用
+        log.opt(exception=True).warning(
+            "sync 错误环写入失败 sync_id={}", job.get("sync_id", kind))
 
 
 def history(limit: int = 50) -> list[dict]:
@@ -388,7 +394,7 @@ def loop_forever(interval: int = 30) -> None:
         try:
             done = tick()
             for r in done:
-                print(f"[sync] {r['sync_id']} → {r['status']} rows={r['rows']}")
+                log.info(f"[sync] {r['sync_id']} → {r['status']} rows={r['rows']}")
         except Exception as e:  # noqa: BLE001  调度循环绝不退出
-            print(f"[warn] sync tick 异常: {e}")
+            log.exception(f"[warn] sync tick 异常: {e}")
         time.sleep(interval)
