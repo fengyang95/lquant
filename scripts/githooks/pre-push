@@ -1,32 +1,53 @@
 #!/usr/bin/env bash
-# 推送前检查：跑测试（比 pre-commit 严格）
+# 推送前检查：跑测试（比 pre-commit 严格）+ 改动行覆盖率门禁 ≥95%
 #
 # 注意：全量测试里有依赖数据的用例（API / sync），所以先做环境自愈 ——
 # 缺库建库、缺数据生成演示数据兜底，避免把"没跑过 bootstrap"误判成代码问题。
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-echo "==> pre-push: 测试"
+echo "==> pre-push: 测试 + diff 覆盖率门禁"
 
 # 跳过开关（CI 上或临时放行）：LQ_SKIP_PUSH_CHECK=1 git push 或 git push --no-verify
 if [ "${LQ_SKIP_PUSH_CHECK:-0}" = "1" ]; then
   echo "    LQ_SKIP_PUSH_CHECK=1，跳过"; exit 0
 fi
 
-if [ -x .venv/bin/python ] && [ -d tests ]; then
+# venv 解析：worktree 里通常没有自己的 .venv —— 退回主 checkout 的 .venv；
+# editable 安装指向主仓 src，必须把本仓 src 放进 PYTHONPATH 才能测到本仓代码。
+PY="$(pwd)/.venv/bin/python"
+if [ ! -x "$PY" ]; then
+  MAIN_ROOT="$(git rev-parse --path-format=absolute --git-common-dir)/.."
+  if [ -x "$MAIN_ROOT/.venv/bin/python" ]; then
+    PY="$MAIN_ROOT/.venv/bin/python"
+    export PYTHONPATH="$(pwd)/src${PYTHONPATH:+:$PYTHONPATH}"
+  else
+    echo "    无可用 .venv，跳过"; exit 0
+  fi
+fi
+
+if [ -d tests ]; then
   mkdir -p data/duckdb data/parquet data/cache
   if [ ! -f data/duckdb/lquant.duckdb ]; then
     echo "    DuckDB 未建库，先 init_db"
-    .venv/bin/python scripts/init_db.py
+    "$PY" scripts/init_db.py
   fi
   if ! find data/parquet -name '*.parquet' -print -quit 2>/dev/null | grep -q .; then
     echo "    无任何 parquet 数据，生成演示数据兜底（换真数据: ./lquant.sh bootstrap）"
-    .venv/bin/lq data demo >/dev/null
+    "$PY" -c "from lquant.cli.main import cli; cli(['data','demo'], standalone_mode=False)" >/dev/null
   fi
-  .venv/bin/python -m pytest -x -q tests/ || {
+  "$PY" -m pytest -x -q tests/ --cov=src/lquant --cov-report=xml:coverage.xml || {
     echo "✗ 测试失败，修复后再 push（临时放行: LQ_SKIP_PUSH_CHECK=1 git push 或 git push --no-verify）"; exit 1; }
+
+  # 增量覆盖率门禁：只看本次改动（vs origin/main）的行覆盖，≥95% 才放行
+  if git diff --name-only origin/main...HEAD -- '*.py' | grep -q .; then
+    echo "==> pre-push: diff-cover（改动行覆盖率 ≥95%）"
+    "$PY" -m diff_cover.diff_cover_tool coverage.xml \
+      --compare-branch=origin/main --fail-under=95 || {
+      echo "✗ 改动行覆盖率不足 95%（详情见上方报告，补测试或 LQ_SKIP_PUSH_CHECK=1 放行）"; exit 1; }
+  fi
 else
-  echo "    无 .venv 或 tests/，跳过"
+  echo "    无 tests/，跳过"
 fi
 
 echo "==> pre-push 通过"

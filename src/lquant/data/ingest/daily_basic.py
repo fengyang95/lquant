@@ -120,14 +120,19 @@ def coalesce_daily_basic(daily: object, basic: object) -> tuple[object, dict[str
             daily = daily.with_columns(pl.lit(None, dtype=pl.Float64).alias(c))
     daily = daily.with_columns(pl.col(k).cast(pl.Utf8) if k == "symbol" else pl.col(k)
                                for k in keys)
+    present = [c for c in FILL_COLS if c in basic.columns]
     basic = basic.select(
         *(pl.col(k).cast(daily.schema[k]) for k in keys),
-        *(pl.col(c) for c in FILL_COLS),
-    ).rename({c: f"__{c}" for c in FILL_COLS})
+        *(pl.col(c) for c in present),
+    ).rename({c: f"__{c}" for c in present})
     joined = daily.join(basic, on=keys, how="left")
     filled: dict[str, int] = {}
     exprs = []
     for c in FILL_COLS:
+        if c not in present:
+            filled[c] = 0  # basic 湖缺该列（老文件/部分源）→ 不填不炸
+            exprs.append(pl.col(c))
+            continue
         n = joined.select(
             (pl.col(c).is_null() & pl.col(f"__{c}").is_not_null()).sum()
         ).item()
@@ -138,7 +143,7 @@ def coalesce_daily_basic(daily: object, basic: object) -> tuple[object, dict[str
             .otherwise(pl.col(c))
             .alias(c)
         )
-    out = joined.with_columns(exprs).drop([f"__{c}" for c in FILL_COLS])
+    out = joined.with_columns(exprs).drop([f"__{c}" for c in present])
     return out, filled
 
 
