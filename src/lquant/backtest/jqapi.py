@@ -501,11 +501,13 @@ class JQRunner:
 
         def history(count: int, unit: str = "1d", field="close",                    # noqa: A002
                     security_list=None, df: bool = True, skip_paused: bool = True):
-            return r._history(int(count), field, security_list, df)
+            return r._history(int(count), field, security_list, df,
+                              skip_paused=skip_paused)
 
         def attribute_history(security: str, count: int, unit: str = "1d",         # noqa: A002
                               fields=("close",), skip_paused: bool = True):
-            return r._attribute_history(str(security), int(count), fields)
+            return r._attribute_history(str(security), int(count), fields,
+                                        skip_paused=skip_paused)
 
         def get_price(security, start_date=None, end_date=None,
                       frequency: str = "daily", fields=None, count: int | None = None,
@@ -640,30 +642,55 @@ class JQRunner:
             return bar.volume
         return float(getattr(bar, f, float("nan")))
 
-    def _history(self, count: int, field, security_list, df: bool = True):
+    def _history(self, count: int, field, security_list, df: bool = True,
+                 skip_paused: bool = True):
         fields = [field] if isinstance(field, str) else list(field or ["close"])
         secs = list(security_list) if security_list else sorted(self._bars_today)
         i = self._day_index
-        lo = max(0, i - count)
+        if skip_paused:
+            # G5:交易日窗口 — 从 i 前推收集 count 个"标的当日有 bar"的交易日
+            # (单标的看该标的,多标的看当日任一标的有 bar,即合并交易日)。
+            # 严格不含今天 → 无未来函数。
+            def _traded(day) -> bool:
+                bars = self._bars_by_day.get(day, {})
+                if len(secs) == 1:
+                    return secs[0] in bars
+                return bool(bars)
+
+            days = [d for d in self._dates[:i] if _traded(d)][-count:]
+        else:
+            days = self._dates[max(0, i - count):i]
         rows = []
-        for j in range(lo, i):                # 严格不含今天 → 无未来函数
-            day = self._dates[j]
+        for day in days:
             bars = self._bars_by_day.get(day, {})
             rows.append({s: {f: self._bar_field(b, f) for f in fields}
                          for s, b in ((s, bars.get(s)) for s in secs) if b})
             rows[-1]["day"] = day
         return self._history_df(secs, fields, rows)
 
-    def _attribute_history(self, sec: str, count: int, fields):
+    def _attribute_history(self, sec: str, count: int, fields,
+                           skip_paused: bool = True):
         fields = list(fields or ["close"])
         try:
             import pandas as pd
         except ImportError:
             pd = None
         i = self._day_index
-        lo = max(0, i - count)
+        if skip_paused:
+            # G5:按"有 bar 的行"从当前 i 向前取 count 根(不含今天)
+            j = i - 1
+            taken = 0
+            js = []
+            while j >= 0 and taken < count:
+                if self._bars_by_day.get(self._dates[j], {}).get(sec):
+                    js.append(j)
+                    taken += 1
+                j -= 1
+            js.reverse()
+        else:
+            js = range(max(0, i - count), i)
         rows = []
-        for j in range(lo, i):
+        for j in js:
             b = self._bars_by_day.get(self._dates[j], {}).get(sec)
             if b:
                 rows.append({"day": self._dates[j], **{f: self._bar_field(b, f) for f in fields}})

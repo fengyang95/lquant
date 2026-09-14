@@ -274,8 +274,9 @@ def test_baseline_excludes_halted(tmp_catalog, tmp_path: Path, monkeypatch):
     # 08-01 全天没有任何 600003 的成交
     assert not [t for t in res.trades
                 if t.trade_date == date(2025, 8, 1) and t.symbol == "600003.SH"]
-    # 复牌后(10-01 调仓)恢复买入;注意 09-01 仍被 MIN_LISTED_DAYS 剔除:
-    # attribute_history(60) 恰好跨过停牌日 → 只有 59 行(缺 bar 的历史行不补)。
+    # 复牌后(10-01 调仓)恢复买入。G5 修复后 attribute_history 默认
+    # skip_paused=True:窗口按"有 bar 的行"前推,08-01 停牌日不再占用
+    # 60 根 bar 的名额,故 600003 在 09-01 即恢复买入(旧口径为 59 行被剔除)。
     assert "600003.SH" in res.positions.get(date(2025, 10, 1), {})
 
 
