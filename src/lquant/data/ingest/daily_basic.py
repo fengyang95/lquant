@@ -78,20 +78,35 @@ def backfill_daily_basic(
 
     provider = _tushare_provider()
     fetched = 0
+    ok_days = 0
     buf: list = []
     for i, d in enumerate(todo, 1):
-        df = provider.daily_basic(d)
-        if len(df):
-            buf.append(df)
-            fetched += len(df)
+        try:
+            df = provider.daily_basic(d)
+        except Exception as e:  # noqa: BLE001 - 单日失败不应炸掉整个任务
+            # 失败日不标记完成：否则 transient 错误会把该交易日永久
+            # 记为 done，重跑全部跳过 —— daily_basic 静默缺口。
+            logger.warning(f"  {d} daily_basic 拉取失败，未标记（重跑将重试）: {e}")
+            continue
+        if not len(df):
+            # 空返回同样不标 done：无法区分「源确认无数据」与「拉取失败」，
+            # 宁可下次重拉（幂等，单请求），也不留静默缺口。
+            logger.warning(f"  {d} daily_basic 空返回，未标记（重跑将重试）")
+            continue
+        buf.append(df)
+        fetched += len(df)
+        ok_days += 1
         cp.mark({d.isoformat()})
-        if len(buf) >= _CHUNK or i == len(todo):
-            if buf:
-                write_daily_basic(_concat(buf))
-                buf = []
+        if len(buf) >= _CHUNK:
+            write_daily_basic(_concat(buf))
+            buf = []
             logger.info(f"  daily_basic 进度 {i}/{len(todo)}（{d}）")
 
-    out = {"days": len(days), "fetched_days": len(todo), "rows": fetched}
+    if buf:
+        write_daily_basic(_concat(buf))
+        buf = []
+
+    out = {"days": len(days), "fetched_days": ok_days, "rows": fetched}
     if merge:
         out.update(merge_daily_basic(start_d, end_d))
     return out

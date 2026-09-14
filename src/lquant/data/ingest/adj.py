@@ -51,18 +51,33 @@ def refresh_adj_factors(*, symbols: list[str] | None = None,
     if not len(merged):
         return 0
 
-    # 取湖里这些 key 的整行 → 替换 adj_factor → 覆盖写回
+    # 取湖里这些 key 的整行 → 只替换 provider 覆盖日的 adj_factor，
+    # 其余日期保留湖内原值（此前 fill_null(1.0) 会把未覆盖日的好因子
+    # 覆盖成 1.0 —— 复权价全部失真）。
     rows = (read_daily(symbols=syms, start=start_d, end=end_d).collect()
             .join(merged.select(["symbol", "trade_date"]),
                   on=["symbol", "trade_date"], how="semi")
-            .drop("adj_factor")
             .join(fac.select(["symbol", "trade_date", "factor"]),
                   on=["symbol", "trade_date"], how="left")
-            .with_columns(pl.col("factor").fill_null(1.0).alias("adj_factor"))
+            .with_columns(
+                pl.coalesce(["factor", "adj_factor"]).alias("adj_factor"))
             .drop("factor"))
 
     if not len(rows):
         return 0
+    # 入湖前门禁：主键去重 + 因子正值断言（adj_factor 最易出错：静默坏
+    # 因子会被 _overlay 覆盖湖内好数据，且 gate_daily 只挂在日线 _stamp）。
+    from lquant.core.errors import DataQualityError
+    from lquant.data.quality.asserts import assert_no_dup
+
+    assert_no_dup(rows, ["symbol", "trade_date"])
+    n_bad = rows.filter(pl.col("adj_factor") <= 0).height
+    if n_bad:
+        raise DataQualityError(
+            "adj_factor_nonpositive",
+            f"复权因子存在非正值（{n_bad} 行），拒绝入湖",
+            "fatal",
+        )
     rows = rows.with_columns(
         ingested_at=pl.lit(datetime.now().replace(tzinfo=None), dtype=pl.Datetime),
         data_version=pl.lit(datetime.now().strftime("%Y%m%d")),

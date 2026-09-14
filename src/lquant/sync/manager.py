@@ -60,6 +60,15 @@ DEFAULT_JOBS: list[dict] = [
     {"sync_id": "adj", "name": "复权因子刷新",
      "kind": "adj_factor", "schedule_time": "08:00", "weekdays": "6",
      "params": {"days": 120}},
+    {"sync_id": "reference", "name": "标的清单/交易日历同步",
+     "kind": "reference", "schedule_time": "07:30", "weekdays": "1,2,3,4,5",
+     "params": {"skip_details": False}},
+    {"sync_id": "daily_basic", "name": "估值指标同步（daily_basic）",
+     "kind": "daily_basic", "schedule_time": "18:45", "weekdays": "1,2,3,4,5",
+     "params": {"days": 14, "merge": True}},
+    {"sync_id": "financial", "name": "PIT 财务数据同步",
+     "kind": "financial", "schedule_time": "19:15", "weekdays": "1,2,3,4,5",
+     "params": {"days": 90}},
 ]
 
 
@@ -117,7 +126,8 @@ def upsert_job(sync_id: str, name: str, kind: str, schedule_time: str,
                enabled: bool = True) -> dict:
     """新建/更新作业（按 sync_id 覆盖；时间格式 HH:MM 校验）。"""
     datetime.strptime(schedule_time, "%H:%M")
-    if kind not in ("collect", "daily", "adj_factor", "backfill"):
+    if kind not in ("collect", "daily", "adj_factor", "backfill",
+                    "reference", "daily_basic", "financial"):
         raise ValueError(f"未知作业类型: {kind}")
     if kind == "daily" and (params or {}).get("market") not in (
             None, "all", "sentinel"):
@@ -200,12 +210,48 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
             from lquant.data.ingest.adj import refresh_adj_factors
 
             rows = refresh_adj_factors(days=int(params.get("days", 120)))
+        elif kind == "reference":
+            from lquant.data.ingest.reference import sync_reference
+
+            res = sync_reference(
+                skip_details=bool(params.get("skip_details", False)))
+            detail = res if isinstance(res, dict) else {"result": str(res)}
+            rows = int(sum(v for v in detail.values() if isinstance(v, int))) \
+                if isinstance(res, dict) else 0
+        elif kind == "daily_basic":
+            from lquant.data.ingest.daily_basic import backfill_daily_basic
+
+            res = backfill_daily_basic(
+                start=(started.date()
+                       - timedelta(days=int(params.get("days", 14)))).isoformat(),
+                merge=bool(params.get("merge", True)))
+            rows = int(res.get("rows", 0))
+            detail = res if isinstance(res, dict) else {}
+        elif kind == "financial":
+            from lquant.data.ingest.financial import backfill_financial
+            from lquant.data.store.catalog import SecurityRepo
+
+            syms = SecurityRepo().stock_symbols(include_delisted=False)
+            rows = backfill_financial(
+                symbols=syms,
+                start=(started.date()
+                       - timedelta(days=int(params.get("days", 90)))).isoformat())
+            detail = {"symbols": len(syms)}
         elif kind == "backfill":
             from lquant.market.backfill import ensure_market_coverage
 
             res = ensure_market_coverage(days=int(params.get("days", 90)))
+            # 日线湖覆盖度对账：日历×标的×湖内日期差集，缺口落 issue 并
+            # 自动建 daily_update 补齐任务（此前只有 index_daily 有对账）。
+            from lquant.data.quality.coverage import scan_coverage
+
+            cov = scan_coverage(days=int(params.get("coverage_days", 30)),
+                                repair=True)
+            res["coverage"] = cov
             rows = int(res.get("persisted") or 0)
             detail = res
+            if cov.get("repair", {}).get("created"):
+                status = "partial"
         else:
             status = "failed"
             detail = {"error": f"未知作业类型 {kind}"}
@@ -214,6 +260,13 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
         detail = {"error": f"{type(e).__name__}: {e}"}
 
     finished = datetime.now()
+    # 告警：终态非 ok → 监控错误环（monitor 错误环 → error_logs 可查）
+    if status != "ok":
+        _emit_sync_error(job, kind, status, detail)
+    # 0 行不算健康：日线/采集类作业空返回记 partial，避免静默缺口被掩盖
+    if rows == 0 and kind in ("daily", "collect", "adj_factor") and status == "ok":
+        status = "partial"
+        detail = {**detail, "zero_rows": True}
     run_id = uuid.uuid4().hex[:12]
     try:
         with writer() as con:
@@ -231,6 +284,28 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
     return {"run_id": run_id, "status": status, "rows": rows,
             "elapsed_sec": round((finished - started).total_seconds(), 1),
             "detail": detail}
+
+
+def _emit_sync_error(job: dict, kind: str, status: str, detail: dict) -> None:
+    """同步失败/部分失败 → monitor 错误环（error_logs 路由 sync://{sync_id}）。
+
+    采集失败绝不影响主流程：ring 不可用时静默降级（stdout 已有日志）。
+    """
+    try:
+        from time import time as _time
+
+        from lquant.monitor.ring import error_ring
+        from lquant.monitor.types import ApiErrorPoint
+
+        err = (detail or {}).get("error") or (detail or {}).get("message")
+        error_ring.append(ApiErrorPoint(
+            ts=_time(), route=f"sync://{job.get('sync_id', kind)}",
+            method="JOB", status=500 if status == "failed" else 207,
+            error_type=f"SyncJob{status.capitalize()}",
+            message=(str(err)[:500] if err else f"{kind} {status}"),
+            traceback_tail=None))
+    except Exception:  # noqa: BLE001 - 告警失败不影响主流程
+        pass
 
 
 def history(limit: int = 50) -> list[dict]:
@@ -256,17 +331,48 @@ def _is_due(job: dict, now: datetime) -> bool:
     hhmm = now.strftime("%H:%M")
     if hhmm < job["schedule_time"]:
         return False
+    # 跨天补跑：last_run 落后于「今天的应触发时刻」即到期。此前按
+    # 「今天是否跑过」判断，宕机跨天后作业被永久跳过 —— 窗口滑过即缺口。
+    try:
+        h, m = job["schedule_time"].split(":")
+        scheduled = now.replace(hour=int(h), minute=int(m),
+                                second=0, microsecond=0)
+    except ValueError:
+        return False
     last = job.get("last_run_at")
     if last:
         last_dt = last if isinstance(last, datetime) else datetime.fromisoformat(str(last))
-        if last_dt.date() >= now.date():       # 今天已跑过
+        if last_dt >= scheduled:               # 本次应触发时刻之后已跑过
             return False
     return True
+
+
+def _trading_day_ok(d) -> bool:
+    """日历覆盖该日时按 is_open 过滤；日历缺失该日时放行（回退周几近似）。
+
+    日历为空/未同步不能让所有作业静默全跳 —— 那会制造新的「静默缺口」。
+    """
+    try:
+        # is_trading_day 查不到该日返回 False —— 不能直接用，否则日历
+        # 未同步会让所有作业静默全跳。先显式查该日是否在日历里。
+        with reader() as con:
+            con.execute("CREATE TABLE IF NOT EXISTS trade_calendar ("
+                        "trade_date DATE PRIMARY KEY, is_open BOOLEAN, "
+                        "source VARCHAR)")
+            row = con.execute(
+                "SELECT is_open FROM trade_calendar WHERE trade_date = ?",
+                [d]).fetchone()
+        return bool(row[0]) if row else True
+    except Exception:  # noqa: BLE001 - 日历不可用 → 放行
+        return True
 
 
 def tick(now: datetime | None = None) -> list[dict]:
     """跑一遍所有到期作业。返回执行结果列表。"""
     now = now or datetime.now()
+    # 非交易日（日历覆盖判断）跳过数据作业：跑也不产数据还污染 sync_run。
+    if not _trading_day_ok(now.date()):
+        return []
     out = []
     for job in list_jobs():
         if not _is_due(job, now):

@@ -164,6 +164,35 @@ def read_daily_basic(start=None, end=None) -> pl.DataFrame:
     return df
 
 
+def _merge_quality_flags(old: pl.DataFrame, new: pl.DataFrame) -> pl.DataFrame:
+    """同键行合并 quality_flags（按位 OR）：对拍/门禁打的标记不被再同步抹掉。
+
+    再同步的新批次 flags 从 0 重建（gate_daily or_flags 从干净位开始），
+    直接 _overlay 整行覆盖会把跨源对拍发现的降级标记无痕清除。
+    """
+    if not old.height or not new.height:
+        return new
+    if "quality_flags" not in old.columns or "quality_flags" not in new.columns:
+        return new
+    keys = ["symbol", "trade_date"]
+    lake_flags = (
+        old.select(*keys, "quality_flags")
+        .join(new.select(keys).unique(), on=keys, how="semi")
+        .group_by(keys)
+        .agg(pl.col("quality_flags").drop_nulls().max().alias("qf_lake"))
+    )
+    return (
+        new.join(lake_flags, on=keys, how="left")
+        .with_columns(
+            pl.when(pl.col("qf_lake").is_not_null())
+            .then(pl.col("quality_flags").fill_null(0) | pl.col("qf_lake"))
+            .otherwise(pl.col("quality_flags"))
+            .alias("quality_flags")
+        )
+        .drop("qf_lake")
+    )
+
+
 def write_daily(df: pl.DataFrame) -> list[Path]:
     if not len(df):
         return []
@@ -173,10 +202,12 @@ def write_daily(df: pl.DataFrame) -> list[Path]:
         p = _daily_path(y)
         p.parent.mkdir(parents=True, exist_ok=True)
         g = g.drop("y")
-        # 同key覆盖：读旧 → 覆盖合并 → 原子写（锁按文件粒度，不串行全年份）
+        # 同key覆盖：读旧 → flags 合并 → 覆盖合并 → 原子写
         with _file_lock(p):
             if p.exists():
-                g = _overlay(pl.read_parquet(p), g, ["symbol", "trade_date"])
+                old = pl.read_parquet(p)
+                g = _merge_quality_flags(old, g)
+                g = _overlay(old, g, ["symbol", "trade_date"])
             g = g.sort(["symbol", "trade_date"])
             _atomic_write_parquet(g, p)
         out.append(p)

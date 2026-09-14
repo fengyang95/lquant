@@ -107,3 +107,33 @@ def test_issue_extra_missing_field_no_fabrication(cc_env, monkeypatch):
     if extra["field"] == "open":
         assert extra["primary"] is None and extra["peer"] == 9.9
         assert extra["deviation_pct"] is None
+
+
+def test_peer_window_matches_primary_window(cc_env, monkeypatch):
+    """显式 start/end 时 peer 必须用同一窗口（此前 peer 拉全湖 → 假 L3 刷屏）。"""
+    import lquant.data.ingest.crosscheck as cc
+
+    sym = "600000.SH"
+    primary = pl.DataFrame({
+        "symbol": [sym],
+        "trade_date": [date(2024, 1, 2)],
+        "open": [10.0], "high": [10.0], "low": [10.0], "close": [10.0],
+        "volume": [100.0],
+    })
+    monkeypatch.setattr(cc, "_sample_symbols",
+                        lambda limit: ([sym], date(2023, 1, 1), date(2024, 6, 1)))
+    monkeypatch.setattr(cc, "_primary_daily",
+                        lambda symbols, start, end: primary)
+    seen: list[tuple] = []
+
+    def _fake_peer(name, symbols, start, end):
+        seen.append((start, end))
+        return primary
+
+    monkeypatch.setattr(cc, "_peer_daily", _fake_peer)
+
+    out = cc.run_crosscheck(peers=["fake"], start="2024-01-02",
+                            end="2024-01-02")
+    assert out["summary"]["checked"] >= 1
+    assert seen and seen[0] == (date(2024, 1, 2), date(2024, 1, 2)), \
+        f"peer 窗口应为 primary 窗口，实际 {seen[0]}"
