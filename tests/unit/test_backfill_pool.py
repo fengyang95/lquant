@@ -128,6 +128,25 @@ def test_end_grouping(fake_settings, no_lake):
     assert ends == {D, date(2023, 6, 30)}
 
 
+def test_empty_response_symbols_marked_failed(fake_settings, no_lake):
+    """provider 无异常但某标的零行返回 → failed(empty_response)，不标 done。
+
+    此前「没抛异常就算成功」，源站静默丢某只股票时整段历史缺失且不可发现。
+    """
+    from lquant.data.ingest.daily import backfill_pool
+
+    class _PartialProvider:
+        def daily_bars(self, symbols, start, end):
+            return _df(symbols[:1], 2)  # 只返回批内第一只
+
+    res = backfill_pool(_pool(2), date(2024, 1, 1), provider=_PartialProvider())
+    assert res["done"] == 1
+    assert [f["symbol"] for f in res["failed"]] == ["sh.600001"]
+    assert res["failed"][0]["reason"].startswith("empty_response")
+    cp = Checkpoint("daily")
+    assert cp.is_done("sh.600000") and not cp.is_done("sh.600001")
+
+
 def test_runtime_error_marks_failed(fake_settings, no_lake):
     from lquant.data.ingest.daily import backfill_pool
 

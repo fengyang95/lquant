@@ -10,8 +10,9 @@ SDK 报权限类错误，本层捕获转成 SourceUnavailable，fallback 链可�
   未安装时本模块 import 报 ImportError，由 providers.__init__._import_all
   吞掉不注册 —— 与 baostock / akshare 同机制。
 - SDK 返回 pandas DataFrame，统一转 polars 后交引擎映射。
-- 单位：daily / fund_daily / stk_mins 的 vol 都是手（×100 → 股），
-  amount 都是千元（×1000 → 元），换算统一在 yaml derive 完成。
+- 单位：daily / fund_daily 的 vol 是手（×100 → 股）、amount 是千元
+  （×1000 → 元）；日线换算在本文件 fetch 侧用 normalize.scale_unit 完成，
+  系数声明见 VOLUME_UNIT / AMOUNT_UNIT（此前在 mapping yaml derive 做）。
 """
 from __future__ import annotations
 
@@ -24,10 +25,16 @@ import polars as pl
 
 from lquant.core.errors import SourceUnavailable
 from lquant.data.capability import Capability
-from lquant.data.normalize import normalize_symbols
+from lquant.data.normalize import normalize_symbols, scale_unit
 from lquant.data.providers import PROVIDERS
 from lquant.data.providers._engine import MappingProvider
 from lquant.data.ratelimit import TokenBucket
+
+# 日线量纲考证（tushare pro 官方文档 daily/fund_daily 字段说明）：vol 单位是
+# **手**（1 手 = 100 股）、amount 单位是**千元** —— 换算在 fetch 侧出帧处做，
+# 入湖统一为 volume=股、amount=元（与 baostock/akshare 同口径）。
+VOLUME_UNIT = "手"
+AMOUNT_UNIT = "千元"
 
 # stk_mins 的 freq 参数与 canonical freq 同名：1min/5min/15min/30min/60min
 _FREQ_MAP = frozenset({"1min", "5min", "15min", "30min", "60min"})
@@ -55,6 +62,24 @@ def _to_date_col(df: pl.DataFrame, col: str) -> pl.DataFrame:
         return df
     return df.with_columns(
         pl.col(col).cast(pl.Utf8).str.to_date("%Y%m%d")
+    )
+
+
+def _prepare_daily(df: pl.DataFrame) -> pl.DataFrame:
+    """daily / fund_daily 出帧：日期解析 + 量价 cast + 量纲归一。
+
+    vol=手 → ×100 股、amount=千元 → ×1000 元（VOLUME_UNIT / AMOUNT_UNIT），
+    入湖统一口径（schema: volume=股、amount=元）。
+    """
+    return scale_unit(
+        scale_unit(
+            _to_date_col(df, "trade_date").with_columns(
+                pl.col(["open", "high", "low", "close", "pre_close",
+                        "vol", "amount"]).cast(pl.Float64),
+            ),
+            col="vol", unit=VOLUME_UNIT,
+        ),
+        col="amount", unit=AMOUNT_UNIT,
     )
 
 
@@ -203,12 +228,7 @@ class TushareProvider(MappingProvider):
             )
             if df.is_empty():
                 continue
-            frames.append(
-                _to_date_col(df, "trade_date").with_columns(
-                    pl.col(["open", "high", "low", "close", "pre_close",
-                            "vol", "amount"]).cast(pl.Float64),
-                )
-            )
+            frames.append(_prepare_daily(df))
         if not frames:
             return pl.DataFrame()
         return pl.concat(frames, how="diagonal")
@@ -276,12 +296,7 @@ class TushareProvider(MappingProvider):
             )
             if df.is_empty():
                 continue
-            frames.append(
-                _to_date_col(df, "trade_date").with_columns(
-                    pl.col(["open", "high", "low", "close", "pre_close",
-                            "vol", "amount"]).cast(pl.Float64),
-                )
-            )
+            frames.append(_prepare_daily(df))
         raw = pl.concat(frames, how="diagonal") if frames else pl.DataFrame()
         return self.request("daily_bar", _raw=raw, sec_type="etf")
 

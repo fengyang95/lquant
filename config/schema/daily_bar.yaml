@@ -23,9 +23,10 @@ sources:
     required: [symbol, trade_date, open, high, low, close, volume]
 
   akshare:
-    # stock_zh_a_hist / fund_etf_hist_em：amount 已是元直接 rename；
-    # volume 是手 → ×100 换算成股。akshare 日线无 preclose/turnover，
-    # 留空（不为 required），保持 None。
+    # stock_zh_a_hist / fund_etf_hist_em：中文列直接 rename。量纲归一
+    # （成交量 手 → ×100 股、成交额 元系数 1.0）在 provider _select_daily
+    # 出帧处用 normalize.scale_unit 完成 —— yaml 不再 derive 单位换算。
+    # akshare 日线无 preclose/turnover，留空（不为 required），保持 None。
     rename:
       股票代码: symbol
       日期: trade_date
@@ -35,20 +36,17 @@ sources:
       最低: low
       成交量: volume
       成交额: amount
-    derive:
-      volume: {expr: "volume * 100", from: [volume]}   # 手 → 股
     fill: {sec_type: stock, source: akshare, quality_flags: 0, adj_factor: 1.0}
     required: [symbol, trade_date, open, high, low, close, volume]
 
   tushare:
-    # pro.daily / fund_daily：ts_code 与内部格式一致直接 rename；
-    # vol 是手 → ×100 股，amount 是千元 → ×1000 元；pre_close 直出。
+    # pro.daily / fund_daily：ts_code 直出；量纲归一（vol 手 → ×100 股、
+    # amount 千元 → ×1000 元）在 provider fetch 侧用 normalize.scale_unit
+    # 完成 —— yaml 不再 derive 单位换算；pre_close 直出。
     # 日期解析（trade_date YYYYMMDD → Date）在 provider _fetch_raw 做。
     rename:
       ts_code: symbol
+      vol: volume
       pre_close: pre_close
-    derive:
-      volume: {expr: "vol * 100", from: [vol]}        # 手 → 股
-      amount: {expr: "amount * 1000", from: [amount]} # 千元 → 元
     fill: {sec_type: stock, source: tushare, quality_flags: 0, adj_factor: 1.0}
     required: [symbol, trade_date, open, high, low, close, volume]

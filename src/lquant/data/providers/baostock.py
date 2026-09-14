@@ -20,9 +20,15 @@ import polars as pl
 from lquant.core.errors import DataQualityError
 from lquant.core.types import SecType, parse_symbol, today_cn
 from lquant.data.capability import Capability
-from lquant.data.normalize import normalize_60min_bounds, normalize_symbols
+from lquant.data.normalize import normalize_60min_bounds, normalize_symbols, scale_unit
 from lquant.data.providers import PROVIDERS
 from lquant.data.providers._engine import MappingProvider
+
+# 日线量纲考证（BaoStock 官方文档 daily 字段说明）：volume 单位是**股**、
+# amount 单位是**元**，与湖内标准口径一致 —— 系数显式声明为 1.0，
+# scale_unit 照常调用以固化契约（单位若变，UNIT_MISMATCH 断言会兜底）。
+VOLUME_UNIT = "股"
+AMOUNT_UNIT = "元"
 
 # baostock 代码格式：sh.600000 / sz.000001
 _FREQ_MAP = {
@@ -289,7 +295,7 @@ def _map_daily_raw(rows: list[list[str]]) -> pl.DataFrame:
     在这里就地转成 is_suspended 布尔列（schema 同名，映射层透传）。
     """
     df = pl.DataFrame(rows, schema=_DAILY_RAW_SCHEMA, orient="row")
-    return df.with_columns(
+    df = df.with_columns(
         pl.col("date").str.to_date("%Y-%m-%d"),
         # 量价字段一律非严格 cast：指数/停牌行 volume、amount 可能是空串 ""
         # （实测 000001.SH 有 5/169 行 volume=""），strict cast 会炸掉整批
@@ -310,6 +316,10 @@ def _map_daily_raw(rows: list[list[str]]) -> pl.DataFrame:
         ),  # "0"=停牌 → True；行保留不丢
         (pl.col("isST").cast(pl.Utf8).str.strip_chars() == "1").alias("is_st"),  # "1"=ST → True
     ).drop("tradestatus", "isST")
+    # 量纲归一：volume → 股、amount → 元（系数 1.0，契约固化见 VOLUME_UNIT 注释）
+    return scale_unit(
+        scale_unit(df, col="volume", unit=VOLUME_UNIT), col="amount", unit=AMOUNT_UNIT
+    )
 
 
 def _attach_is_st(out: pl.DataFrame, raw: pl.DataFrame) -> pl.DataFrame:
