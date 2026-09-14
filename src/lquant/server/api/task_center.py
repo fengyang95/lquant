@@ -154,16 +154,38 @@ def retry_ep(kind: str, task_id: str, req: RetryIn | None = None) -> dict:
         raise HTTPException(422, str(e)) from e
     from lquant.server.jobs import enqueue
 
-    enqueue("lquant-ingest", ingest_tasks.run_claimed_task, task_id)
+    # job_id = task_id：cancel 探针按 task_id 找取消目标（与 data.py 入队一致）
+    enqueue("lquant-ingest", ingest_tasks.run_claimed_task, task_id,
+            job_id=task_id)
     return {"task_id": task_id, "status": "running", "params": task["params"]}
 
 
 @router.post("/{kind}/{task_id}/cancel")
 def cancel_ep(kind: str, task_id: str) -> dict:
-    """cancel：队列任务（backtest/factor）请求取消（协作式：任务体轮询探针提前收尾）。
+    """cancel：请求取消任务（协作式：任务体轮询探针提前收尾）。
 
+    kind=data：data_task 必须存在且 pending/running 才可取消 —— 队列侧的
+    取消目标以 task_id 入队登记（enqueue(job_id=task_id)，本地降级模式
+    LocalJob.id == task_id，request_cancel 置标记，run_claimed_task 批间
+    轮询探针收尾为 interrupted）。RQ 模式下运行中的 job 无法强杀，与
+    backtest/factor 同样返回 409。
     200 + {canceled: true}；404 不存在；409 已结束/不可取消。
     """
+    if kind == "data":
+        task = ingest_tasks.get_task(task_id)
+        if task is None:
+            raise HTTPException(404, f"任务不存在: {task_id}")
+        if task["status"] not in ("pending", "running"):
+            raise HTTPException(409, f"任务 {task_id} 已结束（{task['status']}），不可取消")
+        if not request_cancel(task_id):
+            # pending/running 但队列里没有可取消目标：RQ 运行中 / 降级 job 丢失
+            raise HTTPException(409, f"任务 {task_id} 当前不可取消（队列目标不存在或运行中）")
+        # RQ queued job 被真取消 → job 永不执行，data_task 停 pending 的坑：
+        # 显式落 interrupted。本地模式线程稍后会跑并再收尾一次，状态一致。
+        job = get_job(task_id)
+        if job is not None and getattr(job, "get_status", lambda: None)() == "canceled":
+            ingest_tasks.mark_canceled_pending(task_id)
+        return {"task_id": task_id, "canceled": True}
     if get_job(task_id) is None:
         raise HTTPException(404, f"任务不存在或不可取消: {task_id}")
     if not request_cancel(task_id):

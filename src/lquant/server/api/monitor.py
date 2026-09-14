@@ -39,3 +39,13 @@ def tasks(range: str = Query("1h")) -> dict:
 @router.get("/data-pulls")
 def data_pulls() -> dict:
     return q.data_pulls()
+
+
+@router.get("/error-logs")
+def error_logs(range: str = Query("24h"),
+               route: str | None = Query(default=None),
+               limit: int = Query(default=200, ge=1, le=1000)) -> dict:
+    try:
+        return q.error_logs(range, route=route, limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e

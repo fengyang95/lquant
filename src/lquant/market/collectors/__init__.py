@@ -62,7 +62,11 @@ from lquant.market.collectors.limit_up import (  # noqa: E402
     fetch_limit_up_pool,
 )
 from lquant.market.collectors.money_flow import fetch_money_flow, fetch_northbound  # noqa: E402
-from lquant.market.collectors.sector import fetch_concepts, fetch_sectors  # noqa: E402
+from lquant.market.collectors.sector import (  # noqa: E402
+    fetch_areas,
+    fetch_concepts,
+    fetch_sectors,
+)
 from lquant.market.collectors.sentiment import compute_sentiment, sentiment_score  # noqa: E402
 
 collector("limit_up_pool", label="涨停池", table="limit_up_pool",
@@ -73,8 +77,12 @@ collector("broken_pool", label="炸板池", table="limit_up_pool",
           schedule="close", critical=True)(fetch_broken_pool)
 collector("money_flow", label="个股资金流", table="money_flow",
           schedule="close")(fetch_money_flow)
-collector("sector", label="板块行情", table="sector_daily",
+collector("sector", label="板块行情（行业）", table="sector_daily",
           schedule="close")(fetch_sectors)
+collector("sector_concept", label="板块行情（概念）", table="sector_daily",
+          schedule="close")(fetch_concepts)
+collector("sector_area", label="板块行情（地域）", table="sector_daily",
+          schedule="close")(fetch_areas)
 collector("northbound", label="北向资金", table="northbound_flow",
           schedule="evening")(fetch_northbound)
 collector("sentiment", label="市场情绪", table="sentiment_daily",
@@ -87,5 +95,6 @@ collector("index_daily", label="指数日线", table="index_daily",
 __all__ = ["COLLECTORS", "collector", "run", "run_all", "list_collectors",
            "fetch_limit_up_pool", "fetch_limit_down_pool", "fetch_broken_pool",
            "fetch_money_flow", "fetch_northbound", "fetch_sectors", "fetch_concepts",
+           "fetch_areas",
            "compute_sentiment", "sentiment_score", "fetch_dragon_tiger",
            "fetch_index_daily", "INDEX_POOL"]

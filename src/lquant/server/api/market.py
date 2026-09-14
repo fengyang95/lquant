@@ -51,13 +51,27 @@ def overview() -> dict:
 
 
 @router.get("/sectors")
-def sectors(kind_limit: int = Query(default=50, le=200)) -> list[dict]:
-    df = _read("sector_daily", kind_limit)
+def sectors(kind: str = Query(default="industry",
+                              pattern="^(industry|concept|area)$")) -> list[dict]:
+    """板块行情，按 kind 过滤（行业/概念/地域）。
+
+    每种 kind 取各自的最新交易日（部分 kind 某天采集失败不影响其他 kind）。
+    kind 列是后加的：老库没有该列时用 COALESCE(kind,'industry') 兜底，
+    兼容 ALTER 之前的历史数据（历史上只采过行业）。
+    """
+    try:
+        with reader() as con:
+            df = con.execute(
+                "SELECT * FROM sector_daily WHERE COALESCE(kind, 'industry') = ? "
+                "AND trade_date = (SELECT MAX(trade_date) FROM sector_daily "
+                "WHERE COALESCE(kind, 'industry') = ?)",
+                [kind, kind],
+            ).pl()
+    except Exception:  # noqa: BLE001 - 表未建/结构迁移中 → 空态
+        return []
     if not len(df):
         return []
-    latest_date = df["trade_date"].max()
-    return (df.filter(pl.col("trade_date") == latest_date)
-              .sort("change_pct", descending=True).to_dicts())
+    return df.sort("change_pct", descending=True).to_dicts()
 
 
 @router.get("/money-flow")
@@ -153,6 +167,21 @@ def collect(req: CollectIn) -> dict:
 
     d = date.fromisoformat(req.trade_date) if req.trade_date else None
     return collect_and_save(schedule=None, trade_date=d, demo=req.demo)
+
+
+@router.post("/backfill")
+def backfill(req: CollectIn) -> dict:
+    """手动触发大盘数据缺失检查与补齐。
+
+    正常由 sync 作业 backfill（盘前 09:10）与 API 启动线程自动触发；
+    部署后想立刻补数据也可以手动调这个接口。
+    """
+    from lquant.market.backfill import ensure_market_coverage
+
+    try:
+        return ensure_market_coverage(days=90, demo=req.demo)
+    except Exception as e:  # noqa: BLE001 - 日历源故障时给出可读错误而非裸 500
+        raise HTTPException(status_code=503, detail=f"补齐失败: {e}") from e
 
 
 @router.get("/collect-status")

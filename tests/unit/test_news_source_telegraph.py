@@ -1,4 +1,4 @@
-"""telegraph 采集器单元测试。"""
+"""telegraph 采集器源站直连 + akshare 回退路径测试。"""
 
 from datetime import date
 from unittest.mock import patch
@@ -7,11 +7,24 @@ import pandas as pd
 import pytest
 
 from lquant.news.sources.base import get_sources
-from lquant.news.sources.telegraph import ClsTelegraphSource, SinaTelegraphSource
+from lquant.news.sources.telegraph import (
+    ClsTelegraphSource,
+    SinaTelegraphSource,
+    _fetch_cls_direct,
+    _fetch_sina_direct,
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_direct_http(monkeypatch):
+    """默认把直连 HTTP 打桩为失败 —— 老用例保持走 akshare 回退路径。"""
+    monkeypatch.setattr(
+        "lquant.news.sources.telegraph._http_json",
+        lambda *a, **k: (_ for _ in ()).throw(ConnectionError("stubbed")),
+    )
 
 # 列名按 akshare 1.18.94 实测:
-# stock_info_global_cls -> 标题/内容/发布日期/发布时间
-# stock_info_global_sina -> 时间/内容
+# stock_info_global_cls akshare 封装丢弃 id；直连保留 id → 原文链接
 
 def test_cls_maps_columns():
     fake = pd.DataFrame(
@@ -134,3 +147,63 @@ def test_all_sources_have_protocol_attrs():
         assert isinstance(src.name, str) and src.name
         assert src.category == "telegraph"
         assert callable(src.fetch)
+
+
+# ---------------- 直连路径（真实原文链接） ----------------
+
+
+def test_cls_direct_builds_real_urls(monkeypatch):
+    monkeypatch.setattr(
+        "lquant.news.sources.telegraph._http_json",
+        lambda url, params, **k: {"data": {"roll_data": [
+            {"id": 1234567, "title": "", "content": "直连快讯A",
+             "ctime": 1757402400},
+            {"id": None, "title": "t", "content": "无id快讯B", "ctime": None},
+        ]}},
+    )
+    items = _fetch_cls_direct()
+    assert items[0].url == "https://www.cls.cn/detail/1234567"
+    assert items[0].external_id
+    assert items[1].url == "https://www.cls.cn/telegraph"
+
+
+def test_cls_direct_empty_falls_back_to_akshare(monkeypatch):
+    monkeypatch.setattr(
+        "lquant.news.sources.telegraph._http_json",
+        lambda *a, **k: {"data": {"roll_data": []}},
+    )
+    fake = pd.DataFrame({"标题": [None], "内容": ["ak路快讯"],
+                         "发布日期": ["2026-09-10"], "发布时间": ["10:00:00"]})
+    with patch("lquant.news.sources.telegraph.ak") as mock_ak:
+        mock_ak.stock_info_global_cls.return_value = fake
+        items = ClsTelegraphSource().fetch(date(2026, 9, 10))
+    assert items[0].content == "ak路快讯"
+    assert items[0].url == "https://www.cls.cn/telegraph"
+
+
+def test_sina_direct_prefers_docurl(monkeypatch):
+    monkeypatch.setattr(
+        "lquant.news.sources.telegraph._http_json",
+        lambda url, params, **k: {"result": {"data": {"feed": {"list": [
+            {"id": "1", "rich_text": "新浪快讯A",
+             "create_time": "2026-09-10 10:00:00",
+             "docurl": "https://finance.sina.com.cn/x/1.shtml"},
+            {"id": "2", "rich_text": "新浪快讯B",
+             "create_time": "2026-09-10 10:01:00",
+             "docurl": ""},
+        ]}}}},
+    )
+    items = _fetch_sina_direct()
+    assert items[0].url == "https://finance.sina.com.cn/x/1.shtml"
+    assert items[1].url == "https://finance.sina.com.cn/7x24/"
+
+
+def test_every_telegraph_item_has_url(monkeypatch):
+    monkeypatch.setattr(
+        "lquant.news.sources.telegraph._http_json",
+        lambda url, params, **k: {"result": {"data": {"feed": {"list": [
+            {"id": "1", "rich_text": "c", "create_time": "2026-09-10 10:00:00",
+             "docurl": ""},
+        ]}}}},
+    )
+    assert all(it.url for it in _fetch_sina_direct())

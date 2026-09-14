@@ -12,6 +12,7 @@ from lquant.server.api import (
     ask,
     backtests,
     data,
+    data_admin,
     etf,
     factors,
     health,
@@ -35,7 +36,7 @@ def create_app() -> FastAPI:
         allow_origins=["http://localhost:3000"],
         allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
     )
-    for r in (health, data, factors, backtests, market, paper, watchlist,
+    for r in (health, data, data_admin, factors, backtests, market, paper, watchlist,
               strategies, analyses, sync, etf, news, settings, ask,
               task_center, monitor):
         app.include_router(r.router, prefix="/api")
@@ -138,3 +139,22 @@ def _startup() -> None:
             manager.loop_forever(interval=30)
 
         threading.Thread(target=_sync_worker, name="sync-worker", daemon=True).start()
+
+        def _startup_backfill() -> None:
+            """部署/重启后自动检查 index_daily 缺失并补齐（backfill 作业之外的兜底）。"""
+            import time as _time
+
+            _time.sleep(10)  # 等库与日历源就绪，避开启动风暴
+            from lquant.market.backfill import ensure_market_coverage
+
+            try:
+                res = ensure_market_coverage(days=90)
+                if res.get("missing_before"):
+                    print(f"[startup] 大盘数据补齐: "
+                          f"补 {res.get('persisted', 0)} 行 "
+                          f"({list(res['missing_before'])})")
+            except Exception as e:  # noqa: BLE001 - 启动兜底失败不阻断服务
+                print(f"[warn] 启动补齐失败（可用 POST /api/market/backfill 手动触发）: {e}")
+
+        threading.Thread(target=_startup_backfill, name="startup-backfill",
+                         daemon=True).start()

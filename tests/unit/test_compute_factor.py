@@ -49,6 +49,27 @@ def test_missing_column_error_not_swallowed():
         f"缺列错误被误报为 422: {ei.value}"
 
 
+def test_dsl_error_raises_422_not_500():
+    """缺陷：DSL 公式错误（解析失败/未注册算子/未知字段）直接炸 500，
+    必须转成 422 并带原始错误信息。"""
+    from lquant.server.api.factors import _compute_factor
+
+    for bad in ("$bad + ", "Mean($close, 0)", "Rank($no_such_col)"):
+        with pytest.raises(HTTPException) as ei:
+            _compute_factor(_panel(), bad)
+        assert ei.value.status_code == 422, f"{bad!r} 应为 422，实际 {ei.value.status_code}"
+        assert str(ei.value.detail), "detail 应带原始错误信息"
+
+
+def test_dsl_error_is_factor_error():
+    """DSL 分支抛的应是 FactorError 家族（校验期就能识别），非裸异常。"""
+    from lquant.core.errors import FactorError
+    from lquant.factors.analysis import compute_factor_col
+
+    with pytest.raises(FactorError):
+        compute_factor_col(_panel(), "$bad + ", "_factor")
+
+
 def test_pct_change_still_works():
     from lquant.server.api.factors import _compute_factor
 

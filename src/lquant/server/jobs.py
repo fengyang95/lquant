@@ -135,10 +135,15 @@ def get_job(job_id: str):
 
 @dataclass
 class _CancelTarget:
-    """可取消目标的登记：本地任务用 LocalJob 引用，RQ 任务记队列名。"""
+    """可取消目标的登记：本地任务用 LocalJob 引用，RQ 任务记队列名。
+
+    canceled 是协作式取消标记：request_cancel 受理时置位，探针
+    （enqueue 注入的 cancel_check）轮询它 —— 本地与 RQ 分支统一。
+    """
 
     queue: str
     local_job: LocalJob | None
+    canceled: bool = False
 
 
 # job_id → 取消目标。入队时登记，request_cancel / list_recent 消费。
@@ -154,8 +159,9 @@ def _register_cancelable(job_id: str, target: _CancelTarget) -> None:
 
 
 def request_cancel(job_id: str) -> bool:
-    """请求取消任务。本地任务：置 canceled 标记（线程自然结束后结果被丢弃）；
-    RQ 任务：queued 状态可真取消，运行中的返回 False。返回是否已受理。"""
+    """请求取消任务。本地任务：置 canceled 标记（探针收尾或结果被丢弃）；
+    RQ 任务：queued 可真取消（cancel()），运行中标记后由探针协作收尾，
+    都返回是否已受理。"""
     with _JOBS_LOCK:
         target = _CANCELABLE.get(job_id)
     if target is None:
@@ -163,6 +169,7 @@ def request_cancel(job_id: str) -> bool:
     if target.local_job is not None:
         lj = target.local_job
         lj._canceled = True
+        target.canceled = True
         return True
     if _redis_available():
         try:
@@ -171,6 +178,7 @@ def request_cancel(job_id: str) -> bool:
             job = Job.fetch(job_id, connection=get_redis())
             if job.get_status() == "queued":
                 job.cancel()
+                target.canceled = True
                 return True
         except Exception:  # noqa: BLE001
             pass
@@ -184,12 +192,31 @@ def enqueue(queue: str, fn, *args, job_id: str | None = None, **kwargs):
     本地降级线程无法强杀 —— 任务体不配合时，cancel 只能保证状态标记与
     结果丢弃，线程跑到自然结束。
     """
+    import inspect
+
+    # 探针注入统一在分支前：fn 签名有 cancel_check 就注入（RQ / 本地一致）
+    try:
+        sig = inspect.signature(fn)
+        injects = "cancel_check" in sig.parameters
+    except (TypeError, ValueError):
+        injects = False
+
     if _redis_available():
         from rq import Queue
 
+        jid = job_id or uuid.uuid4().hex[:12]
+        if injects:
+            kwargs["cancel_check"] = lambda: _is_canceled(jid)  # noqa: E731
         q = Queue(queue, connection=get_redis())
-        job = q.enqueue(fn, *args, job_id=job_id, **kwargs) if job_id \
-            else q.enqueue(fn, *args, **kwargs)
+        from rq.exceptions import InvalidJobOperation
+        from rq.job import Job
+
+        try:
+            job = q.enqueue(fn, *args, job_id=jid, **kwargs)
+        except InvalidJobOperation:
+            # 同 job_id 旧 job 仍在（retry 重入队）：删旧再入，等价覆盖
+            Job.fetch(jid, connection=get_redis()).delete()
+            job = q.enqueue(fn, *args, job_id=jid, **kwargs)
         _register_cancelable(job.id, _CancelTarget(queue=queue, local_job=None))
         return job
 
@@ -199,15 +226,8 @@ def enqueue(queue: str, fn, *args, job_id: str | None = None, **kwargs):
     _register_job(job)
     _register_cancelable(job.id, _CancelTarget(queue=queue, local_job=job))
 
-    # fn 签名里有 cancel_check 才注入（RQ 模式同样透传）
-    import inspect
-
-    try:
-        sig = inspect.signature(fn)
-        if "cancel_check" in sig.parameters:
-            kwargs["cancel_check"] = lambda jid=job.id: _is_canceled(jid)  # noqa: E731
-    except (TypeError, ValueError):
-        pass
+    if injects:
+        kwargs["cancel_check"] = lambda jid=job.id: _is_canceled(jid)  # noqa: E731
 
     def _run():
         started = time.time()
@@ -238,7 +258,7 @@ def enqueue(queue: str, fn, *args, job_id: str | None = None, **kwargs):
 def _is_canceled(job_id: str) -> bool:
     with _JOBS_LOCK:
         t = _CANCELABLE.get(job_id)
-        return bool(t and t.local_job is not None and t.local_job._canceled)
+        return bool(t and t.canceled)
 
 
 def list_recent_jobs(limit: int = 50) -> list[dict]:

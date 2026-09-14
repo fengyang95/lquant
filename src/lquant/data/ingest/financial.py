@@ -62,8 +62,10 @@ def backfill_financial(
         try:
             df = target.financial_pit(chunk, start_d, end_d, kinds)
         except Exception as e:  # noqa: BLE001 - 单批失败不应炸掉整个任务
-            logger.warning(f"批次 {i} 失败，跳过: {e}")
-            cp.mark(chunk)
+            # 失败批不标记完成：否则 transient 网络错误会把这批标的永久
+            # 记为 done，重跑全部跳过 —— 基本面静默缺失。
+            logger.warning(f"批次 {i} 失败，未标记（重跑将重试）: {e}")
+            cp.unmark(chunk)
             continue
         if len(df):
             repo.upsert(df)

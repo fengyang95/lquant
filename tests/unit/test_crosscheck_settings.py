@@ -80,7 +80,8 @@ def test_run_crosscheck_cfg_defaults_fallback_to_yaml(fake_settings):
 
     cfg = _cfg()
     # 未配置 crosscheck_peers → 回退 providers.yaml crosscheck.peers
-    assert cfg["peers"] == ["akshare"]
+    # （2026-09-13 起 peer 换成 tushare：akshare 易封 IP，不再做 peer）
+    assert cfg["peers"] == ["tushare"]
     # 主源 = providers_order 首位（config 派生：启用源顺序首位 baostock）
     assert cfg["primary"] == "baostock"
     # tolerance / fields / enabled 仍读 yaml

@@ -233,3 +233,38 @@ def data_pulls() -> dict:
 def summary() -> dict:
     return {"procs": proc_statuses(), "queues": queue_depths(),
             "api_live": api_live(), "task_recent": recent_task_events(10)}
+
+
+def error_logs(range_name: str, route: str | None = None,
+               limit: int = 200) -> dict:
+    """错误日志查询：monitor.duckdb metrics_api_error，按 ts 倒序。
+
+    DuckDB 不可用/表不存在时降级返回空集（首次运行尚无错误表属正常态）。
+    """
+    rs = range_sec(range_name)
+    con = None
+    try:
+        con = _con()  # 连接失败同样降级为空集（此前在 try 外会炸 500）
+        params: list = []
+        where = f"WHERE ts > cast(now() as timestamp) - INTERVAL {rs} SECOND"
+        if route:
+            where += " AND route LIKE ?"
+            params.append(f"%{route}%")
+        total = con.execute(
+            f"SELECT count(*) FROM metrics_api_error {where}", params).fetchone()[0]
+        rows = con.execute(f"""
+            SELECT ts, route, method, status, error_type, message, traceback_tail
+            FROM metrics_api_error
+            {where}
+            ORDER BY ts DESC LIMIT {int(limit)}
+        """, params).fetchall()
+    except Exception:  # noqa: BLE001 - 表不存在时降级为空；其余真实故障记日志便于发现
+        _LOG.warning("error_logs 查询失败，降级为空集", exc_info=True)
+        return {"items": [], "total": 0}
+    finally:
+        if con is not None:
+            con.close()
+    items = [{"ts": str(r[0]), "route": r[1], "method": r[2], "status": r[3],
+              "error_type": r[4], "message": r[5], "traceback_tail": r[6]}
+             for r in rows]
+    return {"items": items, "total": total}

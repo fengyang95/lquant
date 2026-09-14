@@ -138,7 +138,9 @@ DDL_STATEMENTS: list[str] = [
     CREATE TABLE IF NOT EXISTS factor_def (
         name VARCHAR PRIMARY KEY,
         expression VARCHAR, description VARCHAR,
-        enabled BOOLEAN DEFAULT TRUE, created_at TIMESTAMP
+        enabled BOOLEAN DEFAULT TRUE, created_at TIMESTAMP,
+        source VARCHAR DEFAULT 'manual', source_ref VARCHAR,
+        factor_id VARCHAR, category VARCHAR DEFAULT ''
     )
     """,
     """
@@ -296,14 +298,14 @@ def ensure_views(con, parquet_dir: str | Path | None = None) -> int:
 
 
 def ensure_factor_def_columns(con) -> int:
-    """factor_def 增列迁移：source / source_ref / factor_id（M2 来源接入）。
+    """factor_def 增列迁移：source / source_ref / factor_id / category。
 
     幂等：列已存在直接跳过。返回是否执行了迁移。
     """
     cols = {r[0] for r in con.execute("DESCRIBE factor_def").fetchall()}
     n = 0
     for col, typ in (("source", "VARCHAR DEFAULT 'manual'"), ("source_ref", "VARCHAR"),
-                     ("factor_id", "VARCHAR")):
+                     ("factor_id", "VARCHAR"), ("category", "VARCHAR DEFAULT ''")):
         if col not in cols:
             con.execute(f"ALTER TABLE factor_def ADD COLUMN {col} {typ}")
             n += 1

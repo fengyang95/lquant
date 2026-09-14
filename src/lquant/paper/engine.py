@@ -81,9 +81,18 @@ class PaperBroker:
         if qty <= 0:
             o.status, o.reason = "rejected", "数量非法"
         elif side == "buy":
-            need = qty * price * 1.001  # 粗估含费
-            if need > self.cash:
-                o.status, o.reason = "rejected", f"资金不足 need={need:.0f} cash={self.cash:.0f}"
+            need = self._buy_need(symbol, qty, price)
+            # 已挂未成交买单也占资金（与卖侧 pending_sell 同理）：
+            # 两笔 90 万挂单在 100 万现金下各自合法、合计成交即穿仓
+            pending_buy = sum(
+                self._buy_need(b.symbol, b.qty, b.price) for b in self.orders
+                if b.symbol == symbol and b.side == "buy"
+                and b.status == "pending"
+            )
+            if need + pending_buy > self.cash:
+                o.status, o.reason = "rejected", (
+                    f"资金不足 need={need:.0f} 已挂买单占={pending_buy:.0f} "
+                    f"cash={self.cash:.0f}")
         else:
             pos = self.positions.get(symbol)
             avail = pos.available if pos else 0
@@ -100,9 +109,26 @@ class PaperBroker:
         self.orders.append(o)
         return o
 
+    def _buy_need(self, symbol: str, qty: int, price: float) -> float:
+        """买入所需资金 = 金额 + 真实费率估算（含佣金最低额）+ 滑点余量。
+
+        原来 0.1% 粗估在小单上低于佣金最低额（如 ¥5），成交后现金穿仓。
+        """
+        amount = qty * price
+        rules = self._ruleset.for_symbol(symbol, parse_symbol(symbol).sec_type,
+                                         parse_symbol(symbol).board)
+        fee = max(amount * rules.commission.rate, rules.commission.min) + \
+            amount * rules.transfer_fee_rate
+        slip = amount * self.cfg.slippage_pct
+        return amount + fee + slip
+
     def on_quote(self, symbol: str, price: float, limit_up: float | None = None,
                  limit_down: float | None = None, ts: datetime | None = None) -> list[PaperOrder]:
-        """行情驱动：用最新价撮合该标的的挂单。返回本轮有变化的委托。"""
+        """行情驱动：用最新价撮合该标的的挂单。返回本轮有变化的委托。
+
+        限价约束：买单只在 price <= limit、卖单只在 price >= limit 时成交，
+        否则保持 pending —— 限价单才有「限」的语义（以前只记录不检查）。
+        """
         touched: list[PaperOrder] = []
         for o in self.orders:
             if o.symbol != symbol or o.status != "pending":
@@ -115,13 +141,21 @@ class PaperBroker:
                 o.status, o.reason = "rejected", "跌停无法卖出"
                 touched.append(o)
                 continue
+            # 限价未触达 → 继续挂单等待（不是拒单）
+            if o.side == "buy" and price > o.price:
+                continue
+            if o.side == "sell" and price < o.price:
+                continue
             self._fill(o, price, ts)
             touched.append(o)
         return touched
 
     def _fill(self, o: PaperOrder, px: float, ts: datetime | None) -> None:
         slip = px * self.cfg.slippage_pct
-        price = px + slip if o.side == "buy" else px - slip
+        # 成交价不得越过限价：买价压到限价内、卖价抬到限价上，
+        # 否则 quote==limit 时滑点会击穿刚检查过的限价约束
+        price = min(px + slip, o.price) if o.side == "buy" \
+            else max(px - slip, o.price)
         o.filled_price = round(price, 4)
         o.filled_qty = o.qty
 
@@ -158,12 +192,21 @@ class PaperBroker:
         o.status = "filled"
 
     def on_day_close(self, d: date) -> None:
-        """日终：解冻跨日买入的持仓（T+1 及以上）。"""
+        """日终：解冻跨日买入的持仓（T+1 及以上）。
+
+        解冻数量扣除仍有 pending 卖单占用的份额：submit 时挂卖单已从
+        available 里预占，日终解冻若直接 available=qty 会把这笔预占清掉。
+        """
         for sym, pos in self.positions.items():
             rules = self._ruleset.for_symbol(sym, parse_symbol(sym).sec_type,
                                              parse_symbol(sym).board)
             if rules.sellable_after_days >= 1:
-                pos.available = pos.qty
+                pending_sell = sum(
+                    o.qty for o in self.orders
+                    if o.symbol == sym and o.side == "sell"
+                    and o.status == "pending"
+                )
+                pos.available = max(pos.qty - pending_sell, 0)
             if pos.last_price == 0:
                 pos.last_price = pos.avg_cost
 

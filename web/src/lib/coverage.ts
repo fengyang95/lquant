@@ -9,8 +9,8 @@ export type MonthlyCoverageRow = {
   days: number;
 };
 
-/** 后端契约：裸 dict（非封套、非裸数组） */
-export type MonthlyCoverageResp = { rows: MonthlyCoverageRow[] };
+/** 后端契约：裸 dict（非封套、非裸数组）；threshold 为环比告警阈值%（可选，缺省 30） */
+export type MonthlyCoverageResp = { rows: MonthlyCoverageRow[]; threshold?: number };
 
 /** 环比跌幅超过该比例的月份视为疑似缺口月 */
 export const COVERAGE_DROP_THRESHOLD = 0.3;

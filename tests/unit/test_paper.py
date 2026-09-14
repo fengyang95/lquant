@@ -7,22 +7,25 @@ from lquant.paper import PaperConfig, PaperEngine, compare_nav
 
 
 class _OneShotBuy:
-    """首条行情把现金等分买入 syms。"""
+    """每只标的首条行情各自等额买入（价格取自身行情，限价语义才成立）。
+
+    限价单语义修正后，用 A 的行情价给 B 下限价单、而 B 的市场价更高，
+    会被正确地挂在限价之下不成交 —— 测试夹具必须尊重这个语义。
+    """
 
     def __init__(self, syms: list[str]) -> None:
         self.syms = syms
-        self.done = False
+        self.done: set[str] = set()
 
     def signals(self, broker, quote: dict) -> list[dict]:
-        if self.done or quote["symbol"] != self.syms[0]:
+        s = quote["symbol"]
+        if s not in self.syms or s in self.done:
             return []
-        self.done = True
-        out = []
-        for s in self.syms:
-            q = int(broker.cash / len(self.syms) / (quote["price"] * 1.01)) // 100 * 100
-            if q > 0:
-                out.append({"symbol": s, "side": "buy", "qty": q, "price": quote["price"]})
-        return out
+        self.done.add(s)
+        q = int(broker.cash / len(self.syms) / (quote["price"] * 1.01)) // 100 * 100
+        if q <= 0:
+            return []
+        return [{"symbol": s, "side": "buy", "qty": q, "price": quote["price"]}]
 
 
 def _daily_df(days: int = 5) -> pl.DataFrame:

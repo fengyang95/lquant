@@ -14,4 +14,5 @@ def setup_logging(level: str = "INFO", sink: str | None = None) -> None:
         format="<green>{time:HH:mm:ss}</green> | <level>{level:<7}</level> | <cyan>{name}</cyan> - {message}",
     )
     if sink:
-        logger.add(sink, level=level, rotation="50 MB", retention="30 days", enqueue=True)
+        # 运行日志保留 7 天：轮转产生的旧日志自动清理
+        logger.add(sink, level=level, rotation="50 MB", retention="7 days", enqueue=True)
