@@ -231,13 +231,16 @@ financial_pit 中与"同比/yoy"相关的 DISTINCT item:{yoy_items or "(无)"}�
 
 
 MANUAL_NOTES_HEADING = "## 人工补注"
+# 重跑时保留到文末的段(取最早出现的段起,一并提取):人工补注 + 缺口清单。
+PRESERVED_HEADINGS = ("## 缺口清单", MANUAL_NOTES_HEADING)
 
 
 def extract_manual_notes(doc: str) -> str:
-    """提取文档中的"人工补注"段(到文末);没有则返回空串。"""
-    idx = doc.find(MANUAL_NOTES_HEADING)
-    if idx < 0:
+    """提取文档中需重跑保留的段(从最早出现保留段起到文末);没有则返回空串。"""
+    idxs = [doc.find(h) for h in PRESERVED_HEADINGS if doc.find(h) >= 0]
+    if not idxs:
         return ""
+    idx = min(idxs)
     return doc[idx:].rstrip() + "\n"
 
 
