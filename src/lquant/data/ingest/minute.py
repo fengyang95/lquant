@@ -46,8 +46,9 @@ def backfill_minute(
         try:
             df: pl.DataFrame = target.minute_bars(chunk, start_d, end_d, freq)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"批次 {i} 失败，跳过: {e}")
-            cp.mark(chunk)
+            # 失败批不标记完成：否则 transient 网络错误会把这批标的永久
+            # 记为 done，重跑全部跳过 —— 分钟线静默缺失（同 financial.py）。
+            logger.warning(f"批次 {i} 失败，未标记（重跑将重试）: {e}")
             continue
         if len(df):
             write_minute(df)

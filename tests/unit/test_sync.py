@@ -142,6 +142,57 @@ def test_due_logic():
     assert _is_due(_job(), datetime(2026, 9, 8, 15, 5))
 
 
+def test_due_catchup_after_multi_day_downtime():
+    """宕机跨天补跑：last_run 落后于今天的应触发时刻即到期（不再永久跳过）。"""
+    from lquant.sync.manager import _is_due
+
+    # 宕机 3 天后恢复，now 已过当天调度时刻 → 必须补跑
+    assert _is_due(
+        _job(last_run_at=datetime(2026, 9, 4, 15, 10)), datetime(2026, 9, 8, 15, 6))
+    # 当天早些时候手动跑过（在调度时刻之前）不阻塞当晚调度
+    assert _is_due(
+        _job(last_run_at=datetime(2026, 9, 8, 9, 0)), datetime(2026, 9, 8, 15, 6))
+    # 调度时刻之后跑过 → 不重复
+    assert not _is_due(
+        _job(last_run_at=datetime(2026, 9, 8, 15, 10)), datetime(2026, 9, 8, 18, 0))
+    # 时间未到 → 不跑
+    assert not _is_due(
+        _job(last_run_at=datetime(2026, 9, 4, 15, 10)), datetime(2026, 9, 8, 10, 0))
+
+
+def test_upsert_accepts_new_kinds():
+    """reference/daily_basic/financial 三类新作业类型可注册（默认禁用防触网）。"""
+    from lquant.sync import manager
+
+    manager.seed_defaults()
+    for kind in ("reference", "daily_basic", "financial"):
+        manager.upsert_job(f"t-{kind}", "t", kind, "07:00", params={"days": 14},
+                           enabled=False)
+    ids = {j["sync_id"] for j in manager.list_jobs()}
+    assert {"t-reference", "t-daily_basic", "t-financial"} <= ids
+
+
+def test_trading_day_filter():
+    """日历覆盖的日期按 is_open 过滤；日历缺失该日时回退放行（不静默全跳）。"""
+    from datetime import date as _date
+
+    from lquant.sync.manager import _trading_day_ok
+
+    assert _trading_day_ok(_date(2026, 9, 8)) is True   # 日历缺失该日 → 放行
+    from lquant.core.db import writer
+    from lquant.data.store.ddl import DDL_STATEMENTS
+
+    with writer() as con:
+        for stmt in DDL_STATEMENTS:
+            con.execute(stmt)
+        con.execute("INSERT OR REPLACE INTO trade_calendar VALUES (?, true, 't')",
+                    [_date(2026, 9, 8)])
+        con.execute("INSERT OR REPLACE INTO trade_calendar VALUES (?, false, 't')",
+                    [_date(2026, 9, 9)])
+    assert _trading_day_ok(_date(2026, 9, 8)) is True
+    assert _trading_day_ok(_date(2026, 9, 9)) is False  # 假日不跑数据作业
+
+
 # ---------- 作业执行（demo 离线） ----------
 
 
@@ -256,6 +307,9 @@ def test_tick_runs_due_jobs_only():
     from lquant.sync import manager
 
     manager.seed_defaults()
+    # 其它作业（backfill/reference 等会触网）一律禁用：测试必须离线
+    for sid in ("preopen", "backfill", "reference", "daily_basic", "financial"):
+        manager.set_enabled(sid, False)
     # 把 close 作业的时刻改到很早 → 必然到期；daily/adj 改到很晚 → 不到期。
     # weekdays 不能沿用 seed_defaults 的「1,2,3,4,5」/「6」：那是生产节奏，
     # 用例必须与运行日无关（close 显式全周——注意 _is_due 对空串回落

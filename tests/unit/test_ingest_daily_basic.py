@@ -216,7 +216,7 @@ def test_backfill_daily_basic_merge_fills_daily_lake(tmp_path, monkeypatch):
 
 
 def test_coalesce_basic_missing_some_target_cols() -> None:
-    """basic 帧缺部分目标列（老文件/部分源）→ 缺列不填不炸，fill 计 0。"""
+    """basic 帧缺部分目标列（老文件/无此列的源）→ 缺列不填不炸，fill 计 0。"""
     df = _daily_frame()
     basic = _basic_frame().drop("ps_ttm", "total_mv")
     out, filled = coalesce_daily_basic(df, basic)
@@ -225,3 +225,96 @@ def test_coalesce_basic_missing_some_target_cols() -> None:
     assert pa["ps_ttm"][0] is None         # 缺列不填
     assert filled["ps_ttm"] == 0 and filled["total_mv"] == 0
     assert filled["pe_ttm"] == 1
+
+
+# ---------- 失败语义：拉取失败/空结果不得标 done（否则永久缺口） ----------
+
+class _FlakyBasicProvider(_FakeBasicProvider):
+    """指定日期抛异常或返回空帧。"""
+
+    def __init__(self, fail_days: set, empty_days: set) -> None:
+        super().__init__()
+        self._fail = fail_days
+        self._empty = empty_days
+
+    def daily_basic(self, trade_date):
+        if trade_date in self._fail:
+            raise RuntimeError("tushare timeout")
+        if trade_date in self._empty:
+            return self._empty_frame()
+        return super().daily_basic(trade_date)
+
+    def _empty_frame(self):
+        from lquant.data.schema import SCHEMAS
+
+        return pl.DataFrame(schema=list(SCHEMAS["daily_basic"]))
+
+
+def _prep_lake_5days(tmp_path, monkeypatch):
+    monkeypatch.setenv("LQ_ROOT", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    from lquant.core.config import get_settings
+
+    get_settings.cache_clear()
+    _seed_calendar("2026-08-03", "2026-08-07")
+    from lquant.data.store.parquet import write_daily
+
+    write_daily(pl.DataFrame({
+        "symbol": ["600000.SH"] * 5,
+        "trade_date": [date(2026, 8, 3 + i) for i in range(5)],
+        "close": [10.0] * 5,
+    }, schema_overrides={"trade_date": pl.Date}))
+
+
+def test_daily_basic_failure_day_not_marked(tmp_path, monkeypatch) -> None:
+    """provider 抛异常的交易日不得进 checkpoint，重跑自动重试。"""
+    _prep_lake_5days(tmp_path, monkeypatch)
+    try:
+        from lquant.data.ingest import daily_basic as mod
+        from lquant.data.providers import get_provider
+
+        fake = _FlakyBasicProvider({date(2026, 8, 5)}, set())
+
+        class _Chain:
+            providers = [fake]
+
+        monkeypatch.setattr("lquant.data.providers.get_provider",
+                            lambda *a, **k: _Chain())
+        out = mod.backfill_daily_basic(start="2026-08-03", end="2026-08-07",
+                                       merge=False)
+        assert out["fetched_days"] == 4  # 失败日不计入
+        from lquant.data.ingest.checkpoint import Checkpoint
+
+        cp = Checkpoint("daily_basic")
+        assert cp.done == {"2026-08-03", "2026-08-04", "2026-08-06",
+                           "2026-08-07"}
+    finally:
+        from lquant.core.config import get_settings
+
+        get_settings.cache_clear()
+
+
+def test_daily_basic_empty_day_not_marked(tmp_path, monkeypatch) -> None:
+    """空返回的交易日也不标 done：无法区分「源确认无数据」与「拉取失败」。"""
+    _prep_lake_5days(tmp_path, monkeypatch)
+    try:
+        from lquant.data.ingest import daily_basic as mod
+        from lquant.data.providers import get_provider
+
+        fake = _FlakyBasicProvider(set(), {date(2026, 8, 5)})
+
+        class _Chain:
+            providers = [fake]
+
+        monkeypatch.setattr("lquant.data.providers.get_provider",
+                            lambda *a, **k: _Chain())
+        mod.backfill_daily_basic(start="2026-08-03", end="2026-08-07",
+                                 merge=False)
+        from lquant.data.ingest.checkpoint import Checkpoint
+
+        cp = Checkpoint("daily_basic")
+        assert "2026-08-05" not in cp.done
+    finally:
+        from lquant.core.config import get_settings
+
+        get_settings.cache_clear()
