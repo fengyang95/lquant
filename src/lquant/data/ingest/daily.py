@@ -209,6 +209,11 @@ def _notify(cb: ProgressFn | None, frame: dict) -> None:
         logger.warning(f"on_progress 回调异常（忽略）: {e}")
 
 
+def _window_cp_name(start_d: date, end_d: date, full: bool) -> str:
+    """断点名纳入请求窗口与池型——不同窗口不共享断点(防静默 done 0)。"""
+    return f"daily:{start_d.isoformat()}:{end_d.isoformat()}:full={full}"
+
+
 def backfill_daily(
     full: bool = False,
     start: str = "2016-01-01",
@@ -237,7 +242,8 @@ def backfill_daily(
 
     batch = s.ingest_concurrency or concurrency
     pool = [(sym, end_d) for sym in symbols]
-    result = backfill_pool(pool, start_d, end=end_d, batch_size=batch)
+    result = backfill_pool(pool, start_d, end=end_d, batch_size=batch,
+                           cp_name=_window_cp_name(start_d, end_d, full))
     return result["done"]
 
 
