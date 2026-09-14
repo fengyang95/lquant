@@ -20,14 +20,46 @@ from datetime import date as _date
 
 import polars as pl
 
-# JQ 表名 → financial_pit 的 item 前缀（BaoStock kind）
+# JQ 表名 → financial_pit 的 item 前缀（tushare 原生表名）。
+# 实际落库前缀：income / balancesheet / cashflow / indicator
+# （profit/balance/growth/operation 旧 BaoStock 前缀在全库为 0 行）。
 _KIND_PREFIX = {
-    "income": "profit",
-    "balance": "balance",
+    "income": "income",
+    "balance": "balancesheet",
     "cashflow": "cashflow",
     "indicator": "indicator",
     "growth": "growth",
     "operation": "operation",
+}
+
+# 兼容历史落库前缀：查数时额外带上旧前缀，老数据不丢。
+_LEGACY_PREFIX = {"income": "profit", "balance": "balance"}
+
+# JQ 财务字段名 → tushare 尾段（item = "<prefix>.<tushare列名>"）。
+# 未列出的表（cashflow/growth/operation）暂不做字段白名单校验。
+FIELD_MAP: dict[str, dict[str, str]] = {
+    "income": {
+        "net_profit": "n_income_attr_p",
+        "nparent_netprofit": "n_income_attr_p",
+        "total_operating_revenue": "total_revenue",
+        "operating_profit": "operate_profit",
+        "total_operating_cost": "total_cogs",
+        "total_profit": "total_profit",
+    },
+    "balance": {
+        "total_assets": "total_assets",
+        "total_liability": "total_liab",
+        "total_owner_equities": "total_hldr_eqy_exc_min_int",
+        "equities_parent_company_owners": "total_hldr_eqy_exc_min_int",
+    },
+    "indicator": {
+        "roe": "roe",
+        "roa": "roa_yearly",
+        "gross_income_ratio": "gross_margin",
+        "net_profit_margin": "netprofit_margin",
+        "adjusted_profit": "op_income",
+        "net_profit_growth_rate": "netprofit_yoy",
+    },
 }
 
 # JQ valuation 字段 → 日线列
@@ -145,7 +177,9 @@ def _financial_frame(items: dict[Column, str], symbols: list[str] | None,
 
     if not items:
         return {}
-    prefixes = sorted({_KIND_PREFIX[c.table] for c in items})
+    prefixes = sorted({_KIND_PREFIX[c.table] for c in items}
+                      | {_LEGACY_PREFIX[c.table] for c in items
+                         if c.table in _LEGACY_PREFIX})
     conds = ["pub_date <= ?",
              "(" + " OR ".join("item LIKE ?" for _ in prefixes) + ")"]
     params: list = [day, *[f"{p}.%" for p in prefixes]]
@@ -163,9 +197,17 @@ def _financial_frame(items: dict[Column, str], symbols: list[str] | None,
         key = (sym, item)
         if key not in best or (stat_d, pub_d) >= best[key][:2]:
             best[key] = (stat_d, pub_d, value)
-    # 归一化匹配：item 尾段（BaoStock 列名，多为 camelCase）↔ JQ snake_case 名。
-    # 键带表前缀：income 与 cashflow 的同名尾段不互相污染。
-    norm_items = {(_KIND_PREFIX[c.table], _norm(c.name)): c for c in items}
+    # 归一化匹配：item 尾段（tushare 列名或历史 camelCase）↔ JQ 字段名。
+    # 匹配顺序：1) FIELD_MAP（JQ 名 → tushare 尾段）；2) _norm 直配（tushare
+    # 原生名直查）。键带表前缀（含 legacy 前缀）：income 与 cashflow 的同名
+    # 尾段不互相污染。
+    norm_items: dict[tuple[str, str], Column] = {}
+    for c in items:
+        for p in ({_KIND_PREFIX[c.table], _LEGACY_PREFIX.get(c.table)}
+                  - {None}):
+            norm_items[(p, _norm(c.name))] = c
+            for tail in FIELD_MAP.get(c.table, {}).values():
+                norm_items[(p, _norm(tail))] = c
     out: dict[Column, dict[str, tuple]] = {c: {} for c in items}
     for (sym, item), (stat_d, _pub_d, value) in best.items():
         prefix, tail = item.split(".", 1)
@@ -248,9 +290,18 @@ def resolve(q: Query, day: _date) -> pl.DataFrame:
             fin_cols.append(c)
 
     for c in fin_cols:
-        prefix = _KIND_PREFIX.get(c.table)
-        if prefix is None or c.name == "code":
-            raise ValueError(f"{c.table}.{c.name} 未支持")
+        if c.table not in _KIND_PREFIX:
+            raise ValueError(f"表 {c.table} 未支持，可用：{sorted(_KIND_PREFIX)}")
+        if c.name == "code":
+            continue
+        fmap = FIELD_MAP.get(c.table)
+        if fmap is not None:
+            allowed = ({_norm(k) for k in fmap}
+                       | {_norm(v) for v in fmap.values()})
+            if _norm(c.name) not in allowed:
+                raise ValueError(f"未知字段 {c.table}.{c.name}，可用："
+                                 f"{sorted(fmap)} 或 tushare 原生列名"
+                                 f"{sorted(set(fmap.values()))}")
     fin_items = {c: f"{_KIND_PREFIX[c.table]}.{c.name}" for c in fin_cols}
 
     fin_cache = _financial_frame(fin_items, symbols, day)
