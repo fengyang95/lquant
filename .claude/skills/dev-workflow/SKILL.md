@@ -58,6 +58,15 @@ cargo test --workspace  # 若改了 crates/ 下 Rust 代码（在 crates/ 目录
 循环执行（每轮之间 sleep 60~120s 或 ScheduleWakeup 轮询）：
 
 1. **CI**：`gh pr checks <PR号>`。有失败 → 读日志（`gh run view --log-failed`）→ 本地复现修复 → commit + push → 回到步骤 1。
+   - **账单不足导致 CI 未启动**（job 秒挂、日志出现 "recent account payments have failed or your spending limit needs to be increased"，属于基础设施问题而非代码问题）：不要反复重试 push。改为**本地等价复跑 CI 脚本**验证，全绿即视为 CI 通过，继续走合入流程（`gh pr merge --squash --auto` 或直接 merge，视分支保护而定）：
+     ```bash
+     # 等价于 CI 的四个 job（按需跑：只跑与本次改动相关的；在仓库根执行）
+     uvx ruff@0.16.7 check src tests               # Lint (ruff)
+     make test                                     # Python (pytest)（改了 crates/ 还要先 make rust-build）
+     cd crates && cargo test --workspace --no-default-features && cd ..  # Rust
+     cd web && npm run typecheck && npm run test && cd ..                # Web
+     ```
+     本地复跑结果记入 PR 评论（如 `gh pr comment <PR号> --body "CI 因 GitHub Actions 账单问题未启动，已本地等价复跑：lint/pytest/cargo test 全绿"`），供追溯。
 2. **Review 意见**：`gh pr view <PR号> --json reviews,comments` 及
    `gh api repos/{owner}/{repo}/pulls/<PR号>/comments`。逐条处理：
    - 意见合理 → 修改代码、回复说明、push。
