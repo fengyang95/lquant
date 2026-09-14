@@ -108,10 +108,11 @@ financial_pit 中与"同比/yoy"相关的 DISTINCT item:['indicator.cfps_yoy', '
 | G3 | 切片预热伪影:策略要求 60 个交易日历史 bar,只喂 2024 单年时 2024-01~04 调仓日 `tradable` 为空 → 前 4 个月 0 持仓 | 回测正确性(脚本参数) | 实跑持仓数表 2024-01-02~2024-04-01 均为 0;`--start 2023-10` 喂长预热即消失 | P2(脚本默认预热区间,或 G2 回填后自然消除) | 否(已定性为伪影非策略缺陷) |
 | G4 | keep 带漂移:top 20 外但 top 50 内的持仓只卖不调权,单票权重偏离 1/20,实际持仓 19–21 漂移;属策略语义而非引擎缺口,但大样本上"目标 top20、实际 >20" | 回测正确性(策略语义确认) | `tests/unit/test_baseline_strategy.py::test_baseline_monthly_topn_exit_rule` + 实跑持仓数表(见上) | P2(裁定策略语义:保留或补再平衡) | 否(已量化并记录) |
 | G5 | `attribute_history` 窗口按自然日序数截取、缺 bar 日不补行:停牌次日仅 59 行 → 被 MIN_LISTED_DAYS 误剔;与聚宽 skip_paused"跳过但窗口按交易日推"口径不同;另"上市满 60 日"用 60 根 bar 近似,长期停牌老股被保守误剔 | 兼容面 | `tests/unit/test_baseline_strategy.py::test_baseline_excludes_halted` 手算口径(09-01 仍剔除、10-01 买入) | P1 | 否(保守方向偏差) |
-| G6 | `get_fundamentals` 的 date 参数未钳制到当前交易日,存在前视口子(聚宽原生语义同此) | 回测正确性 | Task 1 review deferred;沙箱内以未来日期调用即可复现 | P2 | 否(基准策略仅用当日固定日期) |
+| G6 | `get_fundamentals` 的 date 参数未钳制到当前交易日,存在前视口子(聚宽原生语义同此)。**已在 P0 修复**:显式 date 钳制 `min(date, 当日)` | 回测正确性 | `tests/unit/test_jq_fundamentals_wiring.py::test_future_date_param_clamped_to_trade_day` | 已闭环 | 否 |
 | G7 | BaoStock `growth.YOYNI` item 不存在(growth 前缀 0 行),实际同比 item 为 tushare `indicator.netprofit_yoy`;曾致策略取数表错误 | 数据层 | financial_pit `SELECT DISTINCT item ... LIKE '%yoy%'`(preflight 已打印);已回填常量并同步单测 | 已闭环 | 否 |
 | G8 | T+1 语义口径裁定:计划文本"信号日下单次日开盘成交"与引擎/聚宽口径(当日开盘撮合 + T+1 可卖 `sellable_after_days`)冲突,按引擎/聚宽口径执行;若裁定错误需重审撮合时点 | 回测正确性 | `tests/unit/test_baseline_strategy.py::test_baseline_t_plus_one_fill` | P2(复核撮合时点口径) | 否 |
 | G9 | jq_shim 模块级 `_STATE` + 全局上下文绑定,同进程多 runner 并发会互相污染(当前无此用法) | 回测正确性(工程健壮性) | Task 1 review deferred;同进程构造两个 JQRunner 交替 run 可复现 | P2 | 否 |
+| G10 | NaN 因子穿透评分:沙箱纯 Python 版 `or 0.0` 与 polars 版 `fill_null` 均接不住真实 NaN,一个 NaN 污染全截面 z 分数,NaN 行降序排第一先入池。**已在 P0 修复**(纯 Python `isnan` 归零;polars `fill_nan(0.0)` 后合成) | 回测正确性 | `tests/unit/test_baseline_strategy.py::test_composite_score_real_nan_never_ranks_first` / `::test_sandbox_score_real_nan_isolated_and_deterministic` | 已闭环 | 否(曾阻塞,已修) |
 
 ## 人工补注
 
