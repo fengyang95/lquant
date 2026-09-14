@@ -28,15 +28,18 @@ _KIND_PREFIX = {
     "balance": "balancesheet",
     "cashflow": "cashflow",
     "indicator": "indicator",
-    "growth": "growth",
-    "operation": "operation",
+    # growth/operation 在 financial_pit 无独立前缀行（全库 0 行），真实数据
+    # 落在 indicator 前缀下：同比类（*_yoy）与周转类（*_turn）尾段。
+    "growth": "indicator",
+    "operation": "indicator",
 }
 
 # 兼容历史落库前缀：查数时额外带上旧前缀，老数据不丢。
 _LEGACY_PREFIX = {"income": "profit", "balance": "balance"}
 
 # JQ 财务字段名 → tushare 尾段（item = "<prefix>.<tushare列名>"）。
-# 未列出的表（cashflow/growth/operation）暂不做字段白名单校验。
+# 六张表全部走白名单校验；growth/operation 借 indicator 前缀的数据。
+# 尾段经真实库 DISTINCT 勘察确认（2026-09-14）。
 FIELD_MAP: dict[str, dict[str, str]] = {
     "income": {
         "net_profit": "n_income_attr_p",
@@ -67,6 +70,23 @@ FIELD_MAP: dict[str, dict[str, str]] = {
         "net_increase_cash": "n_incr_cash_cash_equ",
         "cash_end_period": "c_cash_equ_end_period",
         "free_cashflow": "free_cashflow",
+    },
+    # JQ growth 表：同比增速字段 → indicator.<*_yoy> 尾段。
+    # 或有备选：inc_net_profit_annual_year_on_year → dt_netprofit_yoy。
+    "growth": {
+        "inc_revenue_year_on_year": "or_yoy",
+        "inc_net_profit_year_on_year": "netprofit_yoy",
+        "inc_net_profit_annual_year_on_year": "dt_netprofit_yoy",
+        "inc_operating_profit_year_on_year": "op_yoy",
+        "inc_total_profit_year_on_year": "ebt_yoy",
+        "inc_total_assets_year_on_year": "assets_yoy",
+    },
+    # JQ operation 表：营运能力字段 → indicator.<*_turn> 尾段。
+    "operation": {
+        "total_asset_turnover_rate": "assets_turn",
+        "accounts_receivables_turnover_rate": "ar_turn",
+        "current_asset_turnover_rate": "ca_turn",
+        "fixed_asset_turnover_rate": "fa_turn",
     },
 }
 
@@ -302,16 +322,12 @@ def resolve(q: Query, day: _date) -> pl.DataFrame:
             raise ValueError(f"表 {c.table} 未支持，可用：{sorted(_KIND_PREFIX)}")
         if c.name == "code":
             continue
-        fmap = FIELD_MAP.get(c.table)
-        # growth/operation 尚无映射：暂留 permissive（Task 2 扩 FIELD_MAP 时
-        # 收紧为白名单），避免本任务把这两个表全部字段变成报错。
-        if fmap is not None:
-            allowed = ({_norm(k) for k in fmap}
-                       | {_norm(v) for v in fmap.values()})
-            if _norm(c.name) not in allowed:
-                raise ValueError(f"未知字段 {c.table}.{c.name}，可用："
-                                 f"{sorted(fmap)} 或 tushare 原生列名"
-                                 f"{sorted(set(fmap.values()))}")
+        fmap = FIELD_MAP.get(c.table, {})
+        allowed = {_norm(k) for k in fmap} | {_norm(v) for v in fmap.values()}
+        if _norm(c.name) not in allowed:
+            raise ValueError(f"未知字段 {c.table}.{c.name}，可用："
+                             f"{sorted(fmap)} 或 tushare 原生列名"
+                             f"{sorted(set(fmap.values()))}")
     fin_items = {c: f"{_KIND_PREFIX[c.table]}.{c.name}" for c in fin_cols}
 
     fin_cache = _financial_frame(fin_items, symbols, day)
