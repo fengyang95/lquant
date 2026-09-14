@@ -25,6 +25,71 @@ export type Provider = {
   note: string | null;
 };
 
+/** 数据版本（GET /data/version/latest、/data/versions） */
+export type DataVersion = {
+  dataset: string;
+  version: string;
+  created_at: string;
+};
+
+/** 质量问题历史（GET /data/issues）—— rule 级聚合 + 原始 issue 两用 */
+export type DataIssue = {
+  id: number | string;
+  rule_code: string;
+  dataset: string;
+  severity: string; // fatal/error/warn/info
+  message: string;
+  /** 后端 JSON 明细，结构随 rule 而异 */
+  detail: Record<string, unknown> | null;
+  resolved: boolean;
+  created_at: string;
+};
+
+/** 同步作业（GET /sync/jobs）—— lquant.sync.manager */
+export type SyncJob = {
+  sync_id: string;
+  name: string;
+  kind: string; // collect | daily | adj_factor
+  schedule_time: string;
+  weekdays: string;
+  params: Record<string, unknown>;
+  enabled: boolean;
+  last_run?: {
+    status: string | null;
+    finished_at: string | null;
+    rows: number | null;
+  } | null;
+};
+
+/** 运行历史（GET /sync/history） */
+export type SyncRunRecord = {
+  sync_id: string;
+  name?: string | null;
+  kind: string;
+  status: string; // ok/partial/failed/running
+  started_at: string | null;
+  finished_at: string | null;
+  rows: number | null;
+  error: string | null;
+};
+
+/** 数据清理（POST /data/purge） */
+export type PurgeResult = {
+  dry_run: boolean;
+  scope?: string;
+  rows_matched: number;
+  files_scanned?: number;
+  files?: { file: string; rows_matched: number }[];
+};
+
+/** 数据字典（GET /data/dictionary） */
+export type DictionaryTable = {
+  table: string;
+  description: string;
+  fields: { name: string; type: string; description: string }[];
+};
+export type Dictionary = { tables: DictionaryTable[] };
+
 /** 配置项（GET /settings，封套） */
 export type Setting = {
   key: string;

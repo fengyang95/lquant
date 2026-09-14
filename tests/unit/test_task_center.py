@@ -328,14 +328,19 @@ def test_failed_data_task_surfaces_error_in_list(client, monkeypatch):
     assert "模拟崩溃" in (hit["error"] or "")
 
 
-def test_cancel_data_task_id_404(client):
-    """cancel 只作用于队列任务：data 任务 id 不在 job 注册表 → 404。"""
+def test_cancel_finished_data_task_409(client):
+    """data 任务已结束（ok）→ 409 不可取消（不再是不分种类的 404）。"""
     _clear_active_tasks()
     r = client.post("/api/data/tasks", json={"kind": "daily_update",
                                              "params": {"days": 1}})
     tid = r.json()["task_id"]
+    from lquant.core.db import writer
+
+    with writer() as con:  # 显式落 ok 终态，避免 stub 线程完成时机竞态
+        con.execute("UPDATE data_task SET status='ok', finished_at=now() "
+                    "WHERE task_id=?", [tid])
     rr = client.post(f"/api/tasks/data/{tid}/cancel")
-    assert rr.status_code == 404
+    assert rr.status_code == 409
 
 
 def test_summary_counts_canceled(client):

@@ -33,6 +33,8 @@ SETTING_DEFS: dict[str, SettingDef] = {
     "crosscheck_peers": SettingDef(default=(), ty="list", label="对拍 peer 源（跨源印证）"),
     "agent.provider": SettingDef(
         default="mock", ty="str", label="问 AI 后端 provider（mock / claude_code 等）"),
+    "coverage_drop_warn_pct": SettingDef(
+        default=30, ty="int", label="覆盖度环比下降告警阈值（%，前端标橙线）"),
 }
 
 

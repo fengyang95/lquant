@@ -131,9 +131,19 @@ def coverage_monthly(
 
     口径：avg_symbols = 当月各交易日 distinct symbol 数的算术平均，
     days = 当月有数据的交易日数。「应有标的数」无可靠 PIT 来源
-    （security 是当前快照），不做对比 —— 缺口由前端按环比大幅下降
-    （如 >30%）标橙，阈值归前端定。空湖返回空数组不报错。
+    （security 是当前快照），不做对比 —— 缺口由前端按环比大幅下降标橙，
+    告警阈值 coverage_drop_warn_pct 走 settings（响应附 threshold 字段，
+    前端不再硬编码 30）。空湖返回空数组不报错。
     """
+    from lquant.core.settings_store import SettingsStore
+
+    def _threshold() -> int:
+        for item in SettingsStore().all():
+            if item["key"] == "coverage_drop_warn_pct":
+                return int(item["value"])
+        return 30
+
+    threshold = _threshold()
     from datetime import date as _date
 
     for name, val in (("start", start), ("end", end)):
@@ -156,14 +166,14 @@ def coverage_monthly(
             .sort("month"))
         rows = [{"month": r["month"], "avg_symbols": round(r["avg_symbols"], 1),
                  "days": int(r["days"])} for r in monthly.collect().to_dicts()]
-        return {"rows": rows}
+        return {"rows": rows, "threshold": threshold}
     except HTTPException:
         raise
     except Exception as e:  # noqa: BLE001 - 湖读取异常降级为空，不打断首屏
         from loguru import logger
 
         logger.warning(f"coverage monthly 聚合失败: {e}")
-        return {"rows": []}
+        return {"rows": [], "threshold": threshold}
 
 
 @router.get("/securities")
@@ -355,7 +365,9 @@ def create_data_task(req: TaskIn) -> dict:
         raise HTTPException(409, str(e)) from e
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
-    enqueue("lquant-ingest", ingest_tasks.execute_task, task["task_id"])
+    # job_id = task_id：任务中心 cancel 靠它找到队列里的取消目标
+    enqueue("lquant-ingest", ingest_tasks.execute_task, task["task_id"],
+            job_id=task["task_id"])
     return {"task_id": task["task_id"]}
 
 
@@ -396,7 +408,8 @@ def retry_data_task(task_id: str) -> dict:
         raise HTTPException(409, str(e)) from e
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
-    enqueue("lquant-ingest", ingest_tasks.run_claimed_task, task_id)
+    enqueue("lquant-ingest", ingest_tasks.run_claimed_task, task_id,
+            job_id=task_id)
     return {"task_id": task_id}
 
 
@@ -523,10 +536,13 @@ def crosscheck_issues(
     limit: int = Query(default=200, ge=1, le=1000),
     resolved: bool = False,
 ) -> list[dict]:
-    """质量问题检索（data_quality_issue，默认未解决）。"""
-    from lquant.data.quality.issues import latest_issues
+    """质量问题检索（data_quality_issue，默认未解决）。
 
-    return latest_issues(limit=limit, resolved=resolved)
+    与 /data/issues 共用 query_issues 检索口径（无 severity/dataset 过滤）。
+    """
+    from lquant.data.quality.issues import query_issues
+
+    return query_issues(limit=limit, resolved=resolved)
 
 
 @router.post("/crosscheck/issues/resolve")

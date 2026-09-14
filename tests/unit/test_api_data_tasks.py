@@ -320,7 +320,7 @@ def test_coverage_monthly_empty_lake(tmp_path, monkeypatch):
     try:
         from lquant.server.api.data import coverage_monthly
 
-        assert coverage_monthly() == {"rows": []}
+        assert coverage_monthly() == {"rows": [], "threshold": 30}
     finally:
         get_settings.cache_clear()
 

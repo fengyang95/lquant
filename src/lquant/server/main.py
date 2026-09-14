@@ -12,6 +12,7 @@ from lquant.server.api import (
     ask,
     backtests,
     data,
+    data_admin,
     etf,
     factors,
     health,
@@ -35,7 +36,7 @@ def create_app() -> FastAPI:
         allow_origins=["http://localhost:3000"],
         allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
     )
-    for r in (health, data, factors, backtests, market, paper, watchlist,
+    for r in (health, data, data_admin, factors, backtests, market, paper, watchlist,
               strategies, analyses, sync, etf, news, settings, ask,
               task_center, monitor):
         app.include_router(r.router, prefix="/api")

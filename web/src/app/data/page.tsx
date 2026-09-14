@@ -12,6 +12,11 @@ import CrosscheckPanel from './CrosscheckPanel';
 import QualityPanel from './QualityPanel';
 import CheckpointPanel from './CheckpointPanel';
 import CoverageMonthlyChart from './CoverageMonthlyChart';
+import IssuesPanel from './IssuesPanel';
+import SyncJobsPanel from './SyncJobsPanel';
+import DataVersionCard from './DataVersionCard';
+import PurgeModal from './PurgeModal';
+import DataDictionaryModal from './DataDictionaryModal';
 
 type Cover = {
   tables: { table: string; label: string; rows: number | null; latest: string | null; error?: boolean }[];
@@ -45,6 +50,13 @@ export default function DataPage() {
   }, []);
   const [busy, setBusy] = useState<'' | 'demo' | 'live' | 'ref'>('');
   const [msg, setMsg] = useState('');
+  const [showPurge, setShowPurge] = useState(false);
+  const [showDict, setShowDict] = useState(false);
+
+  /** 导出日线 CSV：拼 URL 新窗口下载（GET /data/export 返回文件流） */
+  function exportCsv() {
+    window.open('/api/data/export?dataset=daily&format=csv', '_blank');
+  }
 
   async function syncReference() {
     setBusy('ref');
@@ -93,6 +105,7 @@ export default function DataPage() {
         sub={`数据湖与采集表覆盖度 · 共 ${totalRows.toLocaleString()} 行`}
         actions={
           <>
+            <button onClick={() => setShowDict(true)} className="btn">数据字典</button>
             <button onClick={syncReference} disabled={busy !== ''} className="btn">
               {busy === 'ref' ? '同步中…' : '同步全市场清单（含退市）'}
             </button>
@@ -107,14 +120,27 @@ export default function DataPage() {
       />
       <Msg text={msg} />
 
+      <DataVersionCard />
+
       {/* 日线数据补全：任务进度 / 断点续传 / 数据源配置 / 跨源印证 / 全湖质量检查 */}
       <TasksPanel />
       <CheckpointPanel />
       <SourceConfigPanel />
       <CrosscheckPanel />
       <QualityPanel />
+      <IssuesPanel />
+      <SyncJobsPanel />
 
-      <Panel title="日线数据湖" meta="Parquet">
+      <Panel
+        title="日线数据湖"
+        meta="Parquet"
+        actions={
+          <>
+            <button onClick={exportCsv} className="btn btn-sm">导出 CSV</button>
+            <button onClick={() => setShowPurge(true)} className="btn btn-sm">数据清理</button>
+          </>
+        }
+      >
         {lake?.rows ? (
           <div className="grid grid-cols-2 gap-y-4 divide-line sm:grid-cols-4 sm:divide-x">
             <div className="sm:pr-4">
@@ -195,6 +221,18 @@ export default function DataPage() {
         盘后看板数据由调度器自动采集，也可用右上角按钮手动触发；
         历史分钟线/财务批量补数走 CLI（<code className="bg-paper px-1">lq data --help</code>）。
       </div>
+
+      {showPurge && (
+        <PurgeModal
+          onClose={() => setShowPurge(false)}
+          onPurged={(r) => {
+            setShowPurge(false);
+            setMsg(`✓ 已删除 ${r.rows_matched.toLocaleString()} 行${r.files?.length ? `（${r.files.length} 个文件）` : ''}，重新回填后恢复`);
+            mutate();
+          }}
+        />
+      )}
+      {showDict && <DataDictionaryModal onClose={() => setShowDict(false)} />}
     </div>
   );
 }

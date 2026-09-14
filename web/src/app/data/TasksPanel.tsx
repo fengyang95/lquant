@@ -56,6 +56,22 @@ export default function TasksPanel() {
     }
   }
 
+  async function cancel(taskId: string) {
+    setBusy(taskId);
+    setMsg('');
+    try {
+      await post<{ canceled: boolean }>(`/tasks/data/${taskId}/cancel`, {});
+      setMsg(`✓ 已请求取消（${taskId.slice(0, 8)}…），任务将在下一个协作点退出`);
+      void mutate();
+    } catch (e) {
+      // 409 = 任务已结束，属可忽略的竞态
+      const m = e instanceof Error ? e.message : String(e);
+      setMsg(m.includes('409') || m.includes('已结束') ? `任务已结束，无需取消（${taskId.slice(0, 8)}…）` : `✗ ${m}`);
+    } finally {
+      setBusy('');
+    }
+  }
+
   return (
     <Panel
       title="数据任务"
@@ -84,6 +100,8 @@ export default function TasksPanel() {
               onToggle={() => setExpanded(expanded === t.task_id ? null : t.task_id)}
               onRetry={() => retry(t.task_id)}
               retrying={retrying === t.task_id}
+              onCancel={() => cancel(t.task_id)}
+              canceling={busy === t.task_id}
             />
           ))}
         </div>
@@ -102,13 +120,16 @@ export default function TasksPanel() {
   );
 }
 
-function TaskRow({ task, expanded, onToggle, onRetry, retrying }: {
+function TaskRow({ task, expanded, onToggle, onRetry, retrying, onCancel, canceling }: {
   task: DataTask;
   expanded: boolean;
   onToggle: () => void;
   onRetry: () => void;
   retrying: boolean;
+  onCancel: () => void;
+  canceling: boolean;
 }) {
+  const cancellable = task.status === 'running' || task.status === 'pending';
   const total = task.total_symbols ?? 0;
   const done = task.done_symbols ?? 0;
   const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
@@ -138,6 +159,16 @@ function TaskRow({ task, expanded, onToggle, onRetry, retrying }: {
         <div className="ml-auto flex items-center gap-3 text-xs tabular-nums text-ink-dim">
           <span>{(task.rows_written ?? 0).toLocaleString()} 行</span>
           <span>{taskElapsed(task.started_at, task.finished_at)}</span>
+          {cancellable && (
+            <button
+              className="btn btn-sm"
+              onClick={onCancel}
+              disabled={canceling}
+              aria-label={`取消任务 ${task.task_id.slice(0, 8)}`}
+            >
+              {canceling ? '取消中…' : '取消'}
+            </button>
+          )}
         </div>
       </div>
       {(total > 0 || task.status === 'running') && (

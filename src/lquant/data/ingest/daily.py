@@ -42,6 +42,7 @@ def backfill_pool(
     provider=None,
     batch_size: int = BATCH,
     cp_name: str = _CP_NAME,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict:
     """逐批流式回填日线池。
 
@@ -56,6 +57,8 @@ def backfill_pool(
         batch_size: 每批标的数
         cp_name: checkpoint 名（默认 "daily" 哨兵池；任务执行器传 f"daily:{task_id}"
             隔离记账，避免旧 daily cp 被任务跑满导致每日增量空转）
+        cancel_check: 协作式取消探针 —— 每批开始前轮询，返回 True 提前收尾。
+            None = 不取消（默认，旧调用方零改动）。
 
     Returns:
         {"done": int, "failed": [{"symbol","reason"}...], "rows": int,
@@ -68,7 +71,8 @@ def backfill_pool(
     todo = [(s, e) for s, e in pool if s not in cp.done]
     total = len(todo)
     if not todo:
-        return {"done": 0, "failed": [], "rows": 0, "early_stopped": False}
+        return {"done": 0, "failed": [], "rows": 0, "early_stopped": False,
+                "canceled": False}
     # 空跑不覆盖 meta（end=None 时避免抹掉上次记录）
     cp.set_meta(start=str(start), end=str(end) if end else None)
 
@@ -83,8 +87,12 @@ def backfill_pool(
     failed: list[dict] = []
     consecutive_full_failures = 0
     stopped = False
+    canceled = False
 
     for i in range(0, total, batch_size):
+        if cancel_check is not None and cancel_check():
+            canceled = True
+            break
         chunk = todo[i : i + batch_size]
         batch_failed: dict[str, str] = {}
         batch_rows = 0
@@ -144,6 +152,7 @@ def backfill_pool(
         "failed": failed,
         "rows": rows,
         "early_stopped": stopped,
+        "canceled": canceled,
     }
 
 
