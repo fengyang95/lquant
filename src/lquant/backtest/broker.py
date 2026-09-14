@@ -72,8 +72,8 @@ class Broker:
             order.reason = "无撮合规则"
             return None
 
-        # 涨跌停不可成交
-        limit = r.price_limit.values.get("main", 0.10)
+        # 涨跌停不可成交（走 PriceLimit 规则：ST 5%，板块值 gem/star/bse 生效）
+        limit = r.price_limit.for_symbol(r.symbol, r.symbol.board, is_st=r.is_st)
         if bar.halted:
             order.status = OrderStatus.REJECTED
             order.reason = "停牌"

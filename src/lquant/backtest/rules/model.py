@@ -59,6 +59,7 @@ class InstrumentRules:
     price_limit: PriceLimit
     lot_size: int
     sellable_after_days: int      # T+0 for QDII/黄金/债券/货币 ETF
+    is_st: bool = False           # 涨跌停 5% 判定依据（PriceLimit.for_symbol）
 
     def tax_rate(self, d: date) -> float:
         return self.tax.rate_at(d)
@@ -108,4 +109,5 @@ class RuleSet:
                                        if isinstance(v, (int, float))}),
             lot_size=base.get("lot_size", 100),
             sellable_after_days=int(t_plus),
+            is_st=is_st,
         )
