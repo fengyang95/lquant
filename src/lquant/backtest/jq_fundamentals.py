@@ -19,9 +19,12 @@ def make_get_fundamentals():
     from lquant.research.dialect import jq_shim
 
     def get_fundamentals(query, date=None):
-        day = date if date is not None else _STATE["day"]
+        day = _STATE["day"]
         if day is None:
             raise RuntimeError("get_fundamentals: 沙箱未绑定当前交易日")
+        if date is not None:
+            # G6:显式 date 钳制到当前交易日,策略传未来日期也绝不能看到未来披露
+            day = min(date, day)
         jq_shim.bind(jq_shim.JQContext(engine=None, trade_date=day,
                                        universe=list(_STATE["universe"])))
         return jq_shim.get_fundamentals(query, date=day)

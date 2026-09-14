@@ -174,3 +174,64 @@ def test_future_pub_date_never_leaks_into_sandbox(tmp_catalog, tmp_path, monkeyp
     assert res.error is None
     seen = {v for _, v in res.records.get("net_profit", [])}
     assert seen == {42.0}            # 只见已公告行；未来公告的 999.0 绝不可见
+
+
+G6_CODE = '''
+import datetime
+
+def initialize(context):
+    run_monthly(pick, time="open")
+
+def pick(context):
+    today = context.current_dt.date()
+    future = today + datetime.timedelta(days=30)
+    df_today = get_fundamentals(query(income.net_profit), date=today)
+    df_future = get_fundamentals(query(income.net_profit), date=future)
+    record(today_rows=len(df_today))
+    record(future_rows=len(df_future))
+'''
+
+
+def test_future_date_param_clamped_to_trade_day(tmp_catalog, tmp_path, monkeypatch):
+    """G6 判别:沙箱内显式传未来 date,结果必须与当日一致(未来披露行不可见)。
+
+    若不钳制,date=当日+30 会让 pub_date 在 (当日, 当日+30] 的披露行漏进来,
+    future_rows 会多出 999.0 那一行。
+    """
+    bars = pl.DataFrame({
+        "symbol": ["600000.SH"] * 6,
+        "trade_date": [date.fromordinal(date(2026, 1, 5).toordinal() + i)
+                       for i in range(6)],
+        "open": [100.0] * 6,
+        "high": [101.0] * 6,
+        "low": [99.0] * 6,
+        "close": [100.0] * 6,
+        "volume": [1e8] * 6,
+        "amount": [1e10] * 6,
+        "adj_factor": [1.0] * 6,
+        "pe_ttm": [30.0] * 6,
+        "pb_mrq": [5.0] * 6,
+        "total_mv": [1e10] * 6,
+        "float_mv": [8e9] * 6,
+    })
+    root = tmp_path / "data" / "daily" / "year=2026"
+    root.mkdir(parents=True)
+    bars.write_parquet(root / "part-0.parquet")
+    monkeypatch.setattr("lquant.data.store.parquet._root", lambda: tmp_path / "data")
+
+    _seed_financial([
+        {"symbol": "600000.SH", "stat_date": date(2025, 12, 31),
+         "pub_date": date(2026, 1, 4), "report_type": "2025Q4",
+         "item": "profit.netProfit", "value": 42.0},
+        {"symbol": "600000.SH", "stat_date": date(2026, 1, 31),
+         "pub_date": date(2026, 1, 10), "report_type": "2026Q1",
+         "item": "profit.netProfit", "value": 999.0},   # pub_date > 全部交易日
+    ])
+
+    from lquant.backtest.jqapi import JQRunner
+
+    res = JQRunner(G6_CODE, initial_cash=1_000_000).run(_make_df())
+    assert res.error is None
+    assert res.records["today_rows"] == [(date(2026, 1, 5), 1)]
+    # 传未来 date 被钳到当日 → 与当日结果完全一致,2026Q1 的 999.0 不可见
+    assert res.records["future_rows"] == [(date(2026, 1, 5), 1)]
