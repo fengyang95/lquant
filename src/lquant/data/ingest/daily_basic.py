@@ -180,15 +180,15 @@ def merge_daily_basic(start: date | str, end: date | str) -> dict:
         dp, _bp = _daily_path(year), _daily_basic_path(year)
         if not dp.exists():
             continue
-        daily = pl.read_parquet(dp)
-        basic_y = basic.filter(pl.col("trade_date").dt.year() == year)
-        merged, filled = coalesce_daily_basic(daily, basic_y)
-        if not merged.height:
-            continue
-        merged = merged.sort(["symbol", "trade_date"])
         from lquant.data.store.parquet import _atomic_write_parquet, _file_lock
 
         with _file_lock(dp):
+            daily = pl.read_parquet(dp)
+            basic_y = basic.filter(pl.col("trade_date").dt.year() == year)
+            merged, filled = coalesce_daily_basic(daily, basic_y)
+            if not merged.height:
+                continue
+            merged = merged.sort(["symbol", "trade_date"])
             _atomic_write_parquet(merged, dp)
         years.append(year)
         for c, n in filled.items():

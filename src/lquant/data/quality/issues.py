@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -34,10 +35,20 @@ class Issue:
     extra: dict = field(default_factory=dict)
 
     def to_row(self, data_version: str | None) -> dict:
-        # 内容指纹：同一问题（同规则/标的/日期/描述）重复检出时覆盖而非新增
-        fp = "|".join([self.dataset, self.rule, self.symbol or "",
-                       str(self.trade_date or ""), self.detail,
-                       json.dumps(self.extra, sort_keys=True, ensure_ascii=False)])
+        # 内容指纹：同一问题（同规则/标的/日期）重复检出时覆盖而非新增。
+        # detail 里的数字先掩码（「3 行…」→「N 行…」），否则计数变化会
+        # 生成新 issue_id，issue 表随重跑无限膨胀；非数字文本（如 field 名）
+        # 保留区分度。extra 只取标量字段（field/level 等参与区分），
+        # 列表/嵌套（dates 等 bulk 数据）不进指纹。
+        _digits = re.sub(r"\d+", "N", self.detail)
+        scalars = {k: v for k, v in self.extra.items()
+                   if isinstance(v, (str, int, float, bool)) or v is None}
+        fp = "|".join([
+            self.dataset, self.rule, self.symbol or "",
+            str(self.trade_date or ""),
+            _digits,
+            json.dumps(scalars, sort_keys=True, ensure_ascii=False),
+        ])
         return {
             "issue_id": hashlib.sha1(fp.encode("utf-8")).hexdigest()[:24],
             "dataset": self.dataset,
@@ -81,11 +92,20 @@ def latest_issues(limit: int = 200, resolved: bool = False) -> list[dict]:
             "ORDER BY created_at DESC LIMIT ?",
             [resolved, limit],
         ).fetchall()
+    return _issue_rows(rows)
+
+
+def _issue_rows(rows) -> list[dict]:
+    """issue 行 → dict（latest_issues / query_issues 共用映射）。"""
     import json as _json
+
     return [{
-        "issue_id": r[0], "dataset": r[1], "symbol": r[2], "trade_date": str(r[3]) if r[3] else None,
-        "rule_code": r[4], "severity": r[5], "detail": _json.loads(r[6]) if r[6] else {},
-        "count": r[7], "data_version": r[8], "resolved": r[9], "created_at": str(r[10]),
+        "issue_id": r[0], "dataset": r[1], "symbol": r[2],
+        "trade_date": str(r[3]) if r[3] else None,
+        "rule_code": r[4], "severity": r[5],
+        "detail": _json.loads(r[6]) if r[6] else {},
+        "count": r[7], "data_version": r[8], "resolved": r[9],
+        "created_at": str(r[10]),
     } for r in rows]
 
 
@@ -95,17 +115,27 @@ def query_issues(
     resolved: bool = False,
     limit: int = 100,
 ) -> list[dict]:
-    """质量问题检索（按 severity / dataset / resolved 过滤）。
+    """质量问题检索（按 severity / dataset / resolved 过滤，过滤下推 SQL）。
 
-    latest_issues 的超集：/data/crosscheck/issues 与 /data/issues 共用，
-    检索口径只此一份，避免两处 SQL 漂移。
+    /data/crosscheck/issues 与 /data/issues 共用，检索口径只此一份，
+    避免两处 SQL 漂移。此前全量拉 10 万行内存过滤 —— O(N) 内存与延迟。
     """
-    rows = latest_issues(limit=100_000, resolved=resolved)
+    sql = ("SELECT issue_id, dataset, symbol, trade_date, rule_code, severity, "
+           "detail, count, data_version, resolved, created_at "
+           "FROM data_quality_issue WHERE resolved = ?")
+    params: list = [resolved]
     if severity:
-        rows = [r for r in rows if r["severity"] == severity]
+        sql += " AND severity = ?"
+        params.append(severity)
     if dataset:
-        rows = [r for r in rows if r["dataset"] == dataset]
-    return rows[:limit]
+        sql += " AND dataset = ?"
+        params.append(dataset)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    with reader() as con:
+        ensure_table(con)
+        rows = con.execute(sql, params).fetchall()
+    return _issue_rows(rows)
 
 
 def resolve_issue(issue_id: str) -> bool:
