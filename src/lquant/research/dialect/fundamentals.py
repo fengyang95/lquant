@@ -225,15 +225,17 @@ def _financial_frame(items: dict[Column, str], symbols: list[str] | None,
         key = (sym, item)
         if key not in best or (stat_d, pub_d) >= best[key][:2]:
             best[key] = (stat_d, pub_d, value)
-    # 归一化匹配：item 尾段（tushare 列名或历史 camelCase）↔ JQ 字段名。
-    # 匹配顺序：1) FIELD_MAP（JQ 名 → tushare 尾段）；2) _norm 直配（tushare
-    # 原生名直查）。同一尾段可被多个列映射到（如 net_profit 与
-    # nparent_netprofit → n_income_attr_p），命中时全部填充，不得丢列。
+    # 匹配键 = 列自身的 _norm 名 ∪ 仅「映射到该列自己」的 FIELD_MAP 尾段。
+    # 同一尾段可被多个列映射到（如 net_profit 与 nparent_netprofit →
+    # n_income_attr_p），命中时全部填充，不得丢列；但整表尾段不得跨列
+    # 污染（查 net_profit 不能被 income.total_revenue 的行填上）。
     # 键带表前缀（含 legacy 前缀）：income 与 cashflow 的同名尾段不互相污染。
     norm_items: dict[tuple[str, str], list[Column]] = {}
     for c in items:
-        keys = {_norm(c.name), *(_norm(v) for v in
-                                  FIELD_MAP.get(c.table, {}).values())}
+        keys = {_norm(c.name)} | {
+            _norm(v) for k, v in FIELD_MAP.get(c.table, {}).items()
+            if _norm(k) == _norm(c.name)
+        }
         for p in {_KIND_PREFIX[c.table], _LEGACY_PREFIX.get(c.table)} - {None}:
             for t in keys:
                 norm_items.setdefault((p, t), []).append(c)
