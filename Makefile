@@ -1,6 +1,6 @@
 .PHONY: help setup hooks db-init db-reset bootstrap dev api worker web \
-        test lint fmt type rust-build rust-test docker-up docker-down clean smoke \
-        start stop status logs bundle
+        test coverage diff-cov lint fmt type rust-build rust-test \
+        docker-up docker-down clean smoke start stop status logs bundle
 
 UV      ?= uv
 PY      ?= .venv/bin/python
@@ -19,7 +19,9 @@ help:
 	@echo "  make web         仅前端"
 	@echo "  make bundle      生产构建 + 打发行包（等价 ./lquant.sh build）"
 	@echo "  make smoke       ABI 冒烟：确认 Rust 扩展可加载"
-	@echo "  make test lint fmt type"
+	@echo "  make test / lint / fmt / type"
+	@echo "  make coverage    全量覆盖率报告（coverage.xml/json）"
+	@echo "  make diff-cov    改动行覆盖率门禁（vs origin/main，≥95%）"
 	@echo "  make rust-build  编译 Rust 扩展（maturin develop）"
 	@echo "  make docker-up   启动 Redis"
 
@@ -82,6 +84,18 @@ rust-test:
 
 test:
 	$(PY) -m pytest tests -m "not slow"
+
+# 覆盖率报告：出 term-missing + xml（diff-cover 用）+ json
+coverage:
+	$(PY) -m pytest tests -m "not slow" \
+	  --cov=src/lquant --cov-report=term-missing \
+	  --cov-report=xml:coverage.xml --cov-report=json:coverage.json -q
+
+# 增量门禁：本次改动（vs origin/main）的 diff 覆盖率 ≥95%
+# 首次先 make coverage 生成 coverage.xml；uv sync 装 diff-cover
+diff-cov:
+	$(PY) -m diff_cover.diff_cover_tool coverage.xml \
+	  --compare-branch=origin/main --fail-under=95
 
 lint:
 	.venv/bin/ruff check src tests

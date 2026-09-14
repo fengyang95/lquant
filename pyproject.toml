@@ -58,6 +58,7 @@ server = [
 dev = [
   "pytest>=8.3",
   "pytest-cov>=6.0",
+  "diff-cover>=9",
   "pytest-asyncio>=1.4.0",
   "ruff>=0.8",
   "mypy>=1.13",
@@ -118,3 +119,13 @@ warn_unused_ignores = false
 
 [tool.coverage.run]
 source = ["src/lquant"]
+
+[tool.coverage.report]
+# 增量门禁：全局下限从当前基线（80.3%）起步，随补测逐步上调
+fail_under = 80
+show_missing = true
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "if __name__ == .__main__.:",
+]
