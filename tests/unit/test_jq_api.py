@@ -1,6 +1,7 @@
 """聚宽兼容回测 API 测试：金标准手算 + 防未来 + T+1 + 费率覆盖 + 涨跌停。"""
 from __future__ import annotations
 
+import math
 from datetime import date
 
 import polars as pl
@@ -115,6 +116,85 @@ def check(context):
     days = sorted(cap)
     assert cap[days[0]] == []                                # 首日无历史（防未来）
     assert cap[days[3]] == pytest.approx([100.0, 102.0, 104.04])
+
+
+def _paused_df(days=13, pause_idx=(5, 6), start=date(2026, 1, 5)):
+    """600000.SH 在 pause_idx 对应交易日停牌(缺 bar 行),000001.SZ 每日有 bar。
+
+    close = 100 + 交易日序号 i(含停牌日),停牌造成价格序列缺口,
+    便于按值区分"按 bar 取"与"按自然日取"。
+    """
+    rows = []
+    for i in range(days):
+        d = date.fromordinal(start.toordinal() + i)
+        if i not in pause_idx:
+            rows.append(dict(trade_date=d, symbol="600000.SH", open=100.0 + i,
+                             high=100.5 + i, low=99.5 + i, close=100.0 + i,
+                             pre_close=100.0 + i - 1 if i else 100.0,
+                             volume=1e8, amount=(100.0 + i) * 1e8))
+        rows.append(dict(trade_date=d, symbol="000001.SZ", open=50.0, high=50.25,
+                         low=49.75, close=50.0, pre_close=50.0,
+                         volume=1e8, amount=50.0 * 1e8))
+    return pl.DataFrame(rows)
+
+
+def _capture_hist(code_field: str):
+    code = f'''
+captured = {{}}
+def initialize(context):
+    run_daily(check, time="close")
+
+def check(context):
+    d = str(context.current_dt.date())
+    captured[d] = {code_field}
+'''
+    runner = JQRunner(code, initial_cash=1_000_000)
+    res = runner.run(_paused_df())
+    assert res.error is None, res.error
+    cap = runner.ns["captured"]
+    return cap[max(cap)]
+
+
+def test_attribute_history_skip_paused_counts_traded_bars():
+    """G5:13 个交易日中 600000 停牌 2 日(第 6/7 日),末日的 attribute_history(10):
+
+    - skip_paused=True(默认)→ 最近 10 根**有 bar** 的行 = 全部 10 根 bar,
+      close 序列 [100..104, 107..111](跳过停牌,不停牌窗口截短);
+    - skip_paused=False → 自然日窗口 [i-10, i) = 交易日 2..11,其中停牌 2 日
+      无 bar → 仅 8 行,close [102, 103, 104, 107, 108, 109, 110, 111]。
+    """
+    closes_true = _capture_hist(
+        'list(attribute_history("600000.SH", 10, unit="1d", '
+        'fields=("close",))["close"])')
+    assert len(closes_true) == 10
+    assert closes_true == pytest.approx([100.0, 101.0, 102.0, 103.0, 104.0,
+                                         107.0, 108.0, 109.0, 110.0, 111.0])
+
+
+def test_attribute_history_skip_paused_false_keeps_calendar_window():
+    """skip_paused=False 保持现行为:自然日序数截取,停牌日行缺失(8 行)。"""
+    closes = _capture_hist(
+        'list(attribute_history("600000.SH", 10, unit="1d", fields=("close",), '
+        'skip_paused=False)["close"])')
+    assert len(closes) == 8
+    assert closes == pytest.approx([102.0, 103.0, 104.0, 107.0, 108.0,
+                                    109.0, 110.0, 111.0])
+
+
+def test_history_skip_paused_counts_traded_bars():
+    """G5:history 单标的 skip_paused=True 按有 bar 的行向前取 count 根。"""
+    vals = _capture_hist(
+        'list(history(10, field="close", security_list=["600000.SH"], '
+        'skip_paused=True)["600000.SH"])')
+    assert vals == pytest.approx([100.0, 101.0, 102.0, 103.0, 104.0,
+                                  107.0, 108.0, 109.0, 110.0, 111.0])
+    vals_cal = _capture_hist(
+        'list(history(10, field="close", security_list=["600000.SH"], '
+        'skip_paused=False)["600000.SH"])')
+    # skip_paused=False 锁定现行为:自然日窗口恒 10 行,停牌日为 NaN
+    assert len(vals_cal) == 10
+    assert [v for v in vals_cal if not math.isnan(v)] == pytest.approx(
+        [102.0, 103.0, 104.0, 107.0, 108.0, 109.0, 110.0, 111.0])
 
 
 def test_set_order_cost_fees_applied():
@@ -261,3 +341,138 @@ def handle_data(context, data):
 '''
     res = JQRunner(code, initial_cash=1_000_000).run(df)
     assert res.error is None, res.error
+
+
+# ---------- G1 接线：security 表 is_st ----------
+
+from lquant.data.store import catalog  # noqa: E402
+
+duckdb = pytest.importorskip("duckdb")
+
+
+@pytest.fixture()
+def tmp_catalog(tmp_path, monkeypatch):
+    """隔离 duckdb catalog（同 test_baseline_strategy 模式），seed security 表。"""
+    from contextlib import contextmanager
+
+    db = tmp_path / "lq.duckdb"
+    con = duckdb.connect(str(db))
+    from lquant.data.store.ddl import DDL_STATEMENTS
+    for stmt in DDL_STATEMENTS:
+        con.execute(stmt)
+    con.close()
+
+    @contextmanager
+    def _writer():
+        c = duckdb.connect(str(db))
+        try:
+            yield c
+            c.commit()
+        finally:
+            c.close()
+
+    @contextmanager
+    def _reader():
+        c = duckdb.connect(str(db))
+        try:
+            yield c
+        finally:
+            c.close()
+
+    monkeypatch.setattr(catalog, "writer", _writer)
+    monkeypatch.setattr(catalog, "reader", _reader)
+
+
+def test_is_st_wired_from_security_table(tmp_catalog):
+    """security 表 is_st=TRUE → get_current_data()[sym].is_st 为真（G1 接线金标准）。
+
+    修复前 _sec_data 不传 is_st，恒 False。
+    """
+    with catalog.writer() as con:
+        con.execute("INSERT INTO security VALUES "
+                    "('600000.SH', '*ST测试', 'stock', 'main', "
+                    "DATE '2020-01-01', NULL, TRUE, 'test', now())")
+    code = '''
+def initialize(context):
+    run_daily(trade, time="open")
+
+def trade(context):
+    cd = get_current_data()
+    record(st_flag=1 if cd["600000.SH"].is_st else 0)
+'''
+    res = JQRunner(code, initial_cash=1_000_000).run(make_df())
+    assert res.error is None, res.error
+    assert res.records["st_flag"], "record 无输出"
+    assert all(v == 1 for _, v in res.records["st_flag"])
+
+
+def test_is_st_default_empty_when_no_security_rows(tmp_catalog):
+    """security 表存在但无 ST 行 → is_st 恒 False，回测正常不报错。"""
+    code = """
+def initialize(context):
+    run_daily(trade, time="open")
+
+def trade(context):
+    record(st_flag=1 if get_current_data()["600000.SH"].is_st else 0)
+"""
+    res = JQRunner(code, initial_cash=1_000_000).run(make_df())
+    assert res.error is None, res.error
+    assert res.records["st_flag"], "record 无输出"
+    assert all(v == 0 for _, v in res.records["st_flag"])
+
+
+def test_st_price_limit_5pct(tmp_catalog):
+    """ST 股 +7% 高开（> 5% 涨停价）→ 每日买入委托全部涨停拒单。
+
+    对照 test_non_st_7pct_gap_fills：同行情非 ST 可成交。
+    """
+    rows = []
+    for i in range(4):
+        d = date(2026, 1, 5 + i)
+        rows.append(dict(trade_date=d, symbol="600000.SH", open=107.0,
+                         high=107.0 * 1.005, low=107.0 * 0.995, close=107.0,
+                         pre_close=100.0, volume=1e8, amount=107.0 * 1e8))
+    df = pl.DataFrame(rows)
+    code = '''
+def initialize(context):
+    set_order_cost(type="stock", open_tax=0, close_tax=0,
+                   open_commission=0, close_commission=0, min_commission=0)
+    run_daily(trade, time="open")
+
+def trade(context):
+    if context.portfolio.positions["600000.SH"].total_amount == 0:
+        order_target_value("600000.SH", 500000)
+'''
+    runner = JQRunner(code, initial_cash=1_000_000,
+                      security_meta={"600000.SH": {"is_st": True}})
+    res = runner.run(df)
+    assert res.error is None, res.error
+    assert res.trades == [], f"ST +7% 高开不应成交: {res.trades}"
+    st_rejects = [r for r in res.rejected if "涨停" in r[2]]
+    assert st_rejects, f"预期 ST 5% 涨停拒单，实际 {res.rejected}"
+
+
+def test_non_st_7pct_gap_fills(tmp_catalog):
+    """同行情非 ST 股（无 meta 注入）+7% 高开可成交 —— 10% 板内对照组。"""
+    rows = []
+    for i in range(4):
+        d = date(2026, 1, 5 + i)
+        p = 100.0 if i == 0 else 107.0
+        rows.append(dict(trade_date=d, symbol="600000.SH", open=p, high=p * 1.005,
+                         low=p * 0.995, close=p, pre_close=100.0,
+                         volume=1e8, amount=p * 1e8))
+    df = pl.DataFrame(rows)
+    code = '''
+def initialize(context):
+    set_order_cost(type="stock", open_tax=0, close_tax=0,
+                   open_commission=0, close_commission=0, min_commission=0)
+    run_daily(trade, time="open")
+
+def trade(context):
+    if context.portfolio.positions["600000.SH"].total_amount == 0:
+        order_target_value("600000.SH", 500000)
+'''
+    res = JQRunner(code, initial_cash=1_000_000).run(df)
+    assert res.error is None, res.error
+    assert len(res.trades) == 1, res.trades          # day0 买入后不再下单
+    assert not [r for r in res.rejected if "涨停" in r[2]]

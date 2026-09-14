@@ -349,19 +349,39 @@ class _Log:
 
 # ---------- 运行器 ----------
 
+def _load_security_meta() -> dict[str, dict]:
+    """从 security 表读 is_st 元数据（只取 ST 行）。
+
+    任何异常（表不存在 / 无库连接）与空表都返回 {} —— JQRunner 必须能
+    在无 security 表的沙箱数据上照常回测，绝不因元数据缺失而抛错。
+    """
+    try:
+        from lquant.data.store import catalog
+        with catalog.reader() as con:
+            rows = con.execute(
+                "SELECT symbol, is_st FROM security WHERE is_st").fetchall()
+        return {str(r[0]): {"is_st": bool(r[1])} for r in rows}
+    except Exception:                     # noqa: BLE001 - 元数据缺失不致命
+        return {}
+
+
 class JQRunner:
     """加载用户代码并提供聚宽日频 API。执行前先跑一遍语法/运行时冒烟。"""
 
     def __init__(self, code: str, *, initial_cash: float = 1_000_000.0,
                  benchmark: str = "000300.SH", rebalance: str = "none",
                  participation: float = 0.1, ruleset=None,
-                 factor_formulas: list[str] | None = None) -> None:
+                 factor_formulas: list[str] | None = None,
+                 security_meta: dict[str, dict] | None = None) -> None:
         self.code = code
         self.initial_cash = initial_cash
         self.default_benchmark = benchmark
         self._ruleset = ruleset
         self._participation = participation
         self._factor_formulas = [str(f) for f in (factor_formulas or [])]
+        # security 表 is_st 元数据：参数注入优先，缺省 run() 时自查 security 表。
+        self._security_meta = security_meta
+        self._security_meta_resolved: dict[str, dict] = {}
 
         # 运行期状态
         self.account = Account(cash=initial_cash)
@@ -481,11 +501,13 @@ class JQRunner:
 
         def history(count: int, unit: str = "1d", field="close",                    # noqa: A002
                     security_list=None, df: bool = True, skip_paused: bool = True):
-            return r._history(int(count), field, security_list, df)
+            return r._history(int(count), field, security_list, df,
+                              skip_paused=skip_paused)
 
         def attribute_history(security: str, count: int, unit: str = "1d",         # noqa: A002
                               fields=("close",), skip_paused: bool = True):
-            return r._attribute_history(str(security), int(count), fields)
+            return r._attribute_history(str(security), int(count), fields,
+                                        skip_paused=skip_paused)
 
         def get_price(security, start_date=None, end_date=None,
                       frequency: str = "daily", fields=None, count: int | None = None,
@@ -573,7 +595,8 @@ class JQRunner:
         return self.account.nav(self._prices_map())
 
     def _sec_data(self, sym: str) -> _SecData:
-        return _SecData(self._bars_today.get(sym), self._ref_price(sym))
+        return _SecData(self._bars_today.get(sym), self._ref_price(sym),
+                        is_st=self._security_meta_resolved.get(sym, {}).get("is_st", False))
 
     def _history_df(self, secs: list[str], fields: list[str], rows: list[dict]) -> object:
         """rows 为时间升序窗口 [{sec: {field: v}, 'day': d}]；优先 pandas。
@@ -619,30 +642,55 @@ class JQRunner:
             return bar.volume
         return float(getattr(bar, f, float("nan")))
 
-    def _history(self, count: int, field, security_list, df: bool = True):
+    def _history(self, count: int, field, security_list, df: bool = True,
+                 skip_paused: bool = True):
         fields = [field] if isinstance(field, str) else list(field or ["close"])
         secs = list(security_list) if security_list else sorted(self._bars_today)
         i = self._day_index
-        lo = max(0, i - count)
+        if skip_paused:
+            # G5:交易日窗口 — 从 i 前推收集 count 个"标的当日有 bar"的交易日
+            # (单标的看该标的,多标的看当日任一标的有 bar,即合并交易日)。
+            # 严格不含今天 → 无未来函数。
+            def _traded(day) -> bool:
+                bars = self._bars_by_day.get(day, {})
+                if len(secs) == 1:
+                    return secs[0] in bars
+                return bool(bars)
+
+            days = [d for d in self._dates[:i] if _traded(d)][-count:]
+        else:
+            days = self._dates[max(0, i - count):i]
         rows = []
-        for j in range(lo, i):                # 严格不含今天 → 无未来函数
-            day = self._dates[j]
+        for day in days:
             bars = self._bars_by_day.get(day, {})
             rows.append({s: {f: self._bar_field(b, f) for f in fields}
                          for s, b in ((s, bars.get(s)) for s in secs) if b})
             rows[-1]["day"] = day
         return self._history_df(secs, fields, rows)
 
-    def _attribute_history(self, sec: str, count: int, fields):
+    def _attribute_history(self, sec: str, count: int, fields,
+                           skip_paused: bool = True):
         fields = list(fields or ["close"])
         try:
             import pandas as pd
         except ImportError:
             pd = None
         i = self._day_index
-        lo = max(0, i - count)
+        if skip_paused:
+            # G5:按"有 bar 的行"从当前 i 向前取 count 根(不含今天)
+            j = i - 1
+            taken = 0
+            js = []
+            while j >= 0 and taken < count:
+                if self._bars_by_day.get(self._dates[j], {}).get(sec):
+                    js.append(j)
+                    taken += 1
+                j -= 1
+            js.reverse()
+        else:
+            js = range(max(0, i - count), i)
         rows = []
-        for j in range(lo, i):
+        for j in js:
             b = self._bars_by_day.get(self._dates[j], {}).get(sec)
             if b:
                 rows.append({"day": self._dates[j], **{f: self._bar_field(b, f) for f in fields}})
@@ -855,7 +903,12 @@ class JQRunner:
             ruleset.default["commission"] = {"rate": fo["comm_rate"], "min": fo["min"],
                                              "per_order": True}
             ruleset.default["tax"] = {"rate": fo["tax_rate"]}
-        self._rules = build_rules(symbols, ruleset)
+        # is_st 元数据同源：注入优先，否则自查 security 表；驱动
+        # get_current_data()[sym].is_st 与涨跌停 5% 两条路径。
+        self._security_meta_resolved = (
+            dict(self._security_meta) if self._security_meta is not None
+            else _load_security_meta())
+        self._rules = build_rules(symbols, ruleset, self._security_meta_resolved)
         self._broker = Broker(self._rules, self._slippage)
 
         for i, d in enumerate(self._dates):

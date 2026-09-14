@@ -274,16 +274,14 @@ def test_baseline_excludes_halted(tmp_catalog, tmp_path: Path, monkeypatch):
     # 08-01 全天没有任何 600003 的成交
     assert not [t for t in res.trades
                 if t.trade_date == date(2025, 8, 1) and t.symbol == "600003.SH"]
-    # 复牌后(10-01 调仓)恢复买入;注意 09-01 仍被 MIN_LISTED_DAYS 剔除:
-    # attribute_history(60) 恰好跨过停牌日 → 只有 59 行(缺 bar 的历史行不补)。
+    # 复牌后(10-01 调仓)恢复买入。G5 修复后 attribute_history 默认
+    # skip_paused=True:窗口按"有 bar 的行"前推,08-01 停牌日不再占用
+    # 60 根 bar 的名额,故 600003 在 09-01 即恢复买入(旧口径为 59 行被剔除)。
     assert "600003.SH" in res.positions.get(date(2025, 10, 1), {})
 
 
-@pytest.mark.xfail(reason="gap: JQRunner 的 get_current_data()[sym].is_st 恒为 False,"
-                          "不读 security 表 → ST 剔除不生效",
-                   strict=True)
 def test_baseline_excludes_st(tmp_catalog, bars_flat_130):
-    """security 表 is_st 标记的股票不得进入持仓(引擎缺口 → xfail)。"""
+    """security 表 is_st 标记的股票不得进入持仓(G1 接线已修复)。"""
     syms = [f"60000{i}.SH" for i in range(4)]
     _seed_financial([_fin_row(s, date(2025, 7, 31), date(2025, 7, 20), 0.10)
                      for s in syms])
