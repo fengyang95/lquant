@@ -118,6 +118,17 @@ financial_pit 中与"同比/yoy"相关的 DISTINCT item:['indicator.cfps_yoy', '
 | G13 | 全市场 `get_fundamentals` 单次 ~170s(financial_pit 72M 行,无日期/标的缓存;每日调用 = E2E 20h)。热帧:duckdb 全表扫描 | 回测正确性(性能) | `python - <<EOF` 计时复现:单次 172s/168s/167s ×3 | P1(性能专项) | 是(复杂策略每日盘前选股不可用) |
 | G14 | 复杂策略 E2E 实跑完成(2025-01-02~2026-09-11,600 标的×411 交易日,月度调仓 top15 等权+止损止盈):总收益 +9.51%,336 笔成交/6 笔拒单(拒单原因分布合理:涨停不可买/跌停不可卖/资金不足一手),**审计 PASS**(停牌日无成交、无 T+1 双向成交、无涨停买入/跌停卖出)。耗时 3831s(大头是 14 次 monthly get_fundamentals×170s,即 G13) | 回测正确性 | `PYTHONPATH=src python scripts/run_complex_e2e.py` | 已闭环 | 否 |
 
+### 2026-09-14 双路审查新增(聚宽兼容面 + 引擎正确性)
+
+| 编号 | 现象 | 归属 | 复现 | 优先级 | 阻塞 |
+|---|---|---|---|---|---|
+| G15 | **阻塞**:get_price/history/attribute_history 无 `fq` 参数(传 fq='pre' 直接 TypeError);回测行情全程不复权,跨除权日动量/均线与聚宽系统性发散(adj_factor 已在数据中,jq_shim.py:57-78 有可搬实现) | 兼容面 | 策略内 `history(10, '1d', 'close', fq='pre')` | P1 | 是 |
+| G16 | **阻塞**:order_target_percent 未注入沙箱(NameError);get_trade_days/get_index_stocks 有实现未注入 | 兼容面 | 策略内调 order_target_percent | P1 | 是 |
+| G17 | run_monthly 负数 monthday(月末倒数)静默永不触发;run_daily 具体时刻('14:50')一律归 open 桶,尾盘委托语义丢失 | 兼容面 | run_monthly(fn, monthday=-1) | P2 | 否 |
+| G18 | JQ 路径无公司行为处理(Engine 路径有 _apply_corporate_actions,两路径除权日 NAV 分叉);涨跌停判定未按交易所 tick 取整(pre_close=3.63 涨停价应 3.99,现判定 3.993 → 涨停价买入放行);停牌/退市持仓按 avg_cost 估值,亏损头寸冻结、长回测虚高 | 回测正确性 | 构造含 adj_factor 跳变/3.63→3.99 用例;退市票 3 年回测 | P1 | 是(长回测 NAV 失真) |
+| G19 | 默认值偏离聚宽:history field='close'(JQ 'avg')、history skip_paused=True(JQ False)、attribute_history fields 单列(JQ 六字段);夏普为几何口径(聚宽算术×250);默认费率/滑点低于聚宽默认(无 preset) | 兼容面/回测正确性 | 对照 jqdatasdk api.py 签名 | P2 | 否(对账时需注意) |
+| G20 | get_fundamentals(q, date='2025-08-01' 字符串) 崩(min(str,date) TypeError,应先 fromisoformat);get_current_data ST 股 high_limit 显示 ±10% 而撮合实际 ±5%;Engine 整单拒单 vs jqapi 截量成交,同策略两路径不可比;is_st 全期恒定不随戴帽/摘帽变化 | 兼容面/回测正确性 | get_fundamentals(q, date='2025-08-01') | P2 | 否 |
+
 ## 人工补注
 
 1. **数据缺口**:日线湖当前仅覆盖 2024-01-02 ~ 2024-12-31(2021–2023 未回填)。
