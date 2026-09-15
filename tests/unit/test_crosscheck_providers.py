@@ -18,9 +18,9 @@ import pytest
 
 from lquant.core.errors import MappingError
 from lquant.data.mapping import validate_all_mappings
-from lquant.data.providers.akshare import AkShareProvider
+from lquant.data.providers.akshare import AkShareProvider, _select_daily
 from lquant.data.providers.baostock import BaoStockProvider
-from lquant.data.providers.tushare import TushareProvider
+from lquant.data.providers.tushare import TushareProvider, _prepare_daily
 from lquant.data.schema import SCHEMAS
 
 # ---- 三源共认的「真实值」（归一化目标：股 / 元） --------------------------
@@ -46,7 +46,7 @@ _BAOSTOCK_RAW = pl.DataFrame({
     "psTTM": ["2.0"], "pcfNcfTTM": ["8.0"],
 }).with_columns(pl.col("date").str.to_date("%Y-%m-%d"))
 
-# akshare：中文列、volume 手（derive ×100）、amount 已是元直接 rename
+# akshare：中文列、volume 手（provider 侧 scale_unit ×100）、amount 已是元
 _AKSHARE_RAW = pl.DataFrame({
     "股票代码": ["600000"],
     "日期": ["2024-01-02"],
@@ -58,7 +58,7 @@ _AKSHARE_RAW = pl.DataFrame({
 # tushare：ts_code 直出、trade_date YYYYMMDD、vol 手（×100）、amount 千元（×1000）
 _TUSHARE_RAW = pl.DataFrame({
     "ts_code": ["600000.SH"],
-    "trade_date": [_DAY],   # trade_date 解析（YYYYMMDD → Date）在 provider 侧完成
+    "trade_date": ["20240102"],   # 源格式 YYYYMMDD 字符串，_prepare_daily 解析为 Date
     "open": [10.0], "high": [10.5], "low": [9.8], "close": [10.2],
     "pre_close": [10.1],
     "vol": [_VOLUME_SHARES / 100],         # 手
@@ -68,7 +68,15 @@ _TUSHARE_RAW = pl.DataFrame({
 
 def _normalized(provider: BaoStockProvider | AkShareProvider | TushareProvider,
                 raw: pl.DataFrame) -> pl.DataFrame:
-    """mock 源数据 → request（含 yaml 映射 + coerce + 质量断言）。"""
+    """mock 源数据 → provider 出帧（含量纲归一）→ request（yaml 映射+断言）。
+
+    单位换算已从 yaml derive 迁到 provider fetch 侧（scale_unit），所以
+    这里必须先过各 provider 的出帧函数，保证从**源单位**全链路对拍。
+    """
+    if isinstance(provider, AkShareProvider):
+        raw = _select_daily(raw, _SYMBOL)
+    elif isinstance(provider, TushareProvider):
+        raw = _prepare_daily(raw)
     return provider.request("daily_bar", _raw=raw)
 
 

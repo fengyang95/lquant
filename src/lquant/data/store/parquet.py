@@ -5,8 +5,11 @@
 """
 from __future__ import annotations
 
+import fcntl
 import os
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from datetime import date
 from pathlib import Path
 
@@ -16,20 +19,48 @@ from lquant.core.config import get_settings
 from lquant.data.schema import SCHEMAS
 
 # 读-改-写按 (路径) 加锁：不同 year / (freq, ym) 文件互不阻塞。
-# 锁保护同进程并发（sync-worker 线程与本地任务线程同进程），
-# 并保证「读旧 → 合并 → 写临时文件 → os.replace」对读侧原子可见。
+# 双层锁：
+# - 进程内：_FILE_LOCKS 按 path 加 threading.Lock（sync-worker 线程与
+#   本地任务线程同进程并发）；
+# - 跨进程：`<target>.lock` 文件 + fcntl.flock（API 服务进程与 `lq` CLI
+#   同时写同一 year=YYYY/part-0.parquet 时互斥 —— flock 是 advisory 锁，
+#   两边都必须走 _file_lock，恰好本模块是唯一的写路径）。
+# 锁保护「读旧 → 合并 → 写临时文件 → os.replace」对读侧原子可见。
 _FILE_LOCKS: dict[str, threading.Lock] = {}
 _FILE_LOCKS_GUARD = threading.Lock()
 
 
-def _file_lock(path: Path) -> threading.Lock:
+@contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
     key = str(path)
     with _FILE_LOCKS_GUARD:
         lock = _FILE_LOCKS.get(key)
         if lock is None:
             lock = threading.Lock()
             _FILE_LOCKS[key] = lock
-        return lock
+
+    lock_path = path.with_name(f"{path.name}.lock")
+    fd: int | None = None
+    try:
+        # "a" 语义（O_CREAT|O_APPEND）：仅 touch 锁文件，不写内容
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        # 只读盘 / 不支持 flock 等 → 降级为仅进程内锁，绝不抛
+        if fd is not None:
+            os.close(fd)
+            fd = None
+        from loguru import logger
+
+        logger.warning(f"跨进程文件锁不可用（降级为进程内锁）: {lock_path}")
+    try:
+        with lock:
+            yield
+    finally:
+        if fd is not None:
+            with suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
 
 def _atomic_write_parquet(df: pl.DataFrame, p: Path) -> None:
@@ -164,6 +195,35 @@ def read_daily_basic(start=None, end=None) -> pl.DataFrame:
     return df
 
 
+def _merge_quality_flags(old: pl.DataFrame, new: pl.DataFrame) -> pl.DataFrame:
+    """同键行合并 quality_flags（按位 OR）：对拍/门禁打的标记不被再同步抹掉。
+
+    再同步的新批次 flags 从 0 重建（gate_daily or_flags 从干净位开始），
+    直接 _overlay 整行覆盖会把跨源对拍发现的降级标记无痕清除。
+    """
+    if not old.height or not new.height:
+        return new
+    if "quality_flags" not in old.columns or "quality_flags" not in new.columns:
+        return new
+    keys = ["symbol", "trade_date"]
+    lake_flags = (
+        old.select(*keys, "quality_flags")
+        .join(new.select(keys).unique(), on=keys, how="semi")
+        .group_by(keys)
+        .agg(pl.col("quality_flags").drop_nulls().max().alias("qf_lake"))
+    )
+    return (
+        new.join(lake_flags, on=keys, how="left")
+        .with_columns(
+            pl.when(pl.col("qf_lake").is_not_null())
+            .then(pl.col("quality_flags").fill_null(0) | pl.col("qf_lake"))
+            .otherwise(pl.col("quality_flags"))
+            .alias("quality_flags")
+        )
+        .drop("qf_lake")
+    )
+
+
 def write_daily(df: pl.DataFrame) -> list[Path]:
     if not len(df):
         return []
@@ -173,10 +233,12 @@ def write_daily(df: pl.DataFrame) -> list[Path]:
         p = _daily_path(y)
         p.parent.mkdir(parents=True, exist_ok=True)
         g = g.drop("y")
-        # 同key覆盖：读旧 → 覆盖合并 → 原子写（锁按文件粒度，不串行全年份）
+        # 同key覆盖：读旧 → flags 合并 → 覆盖合并 → 原子写
         with _file_lock(p):
             if p.exists():
-                g = _overlay(pl.read_parquet(p), g, ["symbol", "trade_date"])
+                old = pl.read_parquet(p)
+                g = _merge_quality_flags(old, g)
+                g = _overlay(old, g, ["symbol", "trade_date"])
             g = g.sort(["symbol", "trade_date"])
             _atomic_write_parquet(g, p)
         out.append(p)
@@ -222,8 +284,8 @@ def delete_daily(
 
     - dry_run=True 只统计将删行数，不落盘（用于确认前预览）；
     - 读 → 过滤 → 写回/unlink 整体在 _file_lock 内（与写入路径互斥）；
-      注意：锁只保护**同进程**线程并发，跨进程不安全 —— 调用方（HTTP
-      purge 端点 / CLI）负责保证不与其他进程并发删同一份湖；
+      锁为双层（进程内 threading.Lock + 跨进程 flock），API 进程与 CLI
+      并发删同一份湖也安全；
     - 过滤后为空的文件直接删除，不留空 parquet；
     - 返回 {rows_matched, files_scanned, files: [{file, rows_matched}]}。
 

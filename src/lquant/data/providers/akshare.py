@@ -19,10 +19,16 @@ import polars as pl
 
 from lquant.core.types import parse_symbol
 from lquant.data.capability import Capability
-from lquant.data.normalize import normalize_60min_bounds, normalize_symbols
+from lquant.data.normalize import normalize_60min_bounds, normalize_symbols, scale_unit
 from lquant.data.providers import PROVIDERS
 from lquant.data.providers._engine import MappingProvider
 from lquant.data.ratelimit import TokenBucket
+
+# 日线量纲考证（akshare stock_zh_a_hist / fund_etf_hist_em 实测列说明）：
+# 成交量单位是**手**（1 手 = 100 股）、成交额单位是**元** —— volume 需 ×100，
+# amount 系数 1.0 显式声明。换算在 _select_daily 出帧处做，入湖统一口径。
+VOLUME_UNIT = "手"
+AMOUNT_UNIT = "元"
 
 # freq（canonical）→ 东财 minute 接口 period 参数
 _PERIOD_MAP = {"1min": "1", "5min": "5", "15min": "15", "30min": "30", "60min": "60"}
@@ -40,10 +46,14 @@ def _select_daily(df: pl.DataFrame, symbol: str) -> pl.DataFrame:
     out = df.select(cols)
     if "股票代码" not in out.columns:
         out = out.with_columns(pl.lit(symbol).alias("股票代码"))
-    return out.with_columns(
+    out = out.with_columns(
         pl.col("日期").cast(pl.Utf8).str.to_date("%Y-%m-%d"),
         pl.col(["开盘", "收盘", "最高", "最低", "成交量", "成交额"])
         .cast(pl.Float64),
+    )
+    # 量纲归一（出帧处）：成交量=手 → 股、成交额=元（系数考证见模块级常量）
+    return scale_unit(
+        scale_unit(out, col="成交量", unit=VOLUME_UNIT), col="成交额", unit=AMOUNT_UNIT
     )
 
 

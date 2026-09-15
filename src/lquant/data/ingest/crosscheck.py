@@ -165,7 +165,10 @@ def run_crosscheck(peers: list[str] | None = None, start: str | None = None,
     # 而不是只留最后一个 peer 的计数。
     summary: dict = {"checked": 0, "L1": 0, "L2": 0, "L3": 0}
     for name in peers:
-        peer = _peer_daily(name, symbols[:limit], lo, hi)
+        # peer 与 primary 用同一窗口：此前 peer 拉全湖，显式窗口对拍时
+        # peer 独有行全落「同键缺失」→ 假 L3 刷屏 + 误打 CROSS_SRC_DIFF。
+        peer = _peer_daily(name, symbols[:limit],
+                           date.fromisoformat(lo_s), date.fromisoformat(hi_s))
         if not len(peer):
             from loguru import logger
             logger.warning(f"crosscheck peer {name} 无数据可用，跳过")

@@ -40,6 +40,34 @@ L3 = "L3"   # 离群 / 共识冲突（降级候选人）
 _PRICE_FIELDS = ("open", "high", "low", "close")
 _VOL_FIELDS = ("volume", "amount")
 
+# ---------------------------------------------------------------------------
+# 分字段容差（§3.8.4 补充）：
+# 价格类字段两源应几乎一致，沿用严格阈值（L3 数量级差 1.2×）；
+# 量额类字段（volume/amount）因统计口径差异（是否含盘后/大宗交易、手 vs 股、
+# 单位换算等），两源差 20-50% 属常态 —— 沿用价格阈值会刷大量假 L3 error issue。
+# 因此量额类 L1/L2/L3 阈值整体放宽一档：
+#   L1 < 20%（小偏差提示）  L2 < 50%（material，打标）  L3 >= 50% / 2.0×（数量级差）
+# ---------------------------------------------------------------------------
+_AMOUNT_FIELDS = frozenset({"volume", "amount"})
+
+# 价格类：数量级差硬阈值（倍数）—— 两源价格应几乎一致
+_PRICE_L3_RATIO = 1.2
+# 量额类：L3 数量级差阈值（倍数）；rel_diff >= 0.5 与 2.0× 等价（d=|a-b|/|a|）
+_VOLUME_L3_RATIO = 2.0
+_VOLUME_L2_DIFF = 0.5
+_VOLUME_L1_DIFF = 0.2
+
+
+def _is_amount_field(field: str,
+                     amount_fields: frozenset[str] | set[str]) -> bool:
+    """按字段名判断是否量额类：显式集合命中，或以 volume/amount 结尾。
+
+    兼容衍生命名（如 total_amount / vol_right 这类带前后缀的列）。
+    """
+    if field in amount_fields:
+        return True
+    return field.endswith("volume") or field.endswith("amount")
+
 
 @dataclass(frozen=True)
 class CrossSourceResult:
@@ -63,7 +91,9 @@ def _to_date(dtype, expr) -> pl.Expr:
 
 def classify_divergence(primary: pl.DataFrame, peer: pl.DataFrame,
                         tolerance_pct: float = 0.1,
-                        fields: tuple[str, ...] | None = None) -> pl.DataFrame:
+                        fields: tuple[str, ...] | None = None, *,
+                        amount_fields: frozenset[str] | set[str] | None = None,
+                        ) -> pl.DataFrame:
     """primary × peer 逐 (symbol, trade_date, field) 分类。
 
     输出 schema：symbol / trade_date / field / primary / peer /
@@ -72,6 +102,8 @@ def classify_divergence(primary: pl.DataFrame, peer: pl.DataFrame,
     """
     if not fields:
         fields = _PRICE_FIELDS + _VOL_FIELDS
+    if amount_fields is None:
+        amount_fields = _AMOUNT_FIELDS
     key = ["symbol", "trade_date"]
     # 只在两侧都有的列上比对 —— 缺失的列跳过，避免 select 报错
     fields = tuple(f for f in fields
@@ -127,10 +159,25 @@ def classify_divergence(primary: pl.DataFrame, peer: pl.DataFrame,
                 lvl = L3
             else:
                 d = abs(a_f - b_f) / abs(a_f)
-                lvl = L1 if d <= tol else L2
-                # 数量级差 (>20%) → 离群候选
-                if a_f / max(b_f, 1e-9) > 1.2 or b_f / max(a_f, 1e-9) > 1.2:
-                    lvl = L3
+                if _is_amount_field(f, amount_fields):
+                    # 量额类：口径差异常态，阈值整体放宽一档（见模块常量注释）
+                    if a_f / max(b_f, 1e-9) >= _VOLUME_L3_RATIO or \
+                            b_f / max(a_f, 1e-9) >= _VOLUME_L3_RATIO:
+                        lvl = L3
+                    elif d >= _VOLUME_L2_DIFF:
+                        lvl = L2
+                    elif d >= _VOLUME_L1_DIFF:
+                        lvl = L1
+                    else:
+                        # 量额类小偏差 (<20%) 不落 L1 —— 与"一致"难区分，归 L0 语义
+                        lvl = L0
+                else:
+                    # 价格类（含 pre_close）：两源应几乎一致，维持原严格阈值
+                    lvl = L1 if d <= tol else L2
+                    # 数量级差 (>20%) → 离群候选
+                    if a_f / max(b_f, 1e-9) > _PRICE_L3_RATIO or \
+                            b_f / max(a_f, 1e-9) > _PRICE_L3_RATIO:
+                        lvl = L3
             rows.append({**{k: r[k] for k in key}, "field": f,
                          "primary": a, "peer": b, "rel_diff": d,
                          "missing": None, "level": lvl})

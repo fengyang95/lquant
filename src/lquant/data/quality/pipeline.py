@@ -11,7 +11,7 @@ from datetime import timedelta
 import polars as pl
 
 from lquant.core.errors import DataQualityError
-from lquant.data.quality import asserts, validators
+from lquant.data.quality import adjustment, asserts, universe, validators
 from lquant.data.quality.issues import Issue, save_issues
 
 __all__ = ["gate_daily", "run_lake_checks"]
@@ -65,8 +65,9 @@ def run_lake_checks(start: str | None = None, end: str | None = None,
         return []
 
     # 只挑检查需要的列 —— 全湖宽表全量物化是纯浪费（M5）
-    keep = [c for c in ("symbol", "trade_date", "open", "close", "pre_close",
-                        "volume", "adj_factor") if c in df.columns]
+    keep = [c for c in ("symbol", "trade_date", "open", "high", "low",
+                        "close", "pre_close", "volume", "adj_factor")
+            if c in df.columns]
     df = df.select(keep)
 
     if data_version is None:
@@ -85,6 +86,41 @@ def run_lake_checks(start: str | None = None, end: str | None = None,
     found.extend(validators.check_coverage(df))
     found.extend(validators.check_zombie(df))
     found.extend(validators.check_adj_factor(df))
+
+    # 复权一致性对账（孤儿模块接线）：issues 只并入 found，由尾部
+    # save_issues 统一落库；打标副本（out df）不写回 —— lake 检查只读
+    try:
+        _, adj_issues = adjustment.check_adjustment(df)
+        found.extend(adj_issues)
+    except Exception as e:  # noqa: BLE001  检查自身不能成为链路单点故障
+        from loguru import logger
+        logger.warning(f"adjustment 检查跳过: {e}")
+
+    # 时点股票池检查（幸存者偏差）：只读统计，风险仅打标不阻断
+    try:
+        pit = universe.check_point_in_time(df)
+        if pit.get("survivorship_risk"):
+            reasons = pit.get("reasons") or []
+            found.append(Issue(
+                rule="SURVIVORSHIP_RISK", severity="warn",
+                dataset="daily_bar",
+                detail=("; ".join(reasons) if reasons
+                        else "survivorship risk")[:500],
+                count=1))
+    except Exception as e:  # noqa: BLE001
+        from loguru import logger
+        logger.warning(f"universe 检查跳过: {e}")
+
+    # golden 已知答案集：表缺失/无 case 降级跳过，不能拖垮检查链路
+    try:
+        from lquant.data.quality import golden
+        found.extend(r.as_issue() for r in golden.run_all() if not r.ok)
+    except Exception as e:  # noqa: BLE001
+        from loguru import logger
+        logger.warning(f"golden 检查跳过: {e}")
+
+    # 不接 tradability：flag_tradability 是写回型打标（改湖内数据），
+    # lake 检查只读不写回，接线无意义。
 
     try:
         save_issues(found, data_version=data_version)
