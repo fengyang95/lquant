@@ -235,3 +235,40 @@ def test_future_date_param_clamped_to_trade_day(tmp_catalog, tmp_path, monkeypat
     assert res.records["today_rows"] == [(date(2026, 1, 5), 1)]
     # 传未来 date 被钳到当日 → 与当日结果完全一致,2026Q1 的 999.0 不可见
     assert res.records["future_rows"] == [(date(2026, 1, 5), 1)]
+
+
+def test_two_runners_state_isolated():
+    """G9 判别:两个 JQFundamentalsState 实例互不影响;两个 JQRunner 各持独立 state。"""
+    from lquant.backtest.jq_fundamentals import JQFundamentalsState, set_day
+
+    a, b = JQFundamentalsState(), JQFundamentalsState()
+    a.set_day(date(2026, 1, 5), ["600000.SH"])
+    assert (a.day, a.universe) == (date(2026, 1, 5), ["600000.SH"])
+    assert b.day is None and b.universe == []
+
+    # 模块级兼容包装仍可用(委托专用全局实例),且与实例 a 互不影响
+    set_day(date(2026, 1, 6), ["000001.SZ"])
+    assert a.day == date(2026, 1, 5)
+
+    from lquant.backtest.jqapi import JQRunner
+
+    ra = JQRunner("def initialize(context):\n    pass\n")
+    rb = JQRunner("def initialize(context):\n    pass\n")
+    assert ra._jf_state is not rb._jf_state
+    assert isinstance(ra._jf_state, JQFundamentalsState)
+
+
+def test_legacy_module_api_still_bound_per_runner():
+    """沙箱 ns 里的 get_fundamentals 走所属 runner 的 state:
+
+    rb 绑定了交易日,ra 未绑定 → ra 的 get_fundamentals 必须报"未绑定",
+    说明它读的是自己的 state,而不是被 rb 的 set_day 污染的模块级全局。
+    """
+    from lquant.backtest.jqapi import JQRunner
+
+    ra = JQRunner("def initialize(context):\n    pass\n")
+    rb = JQRunner("def initialize(context):\n    pass\n")
+    rb._jf_state.set_day(date(2026, 1, 5), ["600000.SH"])
+
+    with pytest.raises(RuntimeError, match="未绑定"):
+        ra.ns["get_fundamentals"](None)

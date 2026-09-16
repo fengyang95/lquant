@@ -16,6 +16,10 @@ from typing import Any
 QUEUES = ("lquant-default", "lquant-ingest", "lquant-backtest", "lquant-mining")
 
 
+class JobCanceled(RuntimeError):
+    """协作式取消收尾信号：任务体在 cancel_check() 返回 True 时抛出。"""
+
+
 # Redis 可用性探测结果的 TTL 缓存（秒）。
 # 早期这里是 @lru_cache(maxsize=1)，即首次探测结果被进程永久记住。单机环境下
 # 这是坑：docker-compose 里 API 常比 Redis 先起来，首次探测失败就永久降级为
@@ -88,7 +92,8 @@ class LocalJob:
             return "canceled"
         if self._thread is None:
             return "finished" if self._error is None else "failed"
-        return "started" if self._thread.is_alive() else "finished"
+        return "started" if self._thread.is_alive() \
+            else ("finished" if self._error is None else "failed")
 
     @property
     def result(self) -> Any:
@@ -185,28 +190,41 @@ def request_cancel(job_id: str) -> bool:
     return False
 
 
-def enqueue(queue: str, fn, *args, job_id: str | None = None, **kwargs):
-    """入队。fn 接受 cancel_check 形参时自动注入协作式取消探针。
+def enqueue(queue: str, fn, *args, job_id: str | None = None,
+            name: str | None = None, **kwargs):
+    """入队。fn 接受 cancel_check / progress 形参时自动注入对应回调。
 
     协作式取消：长任务在批次间轮询 cancel_check()，返回 True 就提前收尾。
     本地降级线程无法强杀 —— 任务体不配合时，cancel 只能保证状态标记与
     结果丢弃，线程跑到自然结束。
+    progress：进度回调 set_progress(job_id, ...) 的偏函数，任务体在阶段
+    边界调用它 —— /ws/jobs/{id} 与任务中心列表据此流式渲染进度条。
+    name：任务中心显示名（如「因子评价」），登记进进度注册表。
     """
     import inspect
 
-    # 探针注入统一在分支前：fn 签名有 cancel_check 就注入（RQ / 本地一致）
+    from lquant.server.progress import set_job_name
+
+    jid = job_id or uuid.uuid4().hex[:12]
+
+    if name:
+        set_job_name(jid, name)
+
+    # 探针注入统一在分支前：fn 签名有 cancel_check / progress 就注入（RQ / 本地一致）
     try:
         sig = inspect.signature(fn)
-        injects = "cancel_check" in sig.parameters
+        has_cancel = "cancel_check" in sig.parameters
+        has_progress = "progress" in sig.parameters
     except (TypeError, ValueError):
-        injects = False
+        has_cancel = has_progress = False
 
     if _redis_available():
         from rq import Queue
 
-        jid = job_id or uuid.uuid4().hex[:12]
-        if injects:
+        if has_cancel:
             kwargs["cancel_check"] = lambda: _is_canceled(jid)  # noqa: E731
+        if has_progress:
+            kwargs["progress"] = _make_progress_cb(jid)  # noqa: E731
         q = Queue(queue, connection=get_redis())
         from rq.exceptions import InvalidJobOperation
         from rq.job import Job
@@ -226,8 +244,10 @@ def enqueue(queue: str, fn, *args, job_id: str | None = None, **kwargs):
     _register_job(job)
     _register_cancelable(job.id, _CancelTarget(queue=queue, local_job=job))
 
-    if injects:
+    if has_cancel:
         kwargs["cancel_check"] = lambda jid=job.id: _is_canceled(jid)  # noqa: E731
+    if has_progress:
+        kwargs["progress"] = _make_progress_cb(job.id)
 
     def _run():
         started = time.time()
@@ -253,6 +273,16 @@ def enqueue(queue: str, fn, *args, job_id: str | None = None, **kwargs):
     job._thread = threading.Thread(target=_run, name=f"localjob-{job.id}", daemon=True)
     job._thread.start()
     return job
+
+
+def _make_progress_cb(job_id: str):
+    """progress 回调工厂：签名 (done=None, total=None, phase="", message=None)。"""
+    from lquant.server.progress import set_progress
+
+    def _cb(**kw) -> None:  # noqa: ANN003
+        set_progress(job_id, **kw)
+
+    return _cb
 
 
 def _is_canceled(job_id: str) -> bool:

@@ -205,8 +205,87 @@ class GridBT(_Base):
         self._maybe_target(min(1.0, max(0.0, frac)))
 
 
+class BaselineMultifactorBT(_Base):
+    """基准多因子对账：按主仓预计算的权重调度表执行（order_target_value 语义）。
+
+    调度表 ``{date: {sym: weight}}``（等权 1/N，由 lquant 侧基准策略在调仓日
+    open 时点导出，主仓 venv 跑 JQRunner 生成）。撮合对齐 lquant JQRunner 的
+    「open 时点委托即以当日开盘价撮合」：cheat-on-open + 以当日开盘价口径估
+    total_value，复刻差额整手取整、资金上限 clamp（afford 公式一致）、T+1 可卖。
+    调度表里没有的持仓当日清仓；执行顺序先卖后买（对齐 lquant 合成策略）。
+    """
+
+    params = (("schedule", None),)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._sched = {str(k): dict(v) for k, v in (self.p.schedule or {}).items()}
+
+    def next(self):
+        super().next()
+        today = self.data.datetime.date(0)      # data0 = 全交易日参考标的（日历轴）
+        w = self._sched.get(today.isoformat())
+        if not w:
+            return
+        # 当日开盘价口径 total_value（对齐 lquant JQ open 时点 total_value）
+        cash = float(self.broker.getcash())
+        mv = 0.0
+        advanced: dict[str, bool] = {}
+        for data in self.datas:
+            adv = bt.num2date(data.datetime[0]).date() == today
+            advanced[data._name] = adv
+            if adv:
+                mv += float(self.getposition(data).size) * float(data.open[0])
+        total = cash + mv
+        # 1) 持仓不在调度表 → 清仓
+        for data in self.datas:
+            nm = data._name
+            if (advanced[nm] and float(self.getposition(data).size) != 0
+                    and nm not in w):
+                self._jq_target_value(data, 0.0, today)
+        # 2) 减仓（目标市值低于当前市值）
+        for data in self.datas:
+            nm = data._name
+            if not advanced[nm] or nm not in w:
+                continue
+            cur_val = float(self.getposition(data).size) * float(data.open[0])
+            if cur_val > total * w[nm]:
+                self._jq_target_value(data, total * w[nm], today)
+        # 3) 加仓（含新建仓；停牌标的 open 取的是旧 bar，与 lquant 无参考价跳过对齐）
+        for data in self.datas:
+            nm = data._name
+            if not advanced[nm] or nm not in w:
+                continue
+            cur_val = float(self.getposition(data).size) * float(data.open[0])
+            if cur_val <= total * w[nm]:
+                self._jq_target_value(data, total * w[nm], today)
+
+    def _jq_target_value(self, data, value: float, today) -> None:
+        """镜像 lquant JQ order_target_value → _submit：差额整手取整、
+        买单按 afford 公式 clamp 到现金、卖出受 T+1 约束、|差额| < 1 股跳过。"""
+        px = float(data.open[0])
+        if px <= 0:
+            return
+        cur = float(self.getposition(data).size)
+        amount = value / px - cur
+        if abs(amount) < 1.0:                   # lquant: |amount| < 1 返回 None
+            return
+        if amount > 0:
+            cash = float(self.broker.getcash())
+            afford = cash / (px * (1 + 0.00025 + 0.001))   # lquant _submit 同式
+            qty = int(min(amount, afford)) // self.p.lot * self.p.lot
+            if qty > 0:
+                self.buy(data=data, size=qty)
+        else:
+            avail = self._sellable(data, today)             # T+1 可卖份额
+            qty = int(min(-amount, avail)) // self.p.lot * self.p.lot
+            if qty > 0:
+                self.sell(data=data, size=qty)
+
+
 TASKS = {"sma_cross": SmaCrossBT, "momentum_rotation": MomentumRotationBT,
-         "turtle_donchian": TurtleBT, "grid_trading": GridBT}
+         "turtle_donchian": TurtleBT, "grid_trading": GridBT,
+         "baseline_multifactor": BaselineMultifactorBT}
 
 
 def main() -> None:
@@ -223,12 +302,25 @@ def main() -> None:
     ap.add_argument("--atr_n", type=int, default=20)
     ap.add_argument("--grid_pct", type=float, default=0.05)
     ap.add_argument("--levels", type=int, default=8)
+    ap.add_argument("--schedule", default=None,
+                    help="baseline_multifactor: 权重调度表 JSON 路径")
+    ap.add_argument("--ref-symbol", default="510300.SH",
+                    help="baseline_multifactor: 全交易日参考标的（日历轴，不交易）")
+    ap.add_argument("--tax", type=float, default=0.001,
+                    help="卖出印花税率（默认 0.001；2023-08-28 后为 0.0005）")
     ap.add_argument("--etf", action="store_true", help="ETF：免印花税")
     args = ap.parse_args()
 
     pdf = pd.read_parquet(args.data)
     pdf["trade_date"] = pd.to_datetime(pdf["trade_date"])
     pdf = pdf.set_index("trade_date")
+
+    # baseline：参考标的必须排第一（bt 以 data0 的日期做日历轴）
+    if args.task == "baseline_multifactor":
+        if args.ref_symbol not in set(pdf["symbol"].unique()):
+            raise SystemExit(f"参考标的 {args.ref_symbol} 不在数据里")
+        pdf = pd.concat([pdf[pdf["symbol"] == args.ref_symbol],
+                         pdf[pdf["symbol"] != args.ref_symbol]])
 
     cerebro = bt.Cerebro()
     for sym in pdf["symbol"].unique():
@@ -238,16 +330,23 @@ def main() -> None:
                                    low="low", close="close", volume="volume",
                                    openinterest=None)
         cerebro.adddata(feed, name=sym)
-    task_kw = {
-        "sma_cross": {"fast": args.fast, "slow": args.slow},
-        "momentum_rotation": {"window": args.window, "nsyms": args.nsyms},
-        "turtle_donchian": {"entry": args.entry, "exitp": args.exitp, "atr_n": args.atr_n},
-        "grid_trading": {"grid_pct": args.grid_pct, "levels": args.levels},
-    }[args.task]
+    if args.task == "baseline_multifactor":
+        with open(args.schedule) as f:
+            task_kw = {"schedule": json.load(f)}
+    else:
+        task_kw = {
+            "sma_cross": {"fast": args.fast, "slow": args.slow},
+            "momentum_rotation": {"window": args.window, "nsyms": args.nsyms},
+            "turtle_donchian": {"entry": args.entry, "exitp": args.exitp,
+                                "atr_n": args.atr_n},
+            "grid_trading": {"grid_pct": args.grid_pct, "levels": args.levels},
+        }[args.task]
     cerebro.addstrategy(TASKS[args.task], **task_kw)
     cerebro.broker.setcash(1_000_000.0)
     cerebro.broker.set_checksubmit(False)   # 换仓买单依赖同批卖单资金，不能预检拒单
-    comm = CNCommInfo(commission=0.00025)
+    if args.task == "baseline_multifactor":
+        cerebro.broker.set_coo(True)        # 委托当日开盘价成交（对齐 JQ open 时点）
+    comm = CNCommInfo(commission=0.00025, stamp=args.tax)
     if args.etf:
         comm = CNCommInfo(commission=0.00025, stamp=0.0, transfer=0.0)
     cerebro.broker.addcommissioninfo(comm)

@@ -204,3 +204,27 @@ def test_unknown_operation_field_raises():
 
     with pytest.raises(ValueError, match="未知字段 operation"):
         get_fundamentals(query(operation.made_up_field), date=_DAY)
+
+
+def test_tail_pollution_regression(tmp_catalog):
+    """Critical 回归:income 表其他字段的行不得污染 net_profit 列。
+
+    修复前:每列键集含整表 FIELD_MAP 尾段,seed income.total_revenue
+    会被填进 net_profit 列(逐行覆盖末次获胜)。
+    """
+    from lquant.research.dialect.jq_shim import get_fundamentals
+
+    _seed_financial([_row("600519.SH", "income.total_revenue", 777.0)])
+    df = get_fundamentals(
+        query(income.net_profit).filter(income.code.in_(["600519.SH"])),
+        date=_DAY)
+    assert df["net_profit"].tolist() == [None]
+
+
+def test_pollution_regression_control_group(tmp_catalog):
+    """对照组:seed income.n_income_attr_p 时 net_profit 正常取值。"""
+    from lquant.research.dialect.jq_shim import get_fundamentals
+
+    _seed_financial([_row("600519.SH", "income.n_income_attr_p", 42.0)])
+    df = get_fundamentals(query(income.net_profit), date=_DAY)
+    assert df["net_profit"].tolist() == [42.0]

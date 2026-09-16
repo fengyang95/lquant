@@ -36,6 +36,38 @@ export default function FactorPanel() {
   const [generator, setGenerator] = useState('random');
   const [n, setN] = useState(100);
 
+  /** 运行中任务协作式取消 */
+  async function cancelTask(id: string) {
+    setBusy('cancel');
+    setMsg('');
+    try {
+      await post(`/tasks/factor/${encodeURIComponent(id)}/cancel`, {});
+      setMsg('✓ 已请求取消');
+      void mutate();
+    } catch (e) {
+      setMsg(`✗ ${e instanceof Error ? e.message : e}`);
+    } finally {
+      setBusy('');
+    }
+  }
+
+  /** 已完成的「因子评价」任务 → 取落库结果，跳转评价报告 */
+  async function openResult(t: TaskItem) {
+    setBusy(`res-${t.id}`);
+    setMsg('');
+    try {
+      const r = await get<{ result: { report_url?: string } }>(
+        `/factors/evaluate/${encodeURIComponent(t.id)}`,
+      );
+      if (r.result?.report_url) window.open(r.result.report_url, '_blank');
+      else setMsg('✗ 结果中缺少报告地址');
+    } catch (e) {
+      setMsg(`✗ ${e instanceof Error ? e.message : e}`);
+    } finally {
+      setBusy('');
+    }
+  }
+
   async function launch() {
     setBusy('mine');
     setMsg('');
@@ -110,6 +142,28 @@ export default function FactorPanel() {
           loading={isLoading}
           msg=""
           extraOf={(t) => String(t.params?.generator ?? '—')}
+          actionsOf={(t) => (
+            <>
+              {t.name === '因子评价' && t.state === 'finished' && (
+                <button
+                  className="btn btn-sm"
+                  disabled={busy === `res-${t.id}`}
+                  onClick={() => void openResult(t)}
+                >
+                  查看结果
+                </button>
+                )}
+              {t.state === 'running' && (
+                <button
+                  className="btn btn-sm"
+                  disabled={busy === 'cancel'}
+                  onClick={() => void cancelTask(t.id)}
+                >
+                  取消
+                </button>
+              )}
+            </>
+          )}
           emptyHint="暂无挖掘任务 —— 上方发起一次"
         />
       </Panel>

@@ -350,6 +350,66 @@ def test_baseline_monthly_topn_exit_rule(tmp_catalog, tmp_path: Path, monkeypatc
     assert not (set(n[:5]) & sells0901)
 
 
+def test_keep_band_positions_retained_without_rebalance(tmp_catalog, tmp_path: Path,
+                                                         monkeypatch):
+    """G4 裁定锁定:keep 带(rank 21-50)持仓在调仓日**无任何订单**。
+
+    与 test_baseline_monthly_topn_exit_rule 互补:那边断言"未被卖出",
+    这里断言 stronger 语义——连调权单(order_target_value)也没有:
+    - rank 21-50 的持仓:调仓日交易列表为空(无卖出、无调权买入),股数不变;
+    - rank >50:被卖出;top20:被调到等权(有成交)。
+
+    语义裁定(见 docs/BACKTEST_BASELINE_E2E.md G4):这是缓冲带设计——
+    跌出 top20 但仍在 top50 内的持仓保留以减换手,不追调权重;权重漂移
+    是设计代价,非引擎缺陷。若未来补"带内再平衡",本测试应随之更新。
+
+    场景与 test_baseline_monthly_topn_exit_rule 相同(60 只平价股票,
+    score = z_yoy,排名由财务行手算控制):08-01 买入 H 全体 20 只;
+    09-01 调仓后 H0..H9 居 top20(调权)、H10..H14 落 21-25(keep 带不动)、
+    H15..H19 跌出 top50(卖出)。
+    """
+    h = [f"6001{i:02d}.SH" for i in range(20)]
+    n = [f"6002{i:02d}.SH" for i in range(40)]
+    bars = pl.DataFrame(_flat_panel_rows(h + n, date(2025, 6, 2), 130))
+    root = tmp_path / "data" / "daily" / "year=2025"
+    root.mkdir(parents=True)
+    bars.write_parquet(root / "part-0.parquet")
+    monkeypatch.setattr("lquant.data.store.parquet._root", lambda: tmp_path / "data")
+
+    yoy2: dict[str, float] = {}
+    for i, s in enumerate(h):
+        yoy2[s] = (60.0 - i) if i < 10 else ((40.0 - (i - 10)) if i < 15 else 0.0)
+    for j, s in enumerate(n):
+        yoy2[s] = (50.0 - j) if j < 10 else 35.0
+    _seed_financial(
+        [_fin_row(s, date(2025, 7, 31), date(2025, 7, 20), 100.0 - i)
+         for i, s in enumerate(h)]
+        + [_fin_row(s, date(2025, 8, 31), date(2025, 8, 25), v)
+           for s, v in yoy2.items()])
+
+    res = _run_baseline(bars)
+    assert res.error is None, res.error
+
+    keep_band = set(h[10:15])                      # rank 21-25,keep 带内
+    p0801 = res.positions.get(date(2025, 8, 1), {})
+    p0901 = res.positions.get(date(2025, 9, 1), {})
+    assert keep_band <= set(p0801) and keep_band <= set(p0901)
+
+    # 调仓日(09-01)keep 带持仓零成交:无卖出、无调权买入
+    trades0901 = [t for t in res.trades if t.trade_date == date(2025, 9, 1)]
+    assert not [t for t in trades0901 if t.symbol in keep_band]
+    # 股数一字未动(平价面板、无分红,08-01 与 09-01 之间亦无成交)
+    for s in keep_band:
+        assert p0901[s] == p0801[s]
+
+    # 对照组:跌出 top50 的被卖;新进 top20 的被买入(现金只够 5 只)。
+    # (原 top20 的 H0..H9 平价面板下权重恰已等权,调权单量为零,无成交。)
+    sells0901 = {t.symbol for t in trades0901 if t.side.value == "sell"}
+    buys0901 = {t.symbol for t in trades0901 if t.side.value == "buy"}
+    assert sells0901 == set(h[15:])
+    assert buys0901 == set(n[:5])
+
+
 def test_baseline_t_plus_one_fill(tmp_catalog, bars_flat_130):
     """T+1:开仓当日成交于当日开盘价;当日买入的份额当日不可卖,次日可卖。
 

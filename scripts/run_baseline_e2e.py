@@ -18,12 +18,14 @@ import argparse
 import subprocess
 import sys
 import time
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
 
 from lquant.backtest.jqapi import JQRunner
+from lquant.backtest.metrics import perf_from_returns, turnover_from_trades
 from lquant.data.store import catalog
 from lquant.data.store import parquet as store
 from lquant.research.strategies.baseline_multifactor import (
@@ -33,12 +35,19 @@ from lquant.research.strategies.baseline_multifactor import (
 )
 
 INITIAL_CASH = 10_000_000
+DEFAULT_WARMUP_DAYS = 120
 
 
 def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="基准多因子策略真实数据 E2E")
     ap.add_argument("--start", default="2021-01-01")
     ap.add_argument("--end", default="2024-12-31")
+    ap.add_argument(
+        "--warmup-days",
+        type=int,
+        default=DEFAULT_WARMUP_DAYS,
+        help="预热自然日数:实际喂引擎的 start 提前这么多天(默认 120,0 关闭)",
+    )
     ap.add_argument("--out", default="docs/BACKTEST_BASELINE_E2E.md")
     ap.add_argument("--no-write", action="store_true", help="只打印,不写文档")
     return ap.parse_args()
@@ -93,6 +102,82 @@ def load_bars(start: str, end: str) -> pl.DataFrame:
     return df
 
 
+def resolve_warmup_start(start: str, warmup_days: int) -> str:
+    """计算实际喂引擎的 start。
+
+    请求 start 提前 warmup_days 个自然日;湖在该预热窗内(严格早于请求
+    start)无任何数据时打印 WARN 并跳过预热(引擎 start = 请求 start),
+    不得报错退出。返回最终喂给引擎的 start。
+    """
+    if warmup_days <= 0:
+        return start
+    s = date.fromisoformat(start)
+    warm_start = (s - timedelta(days=warmup_days)).isoformat()
+    mn = (
+        store.read_daily(start=warm_start, end=start)
+        .filter(pl.col("trade_date") < s)
+        .select(pl.col("trade_date").min())
+        .collect()
+        .item()
+    )
+    if mn is None:
+        print(
+            f"[WARN] 湖在预热窗 {warm_start} ~ {start} 内无数据,跳过预热"
+            "(前几个月可能仍是 0 持仓伪影)",
+            flush=True,
+        )
+        return start
+    return warm_start
+
+
+@dataclass
+class ClippedResult:
+    """剔除预热期后的回测结果(metrics 用请求 start 之后的序列重算)。"""
+
+    nav: list[tuple[date, float]]
+    trades: list
+    rejected: list
+    records: dict
+    metrics: dict
+
+
+def clip_warmup(res, start: str) -> ClippedResult:
+    """过滤早于请求 start 的日期,并基于剩余序列重算 metrics。
+
+    预热期只用于让因子/持仓"热身",其调仓与净值不得进入结论。
+    """
+    s = date.fromisoformat(start)
+    nav = [(d, v) for d, v in res.nav if date.fromisoformat(str(d)) >= s]
+    trades = [t for t in res.trades if date.fromisoformat(str(t.trade_date)) >= s]
+    rejected = [
+        r
+        for r in res.rejected
+        if date.fromisoformat(str(r[0] if isinstance(r, tuple) else r.trade_date)) >= s
+    ]
+    records = {
+        k: [(d, x) for d, x in series if date.fromisoformat(str(d)) >= s]
+        for k, series in res.records.items()
+    }
+    rets = [nav[i][1] / nav[i - 1][1] - 1 for i in range(1, len(nav)) if nav[i - 1][1] > 0]
+    dates = [d for d, _ in nav][1 : 1 + len(rets)]
+    perf = perf_from_returns(rets, dates=[str(d) for d in dates])
+    perf.pop("nav", None)
+    metrics = {
+        **perf,
+        "initial_cash": res.metrics.get("initial_cash", INITIAL_CASH),
+        "final_nav": nav[-1][1] if nav else INITIAL_CASH,
+        "n_trades": len(trades),
+        "n_rejected": len(rejected),
+        "total_fee": sum(f.fee for f in trades),
+        "turnover": turnover_from_trades(
+            [(t.trade_date, t.qty * t.price) for t in trades]
+        ),
+        "benchmark": res.metrics.get("benchmark"),
+    }
+    return ClippedResult(nav=nav, trades=trades, rejected=rejected,
+                         records=records, metrics=metrics)
+
+
 def git_commit() -> str:
     try:
         return subprocess.run(
@@ -140,6 +225,7 @@ def render(
     start: str,
     end: str,
     elapsed: float,
+    warm_start: str,
     metrics: dict,
     nav: list[tuple],
     trades: list,
@@ -182,6 +268,7 @@ def render(
 | 项 | 值 |
 |---|---|
 | 区间 | {start} ~ {end} |
+| 预热 | 引擎实际从 {warm_start} 起跑,请求 start 之前的预热期调仓/净值不入结论 |
 | 初始资金 | {INITIAL_CASH:,} |
 | 调仓 | 月度第 1 交易日开盘,top 20 等权,跌出 top 50 卖出 |
 | 因子公式 | {", ".join(FACTOR_FORMULAS)} |
@@ -258,10 +345,13 @@ def merge_manual_notes(new_doc: str, old_doc: str) -> str:
 def main() -> None:
     args = _parse_args()
     t0 = time.time()
+    warm_start = resolve_warmup_start(args.start, args.warmup_days)
     _n_fin, _n_item, yoy_items, cov_mn, cov_mx = preflight(args.start, args.end)
-    df = load_bars(args.start, args.end)
+    df = load_bars(warm_start, args.end)
     n_bars, n_symbols = df.height, df["symbol"].n_unique()
     print(f"[preflight] bars={n_bars:,} symbols={n_symbols:,} yoy_items={yoy_items}", flush=True)
+    if warm_start < args.start:
+        print(f"[warmup] engine start={warm_start}, 结论区间 {args.start} ~ {args.end}", flush=True)
 
     res = JQRunner(STRATEGY_CODE, initial_cash=INITIAL_CASH, factor_formulas=FACTOR_FORMULAS).run(
         df
@@ -269,6 +359,7 @@ def main() -> None:
     if res.error:
         print(f"[E2E FAILED] {res.error}", file=sys.stderr)
         raise SystemExit(1)
+    res = clip_warmup(res, args.start)
 
     elapsed = time.time() - t0
     print("[metrics]", flush=True)
@@ -283,6 +374,7 @@ def main() -> None:
             args.start,
             args.end,
             elapsed,
+            warm_start,
             res.metrics,
             res.nav,
             res.trades,

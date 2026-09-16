@@ -1,5 +1,13 @@
 /** 任务中心共享类型与展示辅助。 */
 
+/** 任务进度（与后端 progress 注册表 / WS 流协议一致） */
+export type TaskProgress = {
+  done: number;
+  total: number;
+  phase: string;
+  message?: string | null;
+};
+
 /** 统一任务项（后端 /api/tasks 归一结构） */
 export type TaskItem = {
   id: string;
@@ -10,6 +18,7 @@ export type TaskItem = {
   created_at: string | null;
   params: Record<string, unknown>;
   error: string | null;
+  progress?: TaskProgress | null;
 };
 
 /** /api/tasks/summary 的单个 kind 统计 */

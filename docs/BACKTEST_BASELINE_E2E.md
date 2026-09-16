@@ -103,11 +103,11 @@ financial_pit 中与"同比/yoy"相关的 DISTINCT item:['indicator.cfps_yoy', '
 
 | 编号 | 现象 | 归属 | 复现方式 | 建议归属 | 是否阻塞基准策略验收 |
 |---|---|---|---|---|---|
-| G1 | `JQRunner._sec_data` 构造 `_SecData` 时 `is_st` 恒 False,不读 security 表;ruleset per-instrument `is_st` 元数据(PriceLimit/涨跌停 5%)未接线,策略源码中 ST 剔除为死代码 | 兼容面 | `tests/unit/test_baseline_strategy.py::test_baseline_excludes_st`(xfail strict) | P1 | 是 |
+| G1 | ~~`JQRunner._sec_data` 构造 `_SecData` 时 `is_st` 恒 False,不读 security 表;ruleset per-instrument `is_st` 元数据(PriceLimit/涨跌停 5%)未接线,策略源码中 ST 剔除为死代码~~ **已在 P1 修复**:is_st 从 security 表贯通策略剔除与涨跌停规则(ST 5%,顺带修复 gem/star 20%/bse 30% 板块值,原先一律 10% 与 cn_a_share.yaml 矛盾) | 兼容面 | `tests/unit/test_jq_api.py::test_is_st_wired_from_security_table` / `::test_st_price_limit_5pct`;`test_baseline_strategy.py::test_baseline_excludes_st` 已 un-xfail | 已闭环(P1) | 否(曾阻塞,已修) |
 | G2 | 日线湖 2021–2023 未回填,基准 E2E 只能实跑 2024 一年(请求 4 年) | 数据层 | `PYTHONPATH=src python scripts/run_baseline_e2e.py`(preflight 打印 WARN "缺 2021-2023 回填") | 数据回填 | 是(4 年基准记录缺失) |
 | G3 | 切片预热伪影:策略要求 60 个交易日历史 bar,只喂 2024 单年时 2024-01~04 调仓日 `tradable` 为空 → 前 4 个月 0 持仓 | 回测正确性(脚本参数) | 实跑持仓数表 2024-01-02~2024-04-01 均为 0;`--start 2023-10` 喂长预热即消失 | P2(脚本默认预热区间,或 G2 回填后自然消除) | 否(已定性为伪影非策略缺陷) |
-| G4 | keep 带漂移:top 20 外但 top 50 内的持仓只卖不调权,单票权重偏离 1/20,实际持仓 19–21 漂移;属策略语义而非引擎缺口,但大样本上"目标 top20、实际 >20" | 回测正确性(策略语义确认) | `tests/unit/test_baseline_strategy.py::test_baseline_monthly_topn_exit_rule` + 实跑持仓数表(见上) | P2(裁定策略语义:保留或补再平衡) | 否(已量化并记录) |
-| G5 | `attribute_history` 窗口按自然日序数截取、缺 bar 日不补行:停牌次日仅 59 行 → 被 MIN_LISTED_DAYS 误剔;与聚宽 skip_paused"跳过但窗口按交易日推"口径不同;另"上市满 60 日"用 60 根 bar 近似,长期停牌老股被保守误剔 | 兼容面 | `tests/unit/test_baseline_strategy.py::test_baseline_excludes_halted` 手算口径(09-01 仍剔除、10-01 买入) | P1 | 否(保守方向偏差) |
+| G4 | ~~keep 带漂移:top 20 外但 top 50 内的持仓只卖不调权,单票权重偏离 1/20,实际持仓 19–21 漂移~~ **已裁定(P2):缓冲带设计,非缺陷**——带内(21-50)持仓保留但不调权是为减换手;权重漂移是设计代价而非引擎缺口,漂移幅度已在人工补注量化(实际持仓 19–21)。若未来改为"带内再平衡",须同步更新锁定测试 | 回测正确性(策略语义确认) | `tests/unit/test_baseline_strategy.py::test_baseline_monthly_topn_exit_rule` + `::test_keep_band_positions_retained_without_rebalance`(锁定"带内零订单"语义)+ 实跑持仓数表(见上) | 已闭环(P2 裁定:保留现状) | 否(已量化并记录) |
+| G5 | ~~`attribute_history` 窗口按自然日序数截取、缺 bar 日不补行:停牌次日仅 59 行 → 被 MIN_LISTED_DAYS 误剔~~ **已在 P1 修复**:history/attribute_history skip_paused=True(默认)按交易日窗口前推(只数有 bar 的行),停牌不再造成保守误剔;skip_paused=False 保持自然日窗口口径 | 兼容面 | `tests/unit/test_jq_api.py::test_attribute_history_skip_paused_counts_traded_bars` / `::test_history_skip_paused_counts_traded_bars`;`test_baseline_strategy.py::test_baseline_excludes_halted` 口径已更新 | 已闭环(P1) | 否(保守方向偏差,已修) |
 | G6 | `get_fundamentals` 的 date 参数未钳制到当前交易日,存在前视口子(聚宽原生语义同此)。**已在 P0 修复**:显式 date 钳制 `min(date, 当日)` | 回测正确性 | `tests/unit/test_jq_fundamentals_wiring.py::test_future_date_param_clamped_to_trade_day` | 已闭环 | 否 |
 | G7 | BaoStock `growth.YOYNI` item 不存在(growth 前缀 0 行),实际同比 item 为 tushare `indicator.netprofit_yoy`;曾致策略取数表错误 | 数据层 | financial_pit `SELECT DISTINCT item ... LIKE '%yoy%'`(preflight 已打印);已回填常量并同步单测 | 已闭环 | 否 |
 | G8 | T+1 语义口径裁定:计划文本"信号日下单次日开盘成交"与引擎/聚宽口径(当日开盘撮合 + T+1 可卖 `sellable_after_days`)冲突,按引擎/聚宽口径执行;若裁定错误需重审撮合时点 | 回测正确性 | `tests/unit/test_baseline_strategy.py::test_baseline_t_plus_one_fill` | P2(复核撮合时点口径) | 否 |
@@ -147,3 +147,7 @@ financial_pit 中与"同比/yoy"相关的 DISTINCT item:['indicator.cfps_yoy', '
 6. **item 确认**:BaoStock `growth.YOYNI` 在本库不存在(growth 前缀无任何行),
    实际 item 为 tushare fina_indicator 的 `indicator.netprofit_yoy`
    (33.4 万行),已回填常量并同步单测。
+7. **get_fundamentals 前缀对齐(P1)**:财务表前缀已对齐真实数据
+   (income→income、balance→balancesheet),六表全白名单 FIELD_MAP
+   (growth/operation 借 indicator 前缀 yoy 尾段),未知字段显式 ValueError。
+   属 G7 历史背景的延伸,未单列新缺口编号。

@@ -18,13 +18,15 @@ from lquant.core.config import get_settings
 # lquant.duckdb 的单写锁，此时服务端 duckdb.connect() 直接 IOException，
 # 所有依赖库表的接口瞬时 500。带退避的短重试能吸收几秒级的锁重叠；
 # 持锁方长期不走时仍会快速失败（指数退避封顶 0.4s）。
-_CONNECT_ATTEMPTS = 8
-_CONNECT_BACKOFF_CAP = 0.4
-
 # 建连锁：同进程多线程同时首次 duckdb.connect() 同一文件会撞 instance cache
 # （Unique file handle conflict），建连阶段串行化。reader() 的建连同样需要它，
 # 所以这一层独立于下面的写锁。
 _connect_lock = threading.Lock()
+
+# 跨进程写锁冲突的重试预算（秒）。单机多进程共享一个 duckdb 文件，别的进程
+# 持锁期间建连直接抛 IOException —— 表现为全站 500（含 /factors/evaluate）。
+# 短重叠（秒级）用重试吸收；长时间持锁重试耗尽后原样抛出，由 API 层映射为 503。
+_CONNECT_RETRY_TOTAL = 10.0
 
 # 写串行锁：跨进程的单写者由 DuckDB 的 OS 文件锁兜底（第二个写进程会直接报错），
 # 但**同进程不同线程**并不受它保护 —— DuckDB 的并发控制是乐观的，两个连接各自
@@ -42,18 +44,18 @@ _WRITE_LOCK = threading.RLock()
 
 
 def _connect() -> duckdb.DuckDBPyConnection:
-    with _connect_lock:
-        delay = 0.05
-        for attempt in range(_CONNECT_ATTEMPTS):
-            try:
+    deadline = time.monotonic() + _CONNECT_RETRY_TOTAL
+    delay = 0.05
+    while True:
+        try:
+            with _connect_lock:
                 return duckdb.connect(_path())
-            except duckdb.IOException as e:
-                transient = "lock" in str(e).lower()
-                if not transient or attempt == _CONNECT_ATTEMPTS - 1:
-                    raise
-                time.sleep(delay)
-                delay = min(delay * 2, _CONNECT_BACKOFF_CAP)
-    raise AssertionError("unreachable")  # pragma: no cover
+        except duckdb.IOException as e:
+            # 只重试锁冲突；文件损坏等其它 IO 错误立即抛出
+            if "lock" not in str(e).lower() or time.monotonic() >= deadline:
+                raise
+            time.sleep(delay)  # 锁外睡眠，不阻塞其它线程建连
+            delay = min(delay * 2, 1.0)
 
 
 def _path() -> str:
