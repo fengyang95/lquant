@@ -14,6 +14,10 @@ import duckdb
 
 from lquant.core.config import get_settings
 
+# 跨进程文件锁冲突的短重试：外部脚本（回填 CLI、校验脚本）可能长期持有
+# lquant.duckdb 的单写锁，此时服务端 duckdb.connect() 直接 IOException，
+# 所有依赖库表的接口瞬时 500。带退避的短重试能吸收几秒级的锁重叠；
+# 持锁方长期不走时仍会快速失败（指数退避封顶 0.4s）。
 # 建连锁：同进程多线程同时首次 duckdb.connect() 同一文件会撞 instance cache
 # （Unique file handle conflict），建连阶段串行化。reader() 的建连同样需要它，
 # 所以这一层独立于下面的写锁。

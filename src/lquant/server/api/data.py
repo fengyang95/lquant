@@ -8,11 +8,14 @@
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import threading
 from datetime import date
 
 import polars as pl
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from lquant.core.db import reader
@@ -375,6 +378,59 @@ def create_data_task(req: TaskIn) -> dict:
 def list_data_tasks(limit: int = Query(default=50, ge=1, le=500)) -> list[dict]:
     """数据任务列表（最新在前）。"""
     return list_tasks(limit)
+
+
+@router.get("/tasks/{task_id}/events")
+async def stream_task_events(task_id: str) -> StreamingResponse:
+    """数据任务进度 SSE 流：`event: progress|done` 帧 + 15s 心跳注释行。
+
+    连接即推一帧当前任务快照；之后转发任务线程 publish() 的每批进度。
+    终态（terminal=true）推一帧 done 后关闭。任务不存在 → 404。
+    事件是进程内存总线（core/task_events.py）—— RQ/redis 分支任务跑在
+    worker 进程收不到，前端保留轮询兜底。
+    """
+    task = get_task(task_id)
+    if task is None:
+        raise HTTPException(404, f"任务不存在: {task_id}")
+    from lquant.core.task_events import subscribe  # noqa: PLC0415
+
+    q, unsubscribe = subscribe(task_id)
+
+    async def gen():
+        yield (
+            'event: snapshot\ndata: '
+            + json.dumps({
+                "task_id": task_id,
+                "status": task["status"],
+                "phase": task.get("phase"),
+                "done": task.get("done_symbols") or 0,
+                "total": task.get("total_symbols"),
+                "rows": task.get("rows_written") or 0,
+            }, ensure_ascii=False)
+            + "\n\n"
+        )
+        try:
+            while True:
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=15.0)
+                except TimeoutError:
+                    yield ": heartbeat\n\n"  # 心跳防代理断空闲连接
+                    continue
+                terminal = ev.get("terminal")
+                yield (
+                    f"event: {'done' if terminal else 'progress'}\ndata: "
+                    + json.dumps(ev, ensure_ascii=False)
+                    + "\n\n"
+                )
+                if terminal:
+                    return
+        finally:
+            unsubscribe()
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/tasks/{task_id}")

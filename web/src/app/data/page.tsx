@@ -5,6 +5,8 @@ import useSWR from 'swr';
 import PageHeader from '@/components/PageHeader';
 import { Panel, Stat } from '@/components/Panel';
 import { Empty, ErrorNote, Loading, Msg } from '@/components/States';
+import LazySection from '@/components/LazySection';
+import Chart from '@/components/Chart';
 import { fetcher, post } from '@/lib/api';
 import TasksPanel from './TasksPanel';
 import SourceConfigPanel from './SourceConfigPanel';
@@ -122,14 +124,15 @@ export default function DataPage() {
 
       <DataVersionCard />
 
-      {/* 日线数据补全：任务进度 / 断点续传 / 数据源配置 / 跨源印证 / 全湖质量检查 */}
-      <TasksPanel />
-      <CheckpointPanel />
-      <SourceConfigPanel />
-      <CrosscheckPanel />
-      <QualityPanel />
-      <IssuesPanel />
-      <SyncJobsPanel />
+      {/* 日线数据补全：任务进度 / 断点续传 / 数据源配置 / 跨源印证 / 全湖质量检查。
+          折叠线以下全部懒挂载：进入视口前不发请求，首屏瞬时请求从 9 路降到 2 路 */}
+      <LazySection><TasksPanel /></LazySection>
+      <LazySection><CheckpointPanel /></LazySection>
+      <LazySection><SourceConfigPanel /></LazySection>
+      <LazySection><CrosscheckPanel /></LazySection>
+      <LazySection><QualityPanel /></LazySection>
+      <LazySection><IssuesPanel /></LazySection>
+      <LazySection><SyncJobsPanel /></LazySection>
 
       <Panel
         title="日线数据湖"
@@ -170,6 +173,7 @@ export default function DataPage() {
           title="采集健康度"
           meta={`${health.checked_at.slice(11, 16)} 检查${health.any_gap ? ' · 有当日缺口' : ''}`}
         >
+          <CollectHealthChart jobs={health.jobs} />
           <div className="grid gap-2 md:grid-cols-2">
             {health.jobs.map((j) => (
               <div
@@ -195,7 +199,7 @@ export default function DataPage() {
         </Panel>
       )}
 
-      <CoverageMonthlyChart />
+      <LazySection><CoverageMonthlyChart /></LazySection>
 
       <Panel title="采集表覆盖度">
         {!data?.tables.length ? (
@@ -233,6 +237,47 @@ export default function DataPage() {
         />
       )}
       {showDict && <DataDictionaryModal onClose={() => setShowDict(false)} />}
+    </div>
+  );
+}
+
+/** 采集健康度成功率横向条形图：null 视为 0（从未成功），≥90% 用涨色，其余警示金 */
+function CollectHealthChart({ jobs }: { jobs: CollectHealth['jobs'] }) {
+  const valid = jobs.filter((j) => j.success_rate != null);
+  if (!valid.length) return null;
+  const sorted = [...valid].sort((a, b) => (a.success_rate ?? 0) - (b.success_rate ?? 0));
+  return (
+    <div className="mb-3">
+      <Chart
+        height={Math.max(120, sorted.length * 30)}
+        option={{
+          grid: { left: 8, right: 48, top: 4, bottom: 4, containLabel: true },
+          tooltip: { trigger: 'item' as const },
+          xAxis: {
+            type: 'value' as const,
+            max: 1,
+            axisLabel: { formatter: (v: number) => `${Math.round(v * 100)}%` },
+          },
+          yAxis: {
+            type: 'category' as const,
+            data: sorted.map((j) => j.label),
+            axisTick: { show: false },
+          },
+          series: [{
+            type: 'bar' as const,
+            barWidth: 12,
+            data: sorted.map((j) => ({
+              value: j.success_rate,
+              itemStyle: { color: (j.success_rate ?? 0) >= 0.9 ? '#0f8a5f' : '#c07f00' },
+            })),
+            label: {
+              show: true, position: 'right' as const,
+              formatter: ({ value }: { value: number }) =>
+                value == null ? '—' : `${Math.round(value * 100)}%`,
+            },
+          }],
+        }}
+      />
     </div>
   );
 }
