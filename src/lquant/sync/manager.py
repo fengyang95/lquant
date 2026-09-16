@@ -198,17 +198,26 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
                     from lquant.data.ingest import tasks as data_tasks
 
                     # auto_crosscheck 透传 job params（缺省 True），运维可在 sync_job 里配置关闭
-                    t = data_tasks.create_task(
-                        "daily_update", {"days": int(params.get("days", 10)),
-                                         "auto_crosscheck": params.get("auto_crosscheck", True)})
-                    task = data_tasks.execute_task(t["task_id"])
-                    rows = int(task.get("rows_written") or 0)
-                    detail = {"task_id": t["task_id"], "task_status": task["status"],
-                              "message": task.get("message")}
-                    if task["status"] == "partial":
-                        status = "partial"
-                    elif task["status"] == "failed":
-                        status = "failed"
+                    try:
+                        t = data_tasks.create_task(
+                            "daily_update", {"days": int(params.get("days", 10)),
+                                             "auto_crosscheck": params.get("auto_crosscheck", True)})
+                    except data_tasks.TaskConflictError as e:
+                        # 手动任务/上次作业还没跑完：跳过本轮并如实记录，不算失败
+                        # （此前直接 failed，监控页每轮都告警一次假故障）
+                        status = "skipped"
+                        detail = {"skipped": True, "reason": f"{type(e).__name__}: {e}"}
+                        log.warning(
+                            f"daily 作业跳过（存在未完成数据任务）sync_id={job.get('sync_id')}: {e}")
+                    else:
+                        task = data_tasks.execute_task(t["task_id"])
+                        rows = int(task.get("rows_written") or 0)
+                        detail = {"task_id": t["task_id"], "task_status": task["status"],
+                                  "message": task.get("message")}
+                        if task["status"] == "partial":
+                            status = "partial"
+                        elif task["status"] == "failed":
+                            status = "failed"
             elif kind == "adj_factor":
                 from lquant.data.ingest.adj import refresh_adj_factors
 
@@ -265,10 +274,12 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
             detail = {"error": f"{type(e).__name__}: {e}"}
 
         finished = datetime.now()
-        # 告警：终态非 ok → 监控错误环（monitor 错误环 → error_logs 可查）
-        if status != "ok":
+        # 告警：终态非 ok/skipped → 监控错误环（monitor 错误环 → error_logs 可查）
+        # skipped（撞活跃任务）是正常排队语义，不告警
+        if status not in ("ok", "skipped"):
             _emit_sync_error(job, kind, status, detail)
         # 0 行不算健康：日线/采集类作业空返回记 partial，避免静默缺口被掩盖
+        # （skipped 不参与该判定：它发生在建任务之前，rows 本就为 0）
         if rows == 0 and kind in ("daily", "collect", "adj_factor") and status == "ok":
             status = "partial"
             detail = {**detail, "zero_rows": True}

@@ -24,7 +24,8 @@ export default function CrosscheckPanel() {
     setBusy(true);
     setMsg('');
     try {
-      const res = await post<CrosscheckResult>('/data/crosscheck', {});
+      // 小样本快跑（HTTP 同步端点，样本大会超时代理断连）；大窗口走 CLI
+      const res = await post<CrosscheckResult>('/data/crosscheck', { limit: 5 });
       setSummary(res.summary);
       setMsg(`✓ 对拍完成：${res.flagged_rows} 行被标记降级`);
       void mutateIssues();

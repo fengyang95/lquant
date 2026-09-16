@@ -12,6 +12,7 @@ import Chart from '@/components/Chart';
 import { Panel, Stat } from '@/components/Panel';
 import PageHeader from '@/components/PageHeader';
 import { Empty } from '@/components/States';
+import LogsPanel from '@/components/LogsPanel';
 import { fetcherData } from '@/lib/api';
 import { C, axes, legend, tooltip } from '@/lib/chart';
 
@@ -396,6 +397,9 @@ export default function MonitorPage() {
             </div>
           )}
         </Panel>
+
+      {/* 运行日志：tail lquant.log，级别过滤 + 关键字搜索 */}
+      <LogsPanel />
       </div>
     </div>
   );

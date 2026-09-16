@@ -179,6 +179,89 @@ def coverage_monthly(
         return {"rows": [], "threshold": threshold}
 
 
+_DATASET_LABELS = {"daily": "日线湖", "daily_basic": "估值指标湖"}
+
+
+def _gaps_report(days: int = 30) -> dict:
+    """缺口报告：scan_coverage(repair=False) 的结果映射成前端友好结构。
+
+    scan_coverage 同时把 COVERAGE_GAP issue 落库（与监控页 issues 共享），
+    这里不需要 repair —— 补采由 /gaps/repair 显式触发。
+    """
+    from lquant.data.quality.coverage import scan_coverage
+
+    rep = scan_coverage(days=days, repair=False)
+    window = rep["window"]
+    from lquant.data.store.catalog import TradeCalendarRepo
+
+    trade_days = TradeCalendarRepo().range(
+        date.fromisoformat(str(window["start"])),
+        date.fromisoformat(str(window["end"])))
+    datasets: list[dict] = []
+    for ds, table in rep["tables"].items():
+        missing = [d.isoformat() for d in table["missing_dates"]]
+        sparse = table["sparse_symbols"]
+        datasets.append({
+            "dataset": ds,
+            "label": _DATASET_LABELS.get(ds, ds),
+            "expected_days": len(trade_days),
+            "actual_days": len(trade_days) - len(missing),
+            "missing": missing,
+            "sparse_symbols": sparse,
+            "sparse_total": len(sparse),
+        })
+    return {
+        "window": {"start": str(window["start"]), "end": str(window["end"])},
+        "datasets": datasets,
+        "missing_dates": sorted(
+            d for ds in datasets for d in ds["missing"]),
+    }
+
+
+@router.get("/gaps")
+def get_gaps(days: int = Query(default=30, ge=1, le=400)) -> dict:
+    """数据缺口：窗口内「日历有交易日、湖里没数据」的日期清单（按 dataset）。"""
+    try:
+        return _gaps_report(days)
+    except Exception as e:  # noqa: BLE001 - 降级不炸首屏
+        from loguru import logger
+
+        logger.warning(f"数据缺口查询失败: {e}")
+        raise HTTPException(502, f"缺口查询失败: {e}") from e
+
+
+class GapsRepairIn(BaseModel):
+    days: int = Field(default=30, ge=1, le=400)
+
+
+@router.post("/gaps/repair", status_code=202)
+def repair_gaps(req: GapsRepairIn = GapsRepairIn()) -> dict:
+    """一键补采：对当前缺口建 daily_update 任务（start=最早缺口日）。
+
+    有活跃数据任务时返回 created=false（不 500，前端提示稍后再试）。
+    """
+    rep = _gaps_report(req.days)
+    # 只按日线湖缺口补采：daily_basic 空湖是常态（info 级），拿它的缺口
+    # 当补采范围会把 start 拉到窗口最早期，回填一整窗
+    daily = next((d for d in rep["datasets"] if d["dataset"] == "daily"), None)
+    missing = daily["missing"] if daily else []
+    if not missing:
+        return {"created": False, "task_id": None, "reason": "no_gap"}
+    try:
+        from lquant.core.types import today_cn
+
+        task = create_task("daily_update", {
+            "start": missing[0],
+            "end": today_cn().isoformat(),  # 与 scan_coverage 窗口同一时区口径
+            "note": "manual_gap_repair",
+            "auto_crosscheck": True,
+        })
+    except TaskConflictError as e:
+        return {"created": False, "task_id": None,
+                "reason": "active_task_exists", "message": str(e)}
+    return {"created": True, "task_id": task["task_id"], "reason": None}
+
+
 @router.get("/securities")
 def securities(
     q: str = Query(default="", max_length=20, description="代码/名称关键字"),
