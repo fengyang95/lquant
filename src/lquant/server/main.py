@@ -1,8 +1,10 @@
 """服务入口。"""
 from __future__ import annotations
 
-from fastapi import FastAPI
+import duckdb
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from lquant.core.logging import setup_logging
 from lquant.monitor import start_monitor, stop_monitor
@@ -34,6 +36,19 @@ def create_app() -> FastAPI:
     setup_logging()
     app = FastAPI(title="lquant", version="0.1.0",
                   description="A股量化研究平台 API")
+
+    @app.exception_handler(duckdb.IOException)
+    async def _duckdb_lock_to_503(request: Request, exc: duckdb.IOException) -> JSONResponse:  # noqa: ARG001
+        """跨进程写锁冲突 → 503（可重试语义）而非裸 500。
+
+        _connect 已做有界重试；到这里说明持锁方长时间不释放，前端可提示
+        「数据湖忙，请稍后重试」。非锁冲突的 IOException 原样 500（重新抛出
+        走 starlette 默认错误页）。
+        """
+        if "lock" not in str(exc).lower():
+            raise exc
+        return JSONResponse(status_code=503,
+                            content={"detail": "数据湖忙：另一进程持有 DuckDB 写锁，请稍后重试"})
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:3000"],

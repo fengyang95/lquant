@@ -67,17 +67,26 @@ def _sync_items(limit: int) -> list[dict]:
 
 
 def _job_items(queue: str, kind: str, limit: int) -> list[dict]:
-    """队列任务（backtest 扫描 / factor 挖掘）归一。"""
+    """队列任务（backtest 扫描 / factor 挖掘 / 因子评价）归一。
+
+    进度取自进度注册表（enqueue 时任务体声明 progress 回调才会写入），
+    显示名优先取登记名（因子评价 / 参数扫描 / 因子挖掘）。
+    """
+    from lquant.server.progress import get_job_name, get_progress
+
     out = []
     for j in list_recent_jobs(limit):
         if j.get("queue") != queue:
             continue
         status = j.get("status") or "queued"
-        out.append({"id": j["id"], "kind": kind,
-                    "name": "参数扫描" if kind == "backtest" else "因子挖掘",
+        jid = j["id"]
+        out.append({"id": jid, "kind": kind,
+                    "name": get_job_name(jid)
+                    or ("参数扫描" if kind == "backtest" else "因子挖掘"),
                     "status": status, "state": _JOB_STATE.get(status, "queued"),
                     "created_at": j.get("created_at", 0.0),
-                    "params": {}, "error": j.get("error")})
+                    "params": {}, "error": j.get("error"),
+                    "progress": get_progress(jid)})
     return out
 
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from datetime import date, timedelta
 
 import polars as pl
@@ -277,17 +278,26 @@ def test_news_stats_by_source_name_groups_correctly():
 # ---------- factors API 补测：公式分支 / 合成 / 报告 / 冗余分析 ----------
 
 def test_evaluate_turnover_formula_ok(client):
+    # 任务化契约：202 入队 → 轮询结果端点取回评价（n_samples>0）
     r = client.post("/api/factors/evaluate",
                     json={"factor": "turn_test", "formula": "turnover",
                           "start": "2025-01-01"})
-    assert r.status_code == 200, r.text
-    assert r.json()["n_samples"] > 0
+    assert r.status_code == 202, r.text
+    jid = r.json()["job_id"]
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        got = client.get(f"/api/factors/evaluate/{jid}")
+        if got.status_code == 200:
+            assert got.json()["result"]["n_samples"] > 0
+            return
+        time.sleep(0.2)
+    pytest.fail("评价任务 180s 内未完成")
 
 
 def test_evaluate_unsupported_formula_422(client):
     r = client.post("/api/factors/evaluate",
                     json={"factor": "bogus1", "formula": "magic_factor"})
-    assert r.status_code == 422
+    assert r.status_code == 422  # 公式白名单预检前移到入队前
 
 
 def test_analyze_correlation(client):
