@@ -46,6 +46,13 @@ def sync_env(tmp_path_factory):
             shutil.copytree(src_parquet, dst_parquet, dirs_exist_ok=True)
         else:
             dst_parquet.mkdir(parents=True, exist_ok=True)
+        # 拷贝来的真实库可能带着生产环境的 pending/running 数据任务，
+        # 会挡住 create_task（TaskConflictError）—— 隔离环境清空任务队列
+        from lquant.core.db import writer as _writer
+
+        with _writer() as con:
+            con.execute(
+                "DELETE FROM data_task WHERE status IN ('pending', 'running')")
         get_settings.cache_clear()
         yield base
         get_settings.cache_clear()
@@ -142,7 +149,9 @@ def test_sync_daily_market_sentinel_keeps_old_path(monkeypatch):
 
 
 @pytest.mark.usefixtures("sync_env")
-def test_sync_daily_conflict_marks_failed(monkeypatch):
+def test_sync_daily_conflict_marks_skipped(monkeypatch):
+    """撞活跃数据任务 → skipped（有 last_run 记录），不算 failed。"""
+
     def boom(kind, params=None):
         raise TaskConflictError("已有运行中的数据任务")
 
@@ -150,10 +159,11 @@ def test_sync_daily_conflict_marks_failed(monkeypatch):
 
     res = manager.run_job(_job({"days": 3, "market": "all"}))   # 不应抛出
 
-    assert res["status"] == "failed"
+    assert res["status"] == "skipped"
+    assert res["detail"]["skipped"] is True
     assert "已有运行中的数据任务" in json.dumps(res["detail"], ensure_ascii=False)
     runs = [r for r in _sync_runs() if r["kind"] == "daily"]
-    assert runs and runs[-1]["status"] == "failed"
+    assert runs and runs[-1]["status"] == "skipped"
 
 
 @pytest.mark.usefixtures("sync_env")

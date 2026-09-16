@@ -49,3 +49,13 @@ def error_logs(range: str = Query("24h"),
         return q.error_logs(range, route=route, limit=limit)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
+
+
+@router.get("/app-logs")
+def app_logs(level: str | None = Query(default=None, max_length=8),
+             q: str = Query(default="", max_length=100),
+             limit: int = Query(default=200, ge=1, le=1000)) -> dict:
+    """运行日志 tail（logs/lquant.log）：级别过滤 + 关键字搜索，倒序最新在前。"""
+    from lquant.monitor.logs import tail_app_logs
+
+    return tail_app_logs(level=level, q=q, limit=limit)
