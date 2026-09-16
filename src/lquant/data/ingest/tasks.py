@@ -199,6 +199,16 @@ def _progress_update(task_id, phase, done, failed, rows) -> None:
              json.dumps(failed, ensure_ascii=False),
              rows, task_id],
         )
+    # SSE 推流：批间进度实时发给 /data/tasks/{id}/events 订阅者（失败不影响任务）
+    try:
+        from lquant.core.task_events import publish  # noqa: PLC0415
+
+        publish(task_id, {
+            "task_id": task_id, "phase": phase, "done": done,
+            "failed": len(syms), "rows": rows, "terminal": False,
+        })
+    except Exception:  # noqa: BLE001 - 事件推送失败不影响数据任务本身
+        pass
 
 
 def _finalize(task_id, total, failed_all, early, *, done_count=None, error=None,
@@ -236,6 +246,17 @@ def _finalize(task_id, total, failed_all, early, *, done_count=None, error=None,
              json.dumps(failed_all, ensure_ascii=False),
              datetime.now(), msg, task_id],
         )
+    # 终态事件：SSE 订阅者据此收流（terminal=true 关闭 EventSource）
+    try:
+        from lquant.core.task_events import publish  # noqa: PLC0415
+
+        publish(task_id, {
+            "task_id": task_id, "status": status, "message": msg,
+            "done": done_count, "failed": len(failed_syms),
+            "terminal": True,
+        })
+    except Exception:  # noqa: BLE001 - 事件推送失败不影响数据任务本身
+        pass
     return status
 
 

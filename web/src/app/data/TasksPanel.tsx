@@ -1,29 +1,115 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import useSWR from 'swr';
 import { Panel } from '@/components/Panel';
 import { Empty, Msg } from '@/components/States';
+import Chart from '@/components/Chart';
 import { fetcher, post } from '@/lib/api';
 import { taskElapsed, TaskStatusBadge, taskKindText } from './TaskBadge';
 import BackfillModal from './BackfillModal';
 import type { DataTask } from './types';
+
+/** 近 50 条任务按 kind × status 堆叠条形图：一眼看出各类任务的成败分布 */
+const STATUS_COLORS: Record<string, string> = {
+  ok: '#0f8a5f',
+  partial: '#c07f00',
+  running: '#3b7dd8',
+  pending: '#9ca3af',
+  failed: '#c0392b',
+  interrupted: '#c0392b',
+};
+
+function TasksSummaryChart({ tasks }: { tasks: DataTask[] }) {
+  const kinds = [...new Set(tasks.map((t) => t.kind))];
+  const statuses = ['ok', 'partial', 'running', 'pending', 'failed', 'interrupted'];
+  const count = (kind: string, s: string) =>
+    tasks.filter((t) => t.kind === kind && t.status === s).length;
+  return (
+    <div className="mb-3">
+      <Chart
+        height={Math.max(100, kinds.length * 42)}
+        option={{
+          grid: { left: 8, right: 16, top: 4, bottom: 20, containLabel: true },
+          tooltip: { trigger: 'axis' as const },
+          legend: { bottom: 0, itemWidth: 10, itemHeight: 10 },
+          xAxis: { type: 'value' as const, minInterval: 1 },
+          yAxis: {
+            type: 'category' as const,
+            data: kinds.map((k) => taskKindText(k)),
+            axisTick: { show: false },
+          },
+          series: statuses.map((s) => ({
+            name: s,
+            type: 'bar' as const,
+            stack: 'total',
+            barWidth: 14,
+            data: kinds.map((k) => count(k, s)),
+            itemStyle: { color: STATUS_COLORS[s] ?? '#9ca3af' },
+          })),
+        }}
+      />
+    </div>
+  );
+}
 
 /** 进行中（running/pending）任务存在 → 列表 2s 轮询（spec 允许的轮询路径） */
 function hasActive(tasks: DataTask[] | undefined): boolean {
   return !!tasks?.some((t) => t.status === 'running' || t.status === 'pending');
 }
 
+/** SSE 实时进度：对每个 running/pending 任务开 EventSource，
+ *  progress 帧 → 本地即时更新（不等 2s 轮询）；done 帧 → mutate 拉列表。
+ *  连接失败自动降级（EventSource 内建重连；RQ worker 场景无事件，靠轮询兜底）。 */
+type LiveFrame = { phase?: string | null; done?: number; rows?: number; failed?: number };
+
+function useTaskEvents(tasks: DataTask[] | undefined, mutate: () => void) {
+  const [live, setLive] = useState<Record<string, LiveFrame>>({});
+  const activeIds = (tasks ?? [])
+    .filter((t) => t.status === 'running' || t.status === 'pending')
+    .map((t) => t.task_id)
+    .sort()
+    .join(',');
+
+  useEffect(() => {
+    if (!activeIds) return;
+    // SSR / jsdom 无 EventSource：跳过 SSE，仅靠轮询兜底
+    if (typeof EventSource === 'undefined') return;
+    const sources = activeIds.split(',').map((id) => {
+      const es = new EventSource(`/api/data/tasks/${id}/events`);
+      const apply = (frame: LiveFrame) =>
+        setLive((prev) => ({ ...prev, [id]: { ...prev[id], ...frame } }));
+      es.addEventListener('snapshot', (e) =>
+        apply(JSON.parse((e as MessageEvent).data as string)));
+      es.addEventListener('progress', (e) =>
+        apply(JSON.parse((e as MessageEvent).data as string)));
+      es.addEventListener('done', (e) => {
+        apply(JSON.parse((e as MessageEvent).data as string));
+        es.close();
+        void mutate();
+      });
+      es.onerror = () => {
+        /* EventSource 自动重连；持续失败时 2s 轮询仍是兜底 */
+      };
+      return es;
+    });
+    return () => sources.forEach((s) => s.close());
+  }, [activeIds, mutate]);
+
+  return live;
+}
+
 export default function TasksPanel() {
   const { data: tasks, mutate } = useSWR<DataTask[]>('/data/tasks?limit=50', fetcher, {
-    // 有 running/pending → 2s 轮询；否则 60s 慢刷（SWR 2.x 支持按最新数据取间隔）
-    refreshInterval: (latest?: DataTask[]) => (hasActive(latest) ? 2_000 : 60_000),
+    // SSE 主通道；轮询降为 5s 兜底（RQ worker 场景无 SSE 事件）
+    refreshInterval: (latest?: DataTask[]) => (hasActive(latest) ? 5_000 : 60_000),
   });
   const [expanded, setExpanded] = useState<string | null>(null);
   const [busy, setBusy] = useState('');
   const [msg, setMsg] = useState('');
   const [showBackfill, setShowBackfill] = useState(false);
   const [retrying, setRetrying] = useState<string | null>(null);
+  const live = useTaskEvents(tasks, mutate);
 
   async function runDailyUpdate() {
     setBusy('daily');
@@ -88,6 +174,7 @@ export default function TasksPanel() {
       }
     >
       <Msg text={msg} />
+      {!!tasks?.length && <TasksSummaryChart tasks={tasks} />}
       {!tasks?.length ? (
         <Empty>暂无任务 —— 点右上角「全量回填」或「立即增量」创建</Empty>
       ) : (
@@ -96,6 +183,7 @@ export default function TasksPanel() {
             <TaskRow
               key={t.task_id}
               task={t}
+              live={live[t.task_id]}
               expanded={expanded === t.task_id}
               onToggle={() => setExpanded(expanded === t.task_id ? null : t.task_id)}
               onRetry={() => retry(t.task_id)}
@@ -120,8 +208,9 @@ export default function TasksPanel() {
   );
 }
 
-function TaskRow({ task, expanded, onToggle, onRetry, retrying, onCancel, canceling }: {
+function TaskRow({ task, live, expanded, onToggle, onRetry, retrying, onCancel, canceling }: {
   task: DataTask;
+  live?: LiveFrame;
   expanded: boolean;
   onToggle: () => void;
   onRetry: () => void;
@@ -131,7 +220,8 @@ function TaskRow({ task, expanded, onToggle, onRetry, retrying, onCancel, cancel
 }) {
   const cancellable = task.status === 'running' || task.status === 'pending';
   const total = task.total_symbols ?? 0;
-  const done = task.done_symbols ?? 0;
+  const done = Math.max(task.done_symbols ?? 0, live?.done ?? 0);
+  const rows = Math.max(task.rows_written ?? 0, live?.rows ?? 0);
   const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
   const canExpand =
     task.status === 'partial' || task.status === 'failed' || task.status === 'interrupted';
@@ -157,7 +247,7 @@ function TaskRow({ task, expanded, onToggle, onRetry, retrying, onCancel, cancel
           {task.params?.start ? `${String(task.params.start)} ~ ${String(task.params.end ?? '')}` : ''}
         </span>
         <div className="ml-auto flex items-center gap-3 text-xs tabular-nums text-ink-dim">
-          <span>{(task.rows_written ?? 0).toLocaleString()} 行</span>
+          <span>{rows.toLocaleString()} 行</span>
           <span>{taskElapsed(task.started_at, task.finished_at)}</span>
           {cancellable && (
             <button

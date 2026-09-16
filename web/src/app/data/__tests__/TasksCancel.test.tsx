@@ -4,6 +4,11 @@ import { SWRConfig } from 'swr';
 import TasksPanel from '../TasksPanel';
 import type { DataTask } from '../types';
 
+// jsdom 无 canvas，echarts 初始化即崩（clearRect of null）—— 桩掉渲染层
+vi.mock('echarts-for-react', () => ({
+  default: () => <div data-testid="echarts-stub" />,
+}));
+
 const runningTask: DataTask = {
   task_id: 't-12345678',
   kind: 'full_backfill',

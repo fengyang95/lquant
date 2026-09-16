@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+import signal
 import time
 from pathlib import Path
 
@@ -20,6 +22,83 @@ _SYSTEM_PROMPT = (
     "你是 lquant 量化研究平台的 AI 助手。回答 A 股相关问题时："
     "优先使用 lquant MCP 工具查询数据，先查数、结论先行，用中文回答。"
 )
+
+
+class _Child:
+    """posix_spawn 启动的 claude 子进程，适配成 asyncio 子进程鸭子接口。
+
+    为什么不用 asyncio.create_subprocess_exec：它走 fork+exec。进程内
+    polars/pandas 已把 OpenBLAS 线程池拉起后，fork 的 pthread_atfork
+    prepare（blas_thread_shutdown_）会去 join 正在等活的 BLAS 线程 ——
+    竞态死锁且持有 GIL，整个 uvicorn 事件循环冻结（线上堆栈实锤：
+    fork → blas_thread_shutdown_ → _pthread_join，主线程 take_gil）。
+    posix_spawn 不经过 fork/atfork，整类问题根除。
+
+    实现要点：posix_spawn 不支持 chdir，用 /bin/sh -c 'cd && exec' 包一层，
+    exec 后 shell 被 claude 替换（同 pid，terminate/wait 语义不变）。
+    stdout/stderr 用 os.pipe + file_actions DUP2 接到父进程，
+    再 connect_read_pipe 桥成 StreamReader 供异步逐行读。
+    """
+
+    def __init__(self, argv: list[str], cwd: str) -> None:
+        out_r, out_w = os.pipe()
+        err_r, err_w = os.pipe()
+        try:
+            self._pid = os.posix_spawn(
+                "/bin/sh",
+                ["/bin/sh", "-c", 'cd "$1" && shift && exec "$@"', "sh", cwd, *argv],
+                dict(os.environ),
+                file_actions=[
+                    (os.POSIX_SPAWN_DUP2, out_w, 1),
+                    (os.POSIX_SPAWN_DUP2, err_w, 2),
+                ],
+            )
+        except BaseException:
+            for fd in (out_r, out_w, err_r, err_w):
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            raise
+        # 子进程已拿到 dup2 副本，父进程侧写端立即关，否则 EOF 不来
+        os.close(out_w)
+        os.close(err_w)
+        self._out_r, self._err_r = out_r, err_r
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        self._waited: int | None = None  # waitpid 已回收后的退出码
+
+    async def attach(self) -> None:
+        """把两个读端桥进事件循环（必须在事件循环线程内调用）。"""
+        loop = asyncio.get_running_loop()
+        for reader, fd in ((self.stdout, self._out_r),
+                           (self.stderr, self._err_r)):
+            protocol = asyncio.StreamReaderProtocol(reader)
+            await loop.connect_read_pipe(
+                lambda protocol=protocol: protocol,
+                os.fdopen(fd, "rb", buffering=0))
+
+    @property
+    def returncode(self) -> int | None:
+        if self._waited is not None:
+            return self._waited
+        try:
+            pid, status = os.waitpid(self._pid, os.WNOHANG)
+        except ChildProcessError:  # 已被别处回收
+            return self._waited
+        if pid == self._pid:
+            self._waited = os.waitstatus_to_exitcode(status)
+        return self._waited
+
+    def terminate(self) -> None:
+        os.kill(self._pid, signal.SIGTERM)
+
+    async def wait(self) -> int:
+        try:
+            code = await asyncio.to_thread(os.waitpid, self._pid, 0)
+        except ChildProcessError:
+            # returncode 属性的 WNOHANG 轮询可能已抢先回收
+            return self._waited if self._waited is not None else 0
+        self._waited = os.waitstatus_to_exitcode(code[1])
+        return self._waited
 
 
 class ClaudeCodeAgentService(AgentService):
@@ -55,7 +134,7 @@ class ClaudeCodeAgentService(AgentService):
         super().__init__(store)
         self._workspace = ensure_workspace(self._workspace_dir, self._root)
         self._tasks: dict[str, asyncio.Task] = {}
-        self._procs: dict[str, asyncio.subprocess.Process] = {}
+        self._procs: dict[str, _Child] = {}
 
     async def create_session(self, context: dict | None) -> Session:
         return await self.store.create(context)
@@ -119,13 +198,9 @@ class ClaudeCodeAgentService(AgentService):
             cmd += ["--resume", claude_sid]
         cmd += self._claude_args
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=self._workspace,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except (FileNotFoundError, NotADirectoryError, PermissionError) as e:
+            proc = _Child(cmd, cwd=str(self._workspace))
+            await proc.attach()
+        except OSError as e:
             raise AgentError(f"无法启动 claude CLI：{e}") from e
         self._procs[sid] = proc
         await self._consume(sid, proc, on_event)
