@@ -74,7 +74,9 @@ REFERENCE_NUMBERS = {
 
 def load_adj_data(data_root: Path, symbols: list[str], start: str, end: str) -> pl.DataFrame:
     """湖内日线 → 前复权（最新因子=1）。两引擎用同一份输出。"""
-    df = (pl.scan_parquet(str(data_root / "parquet" / "daily" / "**" / "*.parquet"))
+    df = (pl.scan_parquet(str(data_root / "parquet" / "daily" / "**" / "*.parquet"),
+                          missing_columns="insert",      # 旧文件缺 year 列
+                          extra_columns="ignore")        # 新文件多 year 列（#59）
           .filter(pl.col("symbol").is_in(symbols))
           .filter(pl.col("trade_date") >= pl.lit(start).str.to_date())
           .filter(pl.col("trade_date") <= pl.lit(end).str.to_date())
