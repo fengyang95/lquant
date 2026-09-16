@@ -27,6 +27,9 @@ from lquant.backtest.rules.model import (
     TaxSchedule,
 )
 from lquant.backtest.strategy.base import Context, Strategy
+from lquant.core.logging import get_logger
+
+log = get_logger(__name__)
 
 __all__ = ["run_selfcheck"]
 
@@ -84,6 +87,7 @@ def run_selfcheck() -> list[dict]:
         try:
             ok, detail = fn()
         except Exception as e:                 # noqa: BLE001
+            log.exception(f"自检项 {name} 异常")
             ok, detail = False, f"异常: {type(e).__name__}: {e}"
         checks.append({"name": name, "passed": bool(ok), "detail": detail})
 

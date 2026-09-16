@@ -337,3 +337,46 @@ def test_tick_runs_due_jobs_only():
     # 再 tick 一次：close 今天已跑 → 不再执行
     res2 = manager.tick()
     assert all(r["sync_id"] != "close" for r in res2)
+
+
+# ---------------------------------------------------------------- 日志接线
+
+def test_run_job_unknown_kind_failed_and_logged(sync_env, tmp_path):
+    """未知作业类型 → status failed，且日志带作业 kind。"""
+    from loguru import logger
+
+    from lquant.core.logging import setup_logging
+    from lquant.sync import manager
+
+    setup_logging(level="DEBUG", log_dir=str(tmp_path))
+    records: list = []
+    hid = logger.add(records.append, level="DEBUG")
+    try:
+        res = manager.run_job(
+            {"sync_id": "unknown-kind-probe", "name": "探针", "kind": "nope", "params": {}})
+        assert res["status"] == "failed"
+        assert "未知作业类型" in res["detail"]["error"]
+        assert any("nope" in str(m) for m in records)
+    finally:
+        logger.remove(hid)
+        logger.remove()  # 收掉 setup_logging 挂的文件/控制台 sink
+
+
+def test_emit_sync_error_survives_ring_failure(sync_env, monkeypatch):
+    """monitor 错误环挂掉 → 告警留痕（warning 日志）但不抛出。"""
+    from loguru import logger
+
+    from lquant.sync import manager
+
+    class _BrokenRing:
+        def append(self, *_a, **_kw):
+            raise RuntimeError("ring down")
+
+    monkeypatch.setattr("lquant.monitor.ring.error_ring", _BrokenRing())
+    records: list = []
+    hid = logger.add(_sink := records.append, level="DEBUG")
+    try:
+        manager._emit_sync_error({"sync_id": "probe"}, "collect", "failed", {"error": "boom"})
+        assert any("错误环写入失败" in str(m) for m in records)
+    finally:
+        logger.remove(hid)

@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from lquant.core.logging import setup_logging
 from lquant.monitor import start_monitor, stop_monitor
 from lquant.monitor.api_mw import MonitorMiddleware
 from lquant.server import ws
@@ -29,6 +30,8 @@ from lquant.server.api import (
 
 
 def create_app() -> FastAPI:
+    # 进程入口统一接线：server（uvicorn）与 sync 调度 worker 共用本进程日志
+    setup_logging()
     app = FastAPI(title="lquant", version="0.1.0",
                   description="A股量化研究平台 API")
     app.add_middleware(
