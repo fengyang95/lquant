@@ -70,9 +70,20 @@ class Account:
         if pos is not None:
             pos.apply_corporate_action(ratio)
 
-    def nav(self, prices: dict[str, float]) -> float:
+    def nav(self, prices: dict[str, float],
+            last_prices: dict[str, float] | None = None) -> float:
+        """持仓估值：prices 优先 → last_prices（该股最近一次有 bar 的 close）→ avg_cost。
+
+        停牌股当日无 bar 时 prices 不含该 symbol；avg_cost 回退会把浮盈浮亏
+        抹平导致 NAV 失真，正确口径是最近可见收盘价。last_prices=None 时
+        行为与旧版完全一致（向后兼容）。
+        """
         v = self.cash
         for sym, pos in self.positions.items():
-            if pos.qty:
-                v += pos.qty * prices.get(sym, pos.avg_cost)
+            if not pos.qty:
+                continue
+            px = prices.get(sym)
+            if px is None and last_prices:
+                px = last_prices.get(sym)
+            v += pos.qty * (px if px is not None else pos.avg_cost)
         return v

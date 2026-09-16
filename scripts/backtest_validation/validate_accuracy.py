@@ -21,11 +21,12 @@ import json
 import subprocess
 import sys
 import tempfile
+from datetime import date, timedelta
 from pathlib import Path
 
 import polars as pl
 
-REPO = Path(__file__).resolve().parents[2]     # worktree 根
+REPO = Path(__file__).resolve().parents[2]     # worktree root
 sys.path.insert(0, str(REPO / "src"))
 
 from lquant.backtest.benchmarks import (  # noqa: E402
@@ -35,7 +36,13 @@ from lquant.backtest.benchmarks import (  # noqa: E402
     TurtleDonchianStrategy,
 )
 from lquant.backtest.engine import Engine, EngineConfig  # noqa: E402
+from lquant.backtest.jqapi import JQRunner  # noqa: E402
 from lquant.backtest.rules.model import RuleSet  # noqa: E402
+from lquant.data.store import parquet as store  # noqa: E402
+from lquant.research.strategies.baseline_multifactor import (  # noqa: E402
+    FACTOR_FORMULAS,
+    STRATEGY_CODE,
+)
 
 BT_RUNNER = Path(__file__).resolve().parent / "bt_runner.py"
 
@@ -67,7 +74,9 @@ REFERENCE_NUMBERS = {
 
 def load_adj_data(data_root: Path, symbols: list[str], start: str, end: str) -> pl.DataFrame:
     """湖内日线 → 前复权（最新因子=1）。两引擎用同一份输出。"""
-    df = (pl.scan_parquet(str(data_root / "parquet" / "daily" / "**" / "*.parquet"))
+    df = (pl.scan_parquet(str(data_root / "parquet" / "daily" / "**" / "*.parquet"),
+                          missing_columns="insert",      # 旧文件缺 year 列
+                          extra_columns="ignore")        # 新文件多 year 列（#59）
           .filter(pl.col("symbol").is_in(symbols))
           .filter(pl.col("trade_date") >= pl.lit(start).str.to_date())
           .filter(pl.col("trade_date") <= pl.lit(end).str.to_date())
@@ -142,7 +151,187 @@ def compare(lq: dict, bt: dict) -> dict:
             "pass": bool(diffs) and max_diff < 0.005}
 
 
+# ---------- baseline_multifactor: 权重调度表方案 ----------
+
+BASELINE_WARMUP_DAYS = 120
+BASELINE_REF_SYMBOL = "510300.SH"   # 全交易日参考标的：只做日历轴/估值，不交易
+
+# 调度表执行策略：主仓 venv 里 JQRunner 跑 —— 与 bt 侧 BaselineMultifactorBT
+# 消费同一份调度表 JSON。只在调度表日期按 order_target_value 执行（先卖后买），
+# 不做任何因子计算 —— 因子/选股逻辑由调度表生成 run（真实基准策略）承担。
+BASELINE_EXEC_CODE = '''
+def initialize(context):
+    set_order_cost(type="stock", open_tax=0, close_tax=0.0005,
+                   open_commission=0.00025, close_commission=0.00025,
+                   min_commission=5)
+    set_slippage(0)
+    run_daily(rebalance, time="open")
+
+
+def rebalance(context):
+    d = context.current_dt.date().isoformat()
+    w = SCHEDULE.get(d)
+    if not w:
+        return
+    pf = context.portfolio
+    total = pf.total_value
+    # 先卖后买：清仓不在目标里的持仓 → 减仓 → 加仓（bt 侧同序）
+    held = []
+    for s, p in list(pf.positions.items()):
+        v = p.value
+        if v == v and v > 0:
+            held.append(s)
+    for s in held:
+        if s not in w:
+            order_target_value(s, 0)
+    for s in w:
+        v = pf.positions[s].value
+        if v == v and v > total * w[s]:
+            order_target_value(s, total * w[s])
+    for s in w:
+        v = pf.positions[s].value
+        if v != v or v <= total * w[s]:
+            order_target_value(s, total * w[s])
+'''
+
+
+def _baseline_gen_code() -> str:
+    """调度表生成策略 = 真实基准策略 + 注入一行 record（记录等权 1/N 目标权重）。
+
+    只加一行观测,不改任何交易语义：record 在下单前执行,记录的是**目标**权重。
+    """
+    anchor = "    keep = [c for c, _ in ranked[:50]]"
+    if anchor not in STRATEGY_CODE:
+        raise SystemExit("STRATEGY_CODE 结构变化,record 注入点失效 —— 请同步更新注入锚点")
+    return STRATEGY_CODE.replace(
+        anchor, anchor + "\n    record(**{f'w__{c}': 1.0 / len(top) for c in top})")
+
+
+def _schedule_from_records(records: dict) -> dict[str, dict[str, float]]:
+    """records['w__<sym>'] 序列 → {date: {sym: weight}}（按日期升序）。"""
+    sched: dict[str, dict[str, float]] = {}
+    for k, series in records.items():
+        if not k.startswith("w__"):
+            continue
+        sym = k[3:]
+        for d, w in series:
+            sched.setdefault(str(d), {})[sym] = float(w)
+    return dict(sorted(sched.items()))
+
+
+def _install_duckdb_lock_retry() -> None:
+    """脚本级补丁：duckdb 文件锁被 dev server / 回填进程短暂占住时重试。
+
+    对账 run 长达 20+ 分钟,期间 dev server(uvicorn)或 lq data sync 任一持有
+    lquant.duckdb 文件锁都会让 get_fundamentals 建连失败、报废整轮 run。
+    只在本脚本运行时包一层重试（等锁最长 5 分钟）,不改库语义。本脚本是
+    只读的（catalog.reader 路径）,不与写方产生数据竞争。
+    """
+    import time
+
+    from lquant.core import db as _db
+
+    orig_connect = _db._connect
+
+    def connect_with_retry() -> object:
+        last: Exception | None = None
+        for _ in range(60):
+            try:
+                return orig_connect()
+            except Exception as e:  # noqa: BLE001 - 锁冲突按消息识别
+                if "lock" not in str(e).lower():
+                    raise
+                last = e
+                time.sleep(5)
+        raise last  # noqa: TRY301
+
+    _db._connect = connect_with_retry
+
+
+def run_baseline(data_root: Path, bt_python: str, tmp: Path,
+                 schedule_file: str | None = None) -> dict:
+    """基准多因子对账（权重调度表方案）。
+
+    1) 主仓 venv 跑真实基准策略（JQRunner + get_fundamentals + factor_formulas）
+       一次,在调仓日导出等权 1/N 目标权重 → 调度表 JSON；
+    2) 同一份前复权调度表标的切片喂两引擎,各自按调度表执行、逐日对账。
+    """
+    start, end = "2024-01-01", "2024-12-31"
+    _install_duckdb_lock_retry()
+    warm_start = (date(2024, 1, 1) - timedelta(days=BASELINE_WARMUP_DAYS)).isoformat()
+    print(f"   [baseline] 预热自 {warm_start}（{BASELINE_WARMUP_DAYS} 自然日）, "
+          f"全市场调度表生成 run …", flush=True)
+
+    # ---- Step 1: 调度表生成（真实基准策略,全市场原始价） ----
+    schedule = None
+    if schedule_file and Path(schedule_file).exists():
+        schedule = json.loads(Path(schedule_file).read_text())
+        print(f"   [baseline] 复用已有调度表 {schedule_file} "
+              f"({len(schedule)} 个调仓日)", flush=True)
+    if schedule is None:
+        df_raw = (store.read_daily(start=warm_start, end=end)
+                  .filter(~pl.col("symbol").str.ends_with(".BJ"))
+                  .collect())
+        if df_raw.is_empty():
+            raise SystemExit("日线湖无数据:先执行 lq data daily 回填")
+        runner = JQRunner(_baseline_gen_code(), initial_cash=1_000_000,
+                          participation=1.0, factor_formulas=FACTOR_FORMULAS)
+        res = runner.run(df_raw)
+        if res.error:
+            raise SystemExit(f"基准策略调度表生成 run 失败: {res.error}")
+        schedule = _schedule_from_records(res.records)
+        if not schedule:
+            raise SystemExit("调度表为空:基准策略未在任何调仓日产出目标权重")
+    n_syms = len({s for w in schedule.values() for s in w})
+    n_reb = len(schedule)
+    print(f"   [baseline] 调度表: {n_reb} 个调仓日, {n_syms} 个标的, "
+          f"拒单 {len(res.rejected) if not schedule_file else 0} 笔", flush=True)
+
+    # ---- Step 2: 同一切片喂两引擎 ----
+    n_syms_set = {s for w in schedule.values() for s in w}
+    df_adj = load_adj_data(data_root, sorted(n_syms_set | {BASELINE_REF_SYMBOL}),
+                           warm_start, end)
+    if BASELINE_REF_SYMBOL not in set(df_adj["symbol"].to_list()):
+        raise SystemExit(f"参考标的 {BASELINE_REF_SYMBOL} 不在湖切片里")
+
+    data_fp = tmp / "baseline_multifactor_data.parquet"
+    out_fp = tmp / "baseline_multifactor_bt.json"
+    sched_fp = tmp / "baseline_multifactor_schedule.json"
+    df_adj.write_parquet(data_fp)
+    sched_fp.write_text(json.dumps(schedule))
+
+    # ---- lquant 侧:调度表执行策略（同一切片、同调度表） ----
+    runner = JQRunner(BASELINE_EXEC_CODE, initial_cash=1_000_000, participation=1.0)
+    runner.ns["SCHEDULE"] = {
+        d: {s: float(x) for s, x in w.items()} for d, w in schedule.items()}
+    lq_res = runner.run(df_adj)
+    lq = {"dates": [str(d) for d, _ in lq_res.nav],
+          "nav": [float(n) for _, n in lq_res.nav],
+          "n_trades": len(lq_res.trades),
+          "n_rejected": len(lq_res.rejected),
+          "total_fee": sum(f.fee for f in lq_res.trades)}
+    lq["n_days"] = len(lq["dates"])
+
+    # ---- bt 侧 ----
+    cmd = [bt_python, str(BT_RUNNER), "--task", "baseline_multifactor",
+           "--data", str(data_fp), "--out", str(out_fp),
+           "--schedule", str(sched_fp), "--tax", "0.0005"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    if r.returncode != 0:
+        raise SystemExit(f"backtrader baseline 执行失败:\n{r.stdout}\n{r.stderr}")
+    bt = json.loads(out_fp.read_text())
+
+    cmp = compare(lq, bt)
+    cmp.update(task="baseline_multifactor",
+               symbols=[f"调度表 {len(schedule)} 个调仓日 / {n_syms} 标的"],
+               start=start, end=end,
+               lq_fee=lq["total_fee"], lq_rejected=lq["n_rejected"],
+               n_days=lq["n_days"])
+    return cmp
+
+
 TASKS = [
+    ("baseline_multifactor", ["(权重调度表)"], False, "2024-01-01", "2024-12-31"),
     ("sma_cross", ["600519.SH"], False, "2024-01-02", "2025-12-31"),
     ("momentum_rotation", ["510300.SH", "159915.SZ"], True, "2024-01-02", "2026-08-31"),
     ("turtle_donchian", ["600519.SH"], False, "2024-01-02", "2025-12-31"),
@@ -157,6 +346,8 @@ def main() -> None:
     ap.add_argument("--data-root", default=None,
                     help="Parquet 湖根目录（默认 LQ_DATA_DIR 或 ./data）")
     ap.add_argument("--out", default=str(REPO / "docs" / "BACKTEST_VALIDATION_BENCHMARKS.md"))
+    ap.add_argument("--schedule-file", default=None,
+                    help="baseline_multifactor: 复用已生成的调度表 JSON(跳过生成 run)")
     args = ap.parse_args()
 
     import os
@@ -168,6 +359,15 @@ def main() -> None:
         tmp = Path(td)
         for task, symbols, etf, start, end in TASKS:
             print(f"== {task} {symbols} {start}~{end}")
+            if task == "baseline_multifactor":
+                cmp = run_baseline(data_root, args.bt_python, tmp,
+                                   schedule_file=args.schedule_file)
+                rows.append(cmp)
+                print(f"   lquant {cmp['lq_total']:+.2%} ({cmp['lq_trades']} 笔) | "
+                      f"backtrader {cmp['bt_total']:+.2%} ({cmp['bt_trades']} 笔) | "
+                      f"最大日差 {cmp['max_daily_nav_diff']:.4%} | "
+                      f"{'PASS' if cmp['pass'] else 'FAIL'}")
+                continue
             df = load_adj_data(data_root, symbols, start, end)
             lq = run_lquant(task, df, symbols, etf)
             bt = run_backtrader(args.bt_python, task, df, etf, tmp)
@@ -200,6 +400,10 @@ def main() -> None:
         "   任何一端的系统性偏差（未来函数、费用漏算、份额换算错误）都会立刻暴露。",
         "2. **公开数字方向性对照（弱验证）**：策略量级与方向应与公开结果相符。",
         "",
+        "   第五个对账任务 `baseline_multifactor`（基准多因子策略）不逐位复刻因子计算，"
+        "   而是把主仓 lquant 侧真实基准策略跑出的**权重调度表**（等权 1/N 目标权重"
+        "   快照）同时喂给两引擎，只对账执行链路（撮合/费用/仓位换算/T+1）。",
+        "",
         "## 2. 逐日对账结果",
         "",
         "| 策略 | 标的 | 区间 | 交易日 | lquant 累计 | backtrader 累计 | 最大日差 | 成交笔数 (lq/bt) | 判定 |",
@@ -225,6 +429,19 @@ def main() -> None:
         if r["pass"]:
             lines.append(f"- **{r['task']}：通过。** 两引擎逐日净值最大差 "
                          f"{r['max_daily_nav_diff']:.4%}，撮合/费用/仓位换算全链路一致。")
+        elif r["task"] == "baseline_multifactor":
+            lines += [
+                f"- **{r['task']}：路径存在分歧（lquant {r['lq_total']:+.2%} vs "
+                f"backtrader {r['bt_total']:+.2%}，最大日差 "
+                f"{r['max_daily_nav_diff']:.4%}）。**"
+                "根因：调度表方案下两引擎按同一份等权 1/N 目标权重执行，差异来自"
+                "换仓执行链路的微观口径："
+                "(a) bt 侧下单时 total_value 按 broker 前收估值，与 lquant open 时点"
+                "估值存在跳空差；"
+                "(b) lquant 买单按 afford 公式 clamp 到现金，bt 执行时现金不足则"
+                "整单作废，成交集合不同；"
+                "(c) lquant 有涨跌停拒单护栏，bt 无。",
+            ]
         else:
             lines += [
                 f"- **{r['task']}：方向与量级一致，路径存在分歧（lquant "

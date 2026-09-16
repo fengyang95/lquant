@@ -350,9 +350,13 @@ from lquant.data.store import catalog  # noqa: E402
 duckdb = pytest.importorskip("duckdb")
 
 
-@pytest.fixture()
+@pytest.fixture(autouse=True)
 def tmp_catalog(tmp_path, monkeypatch):
-    """隔离 duckdb catalog（同 test_baseline_strategy 模式），seed security 表。"""
+    """隔离 duckdb catalog（同 test_baseline_strategy 模式），空 security 表。
+
+    autouse：模块内所有用例（含未显式声明的）都不查真实 catalog —— 否则
+    _load_security_meta 会读到开发机的 ST 行，涨跌停用例随环境漂移。
+    """
     from contextlib import contextmanager
 
     db = tmp_path / "lq.duckdb"
@@ -476,3 +480,71 @@ def trade(context):
     assert res.error is None, res.error
     assert len(res.trades) == 1, res.trades          # day0 买入后不再下单
     assert not [r for r in res.rejected if "涨停" in r[2]]
+
+
+# ---------- 涨跌停按板块参数化锁定（rules/model.py × cn_a_share.yaml） ----------
+
+_BOARD_LIMITS = [
+    pytest.param("600000.SH", 0.10, id="main-10pct"),
+    pytest.param("300001.SZ", 0.20, id="gem-20pct"),
+    pytest.param("688001.SH", 0.20, id="star-20pct"),
+    pytest.param("830001.BJ", 0.30, id="bse-30pct"),
+]
+_ST_LIMIT = 0.05
+_LIMITS = {"600000.SH": 0.10, "300001.SZ": 0.20, "688001.SH": 0.20, "830001.BJ": 0.30}
+
+
+def _limit_bars(symbol: str, limit: float, *, touched: bool) -> pl.DataFrame:
+    """pre_close=100，open=100×(1+limit)（touched）或 ×0.99（板内）。"""
+    open_px = 100.0 * (1 + limit) if touched else 100.0 * (1 + limit) * 0.99
+    rows = []
+    for i in range(3):
+        d = date(2026, 1, 5 + i)
+        rows.append(dict(trade_date=d, symbol=symbol, open=open_px,
+                         high=open_px * 1.005, low=open_px * 0.995, close=open_px,
+                         pre_close=100.0, volume=1e8, amount=open_px * 1e8))
+    return pl.DataFrame(rows)
+
+
+_BUY_CODE = '''
+def initialize(context):
+    set_order_cost(type="stock", open_tax=0, close_tax=0,
+                   open_commission=0, close_commission=0, min_commission=0)
+    run_daily(trade, time="open")
+
+def trade(context):
+    if context.portfolio.positions[g.sym].total_amount == 0:
+        order_target_value(g.sym, 500000)
+'''
+
+
+def _run_limit_case(symbol: str, *, is_st: bool, touched: bool):
+    code = f"g.sym = {symbol!r}\n" + _BUY_CODE
+    meta = {symbol: {"is_st": True}} if is_st else None
+    runner = JQRunner(code, initial_cash=1_000_000, security_meta=meta)
+    return runner.run(_limit_bars(symbol, _ST_LIMIT if is_st else _LIMITS[symbol],
+                                  touched=touched))
+
+
+@pytest.mark.parametrize("symbol,limit", _BOARD_LIMITS + [
+    pytest.param("600000.SH", _ST_LIMIT, id="main-st-5pct"),
+    pytest.param("300001.SZ", _ST_LIMIT, id="gem-st-5pct"),
+    pytest.param("688001.SH", _ST_LIMIT, id="star-st-5pct"),
+    pytest.param("830001.BJ", _ST_LIMIT, id="bse-st-5pct"),
+])
+def test_price_limit_by_board_rejects_at_limit_and_fills_below(symbol, limit):
+    """恰好触板（open=pre_close×(1+limit)）拒单；×0.99 板内成交。
+
+    ST 格通过 security_meta 注入 is_st=True（5% 板对全板块生效）。
+    """
+    # 触板 → 拒单
+    res = _run_limit_case(symbol, is_st=(limit == _ST_LIMIT), touched=True)
+    assert res.error is None, res.error
+    assert res.trades == [], f"{symbol} 触板不应成交: {res.trades}"
+    assert [r for r in res.rejected if "涨停" in r[2]], \
+        f"{symbol} 预期涨停拒单，实际 {res.rejected}"
+
+    # 板内 → 成交
+    res = _run_limit_case(symbol, is_st=(limit == _ST_LIMIT), touched=False)
+    assert res.error is None, res.error
+    assert len(res.trades) == 1, f"{symbol} 板内应成交: {res.trades} {res.rejected}"

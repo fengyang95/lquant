@@ -54,6 +54,7 @@ from lquant.backtest.account import Account
 from lquant.backtest.broker import Broker
 from lquant.backtest.engine import Engine, build_rules
 from lquant.backtest.events import Bar, Fill, Order, Side
+from lquant.backtest.jq_fundamentals import JQFundamentalsState
 from lquant.backtest.metrics import perf_from_returns, turnover_from_trades
 from lquant.backtest.sandbox import safe_builtins
 from lquant.backtest.slippage import PctSlippage
@@ -381,6 +382,7 @@ class JQRunner:
         self._factor_formulas = [str(f) for f in (factor_formulas or [])]
         # security 表 is_st 元数据：参数注入优先，缺省 run() 时自查 security 表。
         self._security_meta = security_meta
+        self._jf_state: JQFundamentalsState = JQFundamentalsState()
         self._security_meta_resolved: dict[str, dict] = {}
 
         # 运行期状态
@@ -519,11 +521,10 @@ class JQRunner:
             raise NotImplementedError("该聚宽 API 未支持（当前兼容日频核心子集）")
 
         # 基本面：get_fundamentals + query DSL 表对象（import 放函数内，
-        # 避免模块级循环依赖；PIT 语义见 jq_fundamentals.make_get_fundamentals）
-        from lquant.backtest.jq_fundamentals import make_get_fundamentals
+        # 避免模块级循环依赖；PIT 语义见 jq_fundamentals.JQFundamentalsState）
         from lquant.research.dialect import fundamentals as _fd
 
-        ns["get_fundamentals"] = make_get_fundamentals()
+        ns["get_fundamentals"] = self._jf_state.make_get_fundamentals()
         for _t in ("fundamentals", "valuation", "income", "balance", "cashflow",
                    "indicator", "growth", "operation"):
             ns[_t] = getattr(_fd, _t)
@@ -592,7 +593,7 @@ class JQRunner:
         return {s: self._ref_price(s) for s in self._bars_today}
 
     def _nav_now(self) -> float:
-        return self.account.nav(self._prices_map())
+        return self.account.nav(self._prices_map(), self._last_close)
 
     def _sec_data(self, sym: str) -> _SecData:
         return _SecData(self._bars_today.get(sym), self._ref_price(sym),
@@ -881,6 +882,7 @@ class JQRunner:
         symbols = sorted({s for b in bars_by_day.values() for s in b})
         self.account = Account(cash=self.initial_cash)
         self._seq = 0
+        self._last_close: dict[str, float] = {}   # 每只股票最近一次有 bar 的 close
 
         # initialize 先跑：set_order_cost / set_benchmark 要在规则构建前生效
         if self._initialize_fn:
@@ -915,10 +917,8 @@ class JQRunner:
             self._today = d
             self._day_index = i
             self._bars_today = bars_by_day[d]
-            # 每日执行策略前绑定 get_fundamentals 的当日交易日与股票池
-            from lquant.backtest import jq_fundamentals as _jf
-
-            _jf.set_day(d, sorted(self._bars_today))
+            # 每日执行策略前绑定 get_fundamentals 的当日交易日与股票池（per-runner 状态）
+            self._jf_state.set_day(d, sorted(self._bars_today))
             self.context.current_dt = datetime.combine(d, dtime(9, 30))
             self.context.previous_date = self._dates[i - 1] if i > 0 else None
 
@@ -961,7 +961,8 @@ class JQRunner:
         """收盘估值 + 持仓快照。"""
         self._bucket = "close"
         prices = {s: b.close for s, b in self._bars_today.items()}
-        nav = self.account.nav(prices)
+        self._last_close.update(prices)
+        nav = self.account.nav(prices, self._last_close)
         if nav > 0:
             self.res.nav.append((d, nav))
         self.res.positions[d] = {
