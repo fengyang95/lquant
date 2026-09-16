@@ -14,9 +14,12 @@ from datetime import datetime
 
 import polars as pl
 
+from lquant.core.logging import get_logger
 from lquant.data.store.catalog import upsert
 from lquant.market.collectors import COLLECTORS
 from lquant.market.schema import TABLE_COLUMNS, ensure_market_tables
+
+log = get_logger(__name__)
 
 __all__ = ["SCHEDULES", "collect", "persist", "collect_and_save",
            "due_schedules", "status"]
@@ -64,7 +67,7 @@ def collect(schedule: str | None = None, trade_date=None, *,
             continue
         out[k] = df
     if errors:
-        print(f"[warn] 采集失败: {errors}")
+        log.warning(f"采集失败 schedule={schedule} trade_date={trade_date} errors={errors}")
     return out
 
 
@@ -89,8 +92,8 @@ def persist(frames: dict[str, pl.DataFrame]) -> dict[str, int]:
             continue
         try:
             counts[name] = upsert(table, df.select(cols))
-        except Exception as e:  # noqa: BLE001
-            print(f"[warn] 写入 {table} 失败: {e}")
+        except Exception:  # noqa: BLE001
+            log.exception(f"写入 {table} 失败 rows={len(df)}")
             counts[name] = 0
     return counts
 
@@ -113,6 +116,7 @@ def collect_and_save(schedule: str | None = "close", trade_date=None, *,
         except Exception as e:  # noqa: BLE001
             frames[k] = pl.DataFrame()
             errs = f"{type(e).__name__}: {e}"
+            log.exception(f"采集器 {k} 失败 schedule={schedule} trade_date={d}")
             if meta.get("critical"):
                 _log_one(k, d, t0, datetime.now(), 0, "failed", errs)
                 raise RuntimeError(f"关键采集器 {k} 失败（数据不可回溯）: {e}") from e
@@ -134,8 +138,8 @@ def _log_one(job: str, trade_date, started_at: datetime, finished_at: datetime,
         from lquant.market.collect_log import record
 
         record(job, trade_date, started_at, finished_at, rows, status, message)
-    except Exception as e:  # noqa: BLE001
-        print(f"[warn] collect_log 记录失败 {job}: {e}")
+    except Exception:  # noqa: BLE001
+        log.exception(f"collect_log 记录失败 job={job} trade_date={trade_date}")
 
 
 def status() -> pl.DataFrame:

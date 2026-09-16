@@ -298,7 +298,36 @@ def _resolve_column(c: Column, day: _date, symbols: list[str] | None,
 
 
 def resolve(q: Query, day: _date) -> pl.DataFrame:
-    """执行查询：返回带 code 列的宽表（外加 day 列）。"""
+    """执行查询：返回带 code 列的宽表（外加 day 列）。
+
+    同 (day, query) 的结果做进程内缓存，键 = (day, cols, conds 归一化,
+    order, limit_n)。键含 day，跨日不命中；cols/conds/order/limit 均参与
+    键，不同查询不互相污染。缓存帧视为只读，容量 4096 条 FIFO 淘汰。
+    测试或数据更新后可用 clear_fundamentals_cache() 手动失效。
+    """
+    key = (day, tuple(q.cols),
+           tuple((c.column, tuple(c.values)) for c in q.conds),
+           q.order, q.limit_n)
+    cached = _RESOLVE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    df = _resolve_uncached(q, day)
+    if len(_RESOLVE_CACHE) >= _RESOLVE_CACHE_MAX:
+        _RESOLVE_CACHE.pop(next(iter(_RESOLVE_CACHE)))   # FIFO 淘汰最早键
+    _RESOLVE_CACHE[key] = df
+    return df
+
+
+_RESOLVE_CACHE: dict[tuple, pl.DataFrame] = {}
+_RESOLVE_CACHE_MAX = 4096
+
+
+def clear_fundamentals_cache() -> None:
+    """清空 resolve 结果缓存（测试隔离 / 数据更新后手动失效）。"""
+    _RESOLVE_CACHE.clear()
+
+
+def _resolve_uncached(q: Query, day: _date) -> pl.DataFrame:
     symbols = _resolve_symbol_scope(q)
     fin_cols, val_cols = [], []
     fetch_cols = list(q.cols)
