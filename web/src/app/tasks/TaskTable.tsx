@@ -1,8 +1,23 @@
 'use client';
 
 import { Empty, Msg } from '@/components/States';
+import ProgressBar from '@/components/ProgressBar';
+import { useJobStream } from '@/lib/streaming';
 import { STATE_BADGE, STATE_TEXT, createdText, paramsBrief } from './types';
 import type { TaskItem } from './types';
+
+/** 行内流式进度条：running 行订阅 /ws/jobs/{id}，WS 未回流时用 REST 快照兜底。 */
+function LiveProgress({ task }: { task: TaskItem }) {
+  const { progress } = useJobStream(task.state === 'running' ? task.id : null);
+  const p = progress ?? task.progress ?? null;
+  if (!p || !p.total) return null;
+  const pct = (p.done / p.total) * 100;
+  return (
+    <div className="mt-1 w-40">
+      <ProgressBar pct={pct} phase={p.phase} />
+    </div>
+  );
+}
 
 /** 统一状态徽章（复用 TaskStatusBadge 的方角描边语义，running 带脉冲点） */
 export function StateBadge({ state }: { state: TaskItem['state'] }) {
@@ -60,6 +75,7 @@ export default function TaskTable({
               <tr key={t.id} className="hover:bg-white">
                 <td>
                   <StateBadge state={t.state} />
+                  <LiveProgress task={t} />
                   {t.error && (
                     <div className="max-w-52 truncate text-xs text-up" title={t.error}>
                       {t.error}

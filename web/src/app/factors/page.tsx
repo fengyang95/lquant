@@ -6,13 +6,15 @@
  * 数据逻辑与旧版一致；evalSeries 为图表数据包（评价成功后拉取，失败不阻塞主结果）。
  */
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import useSWR from 'swr';
 import Chart from '@/components/Chart';
 import { Panel, Stat } from '@/components/Panel';
 import PageHeader from '@/components/PageHeader';
+import ProgressBar from '@/components/ProgressBar';
 import { Empty, Msg } from '@/components/States';
 import { get, post } from '@/lib/api';
+import { useJobStream } from '@/lib/streaming';
 import { C, axes, legend, tooltip } from '@/lib/chart';
 import FactorLibrary from './FactorLibrary';
 
@@ -113,6 +115,9 @@ export default function FactorsPage() {
   const [formula, setFormula] = useState('pct_change_20');
   const [evalRes, setEvalRes] = useState<EvalResult | null>(null);
   const [evalSeries, setEvalSeries] = useState<EvalSeries | null>(null);
+  // 评价任务流：POST 返回 job_id → WS 流式进度 → 终态 result 渲染
+  const [evalJob, setEvalJob] = useState<string | null>(null);
+  const evalStream = useJobStream<EvalResult & { series?: EvalSeries }>(evalJob);
   const [seriesError, setSeriesError] = useState<string | null>(null);
   const [busy, setBusy] = useState<'' | 'eval' | 'corr' | 'syn'>('');
   const [msg, setMsg] = useState('');
@@ -299,6 +304,26 @@ export default function FactorsPage() {
     };
   }, [evalSeries]);
 
+  // 评价任务流回填：终态 result → 指标/图表渲染；error / done-无果 → 消息条
+  useEffect(() => {
+    if (!evalJob) return;
+    if (evalStream.error) {
+      setMsg(`✗ ${evalStream.error}`);
+      setEvalJob(null);
+      setBusy('');
+    } else if (evalStream.result) {
+      setEvalRes(evalStream.result);
+      setEvalSeries(evalStream.result.series ?? null);
+      setSeriesError(evalStream.result.series ? null : '图表数据缺失：评价响应未包含 series 字段');
+      setEvalJob(null);
+      setBusy('');
+    } else if (evalStream.done) {
+      setMsg(`✗ 评价任务异常结束（${evalStream.status ?? 'unknown'}）`);
+      setEvalJob(null);
+      setBusy('');
+    }
+  }, [evalJob, evalStream.error, evalStream.result, evalStream.done, evalStream.status]);
+
   function toggle(f: string) {
     setPicked((p) => (p.includes(f) ? p.filter((x) => x !== f) : [...p, f]));
   }
@@ -324,16 +349,15 @@ export default function FactorsPage() {
         filter_zscore: zThreshold.trim() ? Number(zThreshold) : null,
         event_window: [10, 15],
       };
-      const r = await post<EvalResult & { series?: EvalSeries }>('/factors/evaluate', params);
-      setEvalRes(r);
-      // 图表数据包随主评价一次返回（后端已合并计算）
-      setEvalSeries(r.series ?? null);
-      setSeriesError(r.series ? null : '图表数据缺失：评价响应未包含 series 字段');
+      // 评价任务化：202 {job_id}，进度条与结果经 /ws/jobs/{id} 流式回流
+      const r = await post<{ job_id: string; status: string }>('/factors/evaluate', params);
+      setEvalJob(r.job_id);
+      setMsg('评价任务已排队，进度实时更新');
     } catch (e) {
       setMsg(`✗ ${e instanceof Error ? e.message : e}`);
-    } finally {
       setBusy('');
     }
+    // busy 在流式结果/错误回流时清除（见下方 effect）
   }
 
   async function analyze() {
@@ -469,6 +493,14 @@ export default function FactorsPage() {
           >
             {busy === 'eval' ? '评价中…' : '运行评价'}
           </button>
+          {evalJob && evalStream.progress && evalStream.progress.total > 0 && (
+            <div className="w-64">
+              <ProgressBar
+                pct={(evalStream.progress.done / evalStream.progress.total) * 100}
+                phase={evalStream.progress.phase}
+              />
+            </div>
+          )}
           <p className="text-xs text-ink-faint">
             输入任意内置因子名（如 BETA20、CORR60）或传统公式（pct_change_n / rolling_std_n / turnover）。
           </p>

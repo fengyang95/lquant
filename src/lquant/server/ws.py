@@ -15,6 +15,7 @@ from lquant.data.ingest.tasks import get_task
 from lquant.market import ticks as ticks_mod
 from lquant.server.api.ask import get_event_bus
 from lquant.server.jobs import get_job
+from lquant.server.progress import get_progress
 
 router = APIRouter()
 
@@ -52,10 +53,14 @@ async def job_progress(ws: WebSocket, job_id: str) -> None:
                 await ws.send_json({"job_id": job_id, "status": "not_found", "done": True})
                 break
             status = job.get_status()
-            payload: dict = {"job_id": job_id, "status": status, "done": status in ("finished", "failed")}
+            payload: dict = {"job_id": job_id, "status": status,
+                             "done": status in ("finished", "failed", "canceled")}
+            progress = await loop.run_in_executor(None, get_progress, job_id)
+            if progress:
+                payload["progress"] = progress
             if status == "finished":
                 payload["result"] = _safe_result(job)
-            elif status == "failed":
+            if status == "failed":
                 payload["error"] = _safe_error(job)
             await ws.send_json(payload)
             if payload["done"]:

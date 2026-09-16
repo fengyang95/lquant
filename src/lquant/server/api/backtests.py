@@ -192,11 +192,19 @@ class SweepIn(BaseModel):
     tag: str | None = None
 
 
-def _run_sweep_job(formula: str, param: str, values: list, cfg: dict) -> list[dict]:
-    """后台执行体：读数据 → 逐档回测 → 返回网格表（JSON 安全 dict）。"""
+def _run_sweep_job(formula: str, param: str, values: list, cfg: dict,
+                   cancel_check=None, progress=None) -> list[dict]:
+    """后台执行体：读数据 → 逐档回测 → 返回网格表（JSON 安全 dict）。
+
+    progress：阶段/逐档进度上报（done = 已完成档数，total = 总档数）。
+    """
+    if progress is not None:
+        progress(done=0, total=len(values), phase="读取日线")
     df = read_daily(start=cfg["start"]).collect()
     col = formula.replace("_", "")
     d = _compute_factor(df, formula).drop_nulls([col])
+    if progress is not None:
+        progress(done=0, total=len(values), phase="逐档回测")
     grid = run_sweep(
         d, param, values,
         SweepSpec(factor=col, rebalance=cfg["rebalance"],

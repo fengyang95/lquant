@@ -6,14 +6,16 @@
  * series 为图表数据包（评价成功后拉取，失败不阻塞主结果）。
  */
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useParams } from 'next/navigation';
 import useSWR from 'swr';
 import Chart from '@/components/Chart';
 import { Panel, Stat } from '@/components/Panel';
 import PageHeader from '@/components/PageHeader';
+import ProgressBar from '@/components/ProgressBar';
 import { Empty, ErrorNote, Loading, Msg } from '@/components/States';
 import { fetcher, post } from '@/lib/api';
+import { useJobStream } from '@/lib/streaming';
 import { C, axes, legend, tooltip } from '@/lib/chart';
 
 type FactorDetail = {
@@ -60,6 +62,31 @@ export default function FactorDetailPage() {
   const [series, setSeries] = useState<EvalSeries | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState('');
+  // 评价任务流：POST 202 → WS 流式进度 → 终态 result 渲染
+  const [evalJob, setEvalJob] = useState<string | null>(null);
+  const evalStream = useJobStream<EvalResult & { series?: EvalSeries }>(evalJob);
+
+  // 终态回填：result → 指标/图表；error 或 done-无果 → 消息条（busy 防悬挂）
+  useEffect(() => {
+    if (!evalJob) return;
+    if (evalStream.error) {
+      setMsg(`✗ ${evalStream.error}`);
+      setEvalJob(null);
+      setBusy(false);
+    } else if (evalStream.result) {
+      setRes(evalStream.result);
+      // 图表数据包随主评价一次返回（失败不阻塞主结果）
+      setSeries(evalStream.result.series ?? null);
+      mutate(); // 评价后 reports 列表可能新增
+      setEvalJob(null);
+      setBusy(false);
+    } else if (evalStream.done) {
+      // done 但无 result/error（not_found / canceled 等）：终态兜底，防 busy 悬挂
+      setMsg(`✗ 评价任务异常结束（${evalStream.status ?? 'unknown'}）`);
+      setEvalJob(null);
+      setBusy(false);
+    }
+  }, [evalJob, evalStream, mutate]);
 
   // —— 图表 option（依赖 series） ——
   const cumOption = useMemo(() => {
@@ -123,18 +150,15 @@ export default function FactorDetailPage() {
     setMsg('');
     try {
       const params = { factor: name, formula };
-      const r = await post<EvalResult>('/factors/evaluate', params);
-      setRes(r);
-      // 图表数据包（失败不阻塞主评价结果）
-      try {
-        setSeries(await post<EvalSeries>('/factors/evaluate/series', params));
-      } catch { setSeries(null); }
-      mutate(); // 评价后 reports 列表可能新增
+      // 评价任务化：202 {job_id} → WS 流式进度 → 终态 result 渲染
+      const r = await post<{ job_id: string; status: string }>('/factors/evaluate', params);
+      setEvalJob(r.job_id);
+      setMsg('评价任务已排队');
     } catch (e) {
       setMsg(`✗ ${e instanceof Error ? e.message : e}`);
-    } finally {
       setBusy(false);
     }
+    // busy 在流式结果/错误回流时清除（见下方 effect）
   }
 
   if (isLoading) return <Loading />;
@@ -174,6 +198,15 @@ export default function FactorDetailPage() {
           >
             {busy ? '评价中…' : '运行评价'}
           </button>
+          {evalJob && evalStream.progress && evalStream.progress.total > 0 && (
+            <div className="w-64">
+              <ProgressBar
+                pct={(evalStream.progress.done / evalStream.progress.total) * 100}
+                phase={evalStream.progress.phase}
+              />
+              <div className="text-[11px] text-ink-faint">任务 {evalJob.slice(0, 8)}…</div>
+            </div>
+          )}
         </div>
         <Msg text={msg} />
         {res && (

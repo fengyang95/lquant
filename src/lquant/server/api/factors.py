@@ -323,16 +323,30 @@ def _neutral_ladder(d: pl.DataFrame, col: str, ret_col: str,
     return out
 
 
-def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
+def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[dict, dict]:
     """一次现算 + 评价，返回 (metrics, series)。
 
     /evaluate 与 /evaluate/series 共用同一份计算（缺陷 #2：原先两端点
     各自全量重算，2 倍开销且两次结果可能不一致）。
+    progress / cancel_check：任务化执行时由 enqueue 注入的回调 ——
+    progress 在阶段边界上报 (done, total=100, phase)，cancel_check 在
+    阶段边界轮询，返回 True 抛 JobCanceled 提前收尾。同步调用两参皆 None。
     """
+
+    def _step(pct: int, phase: str) -> None:
+        if cancel_check is not None and cancel_check():
+            from lquant.server.jobs import JobCanceled
+
+            raise JobCanceled(f"因子评价已取消: {req.factor}")
+        if progress is not None:
+            progress(done=pct, total=100, phase=phase)
+
+    _step(2, "读取日线")
     df = read_daily(start=req.start, end=req.end,
                     symbols=_universe_symbols(req.universe)).collect()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
+    _step(10, "计算因子")
     d = drop_nonfinite(_compute_factor(df, req.formula), "_factor")
     d = forward_return(d, "close", periods=req.horizons)
     ret_col = f"fwd_ret_{min(req.horizons)}"
@@ -349,6 +363,7 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
         d, outlier_stats = zscore_filter_with_stats(d, threshold=req.filter_zscore)
 
     # ---- metrics（原 run_evaluate 计算体） ----
+    _step(20, "评价计算")
     res = evaluate(d, "_factor", ret_col=ret_col, n_groups=req.n_groups,
                    horizons=req.horizons, outlier_stats=outlier_stats,
                    event_window=(req.event_window[0], req.event_window[1]))
@@ -415,6 +430,7 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
                for r in icy.to_dicts()] if len(icy) else []
 
     # ---- IC 归因阶梯（方案 5.3）+ 三种中性化视图标注（方案 5.1） ----
+    _step(55, "归因与中性化")
     cov_names_all = ["market_cap", "industry_sw1", "turnover_1m", "momentum_1m"]
     try:
         with reader() as con:
@@ -433,6 +449,7 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
     views = _neutral_views_for(d, ret_col)
 
     # ---- 超额收益体系 / Top-N 收缩测试 / 中性化后风格相关性（研报标准三件套） ----
+    _step(70, "超额与Top-N")
     from lquant.factors.evaluate.excess import (
         benchmark_series,
         group_excess_summary,
@@ -505,6 +522,7 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
                              "passed": style_corr.get("passed")}
 
     # 6) 滚动窗口 IC / RankIC / IR
+    _step(85, "滚动与事件分析")
     from lquant.factors.evaluate.rolling import rolling_ic
     rwin = rolling_ic(d, "_factor", ret_col, req.window)
     rolling = {
@@ -553,15 +571,80 @@ def _evaluate_full(req: EvaluateIn) -> tuple[dict, dict]:
         "style_corr": style_corr,
         "event_study": event_study,
     }
+    _step(95, "汇总")
     return metrics, series
 
 
-@router.post("/evaluate")
-def run_evaluate(req: EvaluateIn) -> dict:
-    """现算因子 → 全套评价 → 存报告。一次计算同时返回指标与图表序列。"""
-    m, s = _evaluate_full(req)
+def _check_formula_supported(formula: str) -> None:
+    """公式白名单预检（与 _compute_factor 分支一致）。
+
+    任务化后计算在队列线程执行，坏公式不再同步 422 —— 校验前移到入队前，
+    不支持的公式保持同步 422，而不是变成队列里跑挂的任务。
+    """
+    from lquant.factors.qlib_alpha import has_factor
+
+    if has_factor(formula) or "$" in formula:
+        return
+    if formula.startswith("pct_change_") and formula.rsplit("_", 1)[1].isdigit():
+        return
+    if formula.startswith("rolling_std_") and formula.rsplit("_", 1)[1].isdigit():
+        return
+    if formula == "turnover":
+        return
+    raise HTTPException(422, f"暂不支持的因子公式: {formula}（内置因子见 GET /api/factors/builtin）")
+
+
+def _run_evaluate_job(req_d: dict, cancel_check=None, progress=None) -> dict:
+    """因子评价任务体：与 /evaluate 同一计算体，结果落 job_results 供任务中心渲染。"""
+    req = EvaluateIn(**req_d)
+    m, s = _evaluate_full(req, progress=progress, cancel_check=cancel_check)
     m["series"] = s
+    from lquant.server.eval_results import save_result
+
+    # 取消后不落结果：协作式取消收尾时，线程可能已越过最后的 cancel_check
+    if cancel_check is not None and cancel_check():
+        from lquant.server.jobs import JobCanceled
+
+        raise JobCanceled(f"因子评价已取消: {req_d.get('factor')}")
+    save_result(_job_result_id(req.factor), "factor_eval", req_d, m)
     return m
+
+
+def _job_result_id(factor: str) -> str:
+    """确定性任务 id / 结果主键：同因子重跑覆盖旧任务与旧结果。"""
+    return f"factor-eval-{factor}"
+
+
+@router.post("/evaluate", status_code=202)
+def run_evaluate(req: EvaluateIn) -> dict:
+    """因子评价任务化：入队 lquant-mining，任务中心可见、可取消。
+
+    202 {job_id}；进度经 /ws/jobs/{job_id} 流式推送，完成后同一通道带
+    result，或 GET /evaluate/{job_id} 轮询取结果。
+    """
+    from lquant.server.jobs import enqueue, get_job
+
+    _check_formula_supported(req.formula)
+    jid = _job_result_id(req.factor)
+    # 确定性 id 的并发保护：同因子上一轮评价仍在跑则拒绝（409），避免同 id
+    # 双线程互踩进度/结果。
+    existing = get_job(jid)
+    if existing is not None and existing.get_status() in ("queued", "started"):
+        raise HTTPException(409, f"因子 {req.factor} 的评价任务进行中，请稍后再试")
+    enqueue("lquant-mining", _run_evaluate_job, req.model_dump(),
+            job_id=jid, name="因子评价")
+    return {"job_id": jid, "status": "queued"}
+
+
+@router.get("/evaluate/{job_id}")
+def get_evaluate_result(job_id: str) -> dict:
+    """评价任务结果查询（WS 断连兜底 / 刷新页面恢复）。404 = 尚未完成或不存在。"""
+    from lquant.server.eval_results import get_result
+
+    r = get_result(job_id)
+    if r is None:
+        raise HTTPException(404, f"结果不存在（任务未完成或 id 错误）: {job_id}")
+    return r
 
 
 @router.post("/evaluate/series")

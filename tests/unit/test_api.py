@@ -10,6 +10,7 @@ strategies 枚举 / ws 任务推送。
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,6 +19,23 @@ from fastapi.testclient import TestClient
 os.environ.setdefault("LQ_SYNC_WORKER", "0")
 
 pytestmark = pytest.mark.usefixtures("api_env")
+
+
+def _run_evaluate(client, payload: dict) -> dict:
+    """任务化契约适配：POST /evaluate 202 → 轮询 GET /evaluate/{id} 到 200。
+
+    返回完整评价结果 dict（原同步响应体），供既有断言复用。
+    """
+    r = client.post("/api/factors/evaluate", json=payload)
+    assert r.status_code == 202, r.text
+    jid = r.json()["job_id"]
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        got = client.get(f"/api/factors/evaluate/{jid}")
+        if got.status_code == 200:
+            return got.json()["result"]
+        time.sleep(0.1)
+    pytest.fail(f"评价任务 180s 未完成: {jid}")
 
 
 def _ensure_cwd():
@@ -180,10 +198,8 @@ def test_seed_builtin_and_evaluate(client):
     names = [f["name"] for f in client.get("/api/factors").json()]
     assert {"MA20", "RSV10"} <= set(names)
     # 内置因子走完整评价管线
-    ev = client.post("/api/factors/evaluate", json={
+    body = _run_evaluate(client, {
         "factor": "MA20", "formula": "MA20", "start": "2024-06-01"})
-    assert ev.status_code == 200
-    body = ev.json()
     assert "ic" in body and body["n_samples"] > 0
     assert body["report_url"].startswith("/api/factors/reports/")
     assert client.get(body["report_url"]).status_code == 200
@@ -250,11 +266,9 @@ def test_evaluate_excess_topn_style_payload(client):
 
 def test_evaluate_event_study_and_outlier_payload(client):
     """事件式分层收益 + 截面异常收益过滤（移植自 alphalens/ferric 的两个算子）。"""
-    r = client.post("/api/factors/evaluate", json={
+    body = _run_evaluate(client, {
         "factor": "MA20e", "formula": "MA20", "n_groups": 5, "start": "2024-06-01",
         "filter_zscore": 5.0, "event_window": [3, 5]})
-    assert r.status_code == 200
-    body = r.json()
 
     # 过滤统计回传（阈值 + 删除行数在报告里要交代清楚）
     out = body["outlier"]
@@ -283,9 +297,9 @@ def test_evaluate_without_filter_returns_null_outlier(client):
     assert r.status_code == 200
     body = r.json()
     assert body["event_study"]["rel_periods"]           # 默认窗口仍在算
-    m = client.post("/api/factors/evaluate", json={
+    m = _run_evaluate(client, {
         "factor": "MA20n2", "formula": "MA20", "n_groups": 5, "start": "2024-06-01"})
-    assert m.json()["outlier"] is None
+    assert m["outlier"] is None
 
 
 # ---------- backtests ----------
