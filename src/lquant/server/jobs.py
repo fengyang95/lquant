@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import queue
 import threading
 import time
 import uuid
@@ -13,7 +14,151 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
 
+from lquant.core.db import reader, writer
+
 QUEUES = ("lquant-default", "lquant-ingest", "lquant-backtest", "lquant-mining")
+
+# ---------------------------------------------------------------- job_record
+
+# 进程内注册表重启即失忆 —— 因子评价/回测扫参这类任务重启后前端只能报
+# 「连接中断」。job_record 表把入队/终态落库：重启后 WS 兜底链与任务
+# 中心历史仍可见（遗留 started 由启动钩子标记 interrupted）。
+_JOB_RECORD_DDL = """
+CREATE TABLE IF NOT EXISTS job_record (
+    job_id     VARCHAR PRIMARY KEY,
+    name       VARCHAR,
+    queue      VARCHAR,
+    status     VARCHAR,
+    error      VARCHAR,
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP
+)
+"""
+
+_TERMINAL = ("finished", "failed", "canceled", "interrupted")
+
+# 持久化走后台 flusher：enqueue/终态只入队，绝不阻塞任务线程。
+# 直接同步写 duckdb 会撞跨进程文件锁（与运行中的 API/CLI 抢写），
+# 把 worker 线程挂住几十秒 —— 这是本设计最初的坑。
+_RECORD_QUEUE: queue.Queue[tuple] = queue.Queue()
+_RECORD_THREAD: threading.Thread | None = None
+
+
+def _ensure_job_record(con) -> None:
+    con.execute(_JOB_RECORD_DDL)
+
+
+# DDL 幂等但并发 CREATE 会撞 duckdb 乐观并发（Catalog write-write conflict），
+# 且每次写都跑 DDL 浪费 —— 按路径记一次：同路径进程内只建一次表。
+_ENSURE_LOCK = threading.Lock()
+_ENSURED_PATH: str | None = None
+
+
+def _ensure_job_record_once() -> None:
+    global _ENSURED_PATH
+    from pathlib import Path
+
+    from lquant.core.config import get_settings
+
+    # 相对路径字符串在不同 cwd 下指向不同文件 —— 必须用解析后的绝对路径比较
+    path = str(Path(get_settings().duckdb_path).resolve())
+    if path == _ENSURED_PATH:
+        return
+    with _ENSURE_LOCK:
+        if path == _ENSURED_PATH:
+            return
+        with writer() as con:
+            _ensure_job_record(con)
+        _ENSURED_PATH = path
+
+
+def _record_flusher() -> None:
+    while True:
+        item = _RECORD_QUEUE.get()
+        batch = [item]
+        while len(batch) < 100 and not _RECORD_QUEUE.empty():
+            batch.append(_RECORD_QUEUE.get_nowait())
+        try:
+            _ensure_job_record_once()
+            with writer() as con:
+                for kind, *args in batch:
+                    if kind == "insert":
+                        job_id, name, q = args
+                        con.execute(
+                            "INSERT OR REPLACE INTO job_record "
+                            "VALUES (?, ?, ?, 'started', NULL, ?, ?)",
+                            [job_id, name, q, _now(), _now()])
+                    else:
+                        job_id, status, error = args
+                        con.execute(
+                            "UPDATE job_record SET status = ?, error = ?, "
+                            "updated_at = ? WHERE job_id = ? AND status NOT IN "
+                            "('finished', 'failed', 'canceled', 'interrupted')",
+                            [status, error, _now(), job_id])
+        except Exception:  # noqa: BLE001 - 持久化失败不影响任务本身，但必须可见
+            from loguru import logger
+
+            logger.exception("job_record 批量落库失败")
+        finally:
+            # task_done 在写完之后：queue.join() 才等价于「已落库」
+            _RECORD_QUEUE.task_done()
+            for _ in batch[1:]:
+                _RECORD_QUEUE.task_done()
+
+
+def _ensure_record_thread() -> None:
+    global _RECORD_THREAD
+    if _RECORD_THREAD is None or not _RECORD_THREAD.is_alive():
+        _RECORD_THREAD = threading.Thread(
+            target=_record_flusher, name="job-record-flusher", daemon=True)
+        _RECORD_THREAD.start()
+
+
+def _record_insert(job_id: str, name: str | None, queue: str) -> None:
+    _ensure_record_thread()
+    _RECORD_QUEUE.put(("insert", job_id, name, queue))
+
+
+def _record_update(job_id: str, status: str, error: str | None = None) -> None:
+    _ensure_record_thread()
+    _RECORD_QUEUE.put(("update", job_id, status, error))
+
+
+def get_job_record(job_id: str) -> dict | None:
+    with reader() as con:
+        try:
+            row = con.execute(
+                "SELECT job_id, name, queue, status, error, created_at "
+                "FROM job_record WHERE job_id = ?", [job_id]).fetchone()
+        except Exception:  # noqa: BLE001 - 表不存在按缺失处理
+            return None
+    if row is None:
+        return None
+    return {"id": row[0], "name": row[1], "queue": row[2], "status": row[3],
+            "error": row[4],
+            "created_at": row[5].timestamp() if row[5] is not None else 0.0}
+
+
+def mark_interrupted_jobs() -> int:
+    """启动钩子：遗留 started 记录 → interrupted（服务重启打断）。"""
+    try:
+        _ensure_job_record_once()
+        with writer() as con:
+            n = con.execute(
+                "SELECT count(*) FROM job_record WHERE status = 'started'"
+            ).fetchone()[0]
+            con.execute(
+                "UPDATE job_record SET status = 'interrupted', updated_at = ? "
+                "WHERE status = 'started'", [_now()])
+        return int(n)
+    except Exception:  # noqa: BLE001 - 标记失败不挡启动
+        return 0
+
+
+def _now():
+    from datetime import datetime
+
+    return datetime.now()
 
 
 class JobCanceled(RuntimeError):
@@ -243,6 +388,7 @@ def enqueue(queue: str, fn, *args, job_id: str | None = None,
     job.queue = queue
     _register_job(job)
     _register_cancelable(job.id, _CancelTarget(queue=queue, local_job=job))
+    _record_insert(job.id, name, queue)
 
     if has_cancel:
         kwargs["cancel_check"] = lambda jid=job.id: _is_canceled(jid)  # noqa: E731
@@ -269,10 +415,31 @@ def enqueue(queue: str, fn, *args, job_id: str | None = None,
                             queue=queue, enqueued_at=None, started_at=started,
                             finished_at=time.time(),
                             message=f"{type(e).__name__}: {e}")
+        finally:
+            _record_update(
+                job.id,
+                "canceled" if job._canceled else ("failed" if job._error else "finished"),
+                job._error)
 
     job._thread = threading.Thread(target=_run, name=f"localjob-{job.id}", daemon=True)
     job._thread.start()
     return job
+
+
+def _recent_job_records(limit: int) -> list[dict]:
+    """job_record 表按创建时间倒序的记录（与内存条目同构）。"""
+    try:
+        with reader() as con:
+            rows = con.execute(
+                "SELECT job_id, name, queue, status, error, created_at "
+                "FROM job_record ORDER BY created_at DESC LIMIT ?",
+                [int(limit)]).fetchall()
+    except Exception:  # noqa: BLE001 - 表不存在按空处理
+        return []
+    return [{"id": r[0], "name": r[1], "queue": r[2], "status": r[3],
+             "error": r[4],
+             "created_at": r[5].timestamp() if r[5] is not None else 0.0}
+            for r in rows]
 
 
 def _make_progress_cb(job_id: str):
@@ -328,5 +495,19 @@ def list_recent_jobs(limit: int = 50) -> list[dict]:
     with _JOBS_LOCK:
         jobs = sorted(_LOCAL_JOBS.values(), key=lambda j: j.created_at,
                       reverse=True)[:limit]
-    return [{"id": j.id, "status": j.get_status(), "queue": j.queue,
-             "created_at": j.created_at, "error": j.error} for j in jobs]
+    from lquant.server.progress import get_job_name
+
+    mem = [{"id": j.id, "status": j.get_status(), "queue": j.queue,
+            "created_at": j.created_at, "error": j.error,
+            "name": get_job_name(j.id)} for j in jobs]
+    # 合并 DB 记录：重启后内存注册表空，历史靠 job_record 表续命。
+    # 同 id 内存优先（状态更新鲜），name 以 DB 为准（内存侧不存名）。
+    seen = {j["id"] for j in mem}
+    db_rows = _recent_job_records(limit)
+    names = {r["id"]: r.get("name") for r in db_rows}
+    merged = [{**j, "name": names.get(j["id"]) or j.get("name")} for j in mem]
+    for r in db_rows:
+        if r["id"] not in seen:
+            merged.append(r)
+    merged.sort(key=lambda x: x.get("created_at", 0.0), reverse=True)
+    return merged[:limit]
