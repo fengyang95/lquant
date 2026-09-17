@@ -328,6 +328,31 @@ def test_failed_data_task_surfaces_error_in_list(client, monkeypatch):
     assert "模拟崩溃" in (hit["error"] or "")
 
 
+def test_cancel_orphan_pending_data_task(client, monkeypatch):
+    """孤儿 pending：本地模式 + 队列目标丢失 → cancel 标 interrupted 解除死锁。"""
+    import uuid
+
+    from lquant.core.db import writer
+    from lquant.data.ingest.tasks import _DDL, get_task
+    from lquant.server import jobs as jobs_mod
+
+    _clear_active_tasks()
+    tid = uuid.uuid4().hex[:12]
+    with writer() as con:  # 直接落一行 pending（绕过 create+enqueue 的瞬时执行）
+        con.execute(_DDL)
+        con.execute(
+            "INSERT INTO data_task (task_id, kind, params, status, "
+            "total_symbols, done_symbols, failed_symbols, failed_detail, "
+            "rows_written) VALUES (?, 'daily_update', '{}'::JSON, 'pending', "
+            "0, 0, '[]'::JSON, '[]'::JSON, 0)", [tid])
+    # 制造孤儿：清掉队列侧取消目标 + 强制本地降级模式
+    monkeypatch.setattr(jobs_mod, "_redis_available", lambda ttl=0: False)
+    monkeypatch.setattr(jobs_mod, "_CANCELABLE", {})
+    rr = client.post(f"/api/tasks/data/{tid}/cancel")
+    assert rr.status_code == 200
+    assert get_task(tid)["status"] == "interrupted"
+
+
 def test_cancel_finished_data_task_409(client):
     """data 任务已结束（ok）→ 409 不可取消（不再是不分种类的 404）。"""
     _clear_active_tasks()

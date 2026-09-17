@@ -7,7 +7,12 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from lquant.data.ingest import tasks as ingest_tasks
-from lquant.server.jobs import get_job, list_recent_jobs, request_cancel
+from lquant.server.jobs import (
+    _redis_available,
+    get_job,
+    list_recent_jobs,
+    request_cancel,
+)
 
 router = APIRouter(prefix="/tasks", tags=["task-center"])
 
@@ -187,7 +192,12 @@ def cancel_ep(kind: str, task_id: str) -> dict:
         if task["status"] not in ("pending", "running"):
             raise HTTPException(409, f"任务 {task_id} 已结束（{task['status']}），不可取消")
         if not request_cancel(task_id):
-            # pending/running 但队列里没有可取消目标：RQ 运行中 / 降级 job 丢失
+            # 孤儿 pending：本地降级模式下注册表已随创建它的进程消失，
+            # 任务永远不会被执行 —— 标记 interrupted 解除对后续任务的阻塞
+            # （等价启动标记语义；RQ 模式下 job 可能在 Redis 队列里，不在此越权）
+            if (not _redis_available() and task["status"] == "pending"
+                    and ingest_tasks.mark_canceled_pending(task_id)):
+                return {"task_id": task_id, "canceled": True}
             raise HTTPException(409, f"任务 {task_id} 当前不可取消（队列目标不存在或运行中）")
         # RQ queued job 被真取消 → job 永不执行，data_task 停 pending 的坑：
         # 显式落 interrupted。本地模式线程稍后会跑并再收尾一次，状态一致。

@@ -113,13 +113,24 @@ def test_gaps_reports_missing_day(client) -> None:
     assert daily["sparse_total"] == 3
 
 
-def test_gaps_repair_creates_daily_update(client) -> None:
+def test_gaps_repair_creates_daily_update(client, monkeypatch) -> None:
+    from lquant.server.api import data as data_api
+
+    enqueued: list[tuple] = []
+    monkeypatch.setattr(
+        data_api, "enqueue",
+        lambda queue, fn, *args, **kw: enqueued.append((queue, fn.__name__, args)))
     r = client.post("/api/data/gaps/repair")
     assert r.status_code == 202
     body = r.json()
     assert body["created"] is True
-    assert body["task_id"]
-    task = client.get(f"/api/data/tasks/{body['task_id']}").json()
+    task_id = body["task_id"]
+    # 必须入队执行器，否则任务永远 pending（PR#66 的回归点）。
+    # fn 是 _stub_executor 打桩后的 tasks.execute_task，名字不关键，
+    # 关键是：queue 正确 + 以 task_id 为 job_id 入队（cancel 探针依赖）
+    assert enqueued and enqueued[0][0] == "lquant-ingest"
+    assert enqueued[0][2][0] == task_id
+    task = client.get(f"/api/data/tasks/{task_id}").json()
     assert task["kind"] == "daily_update"
     params = task["params"]
     assert params["start"] == "2026-09-11"

@@ -259,6 +259,10 @@ def repair_gaps(req: GapsRepairIn = GapsRepairIn()) -> dict:
     except TaskConflictError as e:
         return {"created": False, "task_id": None,
                 "reason": "active_task_exists", "message": str(e)}
+    # 与 POST /data/tasks 一致：job_id = task_id，任务中心 cancel 靠它找取消目标；
+    # 不 enqueue 执行器的话任务永远 pending —— PR#66 漏了这步，补采按钮实际不跑
+    enqueue("lquant-ingest", ingest_tasks.execute_task, task["task_id"],
+            job_id=task["task_id"])
     return {"created": True, "task_id": task["task_id"], "reason": None}
 
 
