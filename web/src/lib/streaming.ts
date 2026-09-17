@@ -55,7 +55,9 @@ export function useJobStream<T = unknown>(jobId: string | null): JobStream<T> {
           status: m.status ?? prev.status,
           progress: m.progress ?? prev.progress,
           result: m.result ?? prev.result,
-          error: m.error ?? prev.error,
+          error: m.error
+            ?? (m.status === 'interrupted' ? '任务因服务重启已中断，请重新发起' : undefined)
+            ?? prev.error,
           done: Boolean(m.done),
         }));
       } catch {

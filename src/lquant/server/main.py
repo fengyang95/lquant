@@ -88,6 +88,16 @@ def _startup() -> None:
     from lquant._rust.loader import print_status
 
     print_status()
+    # 重启遗留的队列任务标记 interrupted（WS 兜底链据此发终态帧，
+    # 前端显示「已中断」而非「连接中断」）
+    try:
+        from lquant.server.jobs import mark_interrupted_jobs
+
+        n = mark_interrupted_jobs()
+        if n:
+            print(f"[startup] {n} 个遗留任务标记 interrupted")
+    except Exception:  # noqa: BLE001 - 标记失败不挡启动
+        pass
     # 结构迁移：老库的 factor_def 缺 expression 列会让因子 API 静默丢数据
     try:
         from lquant.core.db import writer

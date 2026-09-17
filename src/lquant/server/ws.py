@@ -14,7 +14,7 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from lquant.data.ingest.tasks import get_task
 from lquant.market import ticks as ticks_mod
 from lquant.server.api.ask import get_event_bus
-from lquant.server.jobs import get_job
+from lquant.server.jobs import get_job, get_job_record
 from lquant.server.progress import get_progress
 
 router = APIRouter()
@@ -50,6 +50,20 @@ async def job_progress(ws: WebSocket, job_id: str) -> None:
                         break
                     await asyncio.sleep(_POLL_SECONDS)
                     continue
+                # job_record 兜底：因子评价/回测扫参等非 data_task 任务的重启
+                # 遗留记录 —— 发终态帧让前端显示「已中断」而非连接中断
+                rec = await loop.run_in_executor(None, get_job_record, job_id)
+                if rec is not None and rec["status"] in ("finished", "failed",
+                                                         "canceled", "interrupted"):
+                    await ws.send_json({
+                        "job_id": job_id,
+                        "status": rec["status"],
+                        "error": rec["error"]
+                        or ("任务因服务重启已中断，请重新发起"
+                            if rec["status"] == "interrupted" else None),
+                        "done": True,
+                    })
+                    break
                 await ws.send_json({"job_id": job_id, "status": "not_found", "done": True})
                 break
             status = job.get_status()
