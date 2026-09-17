@@ -105,7 +105,7 @@ def _empty() -> pl.DataFrame:
         "change_pct": pl.Float64, "turnover_rate": pl.Float64, "amount": pl.Float64,
         "main_net_inflow": pl.Float64, "leader_symbol": pl.Utf8, "leader_name": pl.Utf8,
         "leader_change": pl.Float64, "up_count": pl.Int64, "down_count": pl.Int64,
-        "collected_at": pl.Datetime("Asia/Shanghai")})
+        "collected_at": pl.Datetime("us")})
 
 
 def _demo_sectors(d, kind: str) -> pl.DataFrame:

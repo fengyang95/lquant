@@ -135,7 +135,7 @@ def fetch_broken_pool(trade_date: date | str | None = None, *,
         schema={"trade_date": pl.Date, "symbol": pl.Utf8, "name": pl.Utf8,
                 "close": pl.Float64, "change_pct": pl.Float64, "amount": pl.Float64,
                 "first_limit_time": pl.Utf8, "open_count": pl.Int64,
-                "industry": pl.Utf8, "collected_at": pl.Datetime("Asia/Shanghai")})
+                "industry": pl.Utf8, "collected_at": pl.Datetime("us")})
 
 
 def fetch_limit_down_pool(trade_date: date | str | None = None, *,
@@ -153,7 +153,7 @@ def fetch_limit_down_pool(trade_date: date | str | None = None, *,
     return pl.DataFrame(rows) if rows else pl.DataFrame(
         schema={"trade_date": pl.Date, "symbol": pl.Utf8, "name": pl.Utf8,
                 "close": pl.Float64, "change_pct": pl.Float64, "amount": pl.Float64,
-                "industry": pl.Utf8, "collected_at": pl.Datetime("Asia/Shanghai")})
+                "industry": pl.Utf8, "collected_at": pl.Datetime("us")})
 
 
 def _demo_pool(d: date, kind: str) -> pl.DataFrame:
