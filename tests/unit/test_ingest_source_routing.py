@@ -193,6 +193,28 @@ def test_resolve_ingest_source_prefers_capability_order(fake_settings, monkeypat
     assert (p_fund.name, m_fund) == ("fundonly", "daily_bars")
 
 
+def test_unparseable_symbol_is_not_fund(fake_settings):
+    """解析不了的代码按非基金处理 —— 分类失败不能把整批带崩。"""
+    from lquant.data.ingest.daily import _by_class, _is_fund
+
+    assert _is_fund("???") is False
+    assert _by_class(["600000.SH", "???"]) == [("other", ["600000.SH", "???"])]
+
+
+def test_resolve_falls_back_to_chain_head_without_capability(
+        fake_settings, monkeypatch):
+    """链里没有任何源声明该能力时回落链头（保持旧行为，不抛错）。"""
+    from lquant.data.ingest.daily import resolve_ingest_source
+
+    class _NoCaps(_FakeProv):
+        name = "nocaps"
+        source = "nocaps"
+
+    _patch_chain(monkeypatch, _Chain([_NoCaps()]))
+    p, method = resolve_ingest_source(fund=True)
+    assert (p.name, method) == ("nocaps", "daily_bars")
+
+
 # ---------- 回填池口径 ----------
 
 

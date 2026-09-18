@@ -32,7 +32,19 @@ if [ -d tests ]; then
     echo "    DuckDB 未建库，先 init_db"
     "$PY" scripts/init_db.py
   fi
-  if ! find data/parquet -name '*.parquet' -print -quit 2>/dev/null | grep -q .; then
+
+  # 只有「确认湖是空的、而且这个湖是本仓自己的」才造演示数据兜底。
+  # 两个坑，都真实发生过（合成数据 21300 行覆盖进主湖 30 只标的）：
+  # ① find 默认**不跟随符号链接**。worktree 里 data/parquet 常是指向主仓
+  #    真实湖的软链（隔离姿势），不加 -L 会误判「湖为空」；
+  # ② 即便真为空，软链指向的也是**别人的**湖，不该往里灌合成数据。
+  # 所以：软链一律不兜底；跟随软链探测，只有真·空目录才生成。
+  lake_empty=0
+  if [ ! -L data/parquet ] \
+     && ! find -L data/parquet -name '*.parquet' -print -quit 2>/dev/null | grep -q .; then
+    lake_empty=1
+  fi
+  if [ "$lake_empty" = "1" ]; then
     echo "    无任何 parquet 数据，生成演示数据兜底（换真数据: ./lquant.sh bootstrap）"
     "$PY" -c "from lquant.cli.main import cli; cli(['data','demo'], standalone_mode=False)" >/dev/null
   fi
