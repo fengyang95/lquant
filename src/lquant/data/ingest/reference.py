@@ -180,45 +180,62 @@ def sync_security_details(limit: int | None = None, batch: int = 200) -> int:
     done = 0
     for i in range(0, len(todo), batch):
         chunk = todo[i : i + batch]
-        df = target.security_details(chunk)
-        if len(df):
-            # 注意：列存在性要对着 with_columns 之后的帧判断 —— 曾有 bug
-            # 用原始 df 判断，source/updated_at 被自己的 select 过滤掉，
-            # INSERT OR REPLACE 把已入库行的 board/is_st/source 冲成 NULL。
-            out = df.with_columns(
-                source=pl.lit(src),
-                updated_at=pl.lit(now_cn().replace(tzinfo=None), dtype=pl.Datetime),
+        try:
+            df = target.security_details(chunk)
+        except Exception as e:  # noqa: BLE001 - 单批失败不炸整步，且绝不标完成
+            logger.warning(f"  详情批次 {i} 失败，未标记（重跑将重试）: {e}")
+            cp.unmark(chunk)
+            continue
+        if not len(df):
+            # 零行不标完成：此前无条件 cp.mark(chunk) 把「源没返回任何详情」
+            # 记成「已补完」，这些标的会永久卡在 pending_details（cp 过滤掉、
+            # security.list_date 恒 NULL），reference 作业每轮空转还报 ok
+            # （实测 516840.SH / 516850.SH 被标 done 后 list_date 永远为 NULL）。
+            logger.warning(f"  详情批次 {i} 零行返回，未标记（{len(chunk)} 只）")
+            cp.unmark(chunk)
+            continue
+        # 注意：列存在性要对着 with_columns 之后的帧判断 —— 曾有 bug
+        # 用原始 df 判断，source/updated_at 被自己的 select 过滤掉，
+        # INSERT OR REPLACE 把已入库行的 board/is_st/source 冲成 NULL。
+        out = df.with_columns(
+            source=pl.lit(src),
+            updated_at=pl.lit(now_cn().replace(tzinfo=None), dtype=pl.Datetime),
+        )
+        # details 接口不带 board/is_st，但 INSERT OR REPLACE 是整行覆盖
+        # —— 写前必须把库内已有值带回去，否则每轮补详情都把这两列冲 NULL。
+        try:
+            with reader() as con:
+                old_meta = con.execute("SELECT symbol, board, is_st FROM security").pl()
+            if len(old_meta) and "board" not in out.columns:
+                out = out.join(old_meta, on="symbol", how="left")
+        except Exception:  # noqa: BLE001 - 表不存在等场景，直接按无旧值处理
+            pass
+        repo.upsert(
+            out.select(
+                [
+                    c
+                    for c in (
+                        "symbol",
+                        "name",
+                        "list_date",
+                        "delist_date",
+                        "sec_type",
+                        "board",
+                        "is_st",
+                        "source",
+                        "updated_at",
+                    )
+                    if c in out.columns
+                ]
             )
-            # details 接口不带 board/is_st，但 INSERT OR REPLACE 是整行覆盖
-            # —— 写前必须把库内已有值带回去，否则每轮补详情都把这两列冲 NULL。
-            try:
-                with reader() as con:
-                    old_meta = con.execute("SELECT symbol, board, is_st FROM security").pl()
-                if len(old_meta) and "board" not in out.columns:
-                    out = out.join(old_meta, on="symbol", how="left")
-            except Exception:  # noqa: BLE001 - 表不存在等场景，直接按无旧值处理
-                pass
-            repo.upsert(
-                out.select(
-                    [
-                        c
-                        for c in (
-                            "symbol",
-                            "name",
-                            "list_date",
-                            "delist_date",
-                            "sec_type",
-                            "board",
-                            "is_st",
-                            "source",
-                            "updated_at",
-                        )
-                        if c in out.columns
-                    ]
-                )
-            )
-        cp.mark(chunk)
-        done += len(chunk)
+        )
+        # 只标记**真正写回**的标的：源可能只返回批次中的一部分，
+        # 整批标完成会让缺失的那几只永久不再重试。
+        got = {str(s) for s in out["symbol"].to_list()} if "symbol" in out.columns else set()
+        marked = [s for s in chunk if s in got]
+        if marked:
+            cp.mark(marked)
+        done += len(marked)
         logger.info(f"  详情进度 {done}/{len(todo)}")
     return done
 

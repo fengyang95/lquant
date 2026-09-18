@@ -143,10 +143,18 @@ def status() -> None:
             click.echo(f"  {name}: {n}")
         except Exception as e:  # noqa: BLE001
             click.echo(f"  {name}: - ({type(e).__name__})")
-    import glob
+    # 湖路径必须来自配置（settings.parquet_dir），不能用相对 CWD 的
+    # "data/parquet/..."：服务进程与 CLI 的 CWD 不同，或配了绝对路径时
+    # 这里会静默显示 0 个分区（与 parquet.lake_glob 同一约定）。
+    from pathlib import Path
 
-    files = glob.glob("data/parquet/daily/**/*.parquet", recursive=True)
-    click.echo(f"  daily parquet 年分区: {len(files)}")
+    from lquant.core.config import get_settings
+    from lquant.data.store.parquet import lake_is_empty
+
+    root = Path(get_settings().parquet_dir) / "daily"
+    files = sorted(root.rglob("*.parquet")) if root.is_dir() else []
+    click.echo(f"  daily parquet 年分区: {len(files)}"
+               + ("（湖为空，先跑 lq data sync）" if lake_is_empty("daily") else ""))
 
 
 @data.command()

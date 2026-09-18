@@ -80,6 +80,10 @@ def backfill_daily_basic(
     fetched = 0
     ok_days = 0
     buf: list = []
+    # 已进 buf、但尚未落湖的交易日。**必须落湖成功后才 mark** ——
+    # 此前是「先 mark 后写」，进程在缓冲窗口内被杀（最多 _CHUNK 天）就会留下
+    # 「checkpoint 说完成、湖里没有」的永久缺口：重跑会跳过这些天。
+    pending_days: list[date] = []
     for i, d in enumerate(todo, 1):
         try:
             df = provider.daily_basic(d)
@@ -94,17 +98,18 @@ def backfill_daily_basic(
             logger.warning(f"  {d} daily_basic 空返回，未标记（重跑将重试）")
             continue
         buf.append(df)
+        pending_days.append(d)
         fetched += len(df)
         ok_days += 1
-        cp.mark({d.isoformat()})
         if len(buf) >= _CHUNK:
-            write_daily_basic(_concat(buf))
-            buf = []
-            logger.info(f"  daily_basic 进度 {i}/{len(todo)}（{d}）")
+            written = write_daily_basic(_concat(buf))
+            cp.mark({x.isoformat() for x in pending_days})  # 落湖成功才记账
+            logger.info(f"  daily_basic 进度 {i}/{len(todo)}（{d}，落盘 {len(written)} 文件）")
+            buf, pending_days = [], []
 
     if buf:
         write_daily_basic(_concat(buf))
-        buf = []
+        cp.mark({x.isoformat() for x in pending_days})
 
     out = {"days": len(days), "fetched_days": ok_days, "rows": fetched}
     if merge:

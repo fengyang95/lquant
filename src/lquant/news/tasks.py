@@ -18,6 +18,7 @@ from typing import Any
 from duckdb import DuckDBPyConnection
 
 from lquant.core.config import load_yaml
+from lquant.core.types import today_cn
 from lquant.news.link import build_name_to_code, link_industry, link_symbols
 from lquant.news.model import NewsItem
 from lquant.news.sources.base import get_sources
@@ -201,7 +202,9 @@ def execute_task(con: DuckDBPyConnection, task_id: str, runner: Runner | None = 
 
     params = task["params"]
     sources = list(params.get("sources") or [])
-    day = _parse_day(params.get("date")) or date.today()
+    # 业务日期用 today_cn()：容器/服务器时区非 Asia/Shanghai 时
+    # date.today() 会与交易日错位一天（core/types 的业务日期约定）
+    day = _parse_day(params.get("date")) or today_cn()
     fetch: Runner = runner if runner is not None else _default_runner
 
     n2c, kw_map, s2i = _load_link_inputs(con)
@@ -230,7 +233,7 @@ def retry_task(con: DuckDBPyConnection, task_id: str, runner: Runner | None = No
     )
 
     params = task["params"]
-    day = _parse_day(params.get("date")) or date.today()
+    day = _parse_day(params.get("date")) or today_cn()
     fetch: Runner = runner if runner is not None else _default_runner
     n2c, kw_map, s2i = _load_link_inputs(con)
     sources_status, rows_written = _run_sources(

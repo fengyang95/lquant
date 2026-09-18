@@ -316,3 +316,96 @@ def test_daily_basic_empty_day_not_marked(tmp_path, monkeypatch) -> None:
         from lquant.core.config import get_settings
 
         get_settings.cache_clear()
+
+
+def test_daily_basic_lake_write_failure_does_not_mark(tmp_path, monkeypatch) -> None:
+    """落湖失败时不得标 done —— 回归：此前「先 mark 后缓冲写」。
+
+    daily_basic 是「攒够 _CHUNK 天再写一次湖」，而 mark 是逐天即时落盘的。
+    旧顺序下进程在缓冲窗口内被杀（最多 60 个交易日），checkpoint 已经
+    说完成、湖里却没有数据，重跑直接跳过 → 永久静默缺口。
+    """
+    import pytest
+
+    _prep_lake_5days(tmp_path, monkeypatch)
+    try:
+        from lquant.data.ingest import daily_basic as mod
+
+        def _boom(_df):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(mod, "write_daily_basic", _boom)
+        fake = _FlakyBasicProvider(set(), set())
+
+        class _Chain:
+            providers = [fake]
+
+        monkeypatch.setattr("lquant.data.providers.get_provider",
+                            lambda *a, **k: _Chain())
+        with pytest.raises(OSError):
+            mod.backfill_daily_basic(start="2026-08-03", end="2026-08-07",
+                                     merge=False)
+
+        from lquant.data.ingest.checkpoint import Checkpoint
+
+        assert Checkpoint("daily_basic").done == set()  # 未落湖 → 一天都没标
+    finally:
+        from lquant.core.config import get_settings
+
+        get_settings.cache_clear()
+
+
+def test_daily_basic_marks_only_after_successful_flush(tmp_path, monkeypatch) -> None:
+    """落湖成功后才记账：第二次 flush 失败时，只保留第一次已落盘的交易日。"""
+    import pytest
+
+    monkeypatch.setenv("LQ_ROOT", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    from lquant.core.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        from datetime import date as _d
+
+        from lquant.data.ingest import daily_basic as mod
+
+        # 10 个交易日库内数据 + _CHUNK=3 → 分批落盘，第 3 次开始失败
+        _seed_calendar("2026-08-03", "2026-08-14")
+        from lquant.data.store.parquet import write_daily
+
+        days = [_d(2026, 8, 3 + i) for i in range(5)]
+        write_daily(pl.DataFrame({
+            "symbol": ["600000.SH"] * len(days),
+            "trade_date": days,
+            "close": [10.0] * len(days),
+        }, schema_overrides={"trade_date": pl.Date}))
+
+        fake = _FlakyBasicProvider(set(), set())
+
+        class _Chain:
+            providers = [fake]
+
+        monkeypatch.setattr("lquant.data.providers.get_provider",
+                            lambda *a, **k: _Chain())
+        monkeypatch.setattr(mod, "_CHUNK", 2, raising=False)
+
+        calls = {"n": 0}
+        real = mod.write_daily_basic
+
+        def _flaky(df):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise OSError("disk full")
+            return real(df)
+
+        monkeypatch.setattr(mod, "write_daily_basic", _flaky)
+        with pytest.raises(OSError):
+            mod.backfill_daily_basic(start="2026-08-03", end="2026-08-07",
+                                     merge=False)
+
+        from lquant.data.ingest.checkpoint import Checkpoint
+
+        # 只有第一次成功落湖的 2 天被记账；失败那批的 2 天必须留待重试
+        assert Checkpoint("daily_basic").done == {"2026-08-03", "2026-08-04"}
+    finally:
+        get_settings.cache_clear()

@@ -130,3 +130,55 @@ def test_default_runner_from_registry(con, monkeypatch):
     out = execute_task(con, t["task_id"])  # 不传 runner
     assert out["status"] == "ok"
     assert calls and calls[0][1] == "s1"
+
+
+def test_run_day_comes_from_today_cn(con, monkeypatch):
+    """采集业务日期取 Asia/Shanghai 的 today_cn()，不是进程本地 date.today()。
+
+    回归：容器/服务器时区非东八区时，date.today() 在 00:00–08:00 会落到
+    前一天，采集器按错误日期抓取（CCTV 文字稿、公告、热搜榜都按日参数取数）。
+    """
+    import datetime as _dt
+
+    import lquant.news.tasks as nt
+
+    sentinel = _dt.date(2031, 12, 31)
+    monkeypatch.setattr(nt, "today_cn", lambda: sentinel)
+
+    seen: list = []
+
+    def runner(day, src):
+        seen.append(day)
+        return []
+
+    t = nt.create_task(con, "manual", {"sources": ["s1"]})   # 不带 date
+    nt.execute_task(con, t["task_id"], runner=runner)
+    assert seen == [sentinel]
+
+    # retry 路径同样走 today_cn（先让任务落到可重试态）
+    def failing(day, src):
+        seen.append(day)
+        raise RuntimeError("boom")
+
+    t2 = nt.create_task(con, "manual", {"sources": ["s1"]})
+    nt.execute_task(con, t2["task_id"], runner=failing)
+    nt.retry_task(con, t2["task_id"], runner=runner)
+    assert seen[-1] == sentinel
+
+
+def test_run_day_honours_explicit_date_param(con, monkeypatch):
+    """显式给了 date 参数时以参数为准（today_cn 只做缺省值）。"""
+    import datetime as _dt
+
+    import lquant.news.tasks as nt
+
+    monkeypatch.setattr(nt, "today_cn", lambda: _dt.date(2031, 12, 31))
+    seen: list = []
+
+    def runner(day, src):
+        seen.append(day)
+        return []
+
+    t = nt.create_task(con, "manual", {"sources": ["s1"], "date": "2026-09-16"})
+    nt.execute_task(con, t["task_id"], runner=runner)
+    assert seen == [_dt.date(2026, 9, 16)]

@@ -401,3 +401,75 @@ def test_merge_existing_details_old_empty(fake_settings):
     df = pl.DataFrame({"symbol": ["600000.SH"], "list_date": [date(1999, 1, 1)]})
     out = ref._merge_existing_details(df)
     assert str(out["list_date"][0]) == "1999-01-01"
+
+
+# ---------- 详情批次记账：只标真正写回的标的（回归） ----------
+#
+# 缺陷现场（2026-09-18 实测）：security_details 批次零行返回时无条件
+# cp.mark(chunk)，标的此后被 cp 过滤掉、security.list_date 恒 NULL ——
+# 516840.SH / 516850.SH 两只 ETF 因此永久卡在 pending_details，
+# reference 作业每轮空转还报 ok。
+
+
+class _EmptyDetailsProvider(_Provider):
+    """零行返回（源不认这些标的）。"""
+
+    def security_details(self, symbols):
+        return pl.DataFrame()
+
+
+class _PartialDetailsProvider(_Provider):
+    """只返回批次里的一部分标的。"""
+
+    def security_details(self, symbols):
+        return pl.DataFrame({
+            "symbol": symbols[:1],
+            "name": [f"n{s}" for s in symbols[:1]],
+            "list_date": [date(2000, 1, 1)] * min(1, len(symbols)),
+            "delist_date": [None] * min(1, len(symbols)),
+        })
+
+
+class _BoomDetailsProvider(_Provider):
+    def security_details(self, symbols):
+        raise RuntimeError("网络中断")
+
+
+def test_sync_security_details_zero_rows_not_marked(fake_settings, monkeypatch):
+    """零行返回不得标 checkpoint —— 否则标的永久卡在 pending_details。"""
+    from lquant.data.ingest.checkpoint import Checkpoint
+
+    repo = _FakeRepo(["516840.SH", "516850.SH"])
+    monkeypatch.setattr(ref, "SecurityRepo", lambda: repo)
+    _patch(monkeypatch, _Chain([_EmptyDetailsProvider()]))
+
+    assert ref.sync_security_details(batch=2) == 0
+    cp = Checkpoint("security_details")
+    assert cp.done == set()          # 一只都没标
+    assert repo.upserts == []        # 也没写库
+
+
+def test_sync_security_details_partial_batch_marks_only_returned(fake_settings, monkeypatch):
+    """源只回一部分标的时，缺的那几只必须留待重试。"""
+    from lquant.data.ingest.checkpoint import Checkpoint
+
+    repo = _FakeRepo(["600000.SH", "000001.SZ"])
+    monkeypatch.setattr(ref, "SecurityRepo", lambda: repo)
+    _patch(monkeypatch, _Chain([_PartialDetailsProvider()]))
+
+    assert ref.sync_security_details(batch=2) == 1
+    cp = Checkpoint("security_details")
+    assert cp.done == {"600000.SH"}
+    assert cp.is_done("000001.SZ") is False
+
+
+def test_sync_security_details_provider_error_not_marked(fake_settings, monkeypatch):
+    """批次抛异常：不炸整步、不标完成（重跑自动补）。"""
+    from lquant.data.ingest.checkpoint import Checkpoint
+
+    repo = _FakeRepo(["600000.SH"])
+    monkeypatch.setattr(ref, "SecurityRepo", lambda: repo)
+    _patch(monkeypatch, _Chain([_BoomDetailsProvider()]))
+
+    assert ref.sync_security_details(batch=2) == 0
+    assert Checkpoint("security_details").done == set()
