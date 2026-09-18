@@ -21,7 +21,7 @@ def load_custom() -> list[dict]:
         return []
     raw = yaml.safe_load(CUSTOM_YAML.read_text()) or {}
     out = []
-    for it in raw.get("factors", []):
+    for it in raw.get("factors") or []:  # `factors:` 空值 → None，按空清单处理
         ast = parse(it["expr"], it["name"])
         check(ast)
         out.append({

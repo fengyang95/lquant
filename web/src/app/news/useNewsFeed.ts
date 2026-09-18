@@ -35,6 +35,7 @@ export function useNewsFeed(params: ItemFilter) {
   }, [rest, limit]);
 
   const loadMore = useCallback(() => {
+    if (loading) return; // 防快速双击并发同 offset 请求导致重复追加
     const id = seq.current; // 落地前比对：过滤条件已变（seq 前进）则丢弃本次追加
     setLoading(true);
     fetchItems({ ...JSON.parse(rest), limit, offset: items.length })
@@ -50,7 +51,7 @@ export function useNewsFeed(params: ItemFilter) {
         setError(e instanceof Error ? e.message : String(e));
         setLoading(false);
       });
-  }, [rest, limit, items.length]);
+  }, [rest, limit, items.length, loading]);
 
   return { items, total, offset, loading, error, loadMore };
 }

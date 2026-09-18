@@ -158,8 +158,11 @@ def event_study_summary(
     pre = curve.filter(pl.col("rel_period") < 0)
     post = curve.filter(pl.col("rel_period") > 0)
     # 事前发散度 vs 事后发散度：事前就张开说明因子在描述既有趋势（滞后）
-    pre_spread = float(pre["spread"].abs().mean()) if len(pre) else float("nan")
-    post_spread = float(post["spread"].abs().mean()) if len(post) else float("nan")
+    pre_m = pre["spread"].abs().mean() if len(pre) else None
+    post_m = post["spread"].abs().mean() if len(post) else None
+    # 无波动 panel 的 mean 可能为 null：float(None) 会 TypeError 穿透到报告调用方
+    pre_spread = float(pre_m) if pre_m is not None else float("nan")
+    post_spread = float(post_m) if post_m is not None else float("nan")
     return {
         "factor": factor,
         "n_groups": n_groups,

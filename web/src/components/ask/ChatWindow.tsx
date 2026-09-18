@@ -60,6 +60,14 @@ export default function ChatWindow({ session }: { session: AskSession }) {
     }
   }, [msgs]);
 
+  // pending 看门狗：重连后服务端可能不再补发 done，2 分钟无任何新事件则复位，
+  // 避免输入框永久卡在「正在生成…」无法再发消息
+  useEffect(() => {
+    if (!pending) return;
+    const t = setTimeout(() => setPending(false), 120_000);
+    return () => clearTimeout(t);
+  }, [pending, msgs]);
+
   const send = useCallback(async () => {
     const content = draft.trim();
     if (!content || pending) return;

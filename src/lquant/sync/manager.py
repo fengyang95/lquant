@@ -139,11 +139,21 @@ def upsert_job(sync_id: str, name: str, kind: str, schedule_time: str,
     now = datetime.now()
     with writer() as con:
         _ensure_tables(con)
+        # 更新场景保留运行轨迹：DELETE+INSERT 若清空 last_run_at/last_status，
+        # _is_due 会误判「今天还没跑」→ 编辑开关立即触发一轮补跑。
+        # 但 schedule_time 变了 → 旧轨迹对应旧调度，必须重置（否则改到更晚的
+        # 时间后当天不再跑）。
+        old = con.execute(
+            "SELECT last_run_at, last_status, last_rows FROM sync_job "
+            "WHERE sync_id = ? AND schedule_time = ?",
+            [sync_id, schedule_time]).fetchone()
         con.execute("DELETE FROM sync_job WHERE sync_id = ?", [sync_id])
         con.execute(
-            "INSERT INTO sync_job VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)",
+            "INSERT INTO sync_job VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [sync_id, name, kind, schedule_time, weekdays,
-             json.dumps(params or {}), enabled, now, now])
+             json.dumps(params or {}), enabled,
+             old[0] if old else None, old[1] if old else None,
+             old[2] if old else None, now, now])
     return {"sync_id": sync_id}
 
 

@@ -46,9 +46,11 @@ def backfill_financial(
             raise RuntimeError(f"provider {provider_name} 不可用（未启用或缺 token）")
         target = matches[0]
     else:
-        ts = [p for p in chain.providers if p.name == "tushare"]
-        target = ts[0] if ts else (
-            chain.providers[0] if hasattr(chain, "providers") else chain)
+        if not hasattr(chain, "providers"):
+            target = chain
+        else:
+            ts = [p for p in chain.providers if p.name == "tushare"]
+            target = ts[0] if ts else chain.providers[0]
     cp_name = f"financial_pit_{target.name}"
 
     cp = Checkpoint(cp_name)

@@ -102,7 +102,7 @@ export default function SettingsPage() {
                                onChange={(e) => setDraft((d) => ({ ...d, [it.key]: e.target.value }))}
                                className="w-64 rounded-md border px-2 py-1 font-mono text-sm text-neutral-900" />
                       )}
-                      <div className="mt-1 text-xs text-neutral-400">默认：{String(it.type === 'list' ? (it.value as string[]).join(',') : it.value)}</div>
+                      <div className="mt-1 text-xs text-neutral-400">默认：{String(it.type === 'list' ? (Array.isArray(it.value) ? (it.value as string[]).join(',') : String(it.value)) : it.value)}</div>
                     </td>
                     <td className="py-2 align-top">
                       <span className={`rounded-full px-2 py-0.5 text-xs ${

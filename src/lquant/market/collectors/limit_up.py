@@ -49,7 +49,7 @@ def _fetch_pool(kind: str, trade_date: date | str | None = None,
     try:
         payload = resp.json()
     except Exception as e:  # noqa: BLE001
-        raise DataUnavailable(f"涨停池响应非 JSON: {e}") from e
+        raise DataUnavailable("eastmoney", f"涨停池响应非 JSON: {e}") from e
     if not payload or not payload.get("data"):
         return []
     return payload["data"].get("pool", []) or []

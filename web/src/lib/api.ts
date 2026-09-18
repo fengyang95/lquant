@@ -19,7 +19,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch { /* 非 JSON 响应体，维持默认消息 */ }
     throw new ApiError(r.status, msg);
   }
-  return r.json() as Promise<T>;
+  return parseBody<T>(r);
+}
+
+/** 空响应体（204 / 空 body 的 DELETE）安全解析：避免 JSON.parse 空串抛错 */
+async function parseBody<T>(r: Response): Promise<T> {
+  if (r.status === 204) return undefined as T;
+  const text = await r.text();
+  if (!text.trim()) return undefined as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new ApiError(r.status, '响应不是合法 JSON');
+  }
 }
 
 export function get<T>(path: string): Promise<T> {
@@ -40,7 +52,7 @@ async function requestData<T>(path: string, init?: RequestInit): Promise<T> {
     } catch { /* 非 JSON 错误体，维持默认消息 */ }
     throw new ApiError(r.status, msg);
   }
-  const body: unknown = await r.json();
+  const body: unknown = await parseBody<unknown>(r);
   if (body && typeof body === 'object' && 'code' in (body as Record<string, unknown>)) {
     const env = body as { code: number; data?: T; message?: string };
     if (env.code !== 0) throw new ApiError(200, env.message || '操作失败');

@@ -79,13 +79,32 @@ function useTaskEvents(tasks: DataTask[] | undefined, mutate: () => void) {
       const es = new EventSource(`/api/data/tasks/${id}/events`);
       const apply = (frame: LiveFrame) =>
         setLive((prev) => ({ ...prev, [id]: { ...prev[id], ...frame } }));
-      es.addEventListener('snapshot', (e) =>
-        apply(JSON.parse((e as MessageEvent).data as string)));
-      es.addEventListener('progress', (e) =>
-        apply(JSON.parse((e as MessageEvent).data as string)));
+      // 非 JSON 帧静默忽略，避免回调抛未捕获异常
+      const parseFrame = (e: Event): LiveFrame | null => {
+        try {
+          return JSON.parse((e as MessageEvent).data as string) as LiveFrame;
+        } catch {
+          return null;
+        }
+      };
+      es.addEventListener('snapshot', (e) => {
+        const f = parseFrame(e);
+        if (f) apply(f);
+      });
+      es.addEventListener('progress', (e) => {
+        const f = parseFrame(e);
+        if (f) apply(f);
+      });
       es.addEventListener('done', (e) => {
-        apply(JSON.parse((e as MessageEvent).data as string));
+        const f = parseFrame(e);
+        if (f) apply(f);
         es.close();
+        // 任务已结束：清掉 live 残留，避免列表数据与旧帧取 max 产生虚高进度
+        setLive((prev) => {
+          if (!(id in prev)) return prev;
+          const { [id]: _drop, ...rest } = prev;
+          return rest;
+        });
         void mutate();
       });
       es.onerror = () => {

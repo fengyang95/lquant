@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import sqlite3
+
 import polars as pl
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -42,7 +44,8 @@ class _TopNProbe:
         self.done = False
 
     def signals(self, broker, quote: dict) -> list[dict]:
-        if self.done or quote["symbol"] != (self.queue[0] if self.queue else None):
+        # 队列空时必须返回 []，避免与 None 比较触发 polars UserWarning
+        if self.done or not self.queue or quote["symbol"] != self.queue[0]:
             return []
         self.done = True
         out = []
@@ -175,6 +178,9 @@ def create_account(req: AccountIn) -> dict:
                                             req.strategy, req.universe)
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
+    except sqlite3.IntegrityError as e:
+        # UNIQUE(name) 冲突：重名账户 → 422 而非 500
+        raise HTTPException(422, f"账户名已存在: {req.name}") from e
 
 
 @router.post("/order")

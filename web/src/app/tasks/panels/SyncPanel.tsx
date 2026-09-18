@@ -81,8 +81,8 @@ export default function SyncPanel() {
     setBusy(id);
     setMsg('');
     try {
-      const r = await post<{ status: string; rows: number }>('/sync/run', { sync_id: id, demo: true });
-      setMsg(`✓ ${id} 执行完成：${r.status}，写入 ${r.rows} 行（demo 模式）`);
+      const r = await post<{ status: string; rows: number }>('/sync/run', { sync_id: id });
+      setMsg(`✓ ${id} 执行完成：${r.status}，写入 ${r.rows} 行`);
       void mutateJobs();
       void mutateHist();
     } catch (e) {

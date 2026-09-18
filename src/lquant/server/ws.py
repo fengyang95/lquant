@@ -80,7 +80,8 @@ async def job_progress(ws: WebSocket, job_id: str) -> None:
             if payload["done"]:
                 break
             await asyncio.sleep(_POLL_SECONDS)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
+        # RuntimeError：客户端断开后 send_json on closed socket，静默收尾不刷栈
         return
     finally:
         with contextlib.suppress(Exception):  # 客户端断开等，静默收尾
@@ -138,12 +139,12 @@ async def market_ticks(ws: WebSocket, symbols: str = Query(default="", max_lengt
                 if failures >= _MAX_CONSECUTIVE_FAILURES:
                     break
             await asyncio.sleep(_TICK_INTERVAL)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
+        # RuntimeError：客户端断开后 send_json on closed socket，静默收尾不刷栈
         return
     finally:
         with contextlib.suppress(Exception):
             await ws.close()
-        await _close(ws)
 
 
 async def _close(ws: WebSocket) -> None:

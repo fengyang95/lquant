@@ -102,14 +102,14 @@ describe('SyncPanel', () => {
     expect(screen.getByText('已停用')).toBeInTheDocument();
   });
 
-  it('点「立即运行」→ POST /sync/run（demo）并透出反馈', async () => {
+  it('点「立即运行」→ POST /sync/run 并透出反馈', async () => {
     setup();
     const user = userEvent.setup();
     await user.click(screen.getAllByRole('button', { name: '立即运行' })[0]);
     await waitFor(() => {
-      expect(postMock).toHaveBeenCalledWith('/sync/run', { sync_id: 'job-a', demo: true });
+      expect(postMock).toHaveBeenCalledWith('/sync/run', { sync_id: 'job-a' });
     });
-    expect(screen.getByText('✓ job-a 执行完成：ok，写入 42 行（demo 模式）')).toBeInTheDocument();
+    expect(screen.getByText('✓ job-a 执行完成：ok，写入 42 行')).toBeInTheDocument();
   });
 
   it('点「停用」→ POST toggle 携带 enabled 取反', async () => {

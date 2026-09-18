@@ -75,8 +75,12 @@ class Dataset:
         ])
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
         if self.cfg.label_rank:
-            y = (d[self.label].rank("average").over(self.cfg.date_col)
-                 / d[self.label].count().over(self.cfg.date_col)).to_numpy()
+            # Series.rank()/.count() 是聚合不是窗口 —— 必须用表达式列 .over
+            ranked = d.with_columns(
+                (pl.col(self.label).rank("average")
+                 / pl.col(self.label).count()).over(self.cfg.date_col)
+                .alias("__rank"))
+            y = ranked["__rank"].to_numpy()
         else:
             y = d[self.label].cast(pl.Float64).to_numpy()
         return X, np.nan_to_num(y, nan=0.0), d[self.cfg.date_col].to_numpy()

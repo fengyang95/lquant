@@ -192,8 +192,6 @@ def hrp_weight(returns, symbols: list[str] | None = None, *,
                 continue
             half = len(c) // 2
             left, right = c[:half], c[half:]
-            if not len(left) or not len(right):
-                continue
             vl, vr = cluster_var(left), cluster_var(right)
             total = vl + vr
             alpha = 0.5 if total <= 1e-16 else 1.0 - vl / total

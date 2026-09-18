@@ -121,8 +121,8 @@ warn_unused_ignores = false
 source = ["src/lquant"]
 
 [tool.coverage.report]
-# 增量门禁：全局下限从当前基线（80.3%）起步，随补测逐步上调
-fail_under = 80
+# 全局门禁：2026-09-17 全仓补测后 95.0%，随演进保持
+fail_under = 95
 show_missing = true
 exclude_also = [
   "if TYPE_CHECKING:",

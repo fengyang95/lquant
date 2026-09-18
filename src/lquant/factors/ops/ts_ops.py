@@ -101,7 +101,9 @@ def ts_slope(x: pl.Expr, n: int) -> pl.Expr:
 @op("Ts_Rsquare", "TS", 1, "时序回归 R^2")
 def ts_rsquare(x: pl.Expr, n: int) -> pl.Expr:
     def _r2(s):
-        if len(s) < 2 or np.std(s) < 1e-12:
+        # rolling_map 回调拿到 polars Series：np.std 会分派到 Series.std(axis=…)
+        # 直接 TypeError，必须先转 numpy
+        if len(s) < 2 or np.std(s.to_numpy()) < 1e-12:
             return float("nan")
         r = np.corrcoef(np.arange(len(s)), s)[0, 1]
         return float(r * r)
@@ -113,9 +115,10 @@ def ts_resi(x: pl.Expr, n: int) -> pl.Expr:
     def _resi(s):
         if len(s) < 2:
             return float("nan")
-        coef = np.polyfit(np.arange(len(s)), s, 1)
-        fit = coef[0] * np.arange(len(s)) + coef[1]
-        return float(np.sqrt(np.mean((s - fit) ** 2)))
+        a = s.to_numpy()
+        coef = np.polyfit(np.arange(len(a)), a, 1)
+        fit = coef[0] * np.arange(len(a)) + coef[1]
+        return float(np.sqrt(np.mean((a - fit) ** 2)))
     return x.rolling_map(lambda s: _resi(s), window_size=n).over("symbol")
 
 

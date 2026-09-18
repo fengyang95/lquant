@@ -201,7 +201,10 @@ def mine(agent: str, generator: str, n: int, proposals: str | None, start: str |
         from lquant.factors.mining.llm import load_proposals
         from lquant.factors.mining.llm import make_generator as mg
 
-        gen = mg(load_proposals(proposals))
+        try:
+            gen = mg(load_proposals(proposals))
+        except Exception as e:  # noqa: BLE001 - CLI 出口：结构化报错而非 traceback
+            raise click.ClickException(f"加载 proposals 失败: {e}") from e
 
     res, survivors = run_session(eng, df, gen, agent=agent, n_candidates=n,
                                  covs=cov_cols)

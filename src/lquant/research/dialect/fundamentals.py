@@ -259,6 +259,11 @@ def _valuation_frame(cols: list[Column], symbols: list[str] | None,
     if lake_is_empty("daily"):
         return {c: {} for c in cols}
     lf = read_daily(symbols=symbols, end=day)
+    unknown = [c.name for c in cols
+               if c.name not in _VALUATION_MAP]
+    if unknown:
+        raise ValueError(f"valuation.{unknown[0]} 未支持，可用："
+                         f"{sorted(_VALUATION_MAP)}")
     colnames = sorted({_VALUATION_MAP[c.name] for c in cols})
     last = (lf.filter(pl.col("trade_date") <= day)
               .sort("trade_date")

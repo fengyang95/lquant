@@ -165,7 +165,11 @@ def collect(req: CollectIn) -> dict:
     """
     from lquant.market.scheduler import collect_and_save
 
-    d = date.fromisoformat(req.trade_date) if req.trade_date else None
+    try:
+        d = date.fromisoformat(req.trade_date) if req.trade_date else None
+    except ValueError as e:
+        raise HTTPException(
+            status_code=422, detail=f"trade_date 格式非法（需 YYYY-MM-DD）: {req.trade_date}") from e
     return collect_and_save(schedule=None, trade_date=d, demo=req.demo)
 
 
@@ -217,9 +221,12 @@ def breadth(days: int = Query(default=60, le=250)) -> dict:
     """
     from lquant.data.store.parquet import read_daily
 
-    df = (read_daily()
-          .select(["trade_date", "symbol", "close", "pre_close", "amount"])
-          .collect())
+    try:
+        df = (read_daily()
+              .select(["trade_date", "symbol", "close", "pre_close", "amount"])
+              .collect())
+    except Exception:  # noqa: BLE001 - 湖缺失/损坏时与 _daily_aggregate 同款兜底
+        return {"latest": None, "history": []}
     if not len(df):
         return {"latest": None, "history": []}
     df = df.filter(pl.col("pre_close") > 0).with_columns(

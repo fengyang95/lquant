@@ -300,8 +300,9 @@ class _JQPortfolio:
 
     @property
     def returns(self) -> float:
+        cash = self.starting_cash
         tv = self.total_value
-        return tv / self.initial_cash - 1.0 if self.initial_cash > 0 and tv > 0 else 0.0
+        return tv / cash - 1.0 if cash > 0 and tv > 0 else 0.0
 
     @property
     def positions(self) -> _PositionsMap:
