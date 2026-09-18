@@ -8,6 +8,8 @@
 backfill_pool 是核心逐批回填循环（T3 重构）：
 - pool 元素 (symbol, end_date)：每只自己的 end（退市股被上游截断）
 - 同批内 end 不同 → 按 end 分组拉取（daily_bars 只接受单一 end）
+- 批内再按标的类别分流：ETF/LOF 走 etf_daily 能力的源 + etf_daily_bars
+  （见 resolve_ingest_source —— 盲取链头会让整个基金段零行）
 - TimeoutError → 缩到 SUB_BATCH 再试；质量门禁 fatal → 拦整组不入湖
 - 连续 EARLY_STOP_BATCHES 批全失败 → 早停，避免对挂掉的数据源空转
 """
@@ -21,7 +23,8 @@ import polars as pl
 
 from lquant.core.config import get_settings
 from lquant.core.errors import DataQualityError
-from lquant.core.types import now_cn, today_cn
+from lquant.core.types import now_cn, parse_symbol, today_cn
+from lquant.data.capability import Capability
 from lquant.data.ingest.checkpoint import Checkpoint
 from lquant.data.store.parquet import write_daily
 
@@ -30,7 +33,50 @@ BATCH = 200
 SUB_BATCH = 20
 EARLY_STOP_BATCHES = 10
 
+# 取数方法名（provider 侧）：基金段优先 etf_daily_bars，其余走 daily_bars
+_DAILY_METHOD = "daily_bars"
+_FUND_METHOD = "etf_daily_bars"
+_FUND_TYPES = ("etf", "lof")
+
 ProgressFn = Callable[[dict], None]
+
+
+def _is_fund(symbol: str) -> bool:
+    """ETF/LOF 判定（代码段规则，与 security 表口径一致，不查库）。"""
+    try:
+        return parse_symbol(symbol).sec_type.value in _FUND_TYPES
+    except Exception:  # noqa: BLE001 - 解析不了的代码按非基金处理
+        return False
+
+
+def resolve_ingest_source(*, fund: bool, provider=None) -> tuple[object, str]:
+    """解析该标的类别的**实际取数源**与取数方法（不盲取链头）。
+
+    为什么不能一律用 ``chain.providers[0]``：各源对「日线」的覆盖面不同 ——
+    tushare 的 pro.daily 只有股票（ETF 在 fund_daily、指数在 index_daily），
+    盲取链头时整个 ETF/LOF 段会逐日返回零行，被记成 empty_response（实测
+    2026-09-17 任务：1582 只 ETF + 85 只 LOF 全段零行，ETF 湖停更 6 天）。
+    基金段因此按 etf_daily 能力选源；源没有 etf_daily_bars 时回落 daily_bars
+    （baostock 没有 etf_daily_bars 但 daily_bars 能取 ETF —— 注意它只覆盖
+    近端：实测 510300.SH / 159915.SZ 在 2026-03 有行、2024-06 零行）。
+
+    provider 显式注入（测试/单源场景）时原样返回，不做能力路由。
+    """
+    if provider is not None:
+        return provider, _FUND_METHOD if fund else _DAILY_METHOD
+
+    from lquant.data.providers import get_provider
+
+    chain = get_provider()
+    if not hasattr(chain, "providers"):
+        return chain, _DAILY_METHOD
+    want = Capability.ETF_DAILY if fund else Capability.DAILY
+    for p in chain.providers:
+        if not p.has(want):
+            continue
+        method = _FUND_METHOD if fund and hasattr(p, _FUND_METHOD) else _DAILY_METHOD
+        return p, method
+    return chain.providers[0], _DAILY_METHOD
 
 
 def backfill_pool(
@@ -53,7 +99,8 @@ def backfill_pool(
         on_progress: 每批回调
             on_progress({"done","total","failed","rows","early_stopped"})，
             回调异常不中断回填
-        provider: 注入 provider（测试用）；默认 get_provider() 并解包 FallbackProvider
+        provider: 注入 provider（测试/单源场景）。注入后整组走它、不做类别
+            路由；缺省按标的类别从链中解析实际取数源（见 resolve_ingest_source）
         batch_size: 每批标的数
         cp_name: checkpoint 名（默认 "daily" 哨兵池；任务执行器传 f"daily:{task_id}"
             隔离记账，避免旧 daily cp 被任务跑满导致每日增量空转）
@@ -76,11 +123,7 @@ def backfill_pool(
     # 空跑不覆盖 meta（end=None 时避免抹掉上次记录）
     cp.set_meta(start=str(start), end=str(end) if end else None)
 
-    if provider is None:
-        from lquant.data.providers import get_provider
-
-        provider = get_provider()
-        provider = provider.providers[0] if hasattr(provider, "providers") else provider
+    explicit_provider = provider is not None
 
     done = 0
     rows = 0
@@ -96,28 +139,38 @@ def backfill_pool(
         chunk = todo[i : i + batch_size]
         batch_failed: dict[str, str] = {}
         batch_rows = 0
-        for end_d, syms in _by_end(chunk):
+        for end_d, group in _by_end(chunk):
             if end_d < start:
                 # 退市截断后窗口倒挂（delist < 窗口 start）：该股在窗口内无
                 # 交易日，视为完成（0 行），不算 empty_response 失败
                 continue
-            df, grp_failed = _pull_group(provider, syms, start, end_d)
-            batch_rows += len(df)
-            batch_failed.update(grp_failed)
-            # 源站静默丢标的（无异常但零行）此前被当成功标 done —— 整段
-            # 历史缺失且不可发现。显式标 empty_response，重跑自动重试。
-            got = set(df["symbol"].to_list()) if len(df) else set()
-            for sym in syms:
-                if sym not in got and sym not in batch_failed:
-                    batch_failed[sym] = "empty_response: 源零行返回"
-            if len(df):
-                try:
-                    write_daily(_stamp(df, _provider_source(provider)))
-                except DataQualityError as e:
-                    # 质量门禁 fatal 拦批：不入湖，标失败留待重试（H2）
-                    logger.error(f"质量门禁拦截（fatal，不入湖）: {e}")
-                    for sym in syms:
-                        batch_failed.setdefault(sym, f"quality: {e}")
+            # 显式注入 provider（测试/单源）时整组走它；否则按标的类别分流，
+            # 基金段路由到支持 etf_daily 的源（盲取链头会让基金段全零行）
+            buckets = ([("all", group)] if explicit_provider
+                       else _by_class(group))
+            for cls, syms in buckets:
+                src, method = resolve_ingest_source(
+                    fund=(cls == "fund"), provider=provider)
+                df, grp_failed = _pull_group(src, syms, start, end_d, method)
+                batch_rows += len(df)
+                batch_failed.update(grp_failed)
+                # 源站静默丢标的（无异常但零行）此前被当成功标 done —— 整段
+                # 历史缺失且不可发现。显式标 empty_response 并带上**实际服务
+                # 源名**：源不具备该标的类别时（如 tushare 的 pro.daily 不含
+                # ETF）一眼可辨，不必再逐层排查。
+                got = set(df["symbol"].to_list()) if len(df) else set()
+                for sym in syms:
+                    if sym not in got and sym not in batch_failed:
+                        batch_failed[sym] = (
+                            f"empty_response: 源({_provider_source(src)})零行返回")
+                if len(df):
+                    try:
+                        write_daily(_stamp(df, _provider_source(src)))
+                    except DataQualityError as e:
+                        # 质量门禁 fatal 拦批：不入湖，标失败留待重试（H2）
+                        logger.error(f"质量门禁拦截（fatal，不入湖）: {e}")
+                        for sym in syms:
+                            batch_failed.setdefault(sym, f"quality: {e}")
         ok = [s for s, _ in chunk if s not in batch_failed]
         cp.mark(ok)
         done += len(ok)
@@ -178,14 +231,41 @@ def _by_end(chunk: list[tuple[str, date]]) -> list[tuple[date, list[str]]]:
     return [(d, groups[d]) for d in order]
 
 
+def _by_class(chunk: list[str]) -> list[tuple[str, list[str]]]:
+    """同组内按标的类别分流（基金 / 其余），保持各自首次出现顺序。
+
+    只分两类即可：基金（ETF/LOF，可能需要 etf_daily 通道）与其余
+    （股票，走 daily 通道）。股票段若混入指数，由上游回填池负责排除
+    （指数点位超价格护栏，见 SecurityRepo.active_symbols 的口径注释）。
+    """
+    fund: list[str] = []
+    other: list[str] = []
+    for sym in chunk:
+        (fund if _is_fund(sym) else other).append(sym)
+    out: list[tuple[str, list[str]]] = []
+    if other:
+        out.append(("other", other))
+    if fund:
+        out.append(("fund", fund))
+    return out
+
+
 def _pull_group(
-    provider, syms: list[str], start: date, end_d: date | None
+    provider, syms: list[str], start: date, end_d: date | None,
+    method: str = _DAILY_METHOD,
 ) -> tuple[pl.DataFrame, dict[str, str]]:
-    """拉一组（同 end）：RuntimeError → 整组失败；TimeoutError → 缩批重试。"""
+    """拉一组（同 end）：RuntimeError → 整组失败；TimeoutError → 缩批重试。
+
+    method：取数方法名（daily_bars / etf_daily_bars）。源未实现该方法时回落
+    daily_bars —— 能力声明与实际方法不必一一对应（baostock 声明 etf_daily
+    但 ETF 走 daily_bars 即可）。
+    """
     from loguru import logger
 
+    fn = getattr(provider, method, None) or provider.daily_bars
+
     try:
-        df = provider.daily_bars(syms, start, end_d)
+        df = fn(syms, start, end_d)
     except TimeoutError as e:
         # 整批挂起 → 缩到 SUB_BATCH 只再试，把挂住的损失压到最小
         logger.warning(f"批次超时，缩批重试（{len(syms)} 只 → {SUB_BATCH} 只）: {e}")
@@ -194,7 +274,7 @@ def _pull_group(
         for j in range(0, len(syms), SUB_BATCH):
             sub = syms[j : j + SUB_BATCH]
             try:
-                frames.append(provider.daily_bars(sub, start, end_d))
+                frames.append(fn(sub, start, end_d))
             except (TimeoutError, RuntimeError) as e2:
                 logger.warning(f"  缩批 {j} 仍失败，跳过 {len(sub)} 只: {e2}")
                 for sym in sub:

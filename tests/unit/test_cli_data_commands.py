@@ -6,7 +6,6 @@ import os
 from types import SimpleNamespace
 
 import polars as pl
-import pytest
 from click.testing import CliRunner
 
 os.environ.setdefault("LQ_SYNC_WORKER", "0")
@@ -215,3 +214,69 @@ def test_fields_empty_raises(monkeypatch):
     r = _invoke("fields")
     assert r.exit_code != 0
     assert "日线数据为空" in r.output
+
+
+def _pinned_root(tmp_path, lake):
+    """写一个自带 config/app.yaml 的临时 LQ_ROOT。
+
+    把 LQ_ROOT 一并钉住（而不是只靠 chdir）：`find_root()` 优先读 LQ_ROOT，
+    没配才沿 `__file__` 上溯找 pyproject.toml。钉住后本用例的期望值与
+    调用方 CWD、以及外层环境里的 LQ_ROOT（常被其他用例改过）都无关。
+     """
+    root = tmp_path / "root"
+    (root / "config").mkdir(parents=True)
+    (root / "config" / "app.yaml").write_text(
+        "paths:\n"
+        f'  parquet: "{lake}/parquet"\n'
+        f'  duckdb: "{tmp_path}/lq.duckdb"\n'
+        f'  cache: "{tmp_path}/cache"\n',
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_status_counts_lake_from_settings_not_cwd(tmp_path, monkeypatch):
+    """湖分区数按 settings.parquet_dir 统计，不能用相对 CWD 的 data/parquet。
+
+    回归：旧实现写死 glob("data/parquet/daily/**/*.parquet")。湖在绝对
+    路径（LQ_DATA_DIR）或服务与 CLI 的 CWD 不同时，这里会静默显示
+    0 个分区 —— 与 parquet.lake_glob 的「SQL 侧必须用绝对 glob」同一约定。
+    """
+    lake = tmp_path / "lake"                      # 湖在 CWD 之外
+    (lake / "parquet" / "daily" / "year=2024").mkdir(parents=True)
+    (lake / "parquet" / "daily" / "year=2024" / "part-0.parquet").write_bytes(b"x")
+    monkeypatch.setenv("LQ_ROOT", str(_pinned_root(tmp_path, lake)))
+    other_cwd = tmp_path / "elsewhere"
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+
+    from lquant.core.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        assert get_settings().parquet_dir == str(lake / "parquet")
+        r = _invoke("status")
+        assert r.exit_code == 0, r.output
+        assert "daily parquet 年分区: 1" in r.output
+        assert "湖为空" not in r.output
+    finally:
+        get_settings.cache_clear()
+
+
+def test_status_reports_empty_lake_hint(tmp_path, monkeypatch):
+    """空湖要显式提示先同步，而不是只报 0 个分区。"""
+    lake = tmp_path / "lake"
+    (lake / "parquet").mkdir(parents=True)
+    monkeypatch.setenv("LQ_ROOT", str(_pinned_root(tmp_path, lake)))
+    monkeypatch.chdir(tmp_path)
+
+    from lquant.core.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        r = _invoke("status")
+        assert r.exit_code == 0, r.output
+        assert "daily parquet 年分区: 0" in r.output
+        assert "湖为空" in r.output
+    finally:
+        get_settings.cache_clear()

@@ -97,20 +97,25 @@ def _resolve_range(kind: str, p: dict) -> tuple[date, date]:
 def _pool_from_con(con, kind: str, start: date, end: date) -> dict[str, list[tuple[str, date]]]:
     """在给定连接上构建回填池（避免 writer 内嵌套 reader）。
 
-    full_backfill：股票（含退市，end=min(end, delist_date)）+ ETF；
-    daily_update：在市股票 + ETF。返回 {"stocks": [...], "etf": [...]}，
+    full_backfill：股票（含退市，end=min(end, delist_date)）+ ETF/LOF；
+    daily_update：在市股票 + ETF/LOF。返回 {"stocks": [...], "etf": [...]}，
     顺序 stocks→etf 与执行 phase 一致。
+
+    股票段限定 ``sec_type = 'stock'``：日线湖只收 stock/etf/lof（见
+    SecurityRepo.active_symbols 注释）。此前用 ``NOT IN ('etf','lof')``
+    把 508 只指数一起拉进来，指数点位超价格护栏、量纲断言也不成立 ——
+    每轮 100% 记成失败（实测 2026-09-17 任务：指数 508/508 失败）。
     """
     if kind == "full_backfill":
         rows = con.execute(
             "SELECT symbol, delist_date FROM security "
-            "WHERE sec_type NOT IN ('etf', 'lof') ORDER BY symbol"
+            "WHERE sec_type = 'stock' ORDER BY symbol"
         ).fetchall()
         stocks = [(sym, min(end, d) if d else end) for sym, d in rows]
     else:
         rows = con.execute(
             "SELECT symbol FROM security "
-            "WHERE sec_type NOT IN ('etf', 'lof') "
+            "WHERE sec_type = 'stock' "
             "AND (delist_date IS NULL OR delist_date > CURRENT_DATE) "
             "ORDER BY symbol"
         ).fetchall()
@@ -152,7 +157,7 @@ def create_task(kind: str, params: dict | None = None) -> dict:
         if kind == "full_backfill":
             n_delisted = con.execute(
                 "SELECT count(*) FROM security "
-                "WHERE delist_date IS NOT NULL AND sec_type NOT IN ('etf', 'lof')"
+                "WHERE delist_date IS NOT NULL AND sec_type = 'stock'"
             ).fetchone()[0]
             if n_delisted == 0:
                 raise ValueError(
