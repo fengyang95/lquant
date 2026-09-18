@@ -389,9 +389,10 @@ def write_minute(df: pl.DataFrame, freq: str | None = None) -> list[Path]:
         return []
     freq = freq or (df["freq"][0] if "freq" in df.columns else "60min")
     out: list[Path] = []
+    has_ts = "ts" in df.columns
     keyed = df.with_columns(
         pl.col("ts").dt.strftime("%Y-%m").alias("_ym")
-    ) if "ts" in df.columns else df
+    ) if has_ts else df.with_columns(pl.lit("na").alias("_ym"))
     for ym, g in keyed.group_by("_ym"):
         period = ym[0]
         p = _root() / "minute" / f"freq={freq}" / f"year_month={period}" / "part-0.parquet"
@@ -399,7 +400,7 @@ def write_minute(df: pl.DataFrame, freq: str | None = None) -> list[Path]:
         g = g.drop("_ym")
         # 同key覆盖：读旧 → 覆盖合并 → 原子写（锁按文件粒度）
         with _file_lock(p):
-            if p.exists():
+            if p.exists() and has_ts:
                 g = _overlay(pl.read_parquet(p), g, ["symbol", "ts"])
             g = g.sort(["symbol", "ts"]) if "ts" in g.columns else g
             _atomic_write_parquet(g, p)

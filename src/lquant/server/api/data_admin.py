@@ -271,6 +271,8 @@ def bare_code_or_full(s: str) -> str:
     code = _bc(s)
     if code.startswith(("6", "9", "5")):
         return f"{code}.SH"
+    if code.startswith(("4", "8")):
+        return f"{code}.BJ"  # 北交所（43/83/87/92 开头）
     return f"{code}.SZ"
 
 

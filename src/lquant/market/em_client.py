@@ -27,5 +27,6 @@ def em_get(url: str, qps: float = 3.0, **kw):
             return requests.get(url, **kw)
         except Exception as e:  # noqa: BLE001
             last = e
-            time.sleep(2 ** i)
+            if i < 2:
+                time.sleep(2 ** i)  # 最后一次失败直接抛，不再空等
     raise RuntimeError(f"请求失败: {url} -> {last}")

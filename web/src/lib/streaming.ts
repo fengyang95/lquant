@@ -39,10 +39,14 @@ export function useJobStream<T = unknown>(jobId: string | null): JobStream<T> {
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${proto}//${window.location.host}/ws/jobs/${encodeURIComponent(jobId)}`;
     let alive = true;
-    const ws = new WebSocket(url);
-    ws.onmessage = (ev: MessageEvent<string>) => {
+    let closed = false;
+    let retry = 0;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let ws: WebSocket | null = null;
+
+    const handleMsg = (raw: string): void => {
       try {
-        const m = JSON.parse(ev.data) as {
+        const m = JSON.parse(raw) as {
           status?: string;
           progress?: JobProgress;
           result?: T;
@@ -64,16 +68,34 @@ export function useJobStream<T = unknown>(jobId: string | null): JobStream<T> {
         /* 非 JSON 帧忽略 */
       }
     };
-    ws.onclose = () => {
-      alive = false;
-      // 服务端未发终态就断连（API 重启 / 网络抖动）：置终态错误，防 busy 悬挂
-      setState((prev) => prev.done
-        ? prev
-        : { ...prev, error: prev.error ?? '任务连接中断，请刷新重试', done: true });
+
+    const connect = (): void => {
+      if (!alive || closed) return;
+      ws = new WebSocket(url);
+      ws.onmessage = (ev: MessageEvent<string>) => handleMsg(ev.data);
+      ws.onclose = () => {
+        if (closed || !alive) return;
+        // 服务端未发终态就断连：有限重连（网络抖动/代理超时下任务仍在跑），
+        // 重试 2 次仍失败才置错误终态，防 busy 悬挂
+        if (retry < 2) {
+          retry += 1;
+          retryTimer = setTimeout(connect, 1000 * retry);
+          return;
+        }
+        closed = true;
+        alive = false;
+        setState((prev) => prev.done
+          ? prev
+          : { ...prev, error: prev.error ?? '任务连接中断，请刷新重试', done: true });
+      };
     };
+
+    connect();
+
     return () => {
       alive = false;
-      ws.close();
+      if (retryTimer !== null) clearTimeout(retryTimer);
+      ws?.close();
     };
   }, [jobId]);
 

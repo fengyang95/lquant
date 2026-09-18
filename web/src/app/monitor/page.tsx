@@ -104,7 +104,7 @@ export default function MonitorPage() {
   const [expanded, setExpanded] = useState<string | null>(null);
   const errItems = errLogs?.items ?? [];
   const expandedRow = expanded
-    ? errItems.find((e, i) => `${e.ts}-${e.route}-${i}` === expanded)
+    ? errItems.find((e) => `${e.ts}-${e.route}-${e.message}` === expanded)
     : undefined;
 
   const procs = sum?.procs ?? [];
@@ -306,8 +306,9 @@ export default function MonitorPage() {
                 </tr>
               </thead>
               <tbody>
-                {errLogs.items.map((e, i) => {
-                  const key = `${e.ts}-${e.route}-${i}`;
+                {errLogs.items.map((e) => {
+                  // key 不含下标：30s 自动刷新会插入新错误，下标位移会让展开态指错行
+                  const key = `${e.ts}-${e.route}-${e.message}`;
                   const isOpen = expanded === key;
                   return (
                     <tr
@@ -397,10 +398,10 @@ export default function MonitorPage() {
             </div>
           )}
         </Panel>
+      </div>
 
       {/* 运行日志：tail lquant.log，级别过滤 + 关键字搜索 */}
       <LogsPanel />
-      </div>
     </div>
   );
 }

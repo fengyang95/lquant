@@ -21,11 +21,30 @@ _STOP = threading.Event()
 _thread: threading.Thread | None = None
 _started = False  # 是否以启用状态启动过（决定 stop 时是否 final flush）
 
-# 写失败时暂存待重试的数据（下个周期优先重写，成功后清空）
+# 写失败时暂存待重试的数据（下个周期优先重写，成功后清空）。
+# 各缓冲有条数上限：monitor.duckdb 长期写不进去（跨进程锁/磁盘满）时
+# 丢最旧保新，防止内存无限增长。
 _PENDING_LOCK = threading.Lock()
 _PENDING_API: list = []
 _PENDING_TASK: list = []
 _PENDING_ERRORS: list = []
+_PENDING_CAP = 100_000
+
+
+def _extend_capped(buf: list, items: list) -> int:
+    """extend 并按上限丢最旧，返回丢弃条数。"""
+    overflow = len(buf) + len(items) - _PENDING_CAP
+    dropped = 0
+    if overflow > 0:
+        take = min(overflow, len(buf))
+        del buf[:take]
+        dropped += take
+        remain = overflow - take
+        if remain > 0:
+            items = items[remain:]
+            dropped += remain
+    buf.extend(items)
+    return dropped
 
 
 def _redis_available() -> bool:
@@ -194,10 +213,12 @@ def _cleanup(con, retention_days: int, now: float | None = None) -> None:
 
 
 def _stash(api: list, task: list) -> None:
-    """写失败时把已 drain 的数据暂存，下个周期优先重写。"""
+    """写失败时把已 drain 的数据暂存，下个周期优先重写（超上限丢最旧）。"""
     with _PENDING_LOCK:
-        _PENDING_API.extend(api)
-        _PENDING_TASK.extend(task)
+        for buf, items in ((_PENDING_API, api), (_PENDING_TASK, task)):
+            dropped = _extend_capped(buf, items)
+            if dropped:
+                _LOG.warning("monitor pending 缓冲超限，丢弃最旧 %d 条", dropped)
 
 
 def _take_pending() -> tuple[list, list]:
@@ -209,9 +230,11 @@ def _take_pending() -> tuple[list, list]:
 
 
 def _stash_errors(errors: list) -> None:
-    """错误日志写失败时暂存，下个周期优先重写。"""
+    """错误日志写失败时暂存，下个周期优先重写（超上限丢最旧）。"""
     with _PENDING_LOCK:
-        _PENDING_ERRORS.extend(errors)
+        dropped = _extend_capped(_PENDING_ERRORS, errors)
+        if dropped:
+            _LOG.warning("monitor pending 错误缓冲超限，丢弃最旧 %d 条", dropped)
 
 
 def _take_pending_errors() -> list:

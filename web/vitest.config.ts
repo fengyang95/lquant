@@ -8,6 +8,14 @@ export default defineConfig({
     environment: 'jsdom',
     include: ['src/**/*.test.{ts,tsx}'],
     setupFiles: ['src/test-setup.ts'],
+    coverage: {
+      provider: 'v8',
+      include: ['src/**/*.{ts,tsx}'],
+      exclude: ['src/test-setup.ts', 'src/**/*.test.{ts,tsx}', 'src/**/*.d.ts'],
+      thresholds: {
+        lines: 60,
+      },
+    },
   },
   resolve: {
     alias: {

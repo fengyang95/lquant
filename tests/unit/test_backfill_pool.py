@@ -121,11 +121,11 @@ def test_end_grouping(fake_settings, no_lake):
     from lquant.data.ingest.daily import backfill_pool
 
     p = FakeProvider([("ok", 1), ("ok", 1)])
-    pool = [("sh.600000", D), ("sh.600001", date(2023, 6, 30))]
+    pool = [("sh.600000", D), ("sh.600001", date(2024, 2, 29))]
     backfill_pool(pool, date(2024, 1, 1), provider=p)
     assert len(p.calls) == 2
     ends = {c[2] for c in p.calls}
-    assert ends == {D, date(2023, 6, 30)}
+    assert ends == {D, date(2024, 2, 29)}
 
 
 def test_empty_response_symbols_marked_failed(fake_settings, no_lake):
@@ -347,3 +347,23 @@ def test_cp_name_isolation(fake_settings, no_lake):
     assert res["done"] == 2
     assert Checkpoint("task1").done == {"sh.600000", "sh.600001"}
     assert Checkpoint("daily").done == {"sh.600000"}
+
+
+# ---------- 退市窗口倒挂 ----------
+
+
+def test_delisted_before_window_skipped_not_failed(fake_settings, no_lake):
+    """退市截断后 end < start：窗口倒挂的标的视为完成（0 行），不拉源、不判失败。"""
+    from lquant.data.ingest.daily import backfill_pool
+
+    p = FakeProvider([("ok", 2)])  # 只有正常标的被拉
+    pool = [
+        ("sh.600000", D),                    # 正常
+        ("sh.600001", date(2020, 6, 30)),    # 退市早于窗口 start
+    ]
+    res = backfill_pool(pool, date(2024, 1, 1), provider=p)
+    assert res["done"] == 2
+    assert res["failed"] == []
+    assert len(p.calls) == 1  # 倒挂窗口未触发 provider 调用
+    cp = Checkpoint("daily")
+    assert cp.is_done("sh.600001")

@@ -106,9 +106,18 @@ def _record_flusher() -> None:
                 _RECORD_QUEUE.task_done()
 
 
+_record_thread_lock = threading.Lock()
+
+
 def _ensure_record_thread() -> None:
+    """双检加锁：并发 enqueue 时只允许起一个 flusher 线程，
+    避免两连接并发写 monitor.duckdb 触发 write-write conflict 丢记录。"""
     global _RECORD_THREAD
-    if _RECORD_THREAD is None or not _RECORD_THREAD.is_alive():
+    if _RECORD_THREAD is not None and _RECORD_THREAD.is_alive():
+        return
+    with _record_thread_lock:
+        if _RECORD_THREAD is not None and _RECORD_THREAD.is_alive():
+            return
         _RECORD_THREAD = threading.Thread(
             target=_record_flusher, name="job-record-flusher", daemon=True)
         _RECORD_THREAD.start()
@@ -125,13 +134,13 @@ def _record_update(job_id: str, status: str, error: str | None = None) -> None:
 
 
 def get_job_record(job_id: str) -> dict | None:
-    with reader() as con:
-        try:
+    try:
+        with reader() as con:
             row = con.execute(
                 "SELECT job_id, name, queue, status, error, created_at "
                 "FROM job_record WHERE job_id = ?", [job_id]).fetchone()
-        except Exception:  # noqa: BLE001 - 表不存在按缺失处理
-            return None
+    except Exception:  # noqa: BLE001 - 表不存在/连接失败（如 monitor 库被占用）按缺失处理
+        return None
     if row is None:
         return None
     return {"id": row[0], "name": row[1], "queue": row[2], "status": row[3],
@@ -304,7 +313,15 @@ _CANCELABLE_MAX = 500  # 登记表容量兜底，超出淘汰最旧条目
 def _register_cancelable(job_id: str, target: _CancelTarget) -> None:
     with _JOBS_LOCK:
         if len(_CANCELABLE) >= _CANCELABLE_MAX:
-            _CANCELABLE.pop(next(iter(_CANCELABLE)), None)
+            # 淘汰最旧时跳过未取消的运行中任务，避免长任务取消目标被挤丢
+            for old_id in list(_CANCELABLE):
+                old = _CANCELABLE[old_id]
+                if old.canceled or (
+                        old.local_job is not None and old.local_job._canceled):
+                    del _CANCELABLE[old_id]
+                    break
+            else:
+                del _CANCELABLE[next(iter(_CANCELABLE))]
         _CANCELABLE[job_id] = target
 
 

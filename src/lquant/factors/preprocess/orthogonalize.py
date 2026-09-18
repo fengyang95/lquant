@@ -20,14 +20,20 @@ __all__ = ["symmetric", "gram_schmidt", "pca", "none"]
 
 
 def _iter_days(df: pl.DataFrame, cols: list[str], by: str):
-    """逐日取出 (mask, 因子矩阵)。缺失任一因子的行不参与。"""
-    out = df.select([by, *cols]).with_columns(
+    """逐日取出 (子表, 因子矩阵, 有限行 mask, 原始行索引)。
+
+    缺失任一因子的行不参与。原始行索引用于结果回写：partition_by
+    的分组顺序不等于输入行序（如 symbol-major 输入），按位置 cursor
+    回写会整体错位且不报错 —— 必须按 rid 对位。
+    """
+    out = df.with_row_index("__rid").select(["__rid", by, *cols]).with_columns(
         [pl.col(c).cast(pl.Float64, strict=False) for c in cols]
     )
     for sub in out.partition_by(by, as_dict=False, maintain_order=True):
         M = np.column_stack([sub[c].to_numpy().astype(float) for c in cols])
         m = np.all(np.isfinite(M), axis=1)
-        yield sub, M, m
+        rid = sub["__rid"].to_numpy()
+        yield sub, M, m, rid
 
 
 @method("symmetric", stage="orthogonalize", label="对称正交", params={"order_independent": True})
@@ -41,12 +47,9 @@ def symmetric(df: pl.DataFrame, cols: list[str], *, by: str = "trade_date") -> p
     if len(cols) < 2:
         return df
     res = {c: np.full(len(df), np.nan) for c in cols}
-    cursor = 0
-    for sub, M, m in _iter_days(df, cols, by):
-        n = len(sub)
+    for _sub, M, m, rid in _iter_days(df, cols, by):
         X = M[m]
         if len(X) <= len(cols):
-            cursor += n
             continue
         Xc = X - X.mean(axis=0)
         sd = Xc.std(axis=0)
@@ -60,8 +63,7 @@ def symmetric(df: pl.DataFrame, cols: list[str], *, by: str = "trade_date") -> p
         except np.linalg.LinAlgError:
             Xs = Z
         for j, c in enumerate(cols):
-            res[c][cursor : cursor + n][m] = Xs[:, j]
-        cursor += n
+            res[c][rid[m]] = Xs[:, j]
     return df.with_columns([pl.Series(c, res[c]) for c in cols])
 
 
@@ -76,12 +78,9 @@ def gram_schmidt(df: pl.DataFrame, cols: list[str], *, by: str = "trade_date") -
     if len(cols) < 2:
         return df
     res = {c: np.full(len(df), np.nan) for c in cols}
-    cursor = 0
-    for sub, M, m in _iter_days(df, cols, by):
-        n = len(sub)
+    for _sub, M, m, rid in _iter_days(df, cols, by):
         X = M[m]
         if len(X) <= len(cols):
-            cursor += n
             continue
         done: list[np.ndarray] = []
         for j in range(len(cols)):
@@ -90,8 +89,7 @@ def gram_schmidt(df: pl.DataFrame, cols: list[str], *, by: str = "trade_date") -
                 D = np.column_stack([np.ones(len(X)), *done])
                 y = ols_resid(D, y)
             done.append(y)
-            res[cols[j]][cursor : cursor + n][m] = y
-        cursor += n
+            res[cols[j]][rid[m]] = y
     return df.with_columns([pl.Series(c, res[c]) for c in cols])
 
 
@@ -106,12 +104,9 @@ def pca(df: pl.DataFrame, cols: list[str], *, by: str = "trade_date",
         return df
     k = n_components or len(cols)
     mats = {i: np.full(len(df), np.nan) for i in range(k)}
-    cursor = 0
-    for sub, M, m in _iter_days(df, cols, by):
-        n = len(sub)
+    for _sub, M, m, rid in _iter_days(df, cols, by):
         X = M[m]
         if len(X) <= len(cols):
-            cursor += n
             continue
         Z = (X - X.mean(axis=0)) / np.clip(X.std(axis=0), 1e-12, None)
         try:
@@ -120,8 +115,7 @@ def pca(df: pl.DataFrame, cols: list[str], *, by: str = "trade_date",
         except np.linalg.LinAlgError:
             comp = Z[:, :k]
         for i in range(k):
-            mats[i][cursor : cursor + n][m] = comp[:, i]
-        cursor += n
+            mats[i][rid[m]] = comp[:, i]
     return df.with_columns([pl.Series(f"{prefix}_{i}", mats[i]) for i in range(k)])
 
 

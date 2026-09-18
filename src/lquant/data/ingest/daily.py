@@ -97,6 +97,10 @@ def backfill_pool(
         batch_failed: dict[str, str] = {}
         batch_rows = 0
         for end_d, syms in _by_end(chunk):
+            if end_d < start:
+                # 退市截断后窗口倒挂（delist < 窗口 start）：该股在窗口内无
+                # 交易日，视为完成（0 行），不算 empty_response 失败
+                continue
             df, grp_failed = _pull_group(provider, syms, start, end_d)
             batch_rows += len(df)
             batch_failed.update(grp_failed)

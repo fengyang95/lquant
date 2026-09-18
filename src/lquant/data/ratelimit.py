@@ -16,6 +16,10 @@ class TokenBucket:
     def acquire(self, n: int = 1) -> None:
         if self.qps >= 100:      # 视为不限流
             return
+        if n > self.capacity:
+            # tokens 被封顶在 capacity，n>capacity 永远等不到 → 此前会死循环
+            raise ValueError(
+                f"acquire({n}) 超过桶容量 {self.capacity}，请调大 burst 或分批获取")
         with self._lock:
             while True:
                 now = time.monotonic()

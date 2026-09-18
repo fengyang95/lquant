@@ -13,6 +13,7 @@ from datetime import date, datetime
 
 import polars as pl
 
+from lquant.core.errors import DataUnavailable
 from lquant.core.types import now_cn, parse_symbol
 from lquant.market.em_client import em_get
 
@@ -112,23 +113,40 @@ def fetch_northbound(trade_date=None, *, demo: bool = False) -> pl.DataFrame:
                   "&fields2=f51,f52,f54,f56&ut=b2884a393a59ad64002292a3e90d46a5")
     data = resp.json().get("data") or {}
     sh = sz = 0.0
-    for _it in (data.get("hk2sh") or [], data.get("hk2sz") or []):
-        pass
-    # 该接口返回结构随版本变化，稳妥做法：取 kamt.rtmin 的最后一条
-    try:
-        r = em_get("https://push2.eastmoney.com/api/qt/kamt.rtmin/get"
-                   "?fields1=f1,f2,f3,f4&fields2=f51,f52,f53,f54,f55,f56"
-                   "&ut=b2884a393a59ad64002292a3e90d46a5")
-        rows = (r.json().get("data") or {}).get("s2n") or []
-        for line in rows:
-            parts = str(line).split(",")
-            if len(parts) >= 4:
-                if "SH" in parts[1] or "沪" in parts[1]:
-                    sh = _num(parts[-1])
-                elif "SZ" in parts[1] or "深" in parts[1]:
-                    sz = _num(parts[-1])
-    except Exception:  # noqa: BLE001
-        pass
+    found = False
+    # 主接口：hk2sh/hk2sz 每行 "date,净买额,..."，取最后一条为最新值
+    for key, target in (("hk2sh", "sh"), ("hk2sz", "sz")):
+        rows = data.get(key) or []
+        if rows:
+            parts = str(rows[-1]).split(",")
+            if len(parts) >= 2:
+                val = _num(parts[1])
+                if target == "sh":
+                    sh = val
+                else:
+                    sz = val
+                found = True
+    # 主接口缺失/结构变化 → rtmin 兜底（分钟线最后一条）
+    if not found:
+        try:
+            r = em_get("https://push2.eastmoney.com/api/qt/kamt.rtmin/get"
+                       "?fields1=f1,f2,f3,f4&fields2=f51,f52,f53,f54,f55,f56"
+                       "&ut=b2884a393a59ad64002292a3e90d46a5")
+            rows = (r.json().get("data") or {}).get("s2n") or []
+            for line in rows:
+                parts = str(line).split(",")
+                if len(parts) >= 4:
+                    if "SH" in parts[1] or "沪" in parts[1]:
+                        sh = _num(parts[-1])
+                        found = True
+                    elif "SZ" in parts[1] or "深" in parts[1]:
+                        sz = _num(parts[-1])
+                        found = True
+        except Exception:  # noqa: BLE001
+            pass
+    if not found:
+        raise DataUnavailable(
+            "eastmoney", f"北向资金无数据（{today}）：主接口与 rtmin 兜底均未取得有效行")
     return pl.DataFrame([{
         "trade_date": today, "ts": now_cn(),
         "sh_net_inflow": sh, "sz_net_inflow": sz, "total_net_inflow": sh + sz,

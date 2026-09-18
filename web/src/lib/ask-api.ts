@@ -159,8 +159,10 @@ export function connectAskEvents(
   let cancelled = false;
   let finished = false;
   let retry = 0;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   const connect = (): void => {
+    if (cancelled || finished) return; // cancel/done 后不再新建连接
     ws = new WebSocket(url);
     ws.onmessage = (e: MessageEvent) => {
       let ev: AgentEventMsg;
@@ -179,7 +181,7 @@ export function connectAskEvents(
       if (cancelled || finished) return; // done 后不再重连
       const delay = Math.min(1000 * 2 ** retry, 10000);
       retry += 1;
-      setTimeout(connect, delay);
+      retryTimer = setTimeout(connect, delay);
     };
   };
 
@@ -187,6 +189,7 @@ export function connectAskEvents(
 
   return () => {
     cancelled = true;
+    if (retryTimer !== null) clearTimeout(retryTimer);
     ws?.close();
   };
 }

@@ -75,7 +75,7 @@ def test_enqueue_failure_recorded_with_error(local_env) -> None:
 
     job = enqueue("lquant-mining", boom)
     job._thread.join(5)
-    rec = _rec(job.id)
+    rec = _rec(job.id, expect="failed")  # 等 flusher 落终态，避免读到 started
     assert rec["status"] == "failed"
     assert "炸了" in rec["error"]
 
