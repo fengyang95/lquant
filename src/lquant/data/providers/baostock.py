@@ -12,13 +12,13 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Any
 
 import polars as pl
 
 from lquant.core.errors import DataQualityError
-from lquant.core.types import SecType, parse_symbol, today_cn
+from lquant.core.types import SecType, now_cn_naive, parse_symbol, today_cn
 from lquant.data.capability import Capability
 from lquant.data.normalize import normalize_60min_bounds, normalize_symbols, scale_unit
 from lquant.data.providers import PROVIDERS
@@ -517,7 +517,7 @@ class BaoStockProvider(MappingProvider):
         if table == "minute_bar":
             df = normalize_60min_bounds(df)
             df = df.with_columns(
-                ingested_at=pl.lit(datetime.now(), dtype=pl.Datetime),
+                ingested_at=pl.lit(now_cn_naive(), dtype=pl.Datetime),
             )
         return df
 
@@ -732,7 +732,7 @@ class BaoStockProvider(MappingProvider):
                                     "value": fv,
                                     "unit": None,
                                     "source": "baostock",
-                                    "ingested_at": datetime.now(),
+                                    "ingested_at": now_cn_naive(),
                                 }
                             )
         return pl.DataFrame(recs) if recs else pl.DataFrame()

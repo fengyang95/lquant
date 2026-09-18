@@ -1,14 +1,20 @@
 """定时同步：后台常驻调度（用户要求的「定时同步数据」）。
 
-三种作业类型：
+作业类型：
 - collect    : 跑市场采集器组（params.schedule = close/evening/preopen，缺省全跑）
 - daily      : 日线增量回填（params.days = 回看天数，只补哨兵池）
 - adj_factor : 复权因子增量刷新（params.days = 回看天数）
 - backfill   : 大盘看板表缺失检查与补齐（params.days = 回看天数，见 market.backfill）
+- news       : 行业资讯采集（params.sources = 来源列表，缺省全部注册源）
 
 调度语义（刻意简单，不上 cron）：
-- schedule_time「HH:MM」，weekdays「1,2,3,4,5」（ISO，周一=1；空 = 每天）
-- 时刻到了且今天没跑过 → 执行；服务重启后 last_run 落在今天之前 → 补跑
+- schedule_time「HH:MM」，支持逗号分隔多时刻（如 "09:05,15:20"），
+  weekdays「1,2,3,4,5」（ISO，周一=1；空 = 每天）
+- 时刻到了且该时刻之后没跑过 → 执行；服务重启后 last_run 落在应触发时刻
+  之前 → 补跑
+- 一切「现在几点/今天几号」都走 Asia/Shanghai 墙钟（now_cn_naive/today_cn）：
+  服务器时区非 CST 时用 datetime.now() 会让 07:30/08:00 的作业错位到别的
+  业务日，并让 run_job 派生出的 start/end 整体偏移一天
 - 节假日按周几近似（采集器失败/空结果会记 sync_run，不炸进程）；
   精确交易日历过滤待接 trade_calendar（预留）
 """
@@ -20,11 +26,15 @@ from datetime import datetime, timedelta
 
 from lquant.core.db import reader, writer
 from lquant.core.logging import get_logger, run_scope
+from lquant.core.types import TZ, now_cn_naive, today_cn
 
 log = get_logger(__name__)
 
 __all__ = ["DEFAULT_JOBS", "seed_defaults", "list_jobs", "upsert_job", "delete_job",
-           "set_enabled", "run_job", "tick", "loop_forever"]
+           "set_enabled", "run_job", "tick", "loop_forever", "freshness"]
+
+_KINDS = ("collect", "daily", "adj_factor", "backfill",
+          "reference", "daily_basic", "financial", "news")
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS sync_job (
@@ -71,7 +81,46 @@ DEFAULT_JOBS: list[dict] = [
     {"sync_id": "financial", "name": "PIT 财务数据同步",
      "kind": "financial", "schedule_time": "19:15", "weekdays": "1,2,3,4,5",
      "params": {"days": 90}},
+    # 资讯此前只有 HTTP API 能触发（无 CLI、无定时作业）——「资讯同步」实际
+    # 靠人手动点，随时静默停更。三档时刻覆盖盘前/盘后/晚间：快讯类来源
+    # 只返回「最近」条目，同一来源重复采集由 news_id 主键去重（INSERT OR
+    # IGNORE），因此多跑几次只增不重。params.sources 留空 = 全部注册源。
+    {"sync_id": "news", "name": "行业资讯采集（快讯/公告/研报/榜单）",
+     "kind": "news", "schedule_time": "09:05,15:20,20:00", "weekdays": "1,2,3,4,5",
+     "params": {"sources": None}},
 ]
+
+
+def _parse_schedules(schedule_time: str) -> list[str]:
+    """解析 schedule_time → ["HH:MM", ...]（支持逗号分隔多档）。
+
+    单档是历史形态，多档用于「日内多次」的作业（资讯）。非法档位直接跳过
+    （由调用方校验并报错），返回空列表表示没有可用时刻 —— 这种作业永不触发，
+    必须在写入时挡住（见 upsert_job）。
+    """
+    out: list[str] = []
+    for raw in str(schedule_time or "").split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        try:
+            datetime.strptime(item, "%H:%M")
+        except ValueError:
+            continue
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def _due_slot(job: dict, now: datetime) -> datetime | None:
+    """今天已到点且最近的一个应触发时刻；未到任意档位返回 None。"""
+    best: datetime | None = None
+    for hhmm in _parse_schedules(job.get("schedule_time")):
+        h, m = hhmm.split(":")
+        cand = now.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+        if cand <= now and (best is None or cand > best):
+            best = cand
+    return best
 
 
 # ---------------------------------------------------------------- CRUD
@@ -91,12 +140,16 @@ def _ensure_tables(con) -> None:
 
 
 def seed_defaults() -> int:
-    """把默认作业写入 sync_job（已存在同名 sync_id 的跳过）。幂等。"""
+    """把默认作业写入 sync_job（已存在同名 sync_id 的跳过）。幂等。
+
+    已存在的作业**不覆盖** —— 包括后续新增的默认作业（如 news）也会被
+    补进来（sync_id 不存在即插入），但运维改过的排期/开关不会被重置。
+    """
     n = 0
     with writer() as con:
         _ensure_tables(con)
         have = {r[0] for r in con.execute("SELECT sync_id FROM sync_job").fetchall()}
-        now = datetime.now()
+        now = now_cn_naive()
         for j in DEFAULT_JOBS:
             if j["sync_id"] in have:
                 continue
@@ -126,17 +179,24 @@ def list_jobs() -> list[dict]:
 def upsert_job(sync_id: str, name: str, kind: str, schedule_time: str,
                weekdays: str = "1,2,3,4,5", params: dict | None = None,
                enabled: bool = True) -> dict:
-    """新建/更新作业（按 sync_id 覆盖；时间格式 HH:MM 校验）。"""
-    datetime.strptime(schedule_time, "%H:%M")
-    if kind not in ("collect", "daily", "adj_factor", "backfill",
-                    "reference", "daily_basic", "financial"):
+    """新建/更新作业（按 sync_id 覆盖；时间格式 HH:MM，支持逗号分隔多档）。"""
+    # 逐档校验：_parse_schedules 会静默丢弃非法档，多档里混进一个 "25:00"
+    # 会让整条作业在那档永不触发；这里让非法输入直接报错
+    slots = [s.strip() for s in str(schedule_time or "").split(",") if s.strip()]
+    if not slots:
+        raise ValueError(f"schedule_time 需为 HH:MM（可逗号分隔多档），收到: {schedule_time!r}")
+    for item in slots:
+        datetime.strptime(item, "%H:%M")
+    if kind not in _KINDS:
         raise ValueError(f"未知作业类型: {kind}")
     if kind == "daily" and (params or {}).get("market") not in (
             None, "all", "sentinel"):
         raise ValueError(
             f"daily 作业 params.market 只接受 all/sentinel，收到: "
             f"{params['market']!r}")
-    now = datetime.now()
+    # 规范化：去掉重复档位（"09:05,09:05" 会让 _is_due 认为还有下一档）
+    schedule_time = ",".join(dict.fromkeys(slots))
+    now = now_cn_naive()
     with writer() as con:
         _ensure_tables(con)
         # 更新场景保留运行轨迹：DELETE+INSERT 若清空 last_run_at/last_status，
@@ -167,15 +227,23 @@ def set_enabled(sync_id: str, enabled: bool) -> None:
     with writer() as con:
         _ensure_tables(con)
         con.execute("UPDATE sync_job SET enabled = ?, updated_at = ? WHERE sync_id = ?",
-                    [enabled, datetime.now(), sync_id])
+                    [enabled, now_cn_naive(), sync_id])
 
 
 # ---------------------------------------------------------------- 执行
 
 def run_job(job: dict, *, demo: bool | None = None) -> dict:
-    """执行一个作业并记录 sync_run / 更新 sync_job 状态。失败不抛出。"""
+    """执行一个作业并记录 sync_run / 更新 sync_job 状态。失败不抛出。
+
+    时间基：started/finished 与派生的 start/end 全部取 Asia/Shanghai 墙钟。
+    服务器时区非 CST 时，本机 datetime.now() 会让 collect 的 trade_date、
+    daily/adj/financial 的 (today - days) 窗口整体偏移一天 —— 采到错日的数据
+    且看不出任何异常。
+    """
     with run_scope() as run_id:
-        started = datetime.now()
+        started = now_cn_naive()
+        # 业务日单独取（不依赖墙钟的日期部分，避免 tz 归一逻辑分散在多处）
+        biz_day = today_cn()
         params = job.get("params") or {}
         kind = job["kind"]
         rows, detail, status = 0, {}, "ok"
@@ -185,7 +253,7 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
 
                 d = params.get("demo", False) if demo is None else demo
                 res = collect_and_save(schedule=params.get("schedule"),
-                                       trade_date=started.date(), demo=d)
+                                       trade_date=biz_day, demo=d)
                 rows = sum(res.get("persisted", {}).values())
                 detail = {"collected": res.get("collected", {}), "errors": res.get("errors", {})}
                 if res.get("errors"):
@@ -201,7 +269,7 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
 
                     rows = backfill_daily(
                         full=False,
-                        start=(started.date()
+                        start=(biz_day
                                - timedelta(days=int(params.get("days", 10)))).isoformat())
                 else:
                     # 全市场增量：建 data_task（历史可查）后走执行器
@@ -244,7 +312,7 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
                 from lquant.data.ingest.daily_basic import backfill_daily_basic
 
                 res = backfill_daily_basic(
-                    start=(started.date()
+                    start=(biz_day
                            - timedelta(days=int(params.get("days", 14)))).isoformat(),
                     merge=bool(params.get("merge", True)))
                 rows = int(res.get("rows", 0))
@@ -254,11 +322,41 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
                 from lquant.data.store.catalog import SecurityRepo
 
                 syms = SecurityRepo().stock_symbols(include_delisted=False)
-                rows = backfill_financial(
-                    symbols=syms,
-                    start=(started.date()
-                           - timedelta(days=int(params.get("days", 90)))).isoformat())
-                detail = {"symbols": len(syms)}
+                win_start = (biz_day
+                             - timedelta(days=int(params.get("days", 90)))).isoformat()
+                res = backfill_financial(
+                    symbols=syms, start=win_start, end=biz_day.isoformat())
+                # done/skipped_covered/rows 分开暴露 —— 只看一个总数时
+                # 「全被断点跳过」与「真的没有新财报」长得一模一样
+                rows = int(res.get("done", 0))
+                detail = res
+            elif kind == "news":
+                # 资讯作业此前不存在：只有 HTTP API 能触发，无自动同步。
+                # 复用 news_task 状态机（有互斥与 cancel/retry 语义），
+                # 撞上运行中的手工任务时记 skipped 而不是 failed。
+                from lquant.news import tasks as news_tasks
+
+                srcs = params.get("sources") or None
+                try:
+                    with writer() as con:
+                        news_tasks.init_news_task_ddl(con)
+                        t = news_tasks.create_task(
+                            con, "daily", {"sources": srcs, "date": biz_day.isoformat()})
+                        task = news_tasks.execute_task(con, t["task_id"])
+                except news_tasks.TaskConflictError as e:
+                    status = "skipped"
+                    detail = {"skipped": True, "reason": f"{type(e).__name__}: {e}"}
+                    log.warning(
+                        f"news 作业跳过（存在未完成资讯任务）"
+                        f"sync_id={job.get('sync_id')}: {e}")
+                else:
+                    rows = int(task.get("rows_written") or 0)
+                    detail = {"task_id": task["task_id"], "task_status": task["status"],
+                              "sources_status": task.get("sources_status")}
+                    if task["status"] == "partial":
+                        status = "partial"
+                    elif task["status"] == "failed":
+                        status = "failed"
             elif kind == "backfill":
                 from lquant.market.backfill import ensure_market_coverage
 
@@ -283,14 +381,18 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
             status = "failed"
             detail = {"error": f"{type(e).__name__}: {e}"}
 
-        finished = datetime.now()
+        finished = now_cn_naive()
         # 告警：终态非 ok/skipped → 监控错误环（monitor 错误环 → error_logs 可查）
         # skipped（撞活跃任务）是正常排队语义，不告警
         if status not in ("ok", "skipped"):
             _emit_sync_error(job, kind, status, detail)
         # 0 行不算健康：日线/采集类作业空返回记 partial，避免静默缺口被掩盖
         # （skipped 不参与该判定：它发生在建任务之前，rows 本就为 0）
-        if rows == 0 and kind in ("daily", "collect", "adj_factor") and status == "ok":
+        # financial 同样纳入：全市场窗口内 0 只被处理时，要么断点全跳过、
+        # 要么标的池为空 —— 两种都必须有人看见（此前静默报 ok）。
+        # news 不纳入：同一来源重复采集由主键去重，0 新增是正常语义。
+        if rows == 0 and kind in ("daily", "collect", "adj_factor", "financial") \
+                and status == "ok":
             status = "partial"
             detail = {**detail, "zero_rows": True}
         try:
@@ -347,28 +449,95 @@ def history(limit: int = 50) -> list[dict]:
              "status": r[7], "detail": json.loads(r[8]) if r[8] else {}} for r in rows]
 
 
+# ---------------------------------------------------------------- 新鲜度
+
+def freshness() -> dict:
+    """各类数据「最新到哪一天」——用于一眼看出同步是不是真的在跑。
+
+    每一项都独立降级：表不存在/查不动就返回 None，绝不因为一个模块没就位
+    就让整个状态视图报错（同步状态查不了本身会掩盖真问题）。
+
+    注意 last_status=ok 不代表数据是新的：作业空转（无到期、断点全跳过、
+    源零返回）都会记 ok。只有看新鲜度才知道数据有没有跟上。
+    """
+    out: dict = {"daily_lake": None, "news": None, "financial_pit": None,
+                 "lag_days": None}
+
+    # 日线湖：最新交易日 + 相对今天落后几个交易日
+    try:
+        import polars as pl  # noqa: PLC0415
+
+        # 必须走 read_daily：它带 missing_columns/extra_columns 容错。
+        # 直接 scan_parquet(lake_glob(...)) 会在年文件 schema 漂移时炸
+        # （实测 extra column 'year'）——状态视图不能因读取方式而失效
+        from lquant.data.store.parquet import read_daily
+
+        latest = read_daily().select(pl.col("trade_date").max()).collect().item()
+        out["daily_lake"] = str(latest) if latest else None
+        if latest:
+            from lquant.data.store.catalog import TradeCalendarRepo
+
+            gap = TradeCalendarRepo().range(latest, today_cn())
+            # range 含首尾 → 减 1 才是「比日历落后几个交易日」
+            out["lag_days"] = max(len(gap) - 1, 0)
+    except Exception as e:  # noqa: BLE001 - 空湖/库不可用都降级
+        log.debug(f"日线湖新鲜度不可得: {e}")
+
+    try:
+        from lquant.core.db import reader as _reader
+
+        with _reader() as con:
+            row = con.execute(
+                "SELECT max(published_at), count(*) FILTER "
+                "(WHERE CAST(published_at AS DATE) = CAST(? AS DATE)) "
+                "FROM news_item", [today_cn()]).fetchone()
+        if row:
+            out["news"] = {"latest": str(row[0]) if row[0] else None,
+                           "today_rows": int(row[1] or 0)}
+    except Exception as e:  # noqa: BLE001 - 表未建/库不可用
+        log.debug(f"资讯新鲜度不可得: {e}")
+
+    try:
+        from lquant.data.ingest.checkpoint import Checkpoint
+
+        cp = Checkpoint("financial_pit_tushare")
+        spans = [cp.covered_window(s) for s in cp.done]
+        spans = [s for s in spans if s]
+        if spans:
+            out["financial_pit"] = {
+                "covered_start": min(a for a, _ in spans).isoformat(),
+                "covered_end": max(b for _, b in spans).isoformat(),
+                "symbols": len(spans),
+                "marked": len(cp),
+            }
+    except Exception as e:  # noqa: BLE001
+        log.debug(f"财务覆盖区间不可得: {e}")
+    return out
+
+
 # ---------------------------------------------------------------- 调度
 
 def _is_due(job: dict, now: datetime) -> bool:
+    """是否到期。now 必须是 Asia/Shanghai 墙钟（naive）。
+
+    多档 schedule_time：取「今天已到点且最近的那一档」作为本次应触发时刻，
+    last_run 早于它即到期。单档时与旧行为完全一致（唯一的档位就是它）。
+    """
     if not job.get("enabled", False):
         return False
     weekdays = str(job.get("weekdays") or "1,2,3,4,5")
     if weekdays.strip() and str(now.isoweekday()) not in [w.strip() for w in weekdays.split(",")]:
         return False
-    hhmm = now.strftime("%H:%M")
-    if hhmm < job["schedule_time"]:
-        return False
     # 跨天补跑：last_run 落后于「今天的应触发时刻」即到期。此前按
     # 「今天是否跑过」判断，宕机跨天后作业被永久跳过 —— 窗口滑过即缺口。
-    try:
-        h, m = job["schedule_time"].split(":")
-        scheduled = now.replace(hour=int(h), minute=int(m),
-                                second=0, microsecond=0)
-    except ValueError:
+    scheduled = _due_slot(job, now)
+    if scheduled is None:
         return False
     last = job.get("last_run_at")
     if last:
         last_dt = last if isinstance(last, datetime) else datetime.fromisoformat(str(last))
+        if last_dt.tzinfo is not None:         # 兼容历史写入的 tz-aware 值
+            last_dt = last_dt.astimezone(TZ).replace(tzinfo=None)
         if last_dt >= scheduled:               # 本次应触发时刻之后已跑过
             return False
     return True
@@ -395,8 +564,15 @@ def _trading_day_ok(d) -> bool:
 
 
 def tick(now: datetime | None = None) -> list[dict]:
-    """跑一遍所有到期作业。返回执行结果列表。"""
-    now = now or datetime.now()
+    """跑一遍所有到期作业。返回执行结果列表。
+
+    now 缺省取 Asia/Shanghai 墙钟。作业的 schedule_time/weekdays 都是
+    运维眼里的 CST 时刻，用本机 datetime.now() 判断到期会在非 CST 服务器上
+    整体错位；显式传入 tz-aware 值时统一换算成 CN 墙钟再比较。
+    """
+    now = now or now_cn_naive()
+    if now.tzinfo is not None:
+        now = now.astimezone(TZ).replace(tzinfo=None)
     # 非交易日（日历覆盖判断）跳过数据作业：跑也不产数据还污染 sync_run。
     if not _trading_day_ok(now.date()):
         return []

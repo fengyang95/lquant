@@ -73,7 +73,8 @@ class Symbol:
     @property
     def board(self) -> Board:
         c = self.code
-        if c.startswith("688"):
+        # 689 是科创板存托凭证（CDR，如 689009.SH 九号公司），与 688 同档
+        if c.startswith(("688", "689")):
             return Board.STAR
         if c.startswith(("300", "301", "302")):
             return Board.GEM
@@ -121,6 +122,18 @@ class DateRange:
 
 def now_cn() -> datetime:
     return datetime.now(TZ)
+
+
+def now_cn_naive() -> datetime:
+    """Asia/Shanghai 墙钟时间（naive），用于写 DuckDB TIMESTAMP 列。
+
+    DuckDB 的 TIMESTAMP 不带时区；直接写 tz-aware 值会带上偏移或被截断，
+    各模块因此各自 ``now_cn().replace(tzinfo=None)``。集中在这里是为了让
+    「lineage / updated_at 用哪个时区」只有一个答案 —— 此前 daily 用 CN
+    墙钟、adj 用本机墙钟，服务器时区非 Asia/Shanghai 时同一批数据的
+    ingested_at 会差 8 小时。
+    """
+    return now_cn().replace(tzinfo=None)
 
 
 def today_cn() -> date:

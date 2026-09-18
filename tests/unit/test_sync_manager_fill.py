@@ -217,9 +217,14 @@ def test_run_job_financial(monkeypatch, sync_env) -> None:
                         lambda: SimpleNamespace(stock_symbols=lambda include_delisted: ["600519.SH"]),
                         raising=False)
     monkeypatch.setattr(fin_mod, "backfill_financial",
-                        lambda symbols, start: 21, raising=False)
+                        lambda symbols, start, end: {"done": 21, "skipped_covered": 3,
+                                                     "groups": 1, "start": start,
+                                                     "end": end, "rows": 999},
+                        raising=False)
     res = _run(_job("financial", {"days": 90}), monkeypatch)
-    assert res["rows"] == 21 and res["detail"]["symbols"] == 1
+    assert res["rows"] == 21
+    assert res["detail"]["skipped_covered"] == 3    # 被覆盖区间跳过 ≠ 没东西可拉
+    assert res["detail"]["rows"] == 999
 
 
 def test_run_job_backfill(monkeypatch, sync_env) -> None:

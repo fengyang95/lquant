@@ -12,12 +12,12 @@
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date
 from typing import Any
 
 import polars as pl
 
-from lquant.core.types import parse_symbol
+from lquant.core.types import now_cn_naive, parse_symbol
 from lquant.data.capability import Capability
 from lquant.data.normalize import normalize_60min_bounds, normalize_symbols, scale_unit
 from lquant.data.providers import PROVIDERS
@@ -157,7 +157,7 @@ class AkShareProvider(MappingProvider):
         if table == "minute_bar":
             df = normalize_60min_bounds(df)
             df = df.with_columns(
-                ingested_at=pl.lit(datetime.now(), dtype=pl.Datetime),
+                ingested_at=pl.lit(now_cn_naive(), dtype=pl.Datetime),
             )
         return df
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import date, datetime
 
 from lquant.core.db import reader, writer
+from lquant.core.types import now_cn_naive
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS collect_log (
@@ -71,7 +72,7 @@ def record_batch(entries: list[dict]) -> int:
 
 def health(now: datetime | None = None) -> dict:
     """健康度汇总：每采集器的成功率/最后成功/当日缺口。"""
-    now = now or datetime.now()
+    now = now or now_cn_naive()
     today = now.date()
     with reader() as con:
         _ensure(con)

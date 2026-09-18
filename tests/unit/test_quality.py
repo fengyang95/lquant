@@ -170,14 +170,105 @@ def test_limit_breach_uses_board_and_st():
     issues2 = check_limit_breach(tiny, sec)
     assert issues2 and issues2[0].severity == "warn"
 
-    # ST 5%：+8% 越界；创业板 20%：+15% 合法
+    # ST 5%：+15% 越界
     st_sec = pl.DataFrame({"symbol": ["000001.SZ"], "board": ["main"], "is_st": [True]})
-    assert check_limit_breach(bars, st_sec)      # 15% > 5%+tol → 仍越界
-    gem_sec = pl.DataFrame({"symbol": ["000001.SZ"], "board": ["gem"], "is_st": [False]})
-    gem_bars = _good_bars().with_columns(close=pl.when(pl.arange(0, 5) == 0)
-                                         .then(pl.col("pre_close") * 1.15)
-                                         .otherwise(pl.col("close")))
-    assert check_limit_breach(gem_bars, gem_sec) == []
+    assert check_limit_breach(bars, st_sec)
+
+
+def test_limit_breach_board_comes_from_code_not_snapshot():
+    """板性以**代码段**为准：security.board 实测对全部股票都是 NULL，
+    旧实现 fill_null("main") 把创业板/科创板/北交所的合法 20%/30% 波动
+    全判成越界（实测 2026-08 起一个月窗口 1191 行命中里 1152 行是这么来的）。
+    """
+    from lquant.data.quality.validators import board_from_code, check_limit_breach
+
+    assert board_from_code("300001.SZ") == "gem"
+    assert board_from_code("688001.SH") == "star"
+    assert board_from_code("689009.SH") == "star"      # 科创板 CDR
+    assert board_from_code("920001.BJ") == "bse"
+    assert board_from_code("600519.SH") == "main"
+    assert board_from_code("510300.SH") == "unknown"   # 基金：代码段无板性
+
+    bars = _good_bars().with_columns(close=pl.when(pl.arange(0, 5) == 0)
+                                     .then(pl.col("pre_close") * 1.15)
+                                     .otherwise(pl.col("close")))
+    # 创业板 +15% 合法（20% 档）——即使快照里的 board 是 null
+    gem = bars.with_columns(symbol=pl.lit("300001.SZ"))
+    sec_null = pl.DataFrame({"symbol": ["300001.SZ"], "board": [None], "is_st": [False]})
+    assert check_limit_breach(gem, sec_null) == []
+
+    # 快照里的板性写错（主板代码却标 gem）也不能放宽：代码段优先
+    sec_wrong = pl.DataFrame({"symbol": ["000001.SZ"], "board": ["gem"], "is_st": [False]})
+    assert check_limit_breach(bars, sec_wrong) != []
+
+
+def test_limit_breach_exempts_new_listings_and_tick_rounding():
+    """两条实测误报源：上市初期无涨跌幅限制、涨跌停价取整到分。"""
+    from lquant.data.quality.validators import check_limit_breach
+
+    # 上市首日 +290%（601123.SH 2026-09-01 实测），list_date == 当日
+    ipo = pl.DataFrame({
+        "symbol": ["601123.SH"], "trade_date": [date(2026, 9, 1)],
+        "close": [26.0], "pre_close": [6.65],
+    })
+    sec = pl.DataFrame({"symbol": ["601123.SH"], "board": [None], "is_st": [False],
+                        "sec_type": ["stock"], "list_date": [date(2026, 9, 1)]})
+    assert check_limit_breach(ipo, sec) == []
+
+    # 同一只票上市满 6 个交易日后 +15% → 真的越界（主板 10%）
+    late = pl.DataFrame({
+        "symbol": ["601123.SH"] * 6,
+        "trade_date": [date(2026, 9, 1 + i) for i in range(6)],
+        "close": [6.65, 7.0, 7.0, 7.0, 7.0, 7.0 * 1.15],
+        "pre_close": [6.65, 6.65, 7.0, 7.0, 7.0, 7.0],
+    })
+    assert check_limit_breach(late, sec) != []
+
+    # 窗口起点晚于上市日 → 无法确认「上市几天了」，不豁免
+    tail_only = pl.DataFrame({
+        "symbol": ["601123.SH"], "trade_date": [date(2026, 10, 8)],
+        "close": [7.0 * 1.5], "pre_close": [7.0],
+    })
+    assert check_limit_breach(tail_only, sec) != []
+
+    # 边界：窗口起点只晚于上市日一两天（IPO 正好卡在窗口边缘）。
+    # 实测 301632.SZ 上市 2025-08-12、窗口首条 08-13 = 上市第 2 个交易日，
+    # 双创前 5 日不设限，当日 +28.2% 合法 —— 旧判据（list_date >= 窗口起点）
+    # 会把它误报成超档。
+    edge = pl.DataFrame({
+        "symbol": ["301632.SZ"], "trade_date": [date(2025, 8, 13)],
+        "close": [43.6], "pre_close": [34.01],
+    })
+    sec_edge = pl.DataFrame({"symbol": ["301632.SZ"], "board": [None], "is_st": [False],
+                             "sec_type": ["stock"],
+                             "list_date": [date(2025, 8, 12)]})
+    assert check_limit_breach(edge, sec_edge) == []
+    # 但间隔拉长到明显属于「历史中途切进来的窗口」就不豁免了
+    far = edge.with_columns(trade_date=pl.lit(date(2025, 12, 1), dtype=pl.Date))
+    assert check_limit_breach(far, sec_edge) != []
+
+    # 低价股跌停取整：688496.SH 2026-09-10 pre_close 0.73 → 跌停价
+    # 0.584 取整 0.58，收益率 20.55% > 20%+0.005，实为合法成交
+    low = pl.DataFrame({"symbol": ["688496.SH"], "trade_date": [date(2026, 9, 10)],
+                        "close": [0.58], "pre_close": [0.73]})
+    sec_low = pl.DataFrame({"symbol": ["688496.SH"], "board": [None], "is_st": [False],
+                            "sec_type": ["stock"],
+                            "list_date": [date(2022, 12, 28)]})
+    assert check_limit_breach(low, sec_low) == []
+
+    # 指数/债券不参与（点位不是价格）
+    idx = pl.DataFrame({"symbol": ["000300.SH"], "trade_date": [date(2026, 9, 1)],
+                        "close": [5000.0], "pre_close": [3000.0]})
+    sec_idx = pl.DataFrame({"symbol": ["000300.SH"], "board": [None], "is_st": [False],
+                            "sec_type": ["index"], "list_date": [date(2005, 4, 8)]})
+    assert check_limit_breach(idx, sec_idx) == []
+
+    # 基金走宽档：创业板 ETF 的单日 19.77% 不是错误（159287.SZ 实测）
+    etf = pl.DataFrame({"symbol": ["159287.SZ"], "trade_date": [date(2026, 8, 10)],
+                        "close": [1.357], "pre_close": [1.133]})
+    sec_etf = pl.DataFrame({"symbol": ["159287.SZ"], "board": [None], "is_st": [False],
+                            "sec_type": ["etf"], "list_date": [date(2025, 8, 27)]})
+    assert check_limit_breach(etf, sec_etf) == []
 
 
 def test_ret_identity():

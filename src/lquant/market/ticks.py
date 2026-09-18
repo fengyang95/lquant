@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+from lquant.core.types import now_cn_naive
+
 
 class TicksError(Exception):
     """实时源不可用（断网/未配置实时 Provider/标的未知）。
@@ -61,7 +63,7 @@ def _realtime_backend(symbols: list[str], *, timeout: float = 5.0) -> list[dict]
     from lquant.data.providers import get_provider
 
     df = get_provider().realtime(symbols)
-    ts = __import__("datetime").datetime.now().isoformat(timespec="seconds")
+    ts = now_cn_naive().isoformat(timespec="seconds")
     rows = []
     for r in df.to_dicts():
         rows.append({"symbol": r.get("symbol"), "name": r.get("name"),

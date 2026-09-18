@@ -150,13 +150,16 @@ def test_norm_fallback():
 
 
 def test_as_date_variants(monkeypatch):
-    class _FakeDT(datetime):
-        @classmethod
-        def now(cls):
-            return datetime(2026, 9, 20)  # 周日
+    # 业务日期走 core.types.today_cn（Asia/Shanghai），不再是模块级 datetime.now()
+    # ——桩要打在 today_cn 上，打 datetime 现在不生效（本用例曾是「假绿」）。
+    monkeypatch.setattr(dt, "today_cn", lambda: date(2026, 9, 20))  # 周日
+    assert dt._as_date(None) == date(2026, 9, 18)  # 昨日周六 → 回退到周五
 
-    monkeypatch.setattr(dt, "datetime", _FakeDT)
-    assert dt._as_date(None) == date(2026, 9, 18)  # 周末回退到周五
+    # 周六 / 周一两个边界：回退逻辑不能把「昨日=周五」也往前推
+    monkeypatch.setattr(dt, "today_cn", lambda: date(2026, 9, 22))  # 周二 → 昨日周一
+    assert dt._as_date(None) == date(2026, 9, 21)
+    monkeypatch.setattr(dt, "today_cn", lambda: date(2026, 9, 21))  # 周一 → 昨日周日
+    assert dt._as_date(None) == date(2026, 9, 18)
 
     assert dt._as_date("20240102") == date(2024, 1, 2)
     assert dt._as_date("2024-01-02") == date(2024, 1, 2)

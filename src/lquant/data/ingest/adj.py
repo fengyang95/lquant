@@ -13,7 +13,7 @@ from datetime import date, timedelta
 
 import polars as pl
 
-from lquant.core.types import today_cn
+from lquant.core.types import now_cn_naive, today_cn
 from lquant.data.store.parquet import read_daily, write_daily
 
 
@@ -25,8 +25,6 @@ def refresh_adj_factors(*, symbols: list[str] | None = None,
     days 窗口从今天往回算；传 start/end 覆盖（全量刷新时 start="2016-01-01"）。
     provider 可注入（测试用），缺省取注册链的第一个数据源。
     """
-    from datetime import datetime
-
     end_d = date.fromisoformat(end) if end else today_cn()
     start_d = date.fromisoformat(start) if start else end_d - timedelta(days=days)
 
@@ -80,7 +78,9 @@ def refresh_adj_factors(*, symbols: list[str] | None = None,
             "fatal",
         )
     rows = rows.with_columns(
-        ingested_at=pl.lit(datetime.now().replace(tzinfo=None), dtype=pl.Datetime),
+        # ingested_at 用 CN 墙钟（与 daily._stamp 同一约定）：此前用本机墙钟，
+        # 服务器时区非 Asia/Shanghai 时同批数据的血缘时间戳差 8 小时
+        ingested_at=pl.lit(now_cn_naive(), dtype=pl.Datetime),
         # 血缘登记：湖内 data_version 必须能对上 data_version 表，
         # 否则因子缓存失效锚点是死的（与 daily._stamp 同一约定）
         data_version=pl.lit(lineage.new_version()),

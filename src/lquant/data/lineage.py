@@ -11,6 +11,7 @@ from datetime import date, datetime
 import polars as pl
 
 from lquant.core.db import reader, writer
+from lquant.core.types import now_cn_naive
 from lquant.data.store.ddl import DDL_DATA_VERSION as _DDL
 
 __all__ = ["new_version", "register", "latest"]
@@ -18,7 +19,7 @@ __all__ = ["new_version", "register", "latest"]
 
 def new_version(now: datetime | None = None) -> str:
     """版本号 = 日期 + 当日序号（YYYYMMDD.n），同日多次同步不互相覆盖。"""
-    now = now or datetime.now()
+    now = now or now_cn_naive()
     day = now.strftime("%Y%m%d")
     with writer() as con:
         _ensure(con)
@@ -56,6 +57,6 @@ def stamp(df: pl.DataFrame, source: str, version: str | None = None) -> pl.DataF
     version = version or new_version()
     return df.with_columns(
         source=pl.lit(source),
-        ingested_at=pl.lit(datetime.now(), dtype=pl.Datetime),
+        ingested_at=pl.lit(now_cn_naive(), dtype=pl.Datetime),
         data_version=pl.lit(version),
     )

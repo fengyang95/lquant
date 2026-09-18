@@ -14,7 +14,7 @@ from datetime import date, datetime
 
 import polars as pl
 
-from lquant.core.types import now_cn, parse_symbol
+from lquant.core.types import now_cn, parse_symbol, today_cn
 from lquant.market.em_client import em_get
 
 __all__ = ["fetch_sectors", "fetch_concepts", "fetch_areas", "SECTOR_FS"]
@@ -36,7 +36,7 @@ def _norm(code: str) -> str:
 
 def _as_date(v) -> date:
     if v is None:
-        return datetime.now().date()
+        return today_cn()
     if isinstance(v, str):
         return datetime.strptime(v.replace("-", ""), "%Y%m%d").date()
     return v

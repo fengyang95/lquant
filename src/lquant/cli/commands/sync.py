@@ -30,7 +30,12 @@ def tick() -> None:
 
 @sync.command()
 def status() -> None:
-    """列出同步作业与最近状态。"""
+    """列出同步作业、最近状态与**数据新鲜度**。
+
+    作业的 last_status=ok 不等于数据是新的：无到期、断点全跳过、源零返回
+    都会记 ok。所以状态视图必须同时给出「各类数据最新到哪一天」，
+    否则「同步在跑」和「同步空转」看起来一模一样。
+    """
 
     jobs = manager.list_jobs()
     if not jobs:
@@ -38,9 +43,30 @@ def status() -> None:
         return
     for j in jobs:
         click.echo(
-            f"{j['sync_id']:<12} {j['schedule_time']} wd={j['weekdays']:<9} "
+            f"{j['sync_id']:<12} {j['schedule_time']:<22} wd={j['weekdays']:<9} "
             f"enabled={j['enabled']} last={j['last_run_at']} "
             f"status={j['last_status']} rows={j['last_rows']}")
+
+    click.echo("")
+    click.echo("数据新鲜度：")
+    fresh = manager.freshness()
+    lake = fresh.get("daily_lake") or "-"
+    lag = fresh.get("lag_days")
+    lag_s = "" if lag is None else f"（落后 {lag} 个交易日）"
+    click.echo(f"  日线湖最新交易日: {lake} {lag_s}".rstrip())
+    news = fresh.get("news")
+    if news:
+        click.echo(f"  资讯最新一条: {news['latest'] or '-'}"
+                   f"（今日 {news['today_rows']} 条）")
+    else:
+        click.echo("  资讯最新一条: -（news_item 表未建或无数据）")
+    fin = fresh.get("financial_pit")
+    if fin:
+        click.echo(f"  PIT 财务覆盖区间: {fin['covered_start']} ~ "
+                   f"{fin['covered_end']}（{fin['symbols']} 只，记账 "
+                   f"{fin['marked']} 只）")
+    else:
+        click.echo("  PIT 财务覆盖区间: -（无窗口记账，下次同步会按窗口重拉）")
 
 
 @sync.command()

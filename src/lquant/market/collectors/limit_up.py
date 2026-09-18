@@ -19,7 +19,7 @@ from datetime import date, datetime
 import polars as pl
 
 from lquant.core.errors import DataUnavailable
-from lquant.core.types import now_cn
+from lquant.core.types import now_cn, today_cn
 from lquant.market.em_client import em_get
 
 __all__ = ["fetch_limit_up_pool", "fetch_limit_down_pool", "fetch_broken_pool"]
@@ -29,8 +29,10 @@ _BASE = "https://push2ex.eastmoney.com"
 
 
 def _ymd(d: date | str | None) -> str:
+    # 缺省交易日用 today_cn()：东财涨跌停池按「业务日」取数，
+    # 服务器时区非 Asia/Shanghai 时 date.today() 会错位一天
     if d is None:
-        return date.today().strftime("%Y%m%d")
+        return today_cn().strftime("%Y%m%d")
     if isinstance(d, str):
         return d.replace("-", "")
     return d.strftime("%Y%m%d")

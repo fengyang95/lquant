@@ -75,7 +75,12 @@ def minute_cmd(symbols: str | None, start: str, end: str | None, freq: str) -> N
               help="缺省自动选 tushare（基本面统一源），缺 token 退回 baostock")
 def financial(symbols: str | None, use_all: bool, start: str, end: str | None,
               provider_name: str | None) -> None:
-    """PIT 财务回填（stat_date + pub_date，防未来函数）。"""
+    """PIT 财务回填（stat_date + pub_date，防未来函数）。
+
+    断点是「窗口 + 标的」的：同一窗口重复跑只补没覆盖到的标的；
+    换了窗口（比如从 2016 起改成只补最近 90 天）会按新窗口重新判定，
+    不会因为「标的上次跑过」就静默跳过。
+    """
     from lquant.data.ingest.financial import backfill_financial
     from lquant.data.store.catalog import SecurityRepo
 
@@ -86,8 +91,10 @@ def financial(symbols: str | None, use_all: bool, start: str, end: str | None,
     else:
         raise click.UsageError("--symbols 与 --all 必须给一个")
 
-    n = backfill_financial(syms, start=start, end=end, provider_name=provider_name)
-    click.echo(f"done {n}")
+    out = backfill_financial(syms, start=start, end=end, provider_name=provider_name)
+    click.echo(f"  窗口 {out['start']} ~ {out['end']}，增量段 {out['groups']} 个")
+    click.echo(f"  实拉 {out['done']} 只，覆盖区间跳过 {out['skipped_covered']} 只")
+    click.echo(f"  financial_pit 累计 {out['rows']} 行")
 
 
 @data.command("basic")

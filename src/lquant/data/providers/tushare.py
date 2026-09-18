@@ -17,13 +17,14 @@ SDK 报权限类错误，本层捕获转成 SourceUnavailable，fallback 链可�
 from __future__ import annotations
 
 import os
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 import polars as pl
 
 from lquant.core.errors import SourceUnavailable
+from lquant.core.types import now_cn_naive
 from lquant.data.capability import Capability
 from lquant.data.normalize import normalize_symbols, scale_unit
 from lquant.data.providers import PROVIDERS
@@ -124,7 +125,7 @@ def _wide_to_long(df: pl.DataFrame, api: str) -> pl.DataFrame:
                 "value": fv,
                 "unit": None,
                 "source": "tushare",
-                "ingested_at": datetime.now(),
+                "ingested_at": now_cn_naive(),
             })
     return pl.DataFrame(recs) if recs else pl.DataFrame()
 
@@ -265,7 +266,7 @@ class TushareProvider(MappingProvider):
         df = normalize_symbols(df)
         if table == "minute_bar":
             df = df.with_columns(
-                ingested_at=pl.lit(datetime.now(), dtype=pl.Datetime),
+                ingested_at=pl.lit(now_cn_naive(), dtype=pl.Datetime),
             )
         return df
 

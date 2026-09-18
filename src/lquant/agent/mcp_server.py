@@ -44,10 +44,17 @@ def _compute(df, name: str):
 
 
 def _end_date(days: int):
-    """end=today、start=today-days（read_daily 内部转 ISO 字符串即可）。"""
-    from datetime import date, timedelta
+    """end=today、start=today-days（read_daily 内部转 ISO 字符串即可）。
 
-    return date.today() - timedelta(days=days), date.today()
+    用 today_cn()：读的是交易日数据，服务器时区非 Asia/Shanghai 时
+    date.today() 会让窗口整体偏移一天（最近一根日线被切掉）。
+    """
+    from datetime import timedelta
+
+    from lquant.core.types import today_cn
+
+    end = today_cn()
+    return end - timedelta(days=days), end
 
 
 def _tool_get_daily(symbol: str, days: int = 60) -> list[dict]:

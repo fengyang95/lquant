@@ -76,6 +76,20 @@ def test_seed_defaults_and_list():
     assert jobs["daily"]["params"].get("days")
 
 
+def test_seed_defaults_includes_news_job():
+    """资讯必须有定时作业：此前只有 HTTP API 能触发，靠人点 → 随时静默停更
+    （实测 news_item 最新一条停在 2026-09-16，当日 0 条）。"""
+    from lquant.sync import manager
+
+    manager.seed_defaults()
+    jobs = {j["sync_id"]: j for j in manager.list_jobs()}
+    assert "news" in jobs, "默认作业里必须有 news，否则资讯同步没有自动入口"
+    assert jobs["news"]["kind"] == "news"
+    assert jobs["news"]["enabled"] is True
+    # 日内多档：单档会在快讯流上留下整段空窗
+    assert len(jobs["news"]["schedule_time"].split(",")) >= 2
+
+
 def test_job_crud():
     from lquant.sync import manager
 
@@ -161,15 +175,56 @@ def test_due_catchup_after_multi_day_downtime():
 
 
 def test_upsert_accepts_new_kinds():
-    """reference/daily_basic/financial 三类新作业类型可注册（默认禁用防触网）。"""
+    """reference/daily_basic/financial/news 四类新作业类型可注册（默认禁用防触网）。"""
     from lquant.sync import manager
 
     manager.seed_defaults()
-    for kind in ("reference", "daily_basic", "financial"):
+    for kind in ("reference", "daily_basic", "financial", "news"):
         manager.upsert_job(f"t-{kind}", "t", kind, "07:00", params={"days": 14},
                            enabled=False)
     ids = {j["sync_id"] for j in manager.list_jobs()}
-    assert {"t-reference", "t-daily_basic", "t-financial"} <= ids
+    assert {"t-reference", "t-daily_basic", "t-financial", "t-news"} <= ids
+
+
+def test_upsert_accepts_multi_slot_and_rejects_bad_slot():
+    """多档 schedule_time：合法档去重后落库；混进非法档必须报错。
+
+    非法档被静默丢弃的话，作业会在那一档永不触发 —— 必须挡住。
+    """
+    from lquant.sync import manager
+
+    manager.upsert_job("multi", "多档", "news", "09:05, 15:20 ,09:05", enabled=False)
+    jobs = {j["sync_id"]: j for j in manager.list_jobs()}
+    assert jobs["multi"]["schedule_time"] == "09:05,15:20"   # 去空白 + 去重
+
+    with pytest.raises(ValueError):
+        manager.upsert_job("bad-multi", "坏档", "news", "09:05,25:00")
+    with pytest.raises(ValueError):
+        manager.upsert_job("bad-multi2", "坏档", "news", "")
+
+
+def test_due_logic_multi_slot():
+    """日内多档：每个档位各触发一次；跑过当前档位后等到下一档再触发。"""
+    from lquant.sync.manager import _due_slot, _is_due, _parse_schedules
+
+    assert _parse_schedules("09:05,15:20,20:00") == ["09:05", "15:20", "20:00"]
+    assert _parse_schedules("09:05,25:00,,") == ["09:05"]
+
+    job = _job(schedule_time="09:05,15:20,20:00")
+    # 第一档之前 / 第一档到点
+    assert not _is_due(job, datetime(2026, 9, 8, 9, 4))
+    assert _is_due(job, datetime(2026, 9, 8, 9, 5))
+    # 第一档跑过 → 第二档之前不重复
+    assert not _is_due(_job(schedule_time="09:05,15:20,20:00",
+                            last_run_at=datetime(2026, 9, 8, 9, 6)),
+                       datetime(2026, 9, 8, 12, 0))
+    # 到第二档 → 再触发
+    assert _is_due(_job(schedule_time="09:05,15:20,20:00",
+                        last_run_at=datetime(2026, 9, 8, 9, 6)),
+                   datetime(2026, 9, 8, 15, 20))
+    # 应触发时刻取「已到点里最近的一档」
+    assert _due_slot(job, datetime(2026, 9, 8, 16, 0)) == datetime(2026, 9, 8, 15, 20)
+    assert _due_slot(job, datetime(2026, 9, 8, 8, 0)) is None
 
 
 def test_trading_day_filter():
@@ -337,6 +392,82 @@ def test_tick_runs_due_jobs_only():
     # 再 tick 一次：close 今天已跑 → 不再执行
     res2 = manager.tick()
     assert all(r["sync_id"] != "close" for r in res2)
+
+
+# ---------------------------------------------------------------- news 作业
+
+
+def test_run_job_news_creates_and_executes_task(monkeypatch):
+    """news 作业：建 news_task 并执行，rows/status 透传到 sync_run 记录。"""
+    from lquant.core.types import today_cn
+    from lquant.news import tasks as news_tasks
+    from lquant.sync import manager
+
+    calls: dict = {}
+    monkeypatch.setattr(news_tasks, "init_news_task_ddl", lambda con: None)
+
+    def _create(con, kind, params):
+        calls["create"] = (kind, dict(params))
+        return {"task_id": "news_test_1"}
+
+    def _execute(con, task_id):
+        calls["execute"] = task_id
+        return {"task_id": task_id, "status": "ok", "rows_written": 7,
+                "sources_status": {"eastmoney": {"status": "ok", "rows": 7}}}
+
+    monkeypatch.setattr(news_tasks, "create_task", _create)
+    monkeypatch.setattr(news_tasks, "execute_task", _execute)
+
+    res = manager.run_job({"sync_id": "news", "name": "资讯", "kind": "news",
+                           "params": {"sources": ["eastmoney"]}})
+    assert res["status"] == "ok"
+    assert res["rows"] == 7
+    assert res["detail"]["task_id"] == "news_test_1"
+    assert calls["create"][0] == "daily"
+    # 业务日期走 CN 时钟：宿主时区非 Asia/Shanghai 时不能错位一天
+    assert calls["create"][1]["date"] == today_cn().isoformat()
+    assert calls["create"][1]["sources"] == ["eastmoney"]
+    assert calls["execute"] == "news_test_1"
+
+
+@pytest.mark.parametrize(("task_status", "expected"), [("partial", "partial"),
+                                                       ("failed", "failed")])
+def test_run_job_news_propagates_task_status(monkeypatch, task_status, expected):
+    """单源失败/全挂 → 作业状态跟着降级，不被吞成 ok。"""
+    from lquant.news import tasks as news_tasks
+    from lquant.sync import manager
+
+    monkeypatch.setattr(news_tasks, "init_news_task_ddl", lambda con: None)
+    monkeypatch.setattr(news_tasks, "create_task",
+                        lambda con, kind, params: {"task_id": "news_test_2"})
+    monkeypatch.setattr(
+        news_tasks, "execute_task",
+        lambda con, task_id: {"task_id": task_id, "status": task_status,
+                              "rows_written": 0, "sources_status": {}},
+    )
+
+    res = manager.run_job({"sync_id": "news", "name": "资讯", "kind": "news", "params": {}})
+    assert res["status"] == expected
+    # news 不在 zero_rows 降级名单里：同源重复采集 0 新增属正常语义
+    assert res["detail"].get("zero_rows") is None
+
+
+def test_run_job_news_conflict_records_skipped(monkeypatch):
+    """撞上运行中的手工资讯任务 → skipped（排队语义，不当故障告警）。"""
+    from lquant.news import tasks as news_tasks
+    from lquant.sync import manager
+
+    monkeypatch.setattr(news_tasks, "init_news_task_ddl", lambda con: None)
+
+    def _boom(con, kind, params):
+        raise news_tasks.TaskConflictError("another news task is pending/running: news_x")
+
+    monkeypatch.setattr(news_tasks, "create_task", _boom)
+
+    res = manager.run_job({"sync_id": "news", "name": "资讯", "kind": "news", "params": {}})
+    assert res["status"] == "skipped"
+    assert res["detail"]["skipped"] is True
+    assert "TaskConflictError" in res["detail"]["reason"]
 
 
 # ---------------------------------------------------------------- 日志接线

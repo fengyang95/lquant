@@ -15,7 +15,7 @@ from datetime import date
 
 import polars as pl
 
-from lquant.core.types import now_cn
+from lquant.core.types import now_cn, today_cn
 from lquant.market.collectors.limit_up import (
     fetch_broken_pool,
     fetch_limit_down_pool,
@@ -59,7 +59,7 @@ def compute_sentiment(trade_date: date | str | None = None, *, demo: bool = Fals
 
     d = zt["trade_date"][0] if len(zt) else (
         zb["trade_date"][0] if len(zb) else
-        (dt["trade_date"][0] if len(dt) else date.today()))
+        (dt["trade_date"][0] if len(dt) else today_cn()))
 
     n_zt, n_zb, n_dt = len(zt), len(zb), len(dt)
     broken_rate = n_zb / max(n_zt + n_zb, 1)

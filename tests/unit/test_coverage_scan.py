@@ -78,8 +78,11 @@ def test_no_gap(env) -> None:
     write_daily(_daily_df(syms, days))
     write_daily_basic(_daily_df(syms, days))
 
+    from lquant.core.types import today_cn
+
     rep = scan_coverage(30, repair=True)
-    assert rep["window"]["end"] == date.today()  # today_cn 在测试时区即本机今天
+    # 窗口右端＝业务日（CN 墙钟），不是进程本地 date.today()
+    assert rep["window"]["end"] == today_cn()
     assert (rep["window"]["end"] - rep["window"]["start"]).days == 30
     assert rep["tables"]["daily"]["missing_dates"] == []
     assert rep["tables"]["daily"]["sparse_symbols"] == {}

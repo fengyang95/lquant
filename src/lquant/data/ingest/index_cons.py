@@ -7,17 +7,23 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
+from datetime import timedelta
 
 import polars as pl
+
+from lquant.core.types import today_cn
 
 # 常用宽基指数：沪深300 / 中证500 / 中证800 / 中证1000
 DEFAULT_INDEXES: list[str] = ["000300.SH", "000905.SH", "000906.SH", "000852.SH"]
 
 
 def _latest_snapshot(api, index_code: str, lookback_days: int = 45) -> pl.DataFrame:
-    """拉该指数近期成分，截取最新 trade_date 的整批快照。"""
-    end = date.today()
+    """拉该指数近期成分，截取最新 trade_date 的整批快照。
+
+    end 用 today_cn()：服务器/容器时区非 Asia/Shanghai 时 date.today() 会
+    与业务日错位一天，查询窗口整体偏移（core/types 的业务日期约定）。
+    """
+    end = today_cn()
     start = end - timedelta(days=lookback_days)
     df = api(
         "index_weight",

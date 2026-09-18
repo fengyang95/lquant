@@ -59,24 +59,30 @@ def test_minute_cmd(monkeypatch):
     assert "done 2" in r.output
 
 
+def _financial_stub(syms, **kw):
+    """backfill_financial 现在返回窗口记账 dict（不再只回一个数）。"""
+    return {"done": len(syms), "skipped_covered": 0, "groups": 1,
+            "start": "2016-01-01", "end": "2026-09-18", "rows": len(syms)}
+
+
 def test_financial_cmd(monkeypatch):
     _patch_mod(monkeypatch, "lquant.data.ingest.financial", "backfill_financial",
-               lambda syms, **kw: len(syms))
+               _financial_stub)
     r = _invoke("financial", "--symbols", "600000.SH,000001.SZ", "--provider", "baostock")
     assert r.exit_code == 0, r.output
-    assert "done 2" in r.output
+    assert "实拉 2 只" in r.output and "覆盖区间跳过 0 只" in r.output
 
 
 def test_financial_all_and_missing_args(monkeypatch):
     import lquant.data.store.catalog as catalog_mod
 
     _patch_mod(monkeypatch, "lquant.data.ingest.financial", "backfill_financial",
-               lambda syms, **kw: len(syms))
+               _financial_stub)
     monkeypatch.setattr(catalog_mod.SecurityRepo, "stock_symbols",
                         lambda self: ["600000.SH", "000001.SZ", "600519.SH"])
     r = _invoke("financial", "--all")
     assert r.exit_code == 0, r.output
-    assert "done 3" in r.output
+    assert "实拉 3 只" in r.output
 
     r2 = _invoke("financial")
     assert r2.exit_code != 0
