@@ -57,7 +57,8 @@ def resolve_ingest_source(*, fund: bool, provider=None) -> tuple[object, str]:
     盲取链头时整个 ETF/LOF 段会逐日返回零行，被记成 empty_response（实测
     2026-09-17 任务：1582 只 ETF + 85 只 LOF 全段零行，ETF 湖停更 6 天）。
     基金段因此按 etf_daily 能力选源；源没有 etf_daily_bars 时回落 daily_bars
-    （baostock 走 sh.510300 就能取 ETF）。
+    （baostock 没有 etf_daily_bars 但 daily_bars 能取 ETF —— 注意它只覆盖
+    近端：实测 510300.SH / 159915.SZ 在 2026-03 有行、2024-06 零行）。
 
     provider 显式注入（测试/单源场景）时原样返回，不做能力路由。
     """
