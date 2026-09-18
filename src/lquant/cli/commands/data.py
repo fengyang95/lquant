@@ -167,7 +167,11 @@ def status() -> None:
 @data.command()
 @click.option("--start", default="2024-01-01")
 def demo(start: str) -> None:
-    """生成演示数据（无网络环境的开箱即用；绝不用于真实回测结论）。"""
+    """生成演示数据（无网络环境的开箱即用；绝不用于真实回测结论）。
+
+    只用于全新/空湖：目标湖已有真实日线时会直接拒绝，避免合成数据覆盖真实
+    观测（隔离 worktree 的 data/parquet 常软链到主仓真实湖）。
+    """
     from lquant.data.ingest.demo import generate_demo
 
     out = generate_demo(start=start)
