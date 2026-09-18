@@ -369,6 +369,163 @@ def test_is_due_edge_cases() -> None:
     assert _is_due({**base, "last_run_at": "2026-09-07 16:00:00"}, monday) is False
 
 
+def test_is_due_tz_aware_last_run_at() -> None:
+    """last_run_at 可能是 tz-aware（历史写入形态）—— 必须换算到 CN 墙钟再比。
+
+    不换算就会拿「UTC 08:00」跟「CST 15:05」比，等于把该跑的那一轮判成已跑。
+    """
+    from datetime import UTC
+
+    from lquant.sync.manager import _is_due
+
+    base = {"sync_id": "t", "kind": "collect", "schedule_time": "15:05",
+            "weekdays": "1,2,3,4,5", "enabled": True, "last_run_at": None}
+    monday = datetime(2026, 9, 7, 16, 0)
+    # 08:00Z == 16:00 CST（周一），已过 15:05 → 不再到期
+    assert _is_due({**base, "last_run_at": datetime(2026, 9, 7, 8, 0, tzinfo=UTC)},
+                   monday) is False
+    # 01:00Z == 09:00 CST，未过 15:05 → 仍到期
+    assert _is_due({**base, "last_run_at": datetime(2026, 9, 7, 1, 0, tzinfo=UTC)},
+                   monday) is True
+
+
+# ---------------------------------------------------------------- 新鲜度
+
+class _FakeCon:
+    """满足 `with reader() as con: con.execute(sql, params).fetchone()`。"""
+
+    def __init__(self, row=None) -> None:
+        self.row = row
+        self.calls: list[tuple] = []
+
+    def execute(self, sql, params=None):
+        self.calls.append((sql, params))
+        return self
+
+    def fetchone(self):
+        return self.row
+
+
+class _ReadCtx:
+    def __init__(self, con) -> None:
+        self._con = con
+
+    def __enter__(self):
+        return self._con
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _patch_lake(monkeypatch, latest):
+    """打桩 read_daily → 只含 trade_date 的惰性帧（None 即空湖）。"""
+    import polars as pl
+
+    from lquant.data.store import parquet as parquet_mod
+
+    df = pl.DataFrame({"trade_date": [latest]},
+                      schema={"trade_date": pl.Date})
+    monkeypatch.setattr(parquet_mod, "read_daily", lambda: df.lazy())
+
+
+def test_freshness_reports_all_three(monkeypatch) -> None:
+    """三块互不依赖：湖最新日 + 落后交易日、资讯最新时间 + 今日行数、财务覆盖窗口。"""
+    from datetime import date
+
+    from lquant.core import db as db_mod
+    from lquant.data.ingest import checkpoint as cp_mod
+    from lquant.data.store import catalog as catalog_mod
+    from lquant.sync import manager
+
+    _patch_lake(monkeypatch, date(2026, 9, 17))
+
+    class _Cal:
+        def range(self, start, end):
+            return [date(2026, 9, 17), date(2026, 9, 18), date(2026, 9, 21)]
+
+    monkeypatch.setattr(catalog_mod, "TradeCalendarRepo", _Cal)
+
+    con = _FakeCon((datetime(2026, 9, 18, 9, 5), 12))
+    monkeypatch.setattr(db_mod, "reader", lambda: _ReadCtx(con))
+
+    class _Cp:
+        done = ["A", "B"]
+
+        def __init__(self, name) -> None:
+            self.name = name
+
+        def covered_window(self, key):
+            return {"A": (date(2016, 1, 1), date(2026, 6, 30)),
+                    "B": (date(2020, 5, 4), date(2026, 9, 1))}[key]
+
+        def __len__(self):
+            return 2
+
+    monkeypatch.setattr(cp_mod, "Checkpoint", _Cp)
+
+    out = manager.freshness()
+    assert out["daily_lake"] == "2026-09-17"
+    assert out["lag_days"] == 2            # 含首尾共 3 天 → 落后 2 个交易日
+    assert out["news"] == {"latest": "2026-09-18 09:05:00", "today_rows": 12}
+    assert out["financial_pit"] == {"covered_start": "2016-01-01",
+                                    "covered_end": "2026-09-01",
+                                    "symbols": 2, "marked": 2}
+    # 资讯「今日行数」按 CN 日历日过滤 → 必须把日期参数传进 SQL
+    assert con.calls and con.calls[0][1] is not None
+
+
+def test_freshness_empty_lake_and_no_spans(monkeypatch) -> None:
+    """空湖 / 无覆盖区间 / 无资讯行：逐项为 None，不抛错。"""
+    from lquant.core import db as db_mod
+    from lquant.data.ingest import checkpoint as cp_mod
+    from lquant.sync import manager
+
+    _patch_lake(monkeypatch, None)
+    monkeypatch.setattr(db_mod, "reader", lambda: _ReadCtx(_FakeCon(None)))
+
+    class _CpEmpty:
+        done: list = []
+
+        def __init__(self, name) -> None:
+            self.name = name
+
+        def covered_window(self, key):  # pragma: no cover - 不该被调用
+            raise AssertionError("无 done 时不该查覆盖窗口")
+
+        def __len__(self):
+            return 0
+
+    monkeypatch.setattr(cp_mod, "Checkpoint", _CpEmpty)
+
+    out = manager.freshness()
+    assert out == {"daily_lake": None, "news": None, "financial_pit": None,
+                   "lag_days": None}
+
+
+def test_freshness_degrades_per_item(monkeypatch) -> None:
+    """任一模块不可用只降级该项 —— 状态视图整体报错会掩盖真问题。"""
+    from lquant.core import db as db_mod
+    from lquant.data.ingest import checkpoint as cp_mod
+    from lquant.data.store import parquet as parquet_mod
+    from lquant.sync import manager
+
+    def _boom(*a, **kw):
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(parquet_mod, "read_daily", _boom)
+    monkeypatch.setattr(db_mod, "reader", _boom)
+
+    class _BadCp:
+        def __init__(self, name) -> None:
+            raise RuntimeError("no cp dir")
+
+    monkeypatch.setattr(cp_mod, "Checkpoint", _BadCp)
+
+    out = manager.freshness()
+    assert out == {"daily_lake": None, "news": None, "financial_pit": None,
+                   "lag_days": None}
+
+
 def test_trading_day_ok_fallbacks(monkeypatch) -> None:
     from lquant.sync import manager
 

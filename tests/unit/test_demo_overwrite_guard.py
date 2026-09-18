@@ -111,6 +111,54 @@ def test_write_daily_demo_on_new_dates_is_allowed(lake_env):
     assert set(got["source"].to_list()) == {"baostock", "demo"}
 
 
+def test_reject_demo_overwrite_early_returns(lake_env):
+    """护栏自身的兜底分支：判不了就别拦（宁可漏也不误杀正常写入）。
+
+    三种「判不了」都必须直接放行 —— 否则会在缺列/空帧的正常路径上炸掉回填。
+    """
+    from lquant.data.store.parquet import _reject_demo_overwrite
+
+    real = _bars(["000001.SZ"], [D1], "baostock", 10.0)
+    demo = _bars(["000001.SZ"], [D1], "demo", 99.0)
+    path = lake_env / "dummy.parquet"
+
+    # ① 缺 source 列（老 schema / 非日线其它 writer 复用本函数）
+    _reject_demo_overwrite(real.drop("source"), demo, path)
+    # ② 任一侧空帧
+    _reject_demo_overwrite(real.head(0), demo, path)
+    _reject_demo_overwrite(real, demo.head(0), path)
+    # ③ 缺 (symbol, trade_date) 键列
+    _reject_demo_overwrite(real.drop("symbol"), demo, path)
+    _reject_demo_overwrite(real, demo.drop("trade_date"), path)
+    # ④ 新帧里没有演示行 → 与真实/演示无关，放行
+    _reject_demo_overwrite(real, _bars(["000002.SZ"], [D1], "baostock", 10.0), path)
+
+
+def test_refuse_guard_degrades_quietly(lake_env, monkeypatch):
+    """粗筛读不动湖时不炸 —— 逐键的精确护栏在写入层兜底。
+
+    读路径上抛异常会把「生成演示数据」变成不可用功能（比如湖正在被别的
+    进程写、或年文件坏了一个），而真正的保护已经在 write_daily 上。
+    """
+    from lquant.data.ingest.demo import _refuse_if_lake_has_real_data
+    from lquant.data.store import parquet as parquet_mod
+
+    def _boom(*a, **kw):
+        raise OSError("lake unreadable")
+
+    monkeypatch.setattr(parquet_mod, "read_daily", _boom)
+    _refuse_if_lake_has_real_data()          # 不抛即通过
+
+
+def test_refuse_guard_allows_pure_demo_lake(lake_env):
+    """湖里只有演示数据 → 允许重跑（幂等刷新演示环境是正常用法）。"""
+    from lquant.data.ingest.demo import _refuse_if_lake_has_real_data
+    from lquant.data.store.parquet import write_daily
+
+    write_daily(_bars(["000001.SZ"], [D1], "demo", 10.0))
+    _refuse_if_lake_has_real_data()          # 不抛即通过
+
+
 def test_generate_demo_refuses_on_lake_with_real_data(lake_env):
     """generate_demo 在写日历/标的/ETF 元数据之前就拒绝（不给 duckdb 留演示残留）。"""
     from lquant.core.errors import DataQualityError

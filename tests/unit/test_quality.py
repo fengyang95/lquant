@@ -202,6 +202,27 @@ def test_limit_breach_board_comes_from_code_not_snapshot():
     assert check_limit_breach(bars, sec_wrong) != []
 
 
+def test_limit_breach_tolerates_dirty_symbol_and_thin_security_table():
+    """兜底分支：代码段解析不了、security 连 board 列都没有 —— 都不能抛。
+
+    这两条都是防守路径（上游串码 / 老 schema 的快照表）。质量门禁自己抛异常，
+    等于从「报告问题」退化成「自己就是问题」—— 门禁不可用会掩盖真数据问题。
+    未知板性一律不参与越界判定（宁可少报也不误报）。
+    """
+    from lquant.data.quality.validators import board_from_code, check_limit_breach
+
+    assert board_from_code("not-a-symbol") == "unknown"
+    assert board_from_code("") == "unknown"
+
+    bars = _good_bars().with_columns(
+        symbol=pl.lit("BADCODE"),
+        close=pl.col("pre_close") * 1.5,      # 涨 50%：任何已知板性都该命中
+    )
+    # 老 schema 的 security：没有 board / sec_type / list_date 列
+    sec = pl.DataFrame({"symbol": ["BADCODE"], "is_st": [False]})
+    assert check_limit_breach(bars, sec) == []
+
+
 def test_limit_breach_exempts_new_listings_and_tick_rounding():
     """两条实测误报源：上市初期无涨跌幅限制、涨跌停价取整到分。"""
     from lquant.data.quality.validators import check_limit_breach

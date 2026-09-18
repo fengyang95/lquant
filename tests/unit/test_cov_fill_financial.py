@@ -204,6 +204,42 @@ def test_wider_request_window_repulls_from_start(fake_settings, monkeypatch):
     assert seen == [(date(2026, 1, 1), date(2026, 9, 18))]
 
 
+def test_todo_windows_reversed_and_covered(fake_settings):
+    """窗口记账的边界：请求窗口反了不产生增量段；已覆盖窗口整段跳过。"""
+    from lquant.data.ingest.checkpoint import Checkpoint
+
+    cp = Checkpoint("financial_pit_tushare")
+    # start > end：既不生成增量段，也不能造出一个 (start, end) 坏区间
+    assert fin._todo_windows(cp, ["a", "b"], date(2026, 9, 18),
+                             date(2026, 9, 1)) == {}
+
+    cp2 = Checkpoint("financial_pit_tushare")
+    cp2.record_coverage(["a"], date(2026, 6, 1), date(2026, 9, 18))
+    assert fin._todo_windows(cp2, ["a"], date(2026, 6, 1), date(2026, 9, 18)) == {}
+    # 只有尾段未覆盖 → 增量从已覆盖区间末尾的次日开始
+    assert fin._todo_windows(cp2, ["a"], date(2026, 6, 1),
+                             date(2026, 12, 31)) == {date(2026, 9, 19): ["a"]}
+
+
+def test_backfill_accepts_bare_provider_without_chain(fake_settings, monkeypatch):
+    """get_provider() 返回的不是链（没有 .providers）→ 直接当单源用。
+
+    checkpoint 键仍要带源名 —— 换源重跑不该被另一个源的记账误跳过。
+    """
+    from lquant.data.ingest.checkpoint import Checkpoint
+
+    ts = _Provider("tushare")
+    repo = _Repo()
+    monkeypatch.setattr(fin, "FinancialRepo", lambda: repo)
+    import lquant.data.providers as prov_mod
+
+    monkeypatch.setattr(prov_mod, "get_provider", lambda: ts)
+    out = fin.backfill_financial(["a"], start="2026-06-01", end="2026-09-18")
+    assert out["done"] == 1 and repo.count() == 1
+    assert Checkpoint("financial_pit_tushare").covers(
+        "a", date(2026, 6, 1), date(2026, 9, 18))
+
+
 def test_legacy_checkpoint_without_coverage_is_repulled(fake_settings, monkeypatch):
     """老 checkpoint 只有 done、没有覆盖区间 → 视为未覆盖，按窗口重拉。
 
@@ -220,4 +256,44 @@ def test_legacy_checkpoint_without_coverage_is_repulled(fake_settings, monkeypat
     assert out["done"] == 2 and len(ts.calls) == 1
     assert Checkpoint("financial_pit_tushare").covers("a", date(2026, 6, 1),
                                                       date(2026, 9, 18))
+
+
+def test_checkpoint_window_ledger_guards(fake_settings):
+    """窗口记账的四条防守：半窗口报错 / 反区间不记 / 脏条目跳过 / clear 清覆盖。
+
+    每条失守都会制造「静默缺口」：checkpoint 说覆盖了、数据其实没有；
+    或者反过来——重置后回填以为自己覆盖过而整段跳过。
+    """
+    import json
+
+    from lquant.data.ingest.checkpoint import Checkpoint
+
+    cp = Checkpoint("financial_pit_tushare")
+    # ① 只给一端必须明确报错：静默回落到 done 语义会把「没窗口」当「已完成」
+    with pytest.raises(ValueError, match="同时给或同时不给"):
+        cp.remaining(["a"], start=date(2026, 1, 1))
+    with pytest.raises(ValueError, match="同时给或同时不给"):
+        cp.remaining(["a"], end=date(2026, 1, 1))
+
+    # ② 反区间（end < start）不记覆盖、也不算 done，该标的仍算未完成
+    cp.record_coverage(["a"], date(2026, 9, 18), date(2026, 9, 1))
+    assert cp.covered_window("a") is None and cp.done == set()
+    assert cp.remaining(["a"], start=date(2026, 1, 1),
+                        end=date(2026, 9, 1)) == ["a"]
+
+    # ③ 文件里的脏条目（手改 / 半写）跳过，不影响同键的合法区间
+    cp.record_coverage(["b"], date(2026, 1, 1), date(2026, 6, 30))
+    raw = json.loads(cp.path.read_text(encoding="utf-8"))
+    raw["coverage"]["b"] += [["not-a-date", "2026-07-01"], ["2026-07-01"]]
+    cp.path.write_text(json.dumps(raw), encoding="utf-8")
+    cp2 = Checkpoint("financial_pit_tushare")
+    assert cp2.covered_window("b") == (date(2026, 1, 1), date(2026, 6, 30))
+    assert cp2.covers("b", date(2026, 1, 1), date(2026, 6, 30)) is True
+
+    # ④ clear 必须连覆盖区间一起清：只清 done 会让回填整段跳过（静默缺口）
+    cp2.clear()
+    assert cp2.done == set() and cp2.covered_window("b") is None
+    assert Checkpoint("financial_pit_tushare").covered_window("b") is None
+    assert cp2.remaining(["b"], start=date(2026, 1, 1),
+                         end=date(2026, 6, 30)) == ["b"]
 
