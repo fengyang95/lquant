@@ -14,13 +14,13 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Any
 
 import duckdb
 
 from lquant.core.db import reader, writer
-from lquant.core.types import today_cn
+from lquant.core.types import now_cn_naive, today_cn
 from lquant.data.ingest.checkpoint import Checkpoint
 from lquant.data.ingest.daily import backfill_pool
 
@@ -249,7 +249,7 @@ def _finalize(task_id, total, failed_all, early, *, done_count=None, error=None,
             [status, done_count,
              json.dumps(failed_syms, ensure_ascii=False),
              json.dumps(failed_all, ensure_ascii=False),
-             datetime.now(), msg, task_id],
+             now_cn_naive(), msg, task_id],
         )
     # 终态事件：SSE 订阅者据此收流（terminal=true 关闭 EventSource）
     try:
@@ -278,7 +278,7 @@ def _claim_running(task_id: str) -> None:
             "failed_symbols=?::JSON, failed_detail=?::JSON, rows_written=0, "
             "started_at=?, finished_at=NULL, message=NULL "
             "WHERE task_id=? AND status NOT IN ('running', 'ok')",
-            ["[]", "[]", datetime.now(), task_id],
+            ["[]", "[]", now_cn_naive(), task_id],
         ).fetchone()
     if not res or not res[0]:
         raise TaskConflictError(
@@ -414,7 +414,7 @@ def claim_retry(task_id: str, params: dict | None = None,
             "failed_symbols='[]'::JSON, failed_detail='[]'::JSON, rows_written=0, "
             "params=?, started_at=?, finished_at=NULL, message=NULL "
             f"WHERE task_id=? AND status IN {claimable}",
-            [stored_json, datetime.now(), task_id],
+            [stored_json, now_cn_naive(), task_id],
         ).fetchone()
     if not res or not res[0]:
         raise TaskConflictError(
@@ -474,7 +474,7 @@ def mark_canceled_pending(task_id: str) -> bool:
             "UPDATE data_task SET status='interrupted', finished_at=?, "
             "message='任务已取消（排队中未执行）' "
             "WHERE task_id=? AND status='pending'",
-            [datetime.now(), task_id],
+            [now_cn_naive(), task_id],
         ).fetchone()
     return bool(res and res[0])
 

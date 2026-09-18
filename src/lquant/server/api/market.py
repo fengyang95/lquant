@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from lquant.core.db import reader
+from lquant.core.types import now_cn_naive
 from lquant.market.collectors import list_collectors
 from lquant.server.deps import resolve_symbol
 
@@ -417,7 +418,7 @@ def schedules() -> dict:
     """采集时点 + 当前时刻应跑哪些（调度器状态，settings/看板用）。"""
     from lquant.market.scheduler import SCHEDULES, due_schedules, status
 
-    now = __import__("datetime").datetime.now()
+    now = now_cn_naive()
     due = due_schedules(now)
     items = [{"name": k, "time": v["time"], "desc": v["desc"], "due": k in due}
              for k, v in SCHEDULES.items()]

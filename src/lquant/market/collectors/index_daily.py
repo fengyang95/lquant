@@ -6,11 +6,11 @@
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
 import polars as pl
 
-from lquant.core.types import now_cn
+from lquant.core.types import now_cn, today_cn
 
 __all__ = ["INDEX_POOL", "fetch_index_daily"]
 
@@ -41,7 +41,7 @@ def fetch_index_daily(trade_date=None, start: str | None = None,
     """拉指数日线。缺省窗口 = 近 30 个自然日（调度器每日增量足够）。"""
     from datetime import timedelta
 
-    end_d = date.fromisoformat(end) if end else (datetime.now().date())
+    end_d = date.fromisoformat(end) if end else today_cn()
     start_d = date.fromisoformat(start) if start else end_d - timedelta(days=30)
 
     if demo:

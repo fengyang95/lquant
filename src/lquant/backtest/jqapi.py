@@ -58,7 +58,7 @@ from lquant.backtest.jq_fundamentals import JQFundamentalsState
 from lquant.backtest.metrics import perf_from_returns, turnover_from_trades
 from lquant.backtest.sandbox import safe_builtins
 from lquant.backtest.slippage import PctSlippage
-from lquant.core.types import parse_symbol
+from lquant.core.types import parse_symbol, today_cn
 from lquant.factors.panel import compute_factor_columns
 
 __all__ = ["JQRunner", "JQResult"]
@@ -320,7 +320,7 @@ class _JQContext:
     def __init__(self, runner: JQRunner) -> None:
         self.portfolio = _JQPortfolio(runner)
         self._r = runner
-        self.current_dt: datetime = datetime.combine(date.today(), dtime(9, 30))
+        self.current_dt: datetime = datetime.combine(today_cn(), dtime(9, 30))
         self.previous_date: date | None = None
         self.benchmark = "000300.SH"
         self.subports = []
@@ -390,7 +390,9 @@ class JQRunner:
         self.account = Account(cash=initial_cash)
         self._rules: dict = {}
         self._bars_today: dict[str, Bar] = {}
-        self._today: date = date.today()
+        # 占位值（每次 step 会被真实交易日覆盖）；用业务日保证与
+        # server / 采集链路的日期口径一致
+        self._today: date = today_cn()
         self._bucket = "open"                # open | close
         self._touched: set[str] = set()
         self.res = JQResult()

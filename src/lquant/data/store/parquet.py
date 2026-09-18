@@ -224,6 +224,50 @@ def _merge_quality_flags(old: pl.DataFrame, new: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def _reject_demo_overwrite(old: pl.DataFrame, new: pl.DataFrame, path: Path) -> None:
+    """禁止用演示数据（source='demo'）覆盖真实观测。
+
+    背景（2026-09-18 事故，同型事故当天发生两次）：`lq data demo` 的落点是
+    CWD 相对的 ./data/parquet。隔离 worktree 的标准姿势恰恰是把 data/parquet
+    **软链到主仓真实湖**，于是在 worktree 里跑一次演示数据生成，就会沿着软链
+    把 30 只合成标的（含 600519.SH / 510300.SH 等真代码）的**真实行覆盖成
+    合成值**，且湖内看不出任何异常（schema 一致、质量断言全过）。
+    实测一次是 21,300 行 / 3 个年分区 / 2024-01-01~2026-09-18。
+
+    堵在写入层而不是调用层：调用方有 CLI（`lq data demo`）、`lquant.sh
+    bootstrap`、pre-push 钩子兜底、以及并发会话里手敲的命令 —— 逐个设防
+    必然漏。合成数据覆盖真实观测在任何场景下都不是想要的结果，所以这里
+    直接拒绝（真实数据覆盖演示数据仍然允许，那是「换真数据」的正常路径）。
+    """
+    if "source" not in new.columns or "source" not in old.columns:
+        return
+    if not old.height or not new.height:
+        return
+    keys = ["symbol", "trade_date"]
+    if not set(keys) <= set(new.columns) or not set(keys) <= set(old.columns):
+        return
+    demo_keys = new.filter(pl.col("source") == "demo").select(keys).unique()
+    if not len(demo_keys):
+        return
+    hit = (
+        old.filter(pl.col("source") != "demo")
+        .select(keys)
+        .join(demo_keys, on=keys, how="inner")
+        .unique()
+    )
+    if not len(hit):
+        return
+    sample = hit.head(3).to_dicts()
+    from lquant.core.errors import DataQualityError
+
+    raise DataQualityError(
+        "DEMO_OVERWRITE_REAL",
+        f"拒绝用演示数据覆盖真实数据：{len(hit)} 个 (symbol, trade_date) 键在 "
+        f"{path.name} 已有真实行（示例 {sample}）。演示数据（source='demo'）"
+        f"绝不覆盖真实观测 —— 若确实要重置该分区，请先手工删除或归档该文件。"
+    )
+
+
 def write_daily(df: pl.DataFrame) -> list[Path]:
     if not len(df):
         return []
@@ -233,10 +277,11 @@ def write_daily(df: pl.DataFrame) -> list[Path]:
         p = _daily_path(y)
         p.parent.mkdir(parents=True, exist_ok=True)
         g = g.drop("y")
-        # 同key覆盖：读旧 → flags 合并 → 覆盖合并 → 原子写
+        # 同key覆盖：读旧 → 演示数据护栏 → flags 合并 → 覆盖合并 → 原子写
         with _file_lock(p):
             if p.exists():
                 old = pl.read_parquet(p)
+                _reject_demo_overwrite(old, g, p)
                 g = _merge_quality_flags(old, g)
                 g = _overlay(old, g, ["symbol", "trade_date"])
             g = g.sort(["symbol", "trade_date"])

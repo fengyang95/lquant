@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime
 from typing import Any
 
 from duckdb import DuckDBPyConnection
 
+from lquant.core.types import now_cn_naive
 from lquant.news.model import NewsItem
 
 # quality_flags 位定义
@@ -47,7 +47,9 @@ def insert_news(con: DuckDBPyConnection, items: Iterable[NewsItem]) -> int:
         published_at = item.published_at
         quality_flags = item.quality_flags
         if published_at is None:
-            published_at = datetime.now()
+            # 兜底发布时间取 CN 墙钟：/summary 按 CAST(published_at AS DATE)
+            # 对业务日聚合，本机时区非 Asia/Shanghai 时这条会落到错误的日期
+            published_at = now_cn_naive()
             quality_flags |= FLAG_NO_PUBLISHED_AT
         content = item.content
         if len(content) > CONTENT_MAX_LEN:
@@ -66,7 +68,7 @@ def insert_news(con: DuckDBPyConnection, items: Iterable[NewsItem]) -> int:
                 list(item.symbols),
                 item.industry_code,
                 published_at,
-                item.collected_at or datetime.now(),
+                item.collected_at or now_cn_naive(),
                 quality_flags,
                 item.source_tag,
             ],

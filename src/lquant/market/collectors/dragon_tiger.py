@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta
 
 import polars as pl
 
-from lquant.core.types import now_cn, parse_symbol
+from lquant.core.types import now_cn, parse_symbol, today_cn
 from lquant.market.em_client import em_get
 
 __all__ = ["fetch_dragon_tiger"]
@@ -89,7 +89,7 @@ def _empty() -> pl.DataFrame:
 def _as_date(v) -> date:
     """缺省取昨日（榜 T+1 公布）；周末自动回退到周五。"""
     if v is None:
-        d = datetime.now().date() - timedelta(days=1)
+        d = today_cn() - timedelta(days=1)
         if d.weekday() >= 5:
             d -= timedelta(days=d.weekday() - 4)
         return d

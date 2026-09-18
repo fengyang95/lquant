@@ -191,10 +191,10 @@ def get_index_stocks(index_symbol, date=None):
     """指数当下成分（默认今天）。date 指定时按该日已生效成分返回（防前视）。
 
     index_symbol 用 JQ 习惯的 '000300.XSHG' 或平台内码 '000300.SH' 皆可。
+    缺省日走 today_cn()：成分表按业务日生效，服务器时区非 Asia/Shanghai 时
+    date.today() 会错位一天（可能取到尚未生效的下一批成分）。
     """
-    from datetime import date as _date  # 参数名 date 遮蔽了模块级类名，用别名引用
-
-    from lquant.core.types import parse_symbol
+    from lquant.core.types import parse_symbol, today_cn
     from lquant.data.store.catalog import IndexConsRepo
 
     try:
@@ -205,7 +205,7 @@ def get_index_stocks(index_symbol, date=None):
     else:
         code = str(sym)
     if date is None:
-        date = _date.today()
+        date = today_cn()
     return IndexConsRepo().symbols_as_of(code, date)
 
 

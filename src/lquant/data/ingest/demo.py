@@ -75,11 +75,50 @@ def _synth_bars(symbol: str, dates: list, seed: int, base_price: float,
     })
 
 
+def _refuse_if_lake_has_real_data() -> None:
+    """湖里已有真实行 → 在写任何东西之前拒绝生成演示数据。
+
+    演示数据的落点是 CWD 相对的 ./data/parquet，而隔离 worktree 的标准姿势正是
+    把 data/parquet 软链到主仓真实湖 —— 一次误跑就会把 20 只真代码股票 + 10 只
+    真代码 ETF 的真实行覆盖成合成值（2026-09-18 事故，实测 21,300 行 /
+    2024-01-01~2026-09-18，schema 与质量断言全都看不出异常）。
+
+    这里先做一次粗筛（湖里有没有非 demo 行）快速失败，避免连日历/标的/ETF 元
+    数据一起被演示值覆盖；逐键的精确护栏在 write_daily（写入层兜底）。
+    """
+    from lquant.core.errors import DataQualityError
+    from lquant.data.store.parquet import read_daily
+
+    try:
+        lake = read_daily().select(["symbol", "trade_date", "source"]).collect()
+    except Exception:  # noqa: BLE001 - 读不动就交给写入层兜底，不在读路径上炸
+        return
+    if not len(lake) or "source" not in lake.columns:
+        return
+    real = lake.filter(pl.col("source") != "demo")
+    if not len(real):
+        return
+    from lquant.core.config import get_settings
+
+    raise DataQualityError(
+        "DEMO_OVERWRITE_REAL",
+        f"目标湖已有 {len(real):,} 行真实日线（{real['symbol'].n_unique()} 只标的），"
+        f"拒绝写入演示数据。演示数据只用于全新/空湖；"
+        f"若要重置请先归档或删除 ({get_settings().parquet_dir})/daily。"
+    )
+
+
 def generate_demo(start: str = "2024-01-01", end: str | None = None) -> dict:
-    """生成合成地基 + 日线。幂等：同 key 直接覆盖。"""
+    """生成合成地基 + 日线。幂等：同 key 直接覆盖。
+
+    拒绝在已有真实数据的湖上运行（见 _refuse_if_lake_has_real_data）——
+    合成数据覆盖真实观测在任何场景下都不是想要的结果。
+    """
     from datetime import date
 
     from loguru import logger
+
+    _refuse_if_lake_has_real_data()
 
     end = end or today_cn().isoformat()
     dates = _calendar(start, end)["trade_date"].to_list()

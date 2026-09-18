@@ -15,6 +15,7 @@ from datetime import datetime
 import polars as pl
 
 from lquant.core.logging import get_logger
+from lquant.core.types import now_cn_naive
 from lquant.data.store.catalog import upsert
 from lquant.market.collectors import COLLECTORS
 from lquant.market.schema import TABLE_COLUMNS, ensure_market_tables
@@ -34,7 +35,7 @@ SCHEDULES: dict[str, dict] = {
 
 def due_schedules(now: datetime | None = None) -> list[str]:
     """当前时刻应该跑哪些时点（用于 cron 之外的常驻调度）。"""
-    now = now or datetime.now()
+    now = now or now_cn_naive()
     hhmm = now.strftime("%H:%M")
     return [k for k, v in SCHEDULES.items() if v["time"] <= hhmm <= "23:59"]
 
@@ -101,7 +102,7 @@ def persist(frames: dict[str, pl.DataFrame]) -> dict[str, int]:
 def collect_and_save(schedule: str | None = "close", trade_date=None, *,
                      demo: bool = False) -> dict:
     """采集 + 落库 + 健康度记录一步到位。CLI 与定时任务都调这个。"""
-    started = datetime.now()
+    started = now_cn_naive()
     d = trade_date or started.date()
     frames: dict[str, pl.DataFrame] = {}
     errors: dict[str, str] = {}
@@ -109,7 +110,7 @@ def collect_and_save(schedule: str | None = "close", trade_date=None, *,
         meta = COLLECTORS.meta(k)
         if schedule and meta.get("schedule") != schedule:
             continue
-        t0 = datetime.now()
+        t0 = now_cn_naive()
         try:
             frames[k] = COLLECTORS.get(k)(trade_date=trade_date, demo=demo)
             errs = ""
@@ -118,12 +119,12 @@ def collect_and_save(schedule: str | None = "close", trade_date=None, *,
             errs = f"{type(e).__name__}: {e}"
             log.exception(f"采集器 {k} 失败 schedule={schedule} trade_date={d}")
             if meta.get("critical"):
-                _log_one(k, d, t0, datetime.now(), 0, "failed", errs)
+                _log_one(k, d, t0, now_cn_naive(), 0, "failed", errs)
                 raise RuntimeError(f"关键采集器 {k} 失败（数据不可回溯）: {e}") from e
             errors[k] = errs
-            _log_one(k, d, t0, datetime.now(), 0, "failed", errs)
+            _log_one(k, d, t0, now_cn_naive(), 0, "failed", errs)
             continue
-        _log_one(k, d, t0, datetime.now(), len(frames[k]),
+        _log_one(k, d, t0, now_cn_naive(), len(frames[k]),
                  "ok" if len(frames[k]) else "empty")
 
     counts = persist(frames)

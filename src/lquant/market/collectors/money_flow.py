@@ -14,7 +14,7 @@ from datetime import date, datetime
 import polars as pl
 
 from lquant.core.errors import DataUnavailable
-from lquant.core.types import now_cn, parse_symbol
+from lquant.core.types import now_cn, parse_symbol, today_cn
 from lquant.market.em_client import em_get
 
 __all__ = ["fetch_money_flow", "fetch_northbound"]
@@ -73,7 +73,7 @@ def fetch_money_flow(trade_date=None, top: int = 200, *, demo: bool = False) -> 
 def _as_date(v) -> date:
     """采集器统一入参：None 用今天，字符串转 date。"""
     if v is None:
-        return datetime.now().date()
+        return today_cn()
     if isinstance(v, str):
         return datetime.strptime(v.replace("-", ""), "%Y%m%d").date()
     return v

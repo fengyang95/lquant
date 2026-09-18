@@ -15,6 +15,7 @@ from fastapi import HTTPException, Query
 from pydantic import BaseModel
 
 from lquant.core.db import reader, writer
+from lquant.core.types import today_cn
 from lquant.server.envelope import make_router
 
 router = make_router(prefix="/news", tags=["news"])
@@ -239,7 +240,9 @@ def retry_news_task(task_id: str) -> dict:
 @router.get("/summary")
 def news_summary(day: str | None = Query(default=None)) -> dict:
     """当日计数：by source / by category / 行业 top10；空数据返回空列表不 500。"""
-    day = _parse_day_or_422(day) or date.today().isoformat()
+    # 缺省日走 today_cn()：资讯按业务日归档，服务器时区非 Asia/Shanghai
+    # 时 date.today() 会让「今天」整体错位一天（凌晨时段的请求尤其明显）
+    day = _parse_day_or_422(day) or today_cn().isoformat()
     with reader() as con:
         _ensure_schema()
         rows = con.execute(

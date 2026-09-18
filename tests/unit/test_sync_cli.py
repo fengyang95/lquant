@@ -27,6 +27,45 @@ def test_sync_status_lists_jobs(monkeypatch):
     assert "15:05" in res.output
 
 
+def test_sync_status_prints_freshness_sections(monkeypatch):
+    """`status` 必须把三块新鲜度都打出来，缺数据时给出「为什么是 -」。
+
+    last_status=ok 不代表数据是新的（空转/断点全跳过/源零返回都记 ok），
+    所以新鲜度是唯一能看出「同步有没有真的在跑」的地方 —— 打不出来这一栏
+    就白加了。
+    """
+    import lquant.cli.commands.sync as sync_cmd
+
+    monkeypatch.setattr(sync_cmd.manager, "list_jobs", _fake_jobs)
+    monkeypatch.setattr(sync_cmd.manager, "freshness", lambda: {
+        "daily_lake": "2026-09-17", "lag_days": 1,
+        "news": {"latest": "2026-09-18 09:05:00", "today_rows": 12},
+        "financial_pit": {"covered_start": "2016-01-01",
+                          "covered_end": "2026-09-01",
+                          "symbols": 5549, "marked": 5549}})
+    res = CliRunner().invoke(sync_cmd.sync, ["status"])
+    assert res.exit_code == 0, res.output
+    assert "日线湖最新交易日: 2026-09-17 （落后 1 个交易日）" in res.output
+    assert "资讯最新一条: 2026-09-18 09:05:00（今日 12 条）" in res.output
+    assert ("PIT 财务覆盖区间: 2016-01-01 ~ 2026-09-01"
+            "（5549 只，记账 5549 只）") in res.output
+
+
+def test_sync_status_freshness_all_missing(monkeypatch):
+    """三块都拿不到 → 逐项显示 `-` + 原因，不能整体报错。"""
+    import lquant.cli.commands.sync as sync_cmd
+
+    monkeypatch.setattr(sync_cmd.manager, "list_jobs", _fake_jobs)
+    monkeypatch.setattr(sync_cmd.manager, "freshness", lambda: {
+        "daily_lake": None, "lag_days": None, "news": None,
+        "financial_pit": None})
+    res = CliRunner().invoke(sync_cmd.sync, ["status"])
+    assert res.exit_code == 0, res.output
+    assert "日线湖最新交易日: -" in res.output
+    assert "news_item 表未建或无数据" in res.output
+    assert "无窗口记账" in res.output
+
+
 def test_sync_tick_calls_manager(monkeypatch):
     import lquant.cli.commands.sync as sync_cmd
 

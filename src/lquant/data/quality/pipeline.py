@@ -147,7 +147,10 @@ def _try_load_security() -> pl.DataFrame | None:
     try:
         from lquant.core.db import reader
         with reader() as con:
-            return con.execute("SELECT symbol, board, is_st FROM security").pl()
+            # sec_type / list_date 是涨跌停检查的必需列：板性要从代码段推
+            # （board 对股票全为 NULL），上市天数决定新股豁免（见 validators）
+            return con.execute(
+                "SELECT symbol, board, is_st, sec_type, list_date FROM security").pl()
     except Exception:
         log.exception("security 快照加载失败，board/is_st 检查降级跳过")
         return None

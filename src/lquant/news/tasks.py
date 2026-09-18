@@ -12,13 +12,13 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import date
 from typing import Any
 
 from duckdb import DuckDBPyConnection
 
 from lquant.core.config import load_yaml
-from lquant.core.types import today_cn
+from lquant.core.types import now_cn_naive, today_cn
 from lquant.news.link import build_name_to_code, link_industry, link_symbols
 from lquant.news.model import NewsItem
 from lquant.news.sources.base import get_sources
@@ -85,7 +85,7 @@ def create_task(con: DuckDBPyConnection, kind: str, params: dict[str, Any]) -> d
     if existing:
         raise TaskConflictError(f"another news task is pending/running: {existing[0][0]}")
 
-    task_id = f"news_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+    task_id = f"news_{now_cn_naive().strftime('%Y%m%d%H%M%S%f')}"
     con.execute(
         "INSERT INTO news_task VALUES (?, ?, ?, 'pending', ?, NULL, NULL, NULL, NULL)",
         [task_id, kind, json.dumps(params), json.dumps({})],
@@ -197,7 +197,7 @@ def execute_task(con: DuckDBPyConnection, task_id: str, runner: Runner | None = 
         )
     con.execute(
         "UPDATE news_task SET status='running', started_at=? WHERE task_id=?",
-        [datetime.now(), task_id],
+        [now_cn_naive(), task_id],
     )
 
     params = task["params"]
@@ -245,7 +245,7 @@ def retry_task(con: DuckDBPyConnection, task_id: str, runner: Runner | None = No
 def _finish(con: DuckDBPyConnection, task_id: str, sources_status, rows_written):  # type: ignore[no-untyped-def]
     """聚合状态并落库,返回任务结果 dict。"""
     status = _aggregate(sources_status)
-    finished_at = datetime.now()
+    finished_at = now_cn_naive()
     con.execute(
         "UPDATE news_task SET status=?, sources_status=?, rows_written=?,"
         " finished_at=?, message=? WHERE task_id=?",
@@ -269,6 +269,6 @@ def mark_interrupted_on_startup(con: DuckDBPyConnection) -> int:
     con.execute(
         "UPDATE news_task SET status='interrupted',"
         " finished_at=? WHERE status IN ('pending', 'running')",
-        [datetime.now()],
+        [now_cn_naive()],
     )
     return n

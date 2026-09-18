@@ -6,8 +6,9 @@ import json
 import logging
 import threading
 import time
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 
+from lquant.core.types import today_cn
 from lquant.monitor.emit import EVENTS_KEY
 from lquant.monitor.ring import api_ring, error_ring, local_events
 
@@ -195,12 +196,17 @@ def _write_errors(con, pts) -> int:
 
 
 def _should_cleanup_today() -> bool:
-    """只判断不更新状态；清理成功后由 _mark_cleanup_done 记账。"""
-    return _CLEANUP_STATE["last"] != date.today()
+    """只判断不更新状态；清理成功后由 _mark_cleanup_done 记账。
+
+    日期用 today_cn()：清理是「每个业务日一次」的节流，与全仓业务日
+    口径统一（服务器时区非 Asia/Shanghai 时 date.today() 会在 UTC 午夜
+    附近提前/推迟触发一次）。
+    """
+    return _CLEANUP_STATE["last"] != today_cn()
 
 
 def _mark_cleanup_done() -> None:
-    _CLEANUP_STATE["last"] = date.today()
+    _CLEANUP_STATE["last"] = today_cn()
 
 
 def _cleanup(con, retention_days: int, now: float | None = None) -> None:
