@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 from datetime import date, datetime
@@ -34,6 +35,12 @@ def _save_report_atomic(html_str: str, path: Path) -> Path:
     tmp.write_text(html_str, encoding="utf-8")
     os.replace(tmp, path)  # 同文件系统原子替换
     return path
+
+def _jf(v, nd=4) -> float | None:
+    """非有限值统一转 null：metrics/series 混入 NaN/Inf 时 json.dumps 会输出
+    裸 NaN 字面量，前端 JSON.parse 直接炸（响应体是非法 JSON）。"""
+    return round(float(v), nd) if v is not None and math.isfinite(float(v)) else None
+
 
 REPORT_DIR = Path("data/reports")
 
@@ -206,10 +213,16 @@ def _universe_symbols(universe: str | None) -> list[str] | None:
 
 
 def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
-    """现算因子。优先命中 Qlib Alpha158 内置因子（白名单探测），其次研究常用形态。"""
+    """现算因子。优先命中 Qlib Alpha158 内置因子（白名单探测），其次研究常用形态。
+
+    入口先按 (symbol, trade_date) 排序：pct_change/rolling 的 .over("symbol")
+    依赖组内行序为日期升序，read_daily 本身不保证顺序（当前只是湖写入时
+    排过序）—— 不防的话未来写入顺序一变，因子值静默错位。
+    """
     from lquant.factors.qlib_alpha import compute as qlib_compute
     from lquant.factors.qlib_alpha import has_factor
 
+    df = df.sort(["symbol", "trade_date"])
     if has_factor(formula):
         return qlib_compute(df, formula)
     if "$" in formula:                     # DSL 表达式 —— 统一走 FactorEngine
@@ -315,8 +328,8 @@ def _neutral_ladder(d: pl.DataFrame, col: str, ret_col: str,
             continue
         out.append({
             "label": label, "covs": covs,
-            "ic_mean": round(float(s["ic"].mean()), 4),
-            "rank_ic_mean": round(float(s["rank_ic"].mean()), 4),
+            "ic_mean": _jf(s["ic"].mean()),
+            "rank_ic_mean": _jf(s["rank_ic"].mean()),
             "n_days": len(s),
             "coverage": round(min((cov_report.get(c, 1.0) for c in covs), default=1.0), 4),
         })
@@ -375,14 +388,15 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
         "factor": req.factor,
         "formula": req.formula,
         "n_samples": len(d),
-        "ic": {"mean": round(ic["mean"], 4), "ir": round(ic["ir"], 3),
-               "t_stat": round(ic["t_stat"], 2), "positive_rate": round(ic["positive_rate"], 4),
-               "ic_gt_002_rate": round(ic["ic_gt_002_rate"], 4)},
-        "rank_ic_mean": round(res["ic"]["rank_ic"]["mean"], 4),
-        "long_short": {"annual_return": round(ls["annual_return"], 4),
-                       "sharpe": round(ls["sharpe"], 2),
-                       "max_drawdown": round(ls["max_drawdown"], 4)},
-        "monotonicity": round(res["quantile"]["monotonicity"], 3),
+        # _jf 兜底：薄截面/常数因子下这些值可能是 NaN，裸 NaN 会产出非法 JSON
+        "ic": {"mean": _jf(ic["mean"]), "ir": _jf(ic["ir"], 3),
+               "t_stat": _jf(ic["t_stat"], 2), "positive_rate": _jf(ic["positive_rate"]),
+               "ic_gt_002_rate": _jf(ic["ic_gt_002_rate"])},
+        "rank_ic_mean": _jf(res["ic"]["rank_ic"]["mean"]),
+        "long_short": {"annual_return": _jf(ls["annual_return"]),
+                       "sharpe": _jf(ls["sharpe"], 2),
+                       "max_drawdown": _jf(ls["max_drawdown"])},
+        "monotonicity": _jf(res["quantile"]["monotonicity"], 3),
         "half_life": res["decay"]["half_life"],
         "suggested_rebalance": res["decay"]["suggested_rebalance"],
         "excess": {},                    # 计算体在下方超额块完成后回填
@@ -393,15 +407,10 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
     }
 
     # ---- series（原 evaluate_series 计算体） ----
-    import math
-
     import numpy as np
 
     from lquant.factors.evaluate import ic_by_year, ic_series, quantile_nav, quantile_summary
     from lquant.factors.evaluate.decay import decay_profile
-
-    def _jf(v, nd=4) -> float | None:
-        return round(float(v), nd) if v is not None and math.isfinite(v) else None
 
     s = ic_series(d, "_factor", ret_col)
     ic_dates = [str(x) for x in s["trade_date"].to_list()]
@@ -1035,12 +1044,12 @@ def synthesize(req: SynthesizeIn) -> dict:
     return {
         "factor": name, "formulas": req.formulas, "method": req.method,
         "n_samples": len(d),
-        "ic": {"mean": round(ic["mean"], 4), "ir": round(ic["ir"], 3),
-               "t_stat": round(ic["t_stat"], 2)},
-        "long_short": {"annual_return": round(ls["annual_return"], 4),
-                       "sharpe": round(ls["sharpe"], 2),
-                       "max_drawdown": round(ls["max_drawdown"], 4)},
-        "monotonicity": round(res["quantile"]["monotonicity"], 3),
+        "ic": {"mean": _jf(ic["mean"]), "ir": _jf(ic["ir"], 3),
+               "t_stat": _jf(ic["t_stat"], 2)},
+        "long_short": {"annual_return": _jf(ls["annual_return"]),
+                       "sharpe": _jf(ls["sharpe"], 2),
+                       "max_drawdown": _jf(ls["max_drawdown"])},
+        "monotonicity": _jf(res["quantile"]["monotonicity"], 3),
         "half_life": res["decay"]["half_life"],
         "report_url": f"/api/factors/reports/{name}",
     }

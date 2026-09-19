@@ -24,8 +24,14 @@ def add_quantile(df: pl.DataFrame, factor: str, n_groups: int = 10,
     用 rank 而不是 qcut：qcut 遇到大量重复值（比如停牌、新股一字）会报错
     或产生不均匀分组，rank 分位则稳定得多。
     """
-    cnt = pl.col(factor).count().over(date_col)
-    q = (pl.col(factor).rank("ordinal").over(date_col) * n_groups / cnt).ceil().clip(1, n_groups)
+    # NaN 不是 null：polars rank 会把 NaN 排在所有有限值之后（实测 1.44），
+    # 不挡的话 NaN 行全进最高分位组且 count() 分母被计入，整体分组挤偏
+    fin = pl.col(factor).is_finite()
+    cnt = fin.sum().over(date_col)
+    q = (pl.when(fin)
+         .then(pl.col(factor).rank("ordinal").over(date_col) * n_groups / cnt)
+         .otherwise(None)
+         .ceil().clip(1, n_groups))
     return df.with_columns(q.cast(pl.Int32).alias(out))
 
 

@@ -49,6 +49,9 @@ def ic_series(
             ]
         )
         .drop_nulls()
+        # NaN 不是 null：drop_nulls 拦不住，单个 NaN 会让当日 corr 变 NaN
+        # （进而毒化整个均值/IR），且被 pl.len() 计入 min_obs 门槛
+        .filter(pl.col(factor).is_finite() & pl.col(ret_col).is_finite())
     )
 
     out = (

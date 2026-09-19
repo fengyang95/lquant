@@ -56,7 +56,9 @@ export default function FactorsMinePage() {
     setBusy(generator);
     setMsg('');
     try {
-      const r = await post<MineResult>('/factors/mine/run', { agent, generator, n });
+      // 必须显式 sync:true：后端默认异步返回 202 {task_id}，前端没有任务轮询，
+      // 按同步结果解析会全部 undefined
+      const r = await post<MineResult>('/factors/mine/run', { agent, generator, n, sync: true });
       setMsg(`✓ run ${r.run_id}: 评估 ${r.n_evaluated} / 幸存 ${r.n_survivors}`);
       setSurvivors(r.survivors ?? []);
       setCurrentRun(r.run_id);

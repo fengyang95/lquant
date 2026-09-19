@@ -24,7 +24,10 @@ def top_n_returns(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
 
     members 列为当日持仓 symbol 列表 —— 供换手率计算复用，避免二次排序。
     """
-    d = df.select([date_col, "symbol", factor, ret_col]).drop_nulls(subset=[factor, ret_col])
+    # NaN 不是 null：rank 会把 NaN 排到最大（descending 下优先入选 Top-N），
+    # 必须连 NaN 一起剔（polars 实测 NaN rank=3 高于全部有限值）
+    d = (df.select([date_col, "symbol", factor, ret_col])
+         .filter(pl.col(factor).is_finite() & pl.col(ret_col).is_finite()))
     if not len(d):
         return pl.DataFrame(schema={"date": d[date_col].dtype, "ret": pl.Float64,
                                     "members": pl.List(pl.Utf8)})
