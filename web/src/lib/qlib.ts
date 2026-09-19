@@ -83,5 +83,8 @@ export function cancelQlibRun(id: string): Promise<{ canceled: boolean }> {
 }
 
 export function compareQlibRuns(ids: [string, string]) {
-  return postData('/qlib/runs/compare', { ids });
+  return postData<{
+    runs: { id: string; config: string; exp_name: string; status: string }[];
+    rows: CompareRow[];
+  }>('/qlib/runs/compare', { ids });
 }
