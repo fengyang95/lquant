@@ -70,19 +70,25 @@ def perf_from_returns(returns, *, dates: list[date] | None = None,
     if n == 0:
         return {"n_periods": 0}
 
-    nav = np.cumprod(1.0 + r)
+    # 初始净值 1.0 是第一个历史峰值，必须纳入回撤计算，
+    # 否则"从投入第一天就亏损"的回撤会被完全抹掉。
+    nav_with_initial = np.concatenate([[1.0], np.cumprod(1.0 + r)])
+    nav = nav_with_initial[1:]  # 对外净值序列仍从首期收益起
     total = float(nav[-1] - 1.0)
     ann_ret = _annualize(total, n, periods_per_year)
     vol = float(np.std(r, ddof=1) * math.sqrt(periods_per_year)) if n > 1 else float("nan")
 
-    downside = r[r < 0]
-    dvol = (float(np.std(downside, ddof=1) * math.sqrt(periods_per_year))
-            if len(downside) > 1 else float("nan"))
+    # 标准下行偏差：所有周期计入分母（正收益贡献 0），MAR 默认 0。
+    # 只对负收益求 std 会系统性高估 Sortino。
+    downside_dev = float(np.sqrt(np.mean(np.minimum(r - risk_free, 0.0) ** 2)) * math.sqrt(periods_per_year))
 
     sharpe = ((ann_ret - risk_free) / vol) if vol and vol > 1e-12 and math.isfinite(vol) else float("nan")
-    sortino = ((ann_ret - risk_free) / dvol) if dvol and dvol > 1e-12 and math.isfinite(dvol) else float("nan")
+    sortino = ((ann_ret - risk_free) / downside_dev) if downside_dev > 1e-12 and math.isfinite(downside_dev) else float("nan")
 
-    mdd, pi, ti = max_drawdown(nav)
+    # 回撤基于含初始峰值 1.0 的净值序列；下标回退 1 对齐到 returns 位置
+    mdd, pi, ti = max_drawdown(nav_with_initial)
+    pi = max(pi - 1, 0) if pi is not None else None
+    ti = max(ti - 1, 0) if ti is not None else None
     calmar = (ann_ret / abs(mdd)) if mdd < -1e-9 and math.isfinite(ann_ret) else float("nan")
 
     wins = r[r > 0]
@@ -90,9 +96,11 @@ def perf_from_returns(returns, *, dates: list[date] | None = None,
     win_rate = float(len(wins) / n) if n else float("nan")
     payoff = (float(wins.mean() / abs(losses.mean()))
               if len(wins) and len(losses) and abs(losses.mean()) > 1e-12 else float("nan"))
+    # 注意：payoff_ratio 是「日度收益」口径（上涨日均幅 / 下跌日均幅），
+    # 不是交易级盈亏比 —— 前端/报表展示时请勿标注为"盈亏比"。
 
     # 长回撤期：从峰值到修复的持续期，比最大回撤幅度更能反映实盘痛苦程度
-    dd = drawdown_series(nav)
+    dd = drawdown_series(nav_with_initial)[1:]
     underwater = int(np.sum(dd < -1e-9))
     longest_dd = _longest_underwater(dd)
 
@@ -158,8 +166,17 @@ def perf_from_nav(nav, *, dates: list[date] | None = None,
         return {"n_periods": max(len(a) - 1, 0)}
     with np.errstate(divide="ignore", invalid="ignore"):
         r = a[1:] / np.where(a[:-1] > 0, a[:-1], np.nan) - 1.0
+    if dates is not None:
+        # 坏收益率（NAV≤0 产生的 inf/nan）被剔除时，对应日期必须一并剔除，
+        # 否则 dates 与 returns 错位 —— start/end/月度聚合全部静默错日。
+        if len(dates) != len(a):
+            raise ValueError("dates 与 nav 长度不一致")
+        d = np.asarray(dates)[1:]
+        dates_kept = list(d[np.isfinite(r)])
+    else:
+        dates_kept = None
     r = r[np.isfinite(r)]
-    out = perf_from_returns(r, dates=dates[1:] if dates else None,
+    out = perf_from_returns(r, dates=dates_kept,
                             periods_per_year=periods_per_year, risk_free=risk_free)
     out["nav"] = a
     return out
@@ -178,13 +195,16 @@ def monthly_returns(dates, returns) -> dict[tuple[int, int], float]:
     return {k: v - 1.0 for k, v in acc.items()}
 
 
-def turnover_from_trades(trades, *, periods: int = 0) -> dict:
-    """换手率：成交金额 / 组合净值，按周期平均。
+def turnover_from_trades(trades, *, nav: list | None = None) -> dict:
+    """换手率：|成交金额| / 平均净值 / 交易日数（无量纲，可跨策略比较）。
 
-    trades : 可迭代的 (date, amount) 或 dict 列表，含 amount / nav 字段
+    trades : 可迭代的 (date, amount) 或 dict 列表，含 amount 字段
+    nav    : [(date, nav), ...] 净值序列。提供时返回真正的换手率；
+             缺省时 turnover_per_period 为 None（无法归一，宁缺毋假）。
     """
     if trades is None or len(trades) == 0:
-        return {"total_amount": 0.0, "turnover_per_period": 0.0, "n_trades": 0}
+        return {"total_amount": 0.0, "turnover_per_period": 0.0, "n_trades": 0,
+                "unit": "amount"}
     amounts = []
     for t in trades:
         if isinstance(t, dict):
@@ -193,11 +213,20 @@ def turnover_from_trades(trades, *, periods: int = 0) -> dict:
             amounts.append(float(t[1]))
     a = np.asarray(amounts, dtype=float)
     total = float(np.nansum(np.abs(a)))
-    return {
+    out = {
         "n_trades": int(len(a)),
         "total_amount": total,
-        "turnover_per_period": float(np.nanmean(np.abs(a))) if len(a) else 0.0,
+        "turnover_per_period": None,   # 无净值序列无法归一，宁缺毋假
+        "unit": "amount",
     }
+    if nav:
+        navs = np.asarray([float(x[1]) for x in nav], dtype=float)
+        navs = navs[np.isfinite(navs) & (navs > 0)]
+        if len(navs) and float(np.mean(navs)) > 0:
+            n_days = max(len(navs), 1)
+            out["turnover_per_period"] = float(total / n_days / float(np.mean(navs)))
+            out["unit"] = "ratio"
+    return out
 
 
 def summary_line(perf: dict) -> str:

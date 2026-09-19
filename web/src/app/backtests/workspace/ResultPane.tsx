@@ -123,6 +123,9 @@ export default function ResultPane({ runId }: { runId: string | null }) {
   const { data: d, isLoading, error } = useSWR<Detail>(
     runId ? `/backtests/${runId}` : null,
     get,
+    // 详情未就绪时轮询刷新（HistoryPanel 同款），拿到结果自动停
+    { refreshInterval: (latest?: Detail) =>
+        latest?.status && latest.status !== 'done' && latest.status !== 'failed' ? 3000 : 0 },
   );
   const navOption = useNavOption(d);
 

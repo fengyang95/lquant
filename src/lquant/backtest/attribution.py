@@ -203,12 +203,21 @@ def brinson_by_group(
 
 def risk_vs_benchmark(rets: list[float], bench_rets: list[float],
                       periods: int = 252) -> dict:
-    """α/β/信息比率/跟踪误差/总超额。两条序列必须逐日对齐（短的对齐）。"""
-    n = min(len(rets), len(bench_rets))
+    """α/β/信息比率/跟踪误差/总超额。
+
+    两条序列必须逐日对齐且长度一致 —— 日期错位时硬失败（ValueError），
+    绝不静默尾部截断：把不同日期的收益率凑成一对算出的 α/β 是纯垃圾。
+    调用方（backtests API）已按日期配对构造，长度不一致 = 调用方 bug。
+    """
+    if len(rets) != len(bench_rets):
+        raise ValueError(
+            f"risk_vs_benchmark 要求两序列逐日对齐：len(rets)={len(rets)} "
+            f"!= len(bench_rets)={len(bench_rets)}（调用方须按日期配对后再传入）")
+    n = len(rets)
     if n < 20:
         return {}
-    s = np.asarray(rets[-n:], dtype=float)
-    b = np.asarray(bench_rets[-n:], dtype=float)
+    s = np.asarray(rets, dtype=float)
+    b = np.asarray(bench_rets, dtype=float)
     var_b = float(np.var(b, ddof=1))
     beta = float(np.cov(s, b, ddof=1)[0, 1] / var_b) if var_b > 1e-15 else 0.0
     # JQ 口径：α 年化 = (组合均值 - β·基准均值) × 252

@@ -188,6 +188,12 @@ class Engine:
         self.account = Account(cash=self.cfg.initial_cash)
         self._last_factor = {}
         self._last_close: dict[str, float] = {}   # 每只股票最近一次有 bar 的 close
+        # 多次 run() 必须从干净状态开始：调仓周期标记、订单序号与残留挂单都重置，
+        # 否则第二次 run 会因周期 key 相同而跳过首个调仓日，或把上一次 run 的
+        # PARTIAL 残单在首日撮合（结果静默错位）。
+        self._seq = 0
+        self._last_rebal_key = None
+        self._pending = []
 
         res = BacktestResult()
 
@@ -245,11 +251,18 @@ class Engine:
             ratio = bar.adj_factor / prev
             if abs(ratio - 1.0) > 1e-12:
                 self.account.apply_corporate_action(sym, ratio)
+                # 待成交挂单同步按比例调整股数（券商对存量委托的除权调整语义）：
+                # 送股后按旧股数撮合会偏离目标仓位，缩股则可能超额卖出。
+                for o in self._pending:
+                    if o.symbol == sym:
+                        o.qty *= ratio
+                        o.filled_qty *= ratio
 
     # ---------- 撮合 ----------
 
     def _fill_pending(self, bars: dict[str, Bar], d: date, res: BacktestResult) -> None:
         assert self.broker is not None
+        remaining: list[Order] = []
         for order in self._pending:
             bar = bars.get(order.symbol)
             if bar is None:
@@ -277,7 +290,11 @@ class Engine:
                 continue
             self.account.apply_fill(fill)
             res.trades.append(fill)
-        self._pending = []
+            if order.status is OrderStatus.PARTIAL:
+                remaining.append(order)
+        # PARTIAL 订单保留到下一交易日继续撮合剩余数量（真实订单簿语义）；
+        # FILLED / REJECTED 直接出队。剩余量挂到回测结束为止自然作废。
+        self._pending = remaining
 
     def _schedule_rebalance(self, bars: dict[str, Bar], d: date, res: BacktestResult) -> None:
         ctx = Context(account=self.account, trade_date=d,
@@ -435,7 +452,8 @@ class Engine:
         dates = [d for d, _ in res.nav]
         perf = perf_from_returns(rets, dates=dates[1:] if rets else None)
         perf.pop("nav", None)
-        to = turnover_from_trades([(f.trade_date, f.qty * f.price) for f in res.trades])
+        to = turnover_from_trades(
+            [(f.trade_date, f.qty * f.price) for f in res.trades], nav=res.nav)
         res.metrics = {
             **perf,
             "initial_cash": self.cfg.initial_cash,

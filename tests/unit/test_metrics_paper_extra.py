@@ -64,7 +64,11 @@ def test_turnover_forms() -> None:
     assert d["n_trades"] == 2 and d["total_amount"] == 150.0
     t = M.turnover_from_trades([(date(2026, 1, 2), 200.0)])
     assert t["total_amount"] == 200.0
-    assert t["turnover_per_period"] == 200.0
+    # 无净值序列 → 不给假换手率（ None，unit=amount）
+    assert t["turnover_per_period"] is None
+    t2 = M.turnover_from_trades([(date(2026, 1, 2), 200.0)],
+                                nav=[(date(2026, 1, 2), 1000.0)])
+    assert t2["turnover_per_period"] == pytest.approx(0.2)
 
 
 def test_summary_line_branches() -> None:

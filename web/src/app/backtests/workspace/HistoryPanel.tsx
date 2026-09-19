@@ -18,7 +18,7 @@ export type RunRow = {
   start_date: string;
   end_date: string;
   status: string;
-  metrics: Record<string, number>;
+  metrics: Record<string, unknown>;
   created_at: string;
 };
 
@@ -32,8 +32,36 @@ type HistoryPanelProps = {
   onLoadRun(row: RunRow): void;
 };
 
+// 指标单元格统一出口：null/undefined/非有限值一律 `--`，
+// 运行中任务的空 metrics 不再伪装成 0.00%。
+function pctf(v: number | null | undefined, digits = 2): string {
+  if (v == null || !Number.isFinite(v)) return '--';
+  return `${(v * 100).toFixed(digits)}%`;
+}
+
+function numf(v: number | null | undefined, digits = 2): string {
+  if (v == null || !Number.isFinite(v)) return '--';
+  return v.toFixed(digits);
+}
+
+// metrics.turnover 落库的是 {total_amount, turnover_per_period, unit} 结构 ——
+// 展示时取无量纲比率；老数据/异常结构统一走 pctf 的 `--` 兜底。
+function turnoverOf(m: Record<string, unknown>): number | null | undefined {
+  const t = m?.turnover;
+  if (t && typeof t === 'object') return (t as { turnover_per_period?: number | null }).turnover_per_period;
+  return t as number | null | undefined;
+}
+
+function isRunning(status?: string): boolean {
+  return status === 'running' || status === 'pending' || status === 'started' || status === 'queued';
+}
+
 export default function HistoryPanel({ onLoadRun }: HistoryPanelProps) {
-  const { data: runs } = useSWR<RunRow[]>('/backtests', get, { refreshInterval: 5000 });
+  // 仅当存在运行中/排队中的任务时才轮询，全部终态即停 —— 不给后端白打请求
+  const { data: runs } = useSWR<RunRow[]>('/backtests', get, {
+    refreshInterval: (latest) =>
+      (latest && Array.isArray(latest) && latest.some((r) => isRunning(r.status))) ? 5000 : 0,
+  });
   // B6 多运行对比
   const [picked, setPicked] = useState<string[]>([]);
   const [cmp, setCmp] = useState<CompareResult | null>(null);
@@ -118,18 +146,22 @@ export default function HistoryPanel({ onLoadRun }: HistoryPanelProps) {
                       </Link>
                     </td>
                     <td className="text-xs text-ink-dim">
-                      {r.params.factor} · Top{r.params.top_n} · {r.params.rebalance}
+                      {r.params?.factor || r.strategy || '--'} · Top{r.params?.top_n ?? '--'} · {r.params?.rebalance ?? '--'}
                     </td>
-                    <td className={`text-right ${(r.metrics.total_return ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
-                      {((r.metrics.total_return ?? 0) * 100).toFixed(2)}%
-                    </td>
-                    <td className={`text-right ${(r.metrics.annual_return ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
-                      {((r.metrics.annual_return ?? 0) * 100).toFixed(2)}%
-                    </td>
-                    <td className="text-right">{(r.metrics.sharpe ?? 0).toFixed(2)}</td>
-                    <td className="text-right text-down">
-                      {((r.metrics.max_drawdown ?? 0) * 100).toFixed(2)}%
-                    </td>
+                    {isRunning(r.status) ? (
+                      <td colSpan={4} className="text-right text-xs text-ink-faint">运行中…</td>
+                    ) : (
+                      <>
+                        <td className={`text-right ${typeof r.metrics.total_return === 'number' && r.metrics.total_return >= 0 ? 'text-up' : 'text-down'}`}>
+                          {pctf(r.metrics.total_return as number | null)}
+                        </td>
+                        <td className={`text-right ${typeof r.metrics.annual_return === 'number' && r.metrics.annual_return >= 0 ? 'text-up' : 'text-down'}`}>
+                          {pctf(r.metrics.annual_return as number | null)}
+                        </td>
+                        <td className="text-right">{numf(r.metrics.sharpe as number | null)}</td>
+                        <td className="text-right text-down">{pctf(r.metrics.max_drawdown as number | null)}</td>
+                      </>
+                    )}
                     <td className="text-right text-xs text-ink-faint">{r.created_at?.slice(5, 16)}</td>
                     <td className="text-right pr-1">
                       <button onClick={() => onLoadRun(r)} className="btn btn-sm">
@@ -167,13 +199,13 @@ export default function HistoryPanel({ onLoadRun }: HistoryPanelProps) {
                           style={{ background: SERIES_COLORS[cmp.runs.indexOf(r) % SERIES_COLORS.length] }} />
                     {r.label}
                   </td>
-                  <td className={`text-right ${(r.metrics.annual_return ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
-                    {((r.metrics.annual_return ?? 0) * 100).toFixed(2)}%
+                  <td className={`text-right ${r.metrics.annual_return != null && r.metrics.annual_return >= 0 ? 'text-up' : 'text-down'}`}>
+                    {pctf(r.metrics.annual_return)}
                   </td>
-                  <td className="text-right">{(r.metrics.sharpe ?? 0).toFixed(2)}</td>
-                  <td className="text-right text-down">{((r.metrics.max_drawdown ?? 0) * 100).toFixed(2)}%</td>
-                  <td className="text-right">{((r.metrics.win_rate ?? 0) * 100).toFixed(0)}%</td>
-                  <td className="text-right">{((r.metrics.turnover ?? 0) * 100).toFixed(0)}%</td>
+                  <td className="text-right">{numf(r.metrics.sharpe)}</td>
+                  <td className="text-right text-down">{pctf(r.metrics.max_drawdown)}</td>
+                  <td className="text-right">{pctf(r.metrics.win_rate, 0)}</td>
+                  <td className="text-right">{pctf(turnoverOf(r.metrics), 0)}</td>
                 </tr>
               ))}
             </tbody>

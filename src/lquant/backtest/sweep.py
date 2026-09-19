@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import polars as pl
 
 from lquant.backtest.engine import Engine, EngineConfig
+from lquant.server.jobs import JobCanceled
 
 # 固定输出列：前端契约，改列名/加列都要同步更新前端
 _OUT_COLS = ["value", "total_return", "annual_return", "sharpe",
@@ -47,11 +48,13 @@ def _metrics_res(metrics: dict, value) -> dict:
 
 def run_sweep(data: pl.DataFrame, param: str, values: list,
               spec: SweepSpec, *, strategy_cls=None,
-              strategy_kwargs: dict | None = None) -> pl.DataFrame:
+              strategy_kwargs: dict | None = None,
+              cancel_check=None) -> pl.DataFrame:
     """对 `param` 在 `values` 上逐档回测，返回网格表。
 
     `strategy_cls` 构造签名需接受 `{**strategy_kwargs, param: value}`；
     默认是 factor_topn（支持 factor= 与 top_n=）。
+    cancel_check：每档开始前轮询，返回 True 时抛 JobCanceled 协作式收尾。
     """
     from lquant.backtest.strategy.factor_topn import FactorTopNStrategy
 
@@ -60,6 +63,8 @@ def run_sweep(data: pl.DataFrame, param: str, values: list,
 
     rows = []
     for v in values:
+        if cancel_check is not None and cancel_check():
+            raise JobCanceled(f"参数扫描在第 {len(rows)}/{len(values)} 档被取消")
         kw = {**base, param: v}          # 未知参数会在构造时 KeyError → 快失败
         strat = cls(factor=spec.factor, **kw)
         res = Engine(strat, config=EngineConfig(

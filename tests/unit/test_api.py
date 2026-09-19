@@ -329,6 +329,19 @@ def test_backtest_run_list_detail_compare(client):
                       params={"ids": f"{a},ghost"}).status_code == 404
 
 
+def _wait_run_code(client, job_id: str) -> dict:
+    """run-code 异步契约：轮询状态端点直到终态（done/failed/canceled）。"""
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        s = client.get(f"/api/backtests/run-code/{job_id}")
+        assert s.status_code == 200, s.text
+        body = s.json()
+        if body["status"] in ("done", "failed", "canceled"):
+            return body
+        time.sleep(0.05)
+    raise AssertionError("run-code 任务 60s 未到终态")
+
+
 def test_jq_run_code_attribution_holdings(client):
     """聚宽代码回测全链路：run-code → code → holdings → attribution。"""
     code = '''
@@ -344,8 +357,11 @@ def rebal(context):
     r = client.post("/api/backtests/run-code", json={
         "code": code, "start": "2026-01-01", "initial_cash": 1_000_000})
     assert r.status_code == 200, r.text
-    rid = r.json()["run_id"]
-    assert r.json()["n_nav_points"] > 10
+    # run-code 已异步化：轮询状态端点直到终态
+    body = _wait_run_code(client, r.json()["job_id"])
+    assert body["status"] == "done", body.get("error")
+    rid = body["run_id"]
+    assert body["n_nav_points"] > 10
 
     # 策略代码可取回
     c = client.get(f"/api/backtests/{rid}/code").json()
