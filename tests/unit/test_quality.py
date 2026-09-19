@@ -434,6 +434,21 @@ def test_issues_roundtrip(q_env):
     assert len(latest_issues()) == 1
 
 
+def test_issues_mixed_trade_date_none_and_date(q_env):
+    """回归：多数行 trade_date=None（标的级稀疏）+ 少数行是真实 date
+    （整日缺失）—— 首行 None 被 polars 推断为 Null 类型，后续 date
+    追加炸 builder（/data/gaps 502 的根因）。显式 schema 后必须通过。"""
+    from lquant.data.quality.issues import Issue, save_issues
+
+    n = save_issues([
+        Issue(rule="COVERAGE_GAP", severity="error", detail="s", count=3,
+              symbol="000001.SZ", trade_date=None),
+        Issue(rule="COVERAGE_GAP", severity="error", detail="g", count=100,
+              trade_date=date(2026, 9, 18)),
+    ])
+    assert n == 2
+
+
 def test_lineage(q_env):
     from lquant.data import lineage
 

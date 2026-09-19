@@ -161,5 +161,9 @@ def resolve_issues(issue_ids: list[str]) -> int:
 
 
 def pl_from_rows(rows: list[dict]):
+    """dict 行 → DataFrame；显式 schema 防止「首行 trade_date=None 被推断
+    为 Null 类型，后续真实 date 追加时炸 builder」。"""
     import polars as pl
-    return pl.DataFrame(rows, schema_overrides={"count": pl.Int64})
+    return pl.DataFrame(rows, schema_overrides={
+        "count": pl.Int64, "trade_date": pl.Date,
+    })
