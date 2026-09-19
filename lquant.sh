@@ -27,7 +27,7 @@ cd "$(dirname "$0")"
 export PATH="$HOME/.local/bin:$PATH"   # uv 默认装在这里
 
 # ----------------------------- 可配置项 ------------------------------------
-PYPI_INDEX="${LQ_PYPI_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+PYPI_INDEX="${LQ_PYPI_INDEX:-https://mirrors.aliyun.com/pypi/simple/}"
 NPM_REGISTRY="${LQ_NPM_REGISTRY:-https://registry.npmmirror.com}"
 # rustup 国内镜像（rsproxy），海外环境可 LQ_RUSTUP_DIST_SERVER=https://static.rust-lang.org 覆盖
 RUSTUP_DIST_SERVER="${LQ_RUSTUP_DIST_SERVER:-https://rsproxy.cn}"
