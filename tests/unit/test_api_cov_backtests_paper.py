@@ -4,9 +4,8 @@
 """
 from __future__ import annotations
 
-import os
-
 import datetime
+import os
 
 import polars as pl
 import pytest
@@ -96,14 +95,41 @@ def test_run_backtest_empty_lake_503(client, monkeypatch):
     monkeypatch.setattr(bt, "read_daily", lambda *a, **k: pl.DataFrame().lazy())
     r = client.post("/api/backtests/run", json={"start": "2026-01-01"})
     assert r.status_code == 503
+    # run-code 异步化后：空湖在任务体内暴露为 failed（错误信息同 503 文案）
     r2 = client.post("/api/backtests/run-code", json={"code": "def initialize(c): pass",
                                                       "start": "2026-01-01"})
-    assert r2.status_code == 503
+    assert r2.status_code == 200
+    body = _wait_run_code(client, r2)
+    assert body["status"] == "failed"
+    assert "日线数据为空" in (body.get("error") or "")
 
 
 def test_run_backtest_bad_formula(client):
     r = client.post("/api/backtests/run", json={"formula": "foo_bar", "start": "2026-01-01"})
     assert r.status_code == 422
+
+
+def _wait_run_code(client, post_resp):
+    """run-code 已异步化：POST 返回 job id，轮询状态端点直到终态。
+
+    post_resp 可传 POST Response 或直接传 job id 字符串。
+    """
+    import time as _t
+
+    if hasattr(post_resp, "status_code"):
+        assert post_resp.status_code == 200, post_resp.text
+        job_id = post_resp.json()["job_id"]
+    else:
+        job_id = post_resp
+    deadline = _t.time() + 30
+    while _t.time() < deadline:
+        s = client.get(f"/api/backtests/run-code/{job_id}")
+        assert s.status_code == 200, s.text
+        body = s.json()
+        if body["status"] in ("done", "failed", "canceled"):
+            return body
+        _t.sleep(0.05)
+    raise AssertionError("run-code 任务 30s 未到终态")
 
 
 def test_run_jq_code_lifecycle(client):
@@ -116,14 +142,17 @@ def test_run_jq_code_lifecycle(client):
     )
     r = client.post("/api/backtests/run-code", json={"code": code, "start": "2026-01-01",
                                                      "run_analysis": True})
-    assert r.status_code == 200, r.text
-    run_id = r.json()["run_id"]
-    assert r.json()["n_nav_points"] >= 1
+    body = _wait_run_code(client, r)
+    assert body["status"] == "done", body.get("error")
+    run_id = body["run_id"]
+    assert body["n_nav_points"] >= 1
     # /{run_id}/code
     c = client.get(f"/api/backtests/{run_id}/code")
     assert c.status_code == 200
     assert c.json()["engine"] == "jq_compat"
     assert client.get("/api/backtests/zzzz/code").status_code == 404
+    # 未知 job id → 404
+    assert client.get("/api/backtests/run-code/zzzz").status_code == 404
 
 
 def test_run_jq_code_rejects_bad_source(client):
@@ -141,8 +170,16 @@ def test_run_jq_code_empty_nav(client):
         "    pass\n"
     )
     r = client.post("/api/backtests/run-code", json={"code": code, "start": "2026-01-01"})
-    # 代码合法但未交易 → 仍应有净值（现金曲线），200；若实现为 422 也算契约
-    assert r.status_code in (200, 422)
+    # 代码合法但未交易 → 任务终态 done（现金曲线）或 failed（无净值），都不该挂死
+    body = _wait_run_code(client, r)
+    assert body["status"] in ("done", "failed")
+
+
+def test_run_jq_code_rejects_bad_range(client):
+    r = client.post("/api/backtests/run-code",
+                    json={"code": "def initialize(c): pass", "start": "2026-02-01",
+                          "end": "2026-01-01"})
+    assert r.status_code == 422
 
 
 def test_list_runs_and_validation_and_compare(client):
@@ -271,8 +308,9 @@ def test_run_code_records_and_analysis_failure(client, monkeypatch):
     r = client.post("/api/backtests/run-code",
                     json={"code": code, "start": "2026-01-01",
                           "factor_formulas": ["pct_change_5"], "run_analysis": True})
-    assert r.status_code == 200, r.text
-    run_id = r.json()["run_id"]
+    body = _wait_run_code(client, r)
+    assert body["status"] == "done", body.get("error")
+    run_id = body["run_id"]
     d = client.get(f"/api/backtests/{run_id}")
     assert d.status_code == 200
     assert d.json()["records"]            # 记录曲线已落库并返回
@@ -294,7 +332,8 @@ def test_run_code_list_analyses_broken(client, monkeypatch):
         "    pass\n"
     )
     r = client.post("/api/backtests/run-code", json={"code": code, "start": "2026-01-01"})
-    assert r.status_code == 200
+    body = _wait_run_code(client, r)
+    assert body["status"] in ("done", "failed")
 
 
 def test_attribution_edge_branches(client, monkeypatch):
@@ -558,8 +597,6 @@ def test_run_code_runner_failures(client, monkeypatch):
     from lquant.backtest import jqapi
     from lquant.backtest.jqapi import JQResult
 
-    from lquant.server.api import backtests as bt
-
     def _value_error(*a, **k):
         raise ValueError("基准代码非法")
 
@@ -590,7 +627,10 @@ def test_run_code_runner_failures(client, monkeypatch):
         monkeypatch.setattr(jqapi, "JQRunner", fake)
         r = client.post("/api/backtests/run-code", json={"code": code,
                                                          "start": "2026-01-01"})
-        assert r.status_code == 422, r.text
+        assert r.status_code == 200, r.text
+        body = _wait_run_code(client, r.json()["job_id"])
+        assert body["status"] == "failed"
+        assert body.get("error")
     monkeypatch.setattr(jqapi, "JQRunner", real_runner)
 
 
@@ -612,7 +652,9 @@ def test_run_code_analysis_crash_swallowed(client, monkeypatch):
     r = client.post("/api/backtests/run-code",
                     json={"code": code, "start": "2026-01-01"})
     assert r.status_code == 200, r.text
-    d = client.get(f"/api/backtests/{r.json()['run_id']}")
+    body = _wait_run_code(client, r.json()["job_id"])
+    assert body["status"] == "done", body.get("error")
+    d = client.get(f"/api/backtests/{body['run_id']}")
     assert d.json()["custom_analysis"] == []
 
 

@@ -9,11 +9,12 @@
 
 import { useMemo, useState } from 'react';
 import useSWR from 'swr';
+import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import Chart from '@/components/Chart';
 import { Panel, Stat } from '@/components/Panel';
 import PageHeader from '@/components/PageHeader';
-import { Loading } from '@/components/States';
+import { ErrorNote, Loading } from '@/components/States';
 import { get } from '@/lib/api';
 import { C, axes, legend, tooltip } from '@/lib/chart';
 import {
@@ -70,7 +71,8 @@ export default function BacktestDetailPage() {
   const [tab, setTab] = useState<TabId>('overview');
   const [holdDay, setHoldDay] = useState<string>('');
 
-  const { data: d } = useSWR<Detail>(runId ? `/backtests/${runId}` : null, get);
+  // 主数据必须带错误分支：404/500 时给出明确提示，而不是永远"加载中"
+  const { data: d, error: mainError } = useSWR<Detail>(runId ? `/backtests/${runId}` : null, get);
   const isJq = d?.strategy === 'jq_custom';
   const { data: att } = useSWR<Attribution>(
     runId && tab === 'attribution' ? `/backtests/${runId}/attribution` : null, get);
@@ -121,8 +123,8 @@ export default function BacktestDetailPage() {
     if (!d?.monthly?.length) return null;
     const years = [...new Set(d.monthly.map((x) => x.year))].sort();
     const data = d.monthly
-      .filter((x) => x.ret != null)
-      .map((x) => [String(x.month - 1), String(x.year), +(x.ret! * 100).toFixed(2)]);
+      .filter((x): x is typeof x & { ret: number } => x.ret != null)
+      .map((x) => [String(x.month - 1), String(x.year), +(x.ret * 100).toFixed(2)]);
     return {
       tooltip: {
         ...tooltip, trigger: 'item',
@@ -211,8 +213,20 @@ export default function BacktestDetailPage() {
     };
   }, [att]);
 
+  if (mainError) {
+    return (
+      <div className="space-y-3">
+        <ErrorNote>
+          {mainError instanceof Error
+            ? mainError.message
+            : `加载运行 ${runId} 失败（不存在或服务异常）`}
+        </ErrorNote>
+        <Link href="/backtests" className="btn btn-sm">← 返回回测列表</Link>
+      </div>
+    );
+  }
   if (!d) {
-    return <Loading>加载中…（run 不存在时会一直为空）</Loading>;
+    return <Loading>加载中…</Loading>;
   }
 
   const TABS: { id: TabId; label: string }[] = [
@@ -338,10 +352,10 @@ export default function BacktestDetailPage() {
           {(d.logs?.length ?? 0) > 0 && (
             <details className="rounded-[2px] border border-line bg-panel px-4 py-3">
               <summary className="cursor-pointer text-sm font-medium text-ink-dim">
-                运行日志（{d.logs!.length} 条）
+                运行日志（{(d.logs ?? []).length} 条）
               </summary>
               <pre className="mt-2 max-h-[320px] overflow-auto text-xs leading-5 text-ink-dim">
-                {d.logs!.join('\n')}
+                {(d.logs ?? []).join('\n')}
               </pre>
             </details>
           )}
@@ -367,7 +381,7 @@ export default function BacktestDetailPage() {
             <>
               <div className="flex flex-wrap gap-1.5">
                 <span className="tag">基准 {String(att.risk.benchmark ?? d.benchmark_label)}</span>
-                <span className="tag">跟踪误差 {pct(att.risk.tracking_error as number)}</span>
+                <span className="tag">跟踪误差 {pct(typeof att.risk.tracking_error === 'number' ? att.risk.tracking_error : null)}</span>
                 <span className="tag">参与个股 {att.stock_contribution.n_stocks}</span>
               </div>
               <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">

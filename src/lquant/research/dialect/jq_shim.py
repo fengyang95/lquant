@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import contextvars
 from datetime import date
 
 import polars as pl
@@ -221,15 +222,18 @@ def log(*args):
     logger.info(" ".join(map(str, args)))
 
 
-_CURRENT: JQContext | None = None
+# 并发安全：模块级全局会让同进程并发跑的两个回测 runner 互相覆盖上下文
+# （策略 A 的 get_fundamentals 读到策略 B 绑定的 trade_date/universe —— 前视偏差
+# 且结果不可复现）。ContextVar 随线程/任务隔离，同一执行流内语义不变。
+_CURRENT: contextvars.ContextVar = contextvars.ContextVar("jq_shim_current", default=None)
 
 
 def _ctx() -> JQContext:
-    if _CURRENT is None:
+    cur = _CURRENT.get()
+    if cur is None:
         raise RuntimeError("JQ 上下文未初始化")
-    return _CURRENT
+    return cur
 
 
 def bind(ctx: JQContext) -> None:
-    global _CURRENT
-    _CURRENT = ctx
+    _CURRENT.set(ctx)

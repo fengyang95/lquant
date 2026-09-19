@@ -5,7 +5,7 @@
 import { useState } from 'react';
 import { mutate } from 'swr';
 import { Panel } from '@/components/Panel';
-import { ErrorNote } from '@/components/States';
+import { ErrorNote, Msg } from '@/components/States';
 import { post } from '@/lib/api';
 
 const FORMULAS = ['pct_change_5', 'pct_change_10', 'pct_change_20', 'rolling_std_20'];
@@ -17,13 +17,16 @@ export default function QuickRunPanel() {
   const [rebalance, setRebalance] = useState('monthly');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  const [ok, setOk] = useState('');
 
   async function run() {
     setBusy(true);
     setErr('');
+    setOk('');
     try {
-      await post('/backtests/run', { top_n: topN, rebalance, formula });
+      const r = await post<{ run_id: string }>('/backtests/run', { top_n: topN, rebalance, formula });
       await mutate('/backtests');
+      setOk(`回测完成：${r.run_id}（见「历史与对比」）`);
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -34,6 +37,7 @@ export default function QuickRunPanel() {
   return (
     <Panel title="运行回测">
       {err && <ErrorNote>{err}</ErrorNote>}
+      {ok && <Msg text={ok} />}
       <div className="flex flex-wrap items-end gap-3">
         <label className="text-sm">
           <div className="mb-1 text-xs text-ink-faint">因子公式</div>

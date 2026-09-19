@@ -225,12 +225,29 @@ def _save_chart_analysis(client, name: str) -> str:
     return r.json()["id"]
 
 
+def _wait_run_code(client, job_id: str) -> dict:
+    """run-code 异步契约：轮询状态端点直到终态（done/failed/canceled）。"""
+    import time as _t
+
+    deadline = _t.time() + 60
+    while _t.time() < deadline:
+        s = client.get(f"/api/backtests/run-code/{job_id}")
+        assert s.status_code == 200, s.text
+        body = s.json()
+        if body["status"] in ("done", "failed", "canceled"):
+            return body
+        _t.sleep(0.05)
+    raise AssertionError("run-code 任务 60s 未到终态")
+
+
 def _run_code(client) -> str:
     """跑一次默认 run-code，返回 run_id。"""
     r = client.post("/api/backtests/run-code", json={
         "code": RUN_CODE_SRC, "start": "2026-01-01", "initial_cash": 1_000_000})
     assert r.status_code == 200, r.text
-    return r.json()["run_id"]
+    body = _wait_run_code(client, r.json()["job_id"])
+    assert body["status"] == "done", body.get("error")
+    return body["run_id"]
 
 
 def test_run_code_auto_executes_saved_analysis(client):
@@ -273,7 +290,9 @@ def test_run_code_without_analysis_flag(client):
         "code": RUN_CODE_SRC, "start": "2026-01-01", "initial_cash": 1_000_000,
         "run_analysis": False})
     assert r.status_code == 200, r.text
-    rid = r.json()["run_id"]
+    body = _wait_run_code(client, r.json()["job_id"])
+    assert body["status"] == "done", body.get("error")
+    rid = body["run_id"]
     assert client.get(f"/api/backtests/{rid}").json()["custom_analysis"] == []
 
 
@@ -316,7 +335,9 @@ def rebal(context):
         "code": code, "start": "2026-01-01", "initial_cash": 1_000_000,
         "factor_formulas": [factor]})
     assert r.status_code == 200, r.text
-    rid = r.json()["run_id"]
+    body = _wait_run_code(client, r.json()["job_id"])
+    assert body["status"] == "done", body.get("error")
+    rid = body["run_id"]
 
     detail = client.get(f"/api/backtests/{rid}")
     assert detail.status_code == 200

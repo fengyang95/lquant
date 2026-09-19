@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import uuid
 from datetime import date, datetime
 
 import polars as pl
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from lquant.backtest.engine import Engine, EngineConfig
 from lquant.backtest.strategy.factor_topn import FactorTopNStrategy
@@ -23,6 +24,45 @@ from lquant.data.store.parquet import read_daily
 from lquant.server.jobs import enqueue, get_job
 
 router = APIRouter(prefix="/backtests", tags=["backtests"])
+
+# 用户策略墙钟预算（秒）。防死循环/超长回测拖垮 worker —— 超时以策略错误收场。
+JQ_CODE_TIMEOUT_S = float(os.environ.get("LQ_JQ_TIMEOUT_S", "300"))
+
+
+def _json_safe(obj):
+    """递归把 NaN/Inf → None、numpy 标量 → Python 标量。
+
+    json.dumps 默认 allow_nan=True 会写出字面量 NaN/Infinity —— 那不是合法
+    JSON，前端 JSON.parse 直接炸。落库与响应统一走这里。
+    """
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, (bool, str)) or obj is None:
+        return obj
+    # numpy 标量判定必须在 float/int 之前（np.float64 是 Python float 的子类，
+    # 反着写会把 np.float64 原样放行，文档承诺的"转 Python 标量"就落空了）
+    if hasattr(obj, "item"):
+        try:
+            return _json_safe(obj.item())
+        except Exception:                        # noqa: BLE001
+            return str(obj)
+    if isinstance(obj, int):
+        return obj
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    return obj
+
+
+def _json_dumps(obj) -> str:
+    return json.dumps(_json_safe(obj), ensure_ascii=False, default=str)
+
+
+def _metrics_response(m: dict) -> dict:
+    """响应用 metrics：NaN/Inf → None，浮点保留 4 位。"""
+    return {k: (round(v, 4) if isinstance(v, float) and math.isfinite(v) else _json_safe(v))
+            for k, v in m.items() if not isinstance(v, dict)}
 
 
 def _persist_result(run_id: str, strategy: str, params: dict, res,
@@ -39,10 +79,10 @@ def _persist_result(run_id: str, strategy: str, params: dict, res,
         con.execute(
             "INSERT OR REPLACE INTO backtest_run VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [run_id, strategy,
-             json.dumps(params, ensure_ascii=False),
+             _json_dumps(params),
              nav_df["trade_date"].min() if len(nav_df) else None,
              nav_df["trade_date"].max() if len(nav_df) else None,
-             "done", json.dumps(m, default=str), datetime.now(), datetime.now()],
+             "done", _json_dumps(m), datetime.now(), datetime.now()],
         )
         con.execute("DELETE FROM backtest_nav WHERE run_id = ?", [run_id])
         con.execute("DELETE FROM backtest_order WHERE run_id = ?", [run_id])
@@ -170,12 +210,20 @@ class BacktestIn(BaseModel):
     start: str = Field(default="2026-01-01", pattern=r"^\d{4}-\d{2}-\d{2}$")
 
 
+def _parse_formula_n(formula: str) -> int:
+    """从公式尾段解析窗口参数 n；解析失败按 422 语义抛 HTTPException。"""
+    try:
+        return int(formula.rsplit("_", 1)[1])
+    except (IndexError, ValueError) as e:
+        raise HTTPException(422, f"因子公式窗口参数非法: {formula}") from e
+
+
 def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
     if formula.startswith("pct_change_"):
-        n = int(formula.rsplit("_", 1)[1])
+        n = _parse_formula_n(formula)
         return df.with_columns(pl.col("close").pct_change(n).over("symbol").alias(formula.replace("_", "")))
     if formula.startswith("rolling_std_"):
-        n = int(formula.rsplit("_", 1)[1])
+        n = _parse_formula_n(formula)
         return df.with_columns(pl.col("close").pct_change().over("symbol")
                                .rolling_std(n).alias(formula.replace("_", "")))
     raise HTTPException(422, f"暂不支持的因子公式: {formula}")
@@ -210,6 +258,7 @@ def _run_sweep_job(formula: str, param: str, values: list, cfg: dict,
         SweepSpec(factor=col, rebalance=cfg["rebalance"],
                   initial_cash=cfg["initial_cash"]),
         strategy_kwargs={"top_n": cfg.get("top_n", 5)},
+        cancel_check=cancel_check,
     )
     rows = grid.to_dicts()
     # value 可能是 int，前端要画轴，统一留浮点
@@ -274,29 +323,90 @@ def run_backtest(req: BacktestIn) -> dict:
                      "formula": req.formula, "start": req.start}, res)
 
     m = res.metrics
-    return {"run_id": run_id, "metrics": {k: (round(v, 4) if isinstance(v, float) else v)
-                                          for k, v in m.items() if not isinstance(v, dict)},
+    return {"run_id": run_id, "metrics": _metrics_response(m),
             "n_nav_points": len(res.nav), "n_trades": m.get("n_trades", 0)}
 
 
 class JQCodeIn(BaseModel):
     code: str = Field(min_length=10, max_length=100_000)
-    start: str = "2026-01-01"
-    end: str | None = None
-    initial_cash: float = Field(default=1_000_000, gt=0)
+    start: str = Field(default="2026-01-01", pattern=r"^\d{4}-\d{2}-\d{2}$")
+    end: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    initial_cash: float = Field(default=1_000_000, gt=0, le=1e15)
     benchmark: str = "000300.SH"
     factor_formulas: list[str] = Field(default_factory=list, max_length=10)
     strategy_id: str | None = None
     run_analysis: bool = True
 
+    @model_validator(mode="after")
+    def _check_range(self):
+        if self.end is not None and self.end <= self.start:
+            raise ValueError("end 必须晚于 start")
+        return self
+
+
+def _run_code_job(payload: dict, cancel_check=None, progress=None) -> dict:
+    """后台执行体：校验过的策略代码 → JQRunner 回测 → 落库 → 返回摘要。
+
+    超时由 JQRunner(timeout_s=...) 的 trace 看门狗兜底（覆盖单日钩子里的死循环）。
+    策略错误抛 ValueError → 任务 failed，错误信息经 get_job 带回前端。
+    """
+    from lquant.backtest.jqapi import JQRunner
+
+    if progress is not None:
+        progress(phase="读取日线")
+    df = read_daily(start=payload["start"], end=payload.get("end")).collect()
+    if not len(df):
+        raise ValueError("日线数据为空，先跑 bootstrap 或 lq data demo")
+
+    runner = JQRunner(payload["code"], initial_cash=payload["initial_cash"],
+                      benchmark=payload.get("benchmark") or "000300.SH",
+                      factor_formulas=payload.get("factor_formulas") or None,
+                      timeout_s=JQ_CODE_TIMEOUT_S)
+    res = runner.run(df)
+    if res.error:
+        raise ValueError(res.error)
+    if not res.nav:
+        raise ValueError("策略未产生净值（检查数据区间与标的代码）")
+
+    run_id = uuid.uuid4().hex[:12]
+    params = {"code": payload["code"], "start": payload["start"],
+              "end": payload.get("end"),
+              "initial_cash": payload["initial_cash"],
+              "benchmark": runner.benchmark, "engine": "jq_compat",
+              "strategy_id": payload.get("strategy_id"),
+              "factor_formulas": payload.get("factor_formulas"),
+              "logs": res.logs[-100:]}
+    if progress is not None:
+        progress(phase="落库")
+    _persist_result(run_id, "jq_custom", params, res)
+    _persist_records(run_id, res.records)
+
+    # 自定义分析：默认全量执行已保存的分析片段，结果并入 params_json 落库。
+    # 放在回测落库之后，整块兜底 —— 分析全炸也不能回滚回测。
+    if payload.get("run_analysis", True):
+        try:
+            params["custom_analysis"] = _run_saved_analyses(res)
+        except Exception:                      # noqa: BLE001
+            params["custom_analysis"] = []
+        with writer() as con:
+            con.execute("UPDATE backtest_run SET params = ? WHERE run_id = ?",
+                        [_json_dumps(params), run_id])
+
+    m = res.metrics
+    return {"run_id": run_id,
+            "metrics": _metrics_response(m),
+            "n_nav_points": len(res.nav), "n_trades": m.get("n_trades", 0),
+            "n_rejected": m.get("n_rejected", 0), "logs": res.logs[:50]}
+
 
 @router.post("/run-code")
 def run_jq_code(req: JQCodeIn) -> dict:
-    """运行聚宽兼容策略代码（initialize/handle_data/order...），落库返回 run_id。
+    """运行聚宽兼容策略代码：静态校验 → 异步入队 → 立即返回 job id。
 
-    同步执行（湖内数据量秒级）；代码异常返回 422 并带堆栈。
+    同步执行会占死请求线程且无法取消/限时长 —— 统一走 jobs 队列（与 sweep
+    一致）。客户端轮询 GET /backtests/run-code/{job_id}：
+    queued/running → 终态（done 带 run_id 与摘要，failed 带 error）。
     """
-    from lquant.backtest.jqapi import JQRunner
     from lquant.backtest.validation import validate_source
 
     # 这里是用户代码入口，静态闸先过一遍再 exec（此前直接进 JQRunner，白名单形同虚设）
@@ -304,49 +414,33 @@ def run_jq_code(req: JQCodeIn) -> dict:
     if errs:
         raise HTTPException(422, "；".join(errs))
 
-    df = read_daily(start=req.start, end=req.end).collect()
-    if not len(df):
-        raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
+    payload = req.model_dump()
+    job = enqueue("lquant-backtest", _run_code_job, payload, name="策略回测")
+    # 注意：这里返回的是 job_id（轮询键），真正的 run_id 在终态响应里 ——
+    # 两个字段语义不同，混用会让外部调用方拿 job id 查 run 详情 404。
+    return {"job_id": job.id, "status": "queued"}
 
-    try:
-        runner = JQRunner(req.code, initial_cash=req.initial_cash,
-                          benchmark=req.benchmark,
-                          factor_formulas=req.factor_formulas or None)
-        res = runner.run(df)
-    except ValueError as e:
-        raise HTTPException(422, str(e)) from e
-    if res.error:
-        raise HTTPException(422, res.error)
-    if not res.nav:
-        raise HTTPException(422, "策略未产生净值（检查数据区间与标的代码）")
 
-    run_id = uuid.uuid4().hex[:12]
-    params = {"code": req.code, "start": req.start, "end": req.end,
-              "initial_cash": req.initial_cash,
-              "benchmark": runner.benchmark, "engine": "jq_compat",
-              "strategy_id": req.strategy_id,
-              "factor_formulas": req.factor_formulas,
-              "logs": res.logs[-100:]}
-    _persist_result(run_id, "jq_custom", params, res)
-    _persist_records(run_id, res.records)
-
-    # 自定义分析：默认全量执行已保存的分析片段，结果并入 params_json 落库。
-    # 放在回测落库之后，整块兜底 —— 分析全炸也不能回滚回测。
-    if req.run_analysis:
-        try:
-            params["custom_analysis"] = _run_saved_analyses(res)
-        except Exception:                      # noqa: BLE001
-            params["custom_analysis"] = []
-        with writer() as con:
-            con.execute("UPDATE backtest_run SET params = ? WHERE run_id = ?",
-                        [json.dumps(params, ensure_ascii=False, default=str), run_id])
-
-    m = res.metrics
-    return {"run_id": run_id,
-            "metrics": {k: (round(v, 4) if isinstance(v, float) else v)
-                        for k, v in m.items() if not isinstance(v, dict)},
-            "n_nav_points": len(res.nav), "n_trades": m.get("n_trades", 0),
-            "n_rejected": m.get("n_rejected", 0), "logs": res.logs[:50]}
+@router.get("/run-code/{job_id}")
+def get_run_code_status(job_id: str) -> dict:
+    """轮询 run-code 任务：queued → running → done(带 run_id/摘要) / failed(带 error)。"""
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(404, f"未找到回测任务 {job_id}")
+    status = job.get_status()
+    if status == "started":
+        status = "running"
+    elif status in ("finished", "done"):
+        status = "done"
+    result = getattr(job, "result", None)
+    error = getattr(job, "error", None)
+    if error is None and status == "failed":
+        exc = getattr(job, "exc_info", None)
+        error = exc if isinstance(exc, str) and exc.strip() else (str(exc) if exc else None)
+    out: dict = {"job_id": job_id, "status": status, "error": error}
+    if status == "done" and isinstance(result, dict):
+        out.update(result)
+    return out
 
 
 @router.get("/{run_id}/code")
@@ -504,7 +598,8 @@ def list_runs(
     with reader() as con:
         rows = con.execute(
             "SELECT run_id, strategy, params, start_date, end_date, status, metrics, created_at "
-            f"FROM backtest_run ORDER BY created_at DESC LIMIT {limit} OFFSET {offset}"
+            "FROM backtest_run ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            [int(limit), int(offset)],
         ).fetchall()
     return [{"run_id": r[0], "strategy": r[1], "params": json.loads(r[2]) if r[2] else {},
              "start_date": str(r[3]), "end_date": str(r[4]), "status": r[5],
@@ -574,6 +669,12 @@ class BenchmarkRunIn(BaseModel):
     symbols: list[str] = Field(default_factory=list, max_length=10)
     params: dict = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def _check_range(self):
+        if self.end is not None and self.end <= self.start:
+            raise ValueError("end 必须晚于 start")
+        return self
+
 
 @router.post("/run-benchmark")
 def run_benchmark(req: BenchmarkRunIn) -> dict:
@@ -607,8 +708,7 @@ def run_benchmark(req: BenchmarkRunIn) -> dict:
 
     m = res.metrics
     return {"run_id": run_id, "label": meta["label"], "symbols": symbols,
-            "metrics": {k: (round(v, 4) if isinstance(v, float) else v)
-                        for k, v in m.items() if not isinstance(v, dict)},
+            "metrics": _metrics_response(m),
             "n_nav_points": len(res.nav), "n_trades": m.get("n_trades", 0)}
 
 

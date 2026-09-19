@@ -35,7 +35,13 @@ type StrategyDetail = {
   config?: Record<string, unknown>;
 };
 
-type RunCodeResult = { run_id: string };
+type RunCodeResult = { job_id: string };
+
+type RunCodeStatus = {
+  status: 'queued' | 'running' | 'done' | 'failed' | 'canceled';
+  run_id?: string;
+  error?: string | null;
+};
 
 const DQ_TEMPLATE = `# 双均线择时示例 —— lquant 用户策略
 # 可用 API: initialize / handle_data / run_daily / order / order_target_value
@@ -128,12 +134,17 @@ function BacktestWorkspace() {
       setName(s?.name ?? '');
       setDescription(s?.description ?? '');
       setCode(s?.source || '');
-      setLoadedConfig(s?.config ?? {});
+      const cfg = s?.config ?? {};
+      setLoadedConfig(cfg);
+      // dirty 基准的 params 必须来自策略自身的 config（factor_formulas），
+      // 用当前编辑器里的旧 params 当基准会让"还原到刚加载状态"语义错位。
+      const formulasRaw = (cfg as { factor_formulas?: unknown }).factor_formulas;
+      const formulas = Array.isArray(formulasRaw) ? formulasRaw.join(',') : '';
       setBase({
         name: s?.name ?? '',
         description: s?.description ?? '',
         code: s?.source || '',
-        params: { ...params },
+        params: { start: params.start, end: params.end, formulas },
       });
     } catch (e) {
       setErrors([e instanceof Error ? e.message : String(e)]);
@@ -225,19 +236,51 @@ function BacktestWorkspace() {
     }
   }
 
+  // 组件卸载后停止 handleRun 的轮询循环，避免卸载后 setState 与请求泄漏
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
   async function handleRun() {
     setBusy('run');
     setErrors([]);
-    setNotice('');
+    setNotice('任务已提交，等待调度…');
     try {
       const payload = buildRunPayload(code, params, selectedId);
       const r = await post<RunCodeResult>('/backtests/run-code', payload);
-      setRunId(r.run_id);
-      setTab('workspace');
+      // run-code 已异步入队：POST 返回 job_id（轮询键），真正的 run_id
+      // 在终态响应里 —— 轮询直到终态（超时 10 分钟兜底），卸载即停。
+      const jobId = r.job_id;
+      const deadline = Date.now() + 10 * 60 * 1000;
+      for (;;) {
+        await new Promise((res) => setTimeout(res, 2000));
+        if (!mountedRef.current) return;
+        if (Date.now() > deadline) {
+          throw new Error(`回测任务 ${jobId} 超过 10 分钟未完成，请稍后在历史列表查看`);
+        }
+        const st = await get<RunCodeStatus>(`/backtests/run-code/${jobId}`);
+        if (!mountedRef.current) return;
+        if (st.status === 'done' && st.run_id) {
+          setRunId(st.run_id);
+          setNotice('');
+          setTab('workspace');
+          return;
+        }
+        if (st.status === 'failed' || st.status === 'canceled') {
+          throw new Error(st.error || `回测任务 ${st.status}`);
+        }
+        setNotice(`回测运行中…（${st.status === 'queued' ? '排队中' : '执行中'}）`);
+      }
     } catch (e) {
+      if (!mountedRef.current) return;
       setErrors([e instanceof Error ? e.message : String(e)]);
+      setNotice('');
     } finally {
-      setBusy('');
+      if (mountedRef.current) setBusy('');
     }
   }
 

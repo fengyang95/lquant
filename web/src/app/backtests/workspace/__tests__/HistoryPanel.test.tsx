@@ -57,11 +57,16 @@ describe('HistoryPanel', () => {
     useSWRMock.mockReturnValue({ data: rows, mutate: vi.fn() });
   });
 
-  it('经 useSWR(\'/backtests\', get, { refreshInterval: 5000 }) 取数并渲染记录表', () => {
+  it('经 useSWR(\'/backtests\', get, { refreshInterval }) 取数并渲染记录表', () => {
     setup();
-    expect(useSWRMock).toHaveBeenCalledWith('/backtests', expect.any(Function), {
-      refreshInterval: 5000,
-    });
+    expect(useSWRMock).toHaveBeenCalledWith('/backtests', expect.any(Function),
+      // 仅当存在运行中任务才轮询：无运行中数据 → 0（停止轮询）
+      { refreshInterval: expect.any(Function) });
+    // 有运行中任务 → 5s 轮询；全部终态 → 0（停止轮询）
+    const opts = useSWRMock.mock.calls[0][2] as { refreshInterval: (d?: { status?: string }[]) => number };
+    expect(opts.refreshInterval([{ status: 'running' }])).toBe(5000);
+    expect(opts.refreshInterval(rows)).toBe(0);
+    expect(opts.refreshInterval([])).toBe(0);
     expect(screen.getByText('run-a')).toBeInTheDocument();
     expect(screen.getByText('run-b')).toBeInTheDocument();
     expect(screen.getByText('pct_change_20 · Top5 · monthly')).toBeInTheDocument();

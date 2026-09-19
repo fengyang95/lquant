@@ -39,7 +39,7 @@ class TickSlippage:
 
     def apply(self, price: float, side: Side, qty: float = 0.0, volume: float = 0.0) -> float:
         d = self.tick * self.n
-        return price + d if side == Side.BUY else max(price - d, self.tick)
+        return price + d if side == Side.BUY else max(price - d, 0.0)
 
 
 @dataclass

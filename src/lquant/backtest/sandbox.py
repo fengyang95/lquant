@@ -107,3 +107,38 @@ def safe_builtins() -> dict[str, object]:
     sb = {name: getattr(builtins, name) for name in SAFE_BUILTIN_NAMES}
     sb["__import__"] = _guarded_import
     return sb
+
+
+class StrategyExecutionTimeout(RuntimeError):
+    """用户策略代码超出墙钟预算时由看门狗抛出。"""
+
+
+def run_with_deadline(fn, /, *args, timeout_s: float, deadline: float | None = None, **kwargs):
+    """在墙钟预算内同步执行用户代码，超时由 sys.settrace 看门狗抢占。
+
+    覆盖用户代码里的 ``while True: pass`` / 巨型内存分配 —— 引擎主循环粒度的
+    deadline 棈检查管不到"单日钩子里死循环"。trace 开销只落在用户代码执行期
+    （引擎自身的数据/撮合路径不装 trace），超时即抛 StrategyExecutionTimeout，
+    由调用方记为策略错误。
+
+    deadline：绝对墙钟时点（time.monotonic() 域）。传入时优先于 timeout_s，
+    供同一轮回测的多次钩子调用共享一个总预算。
+    """
+    import sys
+    import time
+
+    dl = deadline if deadline is not None else time.monotonic() + float(timeout_s)
+
+    def _tracer(frame, event, arg):  # noqa: ARG001
+        if time.monotonic() > dl:
+            remaining = max(dl - time.monotonic(), 0.0)
+            raise StrategyExecutionTimeout(
+                f"策略执行超时（预算 {timeout_s:.0f}s，剩余 {remaining:.0f}s），已强制中断")
+        return _tracer
+
+    old = sys.gettrace()
+    sys.settrace(_tracer)
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        sys.settrace(old)

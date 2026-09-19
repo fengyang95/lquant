@@ -182,10 +182,10 @@ def test_get_price_with_pandas_paths() -> None:
     df = runner._get_price("600000.SH", count=2)
     assert list(df.columns) == ["open", "close", "high", "low", "volume"]
     assert len(df) == 2
-    # start/end 区间
+    # start/end 区间：end_date 钳制到上一交易日（防未来函数），当日 01-07 不含
     df2 = runner._get_price("600000.SH", start_date="2026-01-06",
                             end_date="2026-01-07", fields=["close"])
-    assert len(df2) == 2
+    assert len(df2) == 1
     # 多标的 MultiIndex
     df3 = runner._get_price(["600000.SH", "000001.SZ"], count=1)
     assert df3.columns.nlevels == 2

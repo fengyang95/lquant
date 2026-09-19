@@ -56,7 +56,7 @@ from lquant.backtest.engine import Engine, build_rules
 from lquant.backtest.events import Bar, Fill, Order, Side
 from lquant.backtest.jq_fundamentals import JQFundamentalsState
 from lquant.backtest.metrics import perf_from_returns, turnover_from_trades
-from lquant.backtest.sandbox import safe_builtins
+from lquant.backtest.sandbox import run_with_deadline, safe_builtins
 from lquant.backtest.slippage import PctSlippage
 from lquant.core.types import parse_symbol, today_cn
 from lquant.factors.panel import compute_factor_columns
@@ -374,9 +374,13 @@ class JQRunner:
                  benchmark: str = "000300.SH", rebalance: str = "none",
                  participation: float = 0.1, ruleset=None,
                  factor_formulas: list[str] | None = None,
-                 security_meta: dict[str, dict] | None = None) -> None:
+                 security_meta: dict[str, dict] | None = None,
+                 timeout_s: float | None = None) -> None:
         self.code = code
         self.initial_cash = initial_cash
+        # 用户代码墙钟预算（秒）。None = 不限；服务端入口必须设置（防死循环 DoS）。
+        self._timeout_s = timeout_s
+        self._deadline: float | None = None
         self.default_benchmark = benchmark
         self._ruleset = ruleset
         self._participation = participation
@@ -573,7 +577,7 @@ class JQRunner:
         self.context.current_dt = datetime.combine(
             d, dtime(9, 30) if when == "open" else dtime(15, 0))
         try:
-            fn(self.context) if fn.__code__.co_argcount else fn()
+            self._call_user(fn, self.context) if fn.__code__.co_argcount else self._call_user(fn)
         except Exception as e:                    # noqa: BLE001
             name = getattr(fn, "__name__", "?")
             return (f"{d} {when} 钩子 {name} 异常: {e}\n{traceback.format_exc(limit=4)}")
@@ -713,8 +717,15 @@ class JQRunner:
             lo, hi = max(0, i - int(count)), i          # 不含今天
         else:
             sd = date.fromisoformat(str(start_date)) if start_date else dates[0]
-            ed = date.fromisoformat(str(end_date)) if end_date else (
-                dates[self._day_index - 1] if self._day_index > 0 else dates[0])
+            ed = date.fromisoformat(str(end_date)) if end_date else None
+            # 无未来函数：end_date 一律钳制到上一交易日（与 history/attribute_history 一致）。
+            # 当日 bar 在开盘决策时点含收盘价，放行即是未来函数。
+            if self._day_index > 0:
+                prev = dates[self._day_index - 1]
+                ed = min(ed, prev) if ed is not None else prev
+            else:
+                # 首日开盘决策前没有任何历史数据可看
+                return self._get_price_empty(secs, fields, panel)
             lo = next((k for k, d in enumerate(dates) if d >= sd), 0)
             hi = next((k for k, d in enumerate(dates) if d > ed), len(dates))
         rows = []
@@ -755,6 +766,20 @@ class JQRunner:
         if len(secs) == 1:
             return {f: [r.get(secs[0], {}).get(f) for r in rows] for f in fields}
         return {s: {f: [r.get(s, {}).get(f) for r in rows] for f in fields} for s in secs}
+
+    def _get_price_empty(self, secs: list[str], fields: list[str], panel: bool):
+        """首日决策前无历史数据，返回与 _get_price 相同形状的空结果。"""
+        if _JQFrame is None:
+            if len(secs) == 1:
+                return {f: [] for f in fields}
+            return {s: {f: [] for f in fields} for s in secs}
+        import pandas as pd
+        if not panel and len(secs) > 1:
+            return _JQFrame(
+                index=pd.MultiIndex.from_product([[], secs], names=["day", "code"]))
+        if len(secs) == 1:
+            return _JQFrame({f: [] for f in fields})
+        return _JQFrame(columns=pd.MultiIndex.from_product([secs, fields]))
 
     # ---- 下单 ----
 
@@ -868,7 +893,18 @@ class JQRunner:
         return panels
 
 
+    def _call_user(self, fn, *args):
+        """调用用户钩子：设置了墙钟预算时走 trace 看门狗（可抢占死循环）。"""
+        if self._timeout_s is None:
+            return fn(*args)
+        return run_with_deadline(fn, *args, timeout_s=self._timeout_s,
+                                 deadline=self._deadline)
+
     def run(self, data) -> JQResult:
+        import time as _time
+
+        if self._timeout_s is not None:
+            self._deadline = _time.monotonic() + float(self._timeout_s)
         if self._factor_formulas and not isinstance(data, pl.DataFrame):
             raise ValueError(
                 "factor_formulas 需要 DataFrame 输入（bars_by_day dict 不支持因子面板）")
@@ -890,7 +926,7 @@ class JQRunner:
         # initialize 先跑：set_order_cost / set_benchmark 要在规则构建前生效
         if self._initialize_fn:
             try:
-                self._initialize_fn(self.context)
+                self._call_user(self._initialize_fn, self.context)
             except Exception as e:            # noqa: BLE001
                 self.res.error = f"initialize 异常: {e}\n{traceback.format_exc(limit=4)}"
                 return self.res
@@ -940,9 +976,9 @@ class JQRunner:
                         continue               # handle_data 不重复在 close 跑
                     if fn is self._handle_data_fn and fn.__code__.co_argcount >= 2:
                         # 聚宽标准签名 handle_data(context, data) —— data 是当日 bar 视图
-                        fn(self.context, _DataProxy(self))
+                        self._call_user(fn, self.context, _DataProxy(self))
                     else:
-                        fn(self.context) if fn.__code__.co_argcount else fn()
+                        self._call_user(fn, self.context) if fn.__code__.co_argcount else self._call_user(fn)
                 except Exception as e:        # noqa: BLE001
                     self.res.error = (f"{d} {self._bucket} 调度 {getattr(fn, '__name__', '?')} "
                                       f"异常: {e}\n{traceback.format_exc(limit=4)}")
@@ -954,8 +990,13 @@ class JQRunner:
                 self.res.error = err
                 return self.res
 
-            # 收盘估值 + 持仓快照
-            self._settle(d)
+            # 收盘估值 + 持仓快照（NAV≤0 爆仓 → 记为 res.error 收场，
+            # 与 run() 的"错误进 res.error"契约一致，也让调用方统一走 error 分支）
+            try:
+                self._settle(d)
+            except ValueError as e:
+                self.res.error = str(e)
+                return self.res
 
         self._finalize()
         return self.res
@@ -966,8 +1007,13 @@ class JQRunner:
         prices = {s: b.close for s, b in self._bars_today.items()}
         self._last_close.update(prices)
         nav = self.account.nav(prices, self._last_close)
-        if nav > 0:
-            self.res.nav.append((d, nav))
+        if nav <= 0:
+            # 爆仓日不能静默跳过：跳日会让净值序列断档，后续指标系统性偏乐观
+            # （与 engine.py 的 NAV≤0 快速失败口径一致）。
+            raise ValueError(
+                f"{d} NAV={nav:.2f} ≤ 0，账户已爆仓（现金不足扣费/杠杆漏洞），"
+                f"回测终止。请检查策略仓位与费率设置")
+        self.res.nav.append((d, nav))
         self.res.positions[d] = {
             s: p.qty for s, p in self.account.positions.items() if p.qty}
 
@@ -977,7 +1023,9 @@ class JQRunner:
         dates = [d for d, _ in self.res.nav][1:1 + len(rets)]
         perf = perf_from_returns(rets, dates=dates)
         perf.pop("nav", None)
-        to = turnover_from_trades([(f.trade_date, f.qty * f.price) for f in self.res.trades])
+        to = turnover_from_trades(
+            [(f.trade_date, f.qty * f.price) for f in self.res.trades],
+            nav=self.res.nav)
         self.res.metrics = {
             **perf,
             "initial_cash": self.initial_cash,

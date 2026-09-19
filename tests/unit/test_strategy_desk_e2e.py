@@ -129,7 +129,18 @@ def run_metrics(client):
         "strategy_id": sid,
     })
     assert run.status_code == 200, run.text
-    body = run.json()
+    # run-code 已异步化：轮询状态端点直到终态
+    import time as _t
+
+    deadline = _t.time() + 60
+    while _t.time() < deadline:
+        st = client.get(f"/api/backtests/run-code/{run.json()['job_id']}")
+        assert st.status_code == 200, st.text
+        if st.json()["status"] in ("done", "failed", "canceled"):
+            break
+        _t.sleep(0.05)
+    body = st.json()
+    assert body["status"] == "done", body.get("error")
     assert body["run_id"]
     assert body["n_nav_points"] > 10
     assert body["metrics"], "metrics 不应为空"

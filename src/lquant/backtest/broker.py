@@ -78,14 +78,18 @@ class Broker:
             order.status = OrderStatus.REJECTED
             order.reason = "停牌"
             return None
-        if order.side == Side.BUY and bar.open >= bar.pre_close * (1 + limit) - 1e-9:
-            order.status = OrderStatus.REJECTED
-            order.reason = "涨停不可买"
-            return None
-        if order.side == Side.SELL and bar.open <= bar.pre_close * (1 - limit) + 1e-9:
-            order.status = OrderStatus.REJECTED
-            order.reason = "跌停不可卖"
-            return None
+        # 开盘价处的第一道筛查只对 next_open 有意义 —— next_close/next_vwap
+        # 的成交价不是开盘价，误用 open 判断会在"平开收板"时放行（由下方
+        # 实际成交价的最终校验兜底）。
+        if self.price_mode == "next_open":
+            if order.side == Side.BUY and bar.open >= bar.pre_close * (1 + limit) - 1e-9:
+                order.status = OrderStatus.REJECTED
+                order.reason = "涨停不可买"
+                return None
+            if order.side == Side.SELL and bar.open <= bar.pre_close * (1 - limit) + 1e-9:
+                order.status = OrderStatus.REJECTED
+                order.reason = "跌停不可卖"
+                return None
 
         # 数量先按成交量/资金/一手约束截断，再算滑点 —— 冲击成本必须
         # 按实际成交数量计，不能给被截掉的部分付费（H1 教训）
