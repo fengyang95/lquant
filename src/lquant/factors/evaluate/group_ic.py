@@ -28,8 +28,11 @@ def ic_by_group(df: pl.DataFrame, factor: str, ret_col: str, group_col: str, *,
             continue
         ic, ric = s["ic"].mean(), s["rank_ic"].mean()
         ic_std = s["ic"].std()
+        # 与 ic.py 的 STD_EPS 同口径：polars 常数序列 std 是 ~7e-18 伪零，
+        # 不挡会输出 ±1e16 的荒谬 IR
+        ir = ic / ic_std if ic_std is not None and ic_std > 1e-9 else float("nan")
         out.append({"group": g, "ic_mean": ic, "rank_ic_mean": ric,
-                    "ir": ic / ic_std if ic_std else float("nan"),
+                    "ir": ir,
                     "n_days": len(s)})
     return pl.DataFrame(out)
 
@@ -40,6 +43,12 @@ def size_group(df: pl.DataFrame, *, mcap_col: str = "amount", n_groups: int = 3,
 
     追加 out 列，不改其余数据。
     """
-    cnt = pl.col(mcap_col).count().over(date_col)
-    q = (pl.col(mcap_col).rank("ordinal").over(date_col) * n_groups / cnt).ceil().clip(1, n_groups)
+    # 与 add_quantile 同款 NaN 防护：polars rank 会把 NaN 排到最大，
+    # 不挡的话 NaN 全进最高市值组且 count() 分母被计入
+    fin = pl.col(mcap_col).is_finite()
+    cnt = fin.sum().over(date_col)
+    q = (pl.when(fin)
+         .then(pl.col(mcap_col).rank("ordinal").over(date_col) * n_groups / cnt)
+         .otherwise(None)
+         .ceil().clip(1, n_groups))
     return df.with_columns(q.cast(pl.Int32).alias(out))

@@ -137,10 +137,12 @@ def _prep(df: pl.DataFrame) -> pl.DataFrame:
                 pl.when(pl.col("volume") > 0)
                 .then(pl.col("amount") / pl.col("volume"))
                 .otherwise(pl.col("close")).alias("_vwap"),
-                (pl.col("close") / pl.col("close").shift(1) - 1).alias("_ret"),
-                (pl.col("volume") / pl.col("volume").shift(1) - 1).abs().alias("_vchg"),
-                (pl.col("close") - pl.col("close").shift(1)).alias("_pc"),
-                (pl.col("volume") - pl.col("volume").shift(1)).alias("_pv"),
+                # shift 必须按 symbol 分组：整列 shift 在 symbol-major 排序下
+                # 会让每只股票首日吃到上一只股票末日的 close/volume（跨股票泄漏）
+                (pl.col("close") / pl.col("close").shift(1).over("symbol") - 1).alias("_ret"),
+                (pl.col("volume") / pl.col("volume").shift(1).over("symbol") - 1).abs().alias("_vchg"),
+                (pl.col("close") - pl.col("close").shift(1).over("symbol")).alias("_pc"),
+                (pl.col("volume") - pl.col("volume").shift(1).over("symbol")).alias("_pv"),
             ))
 
 

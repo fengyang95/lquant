@@ -118,11 +118,15 @@ def lasso(df: pl.DataFrame, col: str, *, by: str = "trade_date",
     model = Lasso(alpha=alpha, fit_intercept=False, max_iter=2000)
 
     def solve(X: np.ndarray, y: np.ndarray) -> np.ndarray:
-        # X 第 0 列是截距，Lasso 不能惩罚它 —— 先中心化再拟合
-        y0 = X[:, 0] @ [y.mean()]
-        yc = y - y[:1].mean()
-        model.fit(X[:, 1:], yc)
-        return y - (y0 + X[:, 1:] @ model.coef_)
+        # X 第 0 列是截距，Lasso 不能惩罚它 —— 标准做法：y 与 X[:,1:] 同时
+        # 中心化后拟合（fit_intercept=False），截距以常数 ym 还原。
+        # 注意 X 不中心化时惩罚会直接打在未中心化系数上，系数被严重收缩
+        # （实测 3.0 → 0.85）；旧实现更是 yc=y[0] + X[:,0]@[mean] 形状错崩。
+        ym = y.mean()
+        Xc = X[:, 1:] - X[:, 1:].mean(axis=0)
+        yc = y - ym
+        model.fit(Xc, yc)
+        return y - (ym + Xc @ model.coef_)
 
     return _neutralize_residuals(df, col, by,
                                  factors or [CAP_COL, "industry_sw1"],

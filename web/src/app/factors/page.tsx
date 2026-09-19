@@ -153,7 +153,8 @@ export default function FactorsPage() {
         {
           name: '日度IC', type: 'bar' as const, data: evalSeries.ic.ic,
           itemStyle: {
-            color: (p: { data: number | null }) => (p.data == null || p.data >= 0 ? C.up : C.down),
+            color: (p: { data: number | null }) =>
+              (p.data == null ? C.inkDim : p.data >= 0 ? C.up : C.down),
           },
         },
         { name: '累计IC', type: 'line' as const, yAxisIndex: 1, data: evalSeries.ic.cum_ic, showSymbol: false, lineStyle: { width: 1.5, color: C.indigo }, itemStyle: { color: C.indigo } },
@@ -342,11 +343,24 @@ export default function FactorsPage() {
       const params = {
         // 报告名仅允许字母数字下划线（后端防路径穿越校验），从公式派生并清洗
         factor: (formula.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64) || 'tmp'),
+        // 必须显式传公式：后端 EvaluateIn.formula 默认 pct_change_20，
+        // 漏发的话选什么因子实际都在评 pct_change_20
+        formula,
         n_groups: 5,
         start: evalStart,
         end: evalEnd.trim() ? evalEnd : null,
         universe: evalUniverse,
-        filter_zscore: zThreshold.trim() ? Number(zThreshold) : null,
+        // NaN 会被 JSON.stringify 序列化成 null → 后端静默按「不过滤」处理；
+        // 非法输入必须提示而不是静默改变评价口径
+        filter_zscore: (() => {
+          const t = zThreshold.trim();
+          if (!t) return null;
+          const n = Number(t);
+          if (!Number.isFinite(n) || n < 1) {
+            throw new Error('截面过滤阈值需为 ≥1 的数字');
+          }
+          return n;
+        })(),
         event_window: [10, 15],
       };
       // 评价任务化：202 {job_id}，进度条与结果经 /ws/jobs/{id} 流式回流
@@ -860,7 +874,11 @@ export default function FactorsPage() {
           <label className="flex items-center gap-1 text-xs text-ink-dim">
             冗余阈值
             <input type="number" min={0.5} max={1} step={0.05} value={corrThreshold}
-              onChange={(e) => setCorrThreshold(Number(e.target.value))}
+              onChange={(e) => {
+                // Number('') = 0，违反后端 ge=0.5 → 裸 422；空值回退默认并钳制
+                const n = Number(e.target.value);
+                setCorrThreshold(Number.isFinite(n) ? Math.min(1, Math.max(0.5, n)) : 0.8);
+              }}
               className="input w-20 py-1 text-xs" />
           </label>
         </div>

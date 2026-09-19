@@ -103,9 +103,15 @@ def event_study(
             for k in range(-before, after + 1)
         ])
 
+    # 各 (q, rel_period) 的均值可以按列独立聚合：直接 group_by(q).mean，
+    # 不必把全面板 unpivot 成 26 倍行数的长表（全市场多年 ≈ 上亿行中间帧，
+    # 峰值内存约为面板 25 倍，内存受限机器会 OOM）。
+    means = d.group_by("q").agg(
+        [pl.col(f"r{k}").mean() for k in range(-before, after + 1)]
+    )
     long = (
-        d.unpivot(
-            index=[date_col, symbol_col, "q"],
+        means.unpivot(
+            index="q",
             on=rel,
             variable_name="rel_period",
             value_name="cum_ret",
@@ -113,11 +119,7 @@ def event_study(
         .with_columns(pl.col("rel_period").str.slice(1).cast(pl.Int32))
         .drop_nulls("cum_ret")
     )
-    agg = (
-        long.group_by(["q", "rel_period"])
-        .agg(pl.col("cum_ret").mean())
-        .drop_nulls("cum_ret")
-    )
+    agg = long
     if not len(agg):
         return pl.DataFrame(schema={"rel_period": pl.Int32})
 
