@@ -50,7 +50,7 @@ dataset:
             test: [2026-01-01, 2026-09-18]
 
 model:
-    class: LGBMModel
+    class: LGBModel
     module_path: qlib.contrib.model.gbdt
     kwargs:
         loss: mse
