@@ -92,3 +92,44 @@ def check_ep() -> dict:
     if not d.exists():
         raise HTTPException(404, f"qlib 数据目录不存在：{d}（先导出）")
     return check(d)
+
+
+class ConfigIn(BaseModel):
+    content: str
+
+
+@router.get("/configs")
+def list_configs_ep() -> list[dict]:
+    out = []
+    for p in sorted(_CONFIG_DIR.glob("*.yaml")):
+        out.append({"name": p.stem, "path": str(p),
+                    "mtime": p.stat().st_mtime})
+    return out
+
+
+@router.get("/configs/{name}")
+def get_config_ep(name: str) -> dict:
+    if not _NAME_RE.match(name):
+        raise HTTPException(422, f"非法配置名：{name!r}")
+    p = _CONFIG_DIR / f"{name}.yaml"
+    if not p.exists():
+        raise HTTPException(404, f"配置不存在：{p}")
+    return {"name": name, "content": p.read_text(encoding="utf-8")}
+
+
+@router.put("/configs/{name}")
+def put_config_ep(name: str, req: ConfigIn) -> dict:
+    if not _NAME_RE.match(name):
+        raise HTTPException(422, f"非法配置名（含路径分隔符）：{name!r}")
+    import yaml as _yaml
+
+    try:
+        doc = _yaml.safe_load(req.content)
+    except _yaml.YAMLError as e:
+        raise HTTPException(422, f"yaml 语法错误：{e}") from e
+    if not isinstance(doc, dict) or "qlib_init" not in doc:
+        raise HTTPException(422, "workflow 配置需为 dict 且含 qlib_init 键")
+    p = _CONFIG_DIR / f"{name}.yaml"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(req.content, encoding="utf-8")
+    return {"name": name, "saved": True}
