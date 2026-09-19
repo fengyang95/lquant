@@ -11,7 +11,7 @@ export type TaskProgress = {
 /** 统一任务项（后端 /api/tasks 归一结构） */
 export type TaskItem = {
   id: string;
-  kind: 'data' | 'sync' | 'backtest' | 'factor';
+  kind: 'data' | 'sync' | 'backtest' | 'factor' | 'qlib';
   name: string;
   status: string;
   state: 'queued' | 'running' | 'finished' | 'failed' | 'canceled';
@@ -39,6 +39,7 @@ export const KIND_TEXT: Record<TaskItem['kind'], string> = {
   sync: '同步任务',
   backtest: '回测任务',
   factor: '因子挖掘',
+  qlib: 'Qlib',
 };
 
 /** 统一状态 → 徽章配色（沿用 TaskBadge 语义：running=蓝、failed=红、finished=绿） */
