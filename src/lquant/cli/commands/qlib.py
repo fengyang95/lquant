@@ -8,7 +8,6 @@ pyqlib 不进主 venv（依赖树重）。`lq qlib workflow` 的探测顺序：
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -57,23 +56,10 @@ def check_cmd(out_dir: str) -> None:
 
 
 def _find_qlib_python(python: str | None) -> str | None:
-    """定位可用的 qlib 解释器；None = 当前解释器即可。"""
-    if python:
-        return python
-    env_py = os.environ.get("LQ_QLIB_PYTHON")
-    if env_py and Path(env_py).exists():
-        return env_py
-    try:
-        import qlib  # noqa: F401
+    """定位可用的 qlib 解释器；None = 当前解释器即可（公共实现见 qlib_io.interpreter）。"""
+    from lquant.qlib_io.interpreter import find_qlib_python
 
-        return None
-    except ImportError:
-        pass
-    for cand in (".venv-qlib/bin/python", ".venv-qlib/Scripts/python.exe"):
-        p = Path(cand)
-        if p.exists():
-            return str(p)
-    return ""
+    return find_qlib_python(python)
 
 
 @qlib.command()
