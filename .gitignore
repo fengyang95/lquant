@@ -54,16 +54,20 @@ web/tsconfig.tsbuildinfo
 # OMC 会话状态
 .omc/
 
-<<<<<<< HEAD
 # worktree 内指向主仓数据的符号链接(锚定仓库根,避免误伤子目录同名路径)
 /data
-=======
+
 # coverage 门禁产物
 coverage.xml
 coverage.json
 .coverage
 htmlcov/
->>>>>>> origin/main
+
+# qlib 接入：专用 venv 与工作流运行时产物
+.venv-qlib/
+mlruns/
+data/qlib/
+data/qlib-smoke/
 
 web/coverage/
 web/test-results/
