@@ -3,14 +3,16 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, field_validator
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field, field_validator
 
 from lquant.qlib_io.export import ALL_FIELDS, check
-from lquant.server.jobs import enqueue
+from lquant.server.jobs import enqueue, request_cancel
 
 router = APIRouter(prefix="/qlib", tags=["qlib"])
 
@@ -133,3 +135,157 @@ def put_config_ep(name: str, req: ConfigIn) -> dict:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(req.content, encoding="utf-8")
     return {"name": name, "saved": True}
+
+
+class WorkflowIn(BaseModel):
+    config: str
+    market: str | None = None
+    exp_name: str = "lquant_qlib"
+
+
+class CompareIn(BaseModel):
+    ids: list[str] = Field(min_length=2, max_length=2)
+
+
+from lquant.qlib_io.interpreter import find_qlib_python  # noqa: E402
+
+LOG_DIR = Path("data/qlib/runs")
+
+
+def _log_path(run_id: str) -> Path:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    return LOG_DIR / f"{run_id}.log"
+
+
+def _metrics_out_path(run_id: str) -> Path:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    return LOG_DIR / f"{run_id}_metrics.json"
+
+
+_VENV_MISSING_MSG = (
+    "当前环境没有 pyqlib。安装专用 venv：\n"
+    "  python -m venv .venv-qlib\n"
+    "  .venv-qlib/bin/pip install pyqlib lightgbm\n"
+    "或设置 LQ_QLIB_PYTHON 指向已有解释器。"
+)
+
+
+def _run_workflow_job(run_id: str, config: str, market: str | None,
+                      exp_name: str, progress=None,
+                      cancel_check=None) -> dict:
+    """enqueue 任务体：探测解释器 → 子进程跑 runner → 落库。"""
+    from lquant.qlib_io import store
+
+    store.update_run(run_id, status="running")
+    py = find_qlib_python(None)
+    if py == "":
+        store.update_run(run_id, status="failed", error=_VENV_MISSING_MSG)
+        return {"status": "failed"}
+
+    log_p = _log_path(run_id)
+    out_p = _metrics_out_path(run_id)
+    runner_py = QLIB_RUNNER
+    argv = [str(runner_py), "--provider", _QLIB_DATA_DIR,
+            "--config", str(_CONFIG_DIR / f"{config}.yaml"),
+            "--exp-name", exp_name, "--out", str(out_p)]
+    if market:
+        argv += ["--market", market]
+    cmd = ([py] + argv) if py else ([sys.executable] + argv)
+    if progress:
+        progress(done=0, total=1, phase="workflow", message="训练中")
+    try:
+        with log_p.open("w", encoding="utf-8") as lf:
+            rc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT).returncode
+    except OSError as e:
+        store.update_run(run_id, status="failed", error=str(e))
+        return {"status": "failed"}
+    if cancel_check and cancel_check():
+        store.update_run(run_id, status="canceled")
+        return {"status": "canceled"}
+    if rc != 0:
+        tail = log_p.read_text(encoding="utf-8", errors="replace")[-2000:]
+        store.update_run(run_id, status="failed", error=tail, log_path=str(log_p))
+        return {"status": "failed"}
+    metrics = json.loads(out_p.read_text(encoding="utf-8")) if out_p.exists() else {}
+    store.update_run(run_id, status="finished", metrics=metrics, log_path=str(log_p))
+    if progress:
+        progress(done=1, total=1, phase="done", message="完成")
+    return {"status": "finished"}
+
+
+@router.post("/workflow", status_code=202)
+def workflow_ep(req: WorkflowIn) -> dict:
+    if not _NAME_RE.match(req.config):
+        raise HTTPException(422, f"非法配置名：{req.config!r}")
+    cfg = _CONFIG_DIR / f"{req.config}.yaml"
+    if not cfg.exists():
+        raise HTTPException(404, f"workflow 配置不存在：{cfg}")
+    if not Path(_QLIB_DATA_DIR).exists():
+        raise HTTPException(422, f"qlib 数据目录不存在：{_QLIB_DATA_DIR}（先导出）")
+    if find_qlib_python(None) == "":
+        raise HTTPException(422, _VENV_MISSING_MSG)
+    snapshot = cfg.read_text(encoding="utf-8")
+    from lquant.qlib_io import store
+
+    run = store.create_run(f"{req.config}.yaml", req.market, req.exp_name, snapshot)
+    enqueue("lquant-qlib", _run_workflow_job, run["id"], req.config,
+            req.market, req.exp_name,
+            job_id=f"qlibwf-{run['id']}", name="Qlib 工作流")
+    return {"run_id": run["id"]}
+
+
+@router.get("/runs")
+def list_runs_ep(limit: int = Query(default=50, ge=1, le=500),
+                 status: str | None = None) -> list[dict]:
+    from lquant.qlib_io import store
+
+    return store.list_runs(limit=limit, status=status)
+
+
+@router.get("/runs/{run_id}")
+def get_run_ep(run_id: str) -> dict:
+    from lquant.qlib_io import store
+
+    run = store.get_run(run_id)
+    if run is None:
+        raise HTTPException(404, f"运行不存在：{run_id}")
+    if run.get("log_path"):
+        lp = Path(run["log_path"])
+        run["log_tail"] = (lp.read_text(encoding="utf-8", errors="replace")[-5000:]
+                           if lp.exists() else None)
+    return run
+
+
+@router.post("/runs/{run_id}/cancel")
+def cancel_run_ep(run_id: str) -> dict:
+    from lquant.qlib_io import store
+
+    run = store.get_run(run_id)
+    if run is None:
+        raise HTTPException(404, f"运行不存在：{run_id}")
+    if run["status"] not in ("queued", "running"):
+        raise HTTPException(409, f"运行已结束（{run['status']}）")
+    if not request_cancel(f"qlibwf-{run_id}"):
+        raise HTTPException(409, "任务当前不可取消")
+    store.update_run(run_id, status="canceled")
+    return {"run_id": run_id, "canceled": True}
+
+
+@router.post("/runs/compare")
+def compare_ep(req: CompareIn) -> dict:
+    from lquant.qlib_io import store
+
+    runs = [store.get_run(i) for i in req.ids]
+    missing = [i for i, r in zip(req.ids, runs, strict=True) if r is None]
+    if missing:
+        raise HTTPException(404, f"运行不存在：{missing}")
+    keys: set[str] = set()
+    for r in runs:
+        keys |= set(r.get("metrics") or {})
+    rows = [{"metric": k,
+             **{r["id"]: (r.get("metrics") or {}).get(k) for r in runs}}
+            for k in sorted(keys)]
+    return {"runs": [{"id": r["id"], "config": r["config"],
+                      "exp_name": r["exp_name"],
+                      "status": r["status"]} for r in runs],
+            "rows": rows}
