@@ -17,6 +17,7 @@ import CoverageMonthlyChart from './CoverageMonthlyChart';
 import IssuesPanel from './IssuesPanel';
 import SyncJobsPanel from './SyncJobsPanel';
 import DataVersionCard from './DataVersionCard';
+import QlibExportCard from './QlibExportCard';
 import GapsPanel from './GapsPanel';
 import PurgeModal from './PurgeModal';
 import DataDictionaryModal from './DataDictionaryModal';
@@ -124,6 +125,8 @@ export default function DataPage() {
       <Msg text={msg} />
 
       <DataVersionCard />
+
+      <LazySection><QlibExportCard /></LazySection>
 
       {/* 日线数据补全：任务进度 / 断点续传 / 数据源配置 / 跨源印证 / 全湖质量检查。
           折叠线以下全部懒挂载：进入视口前不发请求，首屏瞬时请求从 9 路降到 2 路 */}
