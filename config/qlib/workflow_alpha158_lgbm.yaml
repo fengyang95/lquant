@@ -1,0 +1,85 @@
+# qlib 工作流：Alpha158 特征 + LightGBM 模型 + TopkDropout 组合回测
+# 格式与 qlib 官方 qrun 的 workflow_config 一致（由 lq qlib workflow 驱动）。
+# 数据由 `lq qlib export` 从 lquant 日线湖导出（默认 data/qlib）。
+#
+# 口径说明：
+# - 湖内无指数数据，benchmark 置 null：回测只看绝对收益，不算超额收益；
+# - 价格为「前复权到最新」序列（$factor = adj_factor/adj_factor_latest），
+#   收益率与真实一致，deal_price 用 $close 即可。
+qlib_init:
+    provider_uri: "data/qlib"
+    region: cn
+
+market: &market all
+# 湖内暂无指数日线：基准用 SH600000 机械代理（qlib 0.9.7 里 benchmark:null
+# 会被默认成 SH000300 然后报不存在），超额收益数字仅作参考。
+benchmark: &benchmark SH600000
+
+data_handler_config: &data_handler_config
+    start_time: 2024-01-01
+    end_time: 2026-09-18
+    fit_start_time: 2024-01-01
+    fit_end_time: 2025-12-31
+    instruments: *market
+    infer_processors:
+        - class: RobustZScoreNorm
+          kwargs:
+              fields_group: feature
+              clip_outlier: true
+    learn_processors:
+        - class: DropnaLabel
+        - class: CSRankNorm
+          kwargs:
+              fields_group: label
+
+label: &label ["Ref($close, -2) / Ref($close, -1) - 1"]
+
+dataset:
+    class: DatasetH
+    module_path: qlib.data.dataset
+    kwargs:
+        handler:
+            class: Alpha158
+            module_path: qlib.contrib.data.handler
+            kwargs:
+                <<: *data_handler_config
+                label: *label
+        segments:
+            train: [2024-01-01, 2025-06-30]
+            valid: [2025-07-01, 2025-12-31]
+            test: [2026-01-01, 2026-09-18]
+
+model:
+    class: LGBMModel
+    module_path: qlib.contrib.model.gbdt
+    kwargs:
+        loss: mse
+        colsample_bytree: 0.8879
+        learning_rate: 0.0421
+        subsample: 0.8789
+        lambda_l1: 205.6999
+        lambda_l2: 580.9768
+        max_depth: 8
+        num_leaves: 210
+        num_threads: 8
+
+port_analysis: &port_analysis
+    strategy:
+        class: TopkDropoutStrategy
+        module_path: qlib.contrib.strategy
+        kwargs:
+            signal: <PRED>
+            topk: 30
+            n_drop: 3
+    backtest:
+        start_time: 2026-01-01
+        # end 收到日历倒数第二个交易日：qlib 末步需要下一交易日定价
+        end_time: 2026-09-17
+        account: 100000000
+        benchmark: *benchmark
+        exchange_kwargs:
+            deal_price: close
+            open_cost: 0.0005
+            close_cost: 0.0015
+            min_cost: 5
+            trade_unit: 100
