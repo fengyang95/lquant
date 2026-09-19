@@ -17,6 +17,7 @@ import { get, post } from '@/lib/api';
 import { useJobStream } from '@/lib/streaming';
 import { C, axes, legend, tooltip } from '@/lib/chart';
 import FactorLibrary from './FactorLibrary';
+import QlibWorkflowPanel from './QlibWorkflowPanel';
 
 type FactorRow = {
   name: string; expression: string; description: string; created_at: string;
@@ -111,7 +112,7 @@ export default function FactorsPage() {
   const { data: builtin } = useSWR<BuiltinItem[]>('/factors/builtin', get);
   const { data: universes } = useSWR<{ key: string; index_code: string | null; label: string }[]>(
     '/factors/universes', get);
-  const [tab, setTab] = useState<'eval' | 'lab' | 'library'>('eval');
+  const [tab, setTab] = useState<'eval' | 'lab' | 'library' | 'qlib'>('eval');
   const [formula, setFormula] = useState('pct_change_20');
   const [evalRes, setEvalRes] = useState<EvalResult | null>(null);
   const [evalSeries, setEvalSeries] = useState<EvalSeries | null>(null);
@@ -420,6 +421,7 @@ export default function FactorsPage() {
           ['eval', '快速评价'],
           ['lab', '相关性 · 合成'],
           ['library', '因子库'],
+          ['qlib', 'Qlib 工作流'],
         ] as const).map(([key, label]) => (
           <button
             key={key}
@@ -971,6 +973,8 @@ export default function FactorsPage() {
         onPickFormula={(n) => { setFormula(n); setTab('eval'); }}
       />
       )}
+
+      {tab === 'qlib' && <QlibWorkflowPanel />}
     </div>
   );
 }
