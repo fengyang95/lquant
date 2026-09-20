@@ -15,7 +15,7 @@ export type TaskItem = {
   name: string;
   status: string;
   state: 'queued' | 'running' | 'finished' | 'failed' | 'canceled';
-  created_at: string | null;
+  created_at: string | number | null;
   params: Record<string, unknown>;
   error: string | null;
   progress?: TaskProgress | null;
@@ -72,7 +72,14 @@ export function paramsBrief(params: Record<string, unknown> | null | undefined):
   return rest > 0 ? `${head} +${rest}` : head;
 }
 
-/** 时间展示：created_at 截到 分（缺省 —） */
-export function createdText(t: string | null): string {
-  return t ? t.slice(0, 16).replace('T', ' ') : '—';
+/** 时间展示：created_at（ISO 串或 epoch 秒）截到 分（缺省 —） */
+export function createdText(t: string | number | null): string {
+  if (t === null || t === undefined || t === '') return '—';
+  if (typeof t === 'number') {
+    const d = new Date(t * 1000);
+    if (Number.isNaN(d.getTime())) return '—';
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+  return t.slice(0, 16).replace('T', ' ');
 }
