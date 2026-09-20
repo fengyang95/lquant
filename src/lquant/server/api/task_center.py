@@ -16,7 +16,7 @@ from lquant.server.jobs import (
 
 router = APIRouter(prefix="/tasks", tags=["task-center"])
 
-KINDS = ("data", "sync", "backtest", "factor")
+KINDS = ("data", "sync", "backtest", "factor", "qlib")
 
 # 各自原生状态 → 统一 state（queued/running/finished/failed/canceled）
 _DATA_STATE = {
@@ -87,7 +87,8 @@ def _job_items(queue: str, kind: str, limit: int) -> list[dict]:
         jid = j["id"]
         out.append({"id": jid, "kind": kind,
                     "name": get_job_name(jid)
-                    or ("参数扫描" if kind == "backtest" else "因子挖掘"),
+                    or ("参数扫描" if kind == "backtest"
+                        else ("Qlib 任务" if kind == "qlib" else "因子挖掘")),
                     "status": status, "state": _JOB_STATE.get(status, "queued"),
                     "created_at": j.get("created_at", 0.0),
                     "params": {}, "error": j.get("error"),
@@ -113,6 +114,8 @@ def _items(kind: str, limit: int) -> list[dict]:
         return _job_items("lquant-backtest", "backtest", limit)
     if kind == "factor":
         return _job_items("lquant-mining", "factor", limit)
+    if kind == "qlib":
+        return _job_items("lquant-qlib", "qlib", limit)
     raise HTTPException(422, f"未知任务类别: {kind!r}（可选 {KINDS}）")
 
 

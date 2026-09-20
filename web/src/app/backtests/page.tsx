@@ -18,6 +18,7 @@ import ResultPane from './workspace/ResultPane';
 import QuickRunPanel from './workspace/QuickRunPanel';
 import HistoryPanel from './workspace/HistoryPanel';
 import ValidationPanel from './workspace/ValidationPanel';
+import QlibRunsSection from './QlibRunsSection';
 import {
   buildRunPayload,
   isDirty,
@@ -398,7 +399,12 @@ function BacktestWorkspace() {
           }
         />
       )}
-      {tab === 'validation' && <ValidationPanel />}
+      {tab === 'validation' && (
+        <div className="space-y-4">
+          <ValidationPanel />
+          <QlibRunsSection />
+        </div>
+      )}
     </div>
   );
 }

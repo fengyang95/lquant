@@ -16,7 +16,8 @@ from typing import Any
 
 from lquant.core.db import reader, writer
 
-QUEUES = ("lquant-default", "lquant-ingest", "lquant-backtest", "lquant-mining")
+QUEUES = ("lquant-default", "lquant-ingest", "lquant-backtest", "lquant-mining",
+          "lquant-qlib")
 
 # ---------------------------------------------------------------- job_record
 
