@@ -64,6 +64,17 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     def _monitor_startup() -> None:
         start_monitor()
+        # 默认同步作业播种（幂等）：每个 app 实例的 startup 都要执行 ——
+        # 只挂在模块级 _startup 上的话，TestClient(create_app()) 这类新建
+        # 实例不会播种，GET /sync/jobs 拿到空列表。
+        try:
+            from lquant.sync import manager
+
+            n = manager.seed_defaults()
+            if n:
+                print(f"[sync] 已种子 {n} 个默认同步作业")
+        except Exception as e:  # noqa: BLE001 - 播种失败不挡启动
+            print(f"[warn] sync 作业种子失败: {e}")
 
     @app.on_event("shutdown")
     async def _monitor_shutdown() -> None:
@@ -159,12 +170,6 @@ def _startup() -> None:
         def _sync_worker() -> None:
             from lquant.sync import manager
 
-            try:
-                n = manager.seed_defaults()
-                if n:
-                    print(f"[sync] 已种子 {n} 个默认同步作业")
-            except Exception as e:  # noqa: BLE001
-                print(f"[warn] sync 作业种子失败: {e}")
             manager.loop_forever(interval=30)
 
         threading.Thread(target=_sync_worker, name="sync-worker", daemon=True).start()

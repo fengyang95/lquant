@@ -3,14 +3,18 @@
 import { useState } from 'react';
 import useSWR from 'swr';
 import PageHeader from '@/components/PageHeader';
-import { Panel, Stat } from '@/components/Panel';
+import { Panel } from '@/components/Panel';
 import { Empty, Msg } from '@/components/States';
 import { get, post, del } from '@/lib/api';
+import RetryBadge from './RetryBadge';
+import { runRetryText } from './retry';
+import type { Freshness } from '../data/FreshnessHealthCard';
+import { Dot, lagTone } from '../data/FreshnessHealthCard';
 
 type SyncJob = {
   sync_id: string;
   name: string;
-  kind: 'collect' | 'daily' | 'adj_factor';
+  kind: string; // collect | daily | adj_factor | daily_basic | financial
   schedule_time: string;
   weekdays: string;
   params: Record<string, unknown>;
@@ -18,6 +22,8 @@ type SyncJob = {
   last_run_at: string | null;
   last_status: string | null;
   last_rows: number | null;
+  retry_count: number | null;
+  next_retry_at: string | null;
 };
 
 type SyncRun = {
@@ -26,14 +32,9 @@ type SyncRun = {
   detail: Record<string, unknown>;
 };
 
-type Coverage = {
-  lake: { rows: number; symbols: number; first_day: string | null; last_day: string | null };
-  reference: { table: string; rows: number }[];
-  market_tables: { table: string; rows: number; first_day: string | null; last_day: string | null }[];
-};
-
 const KIND_LABEL: Record<string, string> = {
   collect: '市场采集', daily: '日线增量', adj_factor: '复权因子',
+  daily_basic: '基本面增量', financial: '财务数据',
 };
 const WD_LABEL = ['一', '二', '三', '四', '五', '六', '日'];
 
@@ -58,12 +59,19 @@ function StatusTag({ job }: { job: SyncJob }) {
 export default function SyncPage() {
   const { data: jobs, mutate: mutateJobs } = useSWR<SyncJob[]>('/sync/jobs', get, { refreshInterval: 10_000 });
   const { data: hist, mutate: mutateHist } = useSWR<SyncRun[]>('/sync/history?limit=30', get, { refreshInterval: 15_000 });
-  const { data: cov } = useSWR<Coverage>('/sync/coverage', get);
+  const { data: fresh } = useSWR<Freshness>('/sync/freshness', get, { refreshInterval: 60_000, shouldRetryOnError: false });
 
   const [busy, setBusy] = useState('');
   const [msg, setMsg] = useState('');
+  const [highlight, setHighlight] = useState('');
   // 新建/编辑表单
   const [form, setForm] = useState({ sync_id: '', name: '', kind: 'collect', schedule_time: '15:05', weekdays: '1,2,3,4,5', schedule: 'close' });
+
+  /** 摘要卡点击 → 滚动到作业行并短暂高亮（timeout 自清理） */
+  function scrollToJob(id: string) {
+    setHighlight(id);
+    document.getElementById(`job-row-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
 
   async function runNow(id: string) {
     setBusy(id);
@@ -118,12 +126,50 @@ export default function SyncPage() {
     } finally { setBusy(''); }
   }
 
+  /** 失败 / 重试中的作业 → 摘要卡红色项 */
+  const problemJobs = (jobs ?? []).filter(
+    (j) => j.enabled && (j.last_status === 'failed' || (j.retry_count ?? 0) > 0 || j.next_retry_at != null),
+  );
+
   return (
     <div className="space-y-5">
       <PageHeader
-        title="同步"
-        sub="后台 worker 每 30s 检查到期作业 · 到点自动执行 · 重启自动补跑"
+        title="同步操作"
+        sub="后台 worker 每 30s 检查到期作业 · 到点自动执行 · 失败自动重试"
       />
+
+      {/* 健康度摘要卡：新鲜度 + 问题作业直达 */}
+      <Panel title="健康度摘要" meta="失败 / 重试中的作业点击直达作业行">
+        <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
+          <div className="flex items-center gap-2">
+            <Dot tone={lagTone(fresh?.lag_days ?? null)} label="日线湖新鲜度" />
+            <span className="text-ink-faint">日线湖</span>
+            <span className="tabular-nums">{fresh?.daily_lake ? fresh.daily_lake.slice(0, 10) : '—'}</span>
+            <span className="text-xs text-ink-faint">
+              {fresh?.lag_days == null ? '' : `落后 ${fresh.lag_days} 交易日`}
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <Dot tone={lagTone(fresh?.news ? (fresh.news.today_rows > 0 ? 0 : null) : null)} label="资讯新鲜度" />
+            <span className="text-ink-faint">资讯</span>
+            <span className="tabular-nums">{fresh?.news?.latest ? fresh.news.latest.slice(0, 10) : '—'}</span>
+          </div>
+          {problemJobs.length === 0 ? (
+            <span className="text-xs text-ink-faint">无失败 / 重试作业</span>
+          ) : (
+            problemJobs.map((j) => (
+              <button
+                key={j.sync_id}
+                type="button"
+                onClick={() => scrollToJob(j.sync_id)}
+                className="border border-up/40 bg-up/5 px-2 py-1 text-xs text-up hover:bg-up/10"
+              >
+                {j.name}（{j.last_status === 'failed' ? '失败' : '重试中'}）
+              </button>
+            ))
+          )}
+        </div>
+      </Panel>
 
       <Msg text={msg} />
 
@@ -145,7 +191,11 @@ export default function SyncPage() {
             </thead>
             <tbody>
               {jobs.map((j) => (
-                <tr key={j.sync_id} className="hover:bg-white">
+                <tr
+                  key={j.sync_id}
+                  id={`job-row-${j.sync_id}`}
+                  className={highlight === j.sync_id ? 'bg-gold/10' : 'hover:bg-white'}
+                >
                   <td>
                     <div className="font-medium">{j.name}</div>
                     <div className="font-mono text-xs text-ink-faint">{j.sync_id}</div>
@@ -162,7 +212,10 @@ export default function SyncPage() {
                     {j.last_run_at?.slice(5, 16) ?? '—'}
                     <span className="ml-1 text-ink-faint">{j.last_rows != null ? `${j.last_rows}行` : ''}</span>
                   </td>
-                  <td><StatusTag job={j} /></td>
+                  <td>
+                    <StatusTag job={j} />
+                    <RetryBadge retryCount={j.retry_count} nextRetryAt={j.next_retry_at} />
+                  </td>
                   <td className="text-right">
                     <button onClick={() => runNow(j.sync_id)} disabled={busy === j.sync_id} className="btn btn-sm">
                       {busy === j.sync_id ? '…' : '立即运行'}
@@ -199,6 +252,8 @@ export default function SyncPage() {
               <option value="collect">市场采集</option>
               <option value="daily">日线增量</option>
               <option value="adj_factor">复权因子</option>
+              <option value="daily_basic">基本面增量</option>
+              <option value="financial">财务数据</option>
             </select>
           </label>
           <label className="text-xs text-ink-faint">时间
@@ -225,53 +280,6 @@ export default function SyncPage() {
         </div>
       </Panel>
 
-      {/* 数据覆盖度 */}
-      <div className="grid gap-5 lg:grid-cols-3">
-        <Panel title="Parquet 日线湖">
-          {cov ? (
-            <div className="space-y-1 text-sm">
-              <div className="flex justify-between"><span className="text-ink-faint">行数</span><span className="tabular-nums">{cov.lake.rows.toLocaleString()}</span></div>
-              <div className="flex justify-between"><span className="text-ink-faint">标的数</span><span className="tabular-nums">{cov.lake.symbols}</span></div>
-              <div className="flex justify-between"><span className="text-ink-faint">起止</span>
-                <span className="tabular-nums text-xs">{cov.lake.first_day ?? '—'} ~ {cov.lake.last_day ?? '—'}</span></div>
-            </div>
-          ) : <div className="py-8 text-center text-xs text-ink-faint">加载中…</div>}
-        </Panel>
-        <Panel title="参考数据表">
-          {!cov?.reference.length ? (
-            <div className="py-8 text-center text-xs text-ink-faint">加载中…</div>
-          ) : (
-            <table className="table-dense">
-              <tbody>
-                {cov.reference.map((t) => (
-                  <tr key={t.table}>
-                    <td className="py-1 font-mono text-xs">{t.table}</td>
-                    <td className="py-1 text-right text-xs">{t.rows.toLocaleString()}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </Panel>
-        <Panel title="看板采集表">
-          {!cov?.market_tables.length ? (
-            <div className="py-8 text-center text-xs text-ink-faint">加载中…</div>
-          ) : (
-            <table className="table-dense">
-              <tbody>
-                {cov.market_tables.map((t) => (
-                  <tr key={t.table}>
-                    <td className="py-1 font-mono text-xs">{t.table}</td>
-                    <td className="py-1 text-right text-xs">{(t.rows ?? 0).toLocaleString()}</td>
-                    <td className="py-1 text-right text-xs text-ink-faint">{t.last_day ?? '—'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </Panel>
-      </div>
-
       {/* 运行历史 */}
       <Panel title="运行历史" meta={`${hist?.length ?? 0} 条`}>
         {!hist?.length ? (
@@ -286,25 +294,30 @@ export default function SyncPage() {
                   <th className="text-left">类型</th>
                   <th className="text-right">行数</th>
                   <th className="text-left">状态</th>
+                  <th className="text-left">重试</th>
                   <th className="text-left">详情</th>
                 </tr>
               </thead>
               <tbody>
-                {hist.map((h) => (
-                  <tr key={h.run_id} className="hover:bg-white">
-                    <td className="text-xs tabular-nums">{h.started_at.slice(5, 16)}</td>
-                    <td className="text-xs">{h.job_name}</td>
-                    <td className="text-xs">{KIND_LABEL[h.kind] ?? h.kind}</td>
-                    <td className="text-right">{h.rows}</td>
-                    <td className={`text-xs font-medium ${
-                      h.status === 'ok' ? 'text-down' : h.status === 'partial' ? 'text-gold' : 'text-up'}`}>
-                      {h.status}
-                    </td>
-                    <td className="max-w-64 truncate text-xs text-ink-faint" title={JSON.stringify(h.detail)}>
-                      {h.detail && Object.keys(h.detail).length ? JSON.stringify(h.detail).slice(0, 80) : '—'}
-                    </td>
-                  </tr>
-                ))}
+                {hist.map((h) => {
+                  const retryTxt = runRetryText(h.detail);
+                  return (
+                    <tr key={h.run_id} className="hover:bg-white">
+                      <td className="text-xs tabular-nums">{h.started_at.slice(5, 16)}</td>
+                      <td className="text-xs">{h.job_name}</td>
+                      <td className="text-xs">{KIND_LABEL[h.kind] ?? h.kind}</td>
+                      <td className="text-right">{h.rows}</td>
+                      <td className={`text-xs font-medium ${
+                        h.status === 'ok' ? 'text-down' : h.status === 'partial' ? 'text-gold' : 'text-up'}`}>
+                        {h.status}
+                      </td>
+                      <td className="text-xs text-gold">{retryTxt ?? '—'}</td>
+                      <td className="max-w-64 truncate text-xs text-ink-faint" title={JSON.stringify(h.detail)}>
+                        {h.detail && Object.keys(h.detail).length ? JSON.stringify(h.detail).slice(0, 80) : '—'}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

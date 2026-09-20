@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from lquant.sync import manager
+from lquant.sync.manager import _KINDS
 
 router = APIRouter(prefix="/sync", tags=["sync"])
 
@@ -17,15 +18,19 @@ router = APIRouter(prefix="/sync", tags=["sync"])
 @router.get("/jobs")
 def get_jobs() -> list[dict]:
     """同步作业列表（含下次到期判断所需的 last_run 状态）。"""
-    manager.seed_defaults()
     return manager.list_jobs()
+
+
+# 与 manager._KINDS 对齐：reference/daily_basic/financial/news/backfill
+# 也必须能经 API 编辑/手跑，不能只留旧三类。
+_KIND_PATTERN = "^(?:" + "|".join(_KINDS) + ")$"
 
 
 class JobIn(BaseModel):
     sync_id: str = Field(min_length=1, max_length=48)
     name: str = Field(min_length=1, max_length=128)
-    kind: str = Field(pattern="^(collect|daily|adj_factor)$")
-    schedule_time: str = Field(pattern=r"^\d{2}:\d{2}$")
+    kind: str = Field(pattern=_KIND_PATTERN)
+    schedule_time: str = Field(pattern=r"^\d{2}:\d{2}(,\d{2}:\d{2})*$")
     weekdays: str = Field(default="1,2,3,4,5", max_length=20)
     params: dict = Field(default_factory=dict)
     enabled: bool = True
@@ -62,7 +67,7 @@ def remove_job(sync_id: str) -> dict:
 
 class RunIn(BaseModel):
     sync_id: str | None = None
-    kind: str | None = Field(default=None, pattern="^(collect|daily|adj_factor)$")
+    kind: str | None = Field(default=None, pattern=_KIND_PATTERN)
     schedule: str | None = Field(default=None,
                                  description="collect 时的采集时点（close/evening/preopen）")
     demo: bool = False
@@ -116,15 +121,27 @@ def coverage() -> dict:
     ref: list[dict] = []
     try:
         with reader() as con:
-            for t in ("security", "trade_calendar", "etf_meta", "adj_factor",
-                      "financial_pit", "industry_classify", "factor_value"):
-                try:
-                    r = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()
-                    ref.append({"table": t, "rows": r[0] or 0})
-                except Exception:  # noqa: BLE001
-                    ref.append({"table": t, "rows": 0})
+            # 单条 UNION ALL：逐表两次往返（COUNT + try/except 兜底）换成
+            # 一次往返；无日期列的表 max_date 取 NULL。
+            union_sql = " UNION ALL ".join(
+                f"SELECT '{t}' AS table_name, COUNT(*) AS row_cnt, "
+                f"MAX({col}) AS max_date FROM {t}"
+                for t, col in [
+                    ("security", "list_date"),
+                    ("trade_calendar", "trade_date"),
+                    ("etf_meta", "listing_date"),
+                    ("adj_factor", "trade_date"),
+                    ("financial_pit", "NULL"),
+                    ("industry_classify", "NULL"),
+                    ("factor_value", "NULL"),
+                ])
+            rows = con.execute(union_sql).fetchall()
+        ref = [{"table": r[0], "rows": r[1] or 0,
+                "last_day": str(r[2]) if r[2] else None} for r in rows]
     except Exception:  # noqa: BLE001
-        pass
+        ref = [{"table": t, "rows": 0, "last_day": None} for t in (
+            "security", "trade_calendar", "etf_meta", "adj_factor",
+            "financial_pit", "industry_classify", "factor_value")]
 
     board: list[dict] = []
     try:
