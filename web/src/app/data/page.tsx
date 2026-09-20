@@ -11,6 +11,7 @@ import ChecksPanel from './ChecksPanel';
 import RecentIssuesPanel from './RecentIssuesPanel';
 import CoverageMonthlyChart from './CoverageMonthlyChart';
 import DataVersionCard from './DataVersionCard';
+import QlibExportCard from './QlibExportCard';
 import DataDictionaryModal from './DataDictionaryModal';
 import { useState } from 'react';
 
@@ -57,6 +58,8 @@ export default function DataPage() {
       <LazySection><RecentIssuesPanel /></LazySection>
 
       <DataVersionCard />
+
+      <LazySection><QlibExportCard /></LazySection>
 
       {/* 日线数据湖规模 */}
       <Panel title="日线数据湖" meta="Parquet">
