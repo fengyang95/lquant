@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from datetime import datetime, timedelta
@@ -36,6 +37,12 @@ __all__ = ["DEFAULT_JOBS", "seed_defaults", "list_jobs", "upsert_job", "delete_j
 _KINDS = ("collect", "daily", "adj_factor", "backfill",
           "reference", "daily_basic", "financial", "news")
 
+# 失败自动重试：failed / partial（含完备性检查不过、空返回）终态后按退避
+# 排 2 次重试（5/15 分钟）。skipped 是排队语义（撞活跃任务），不重试。
+# 重试耗尽 → 清空重试态，等下一档调度时刻自然再跑。
+MAX_RETRIES = 2
+RETRY_BACKOFF_MIN = (5, 15)
+
 _DDL = """
 CREATE TABLE IF NOT EXISTS sync_job (
     sync_id      VARCHAR PRIMARY KEY,
@@ -49,7 +56,9 @@ CREATE TABLE IF NOT EXISTS sync_job (
     last_status  VARCHAR,
     last_rows    INTEGER,
     created_at   TIMESTAMP,
-    updated_at   TIMESTAMP
+    updated_at   TIMESTAMP,
+    retry_count  INTEGER,
+    next_retry_at TIMESTAMP
 )
 """
 
@@ -127,6 +136,11 @@ def _due_slot(job: dict, now: datetime) -> datetime | None:
 
 def _ensure_tables(con) -> None:
     con.execute(_DDL)
+    # 旧库表结构迁移：新列逐个补齐（DuckDB 的 ADD COLUMN 无 IF NOT EXISTS
+    # 语义，重复执行会报错 —— 报「列已存在」说明迁移已完成，静默即可）
+    for col in ("retry_count INTEGER", "next_retry_at TIMESTAMP"):
+        with contextlib.suppress(Exception):  # 列已存在 = 迁移完成，静默
+            con.execute(f"ALTER TABLE sync_job ADD COLUMN {col}")  # noqa: S608
     con.execute("""
         CREATE TABLE IF NOT EXISTS sync_run (
             run_id     VARCHAR PRIMARY KEY,
@@ -154,7 +168,9 @@ def seed_defaults() -> int:
             if j["sync_id"] in have:
                 continue
             con.execute(
-                "INSERT INTO sync_job VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)",
+                "INSERT INTO sync_job (sync_id, name, kind, schedule_time, weekdays, "
+                "params, enabled, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [j["sync_id"], j["name"], j["kind"], j["schedule_time"],
                  j.get("weekdays", "1,2,3,4,5"), json.dumps(j.get("params", {})),
                  j.get("enabled", True), now, now])
@@ -167,13 +183,15 @@ def list_jobs() -> list[dict]:
         _ensure_tables(con)
         rows = con.execute(
             "SELECT sync_id, name, kind, schedule_time, weekdays, params, enabled, "
-            "last_run_at, last_status, last_rows, created_at, updated_at "
-            "FROM sync_job ORDER BY schedule_time").fetchall()
+            "last_run_at, last_status, last_rows, created_at, updated_at, "
+            "retry_count, next_retry_at FROM sync_job ORDER BY schedule_time").fetchall()
     return [{"sync_id": r[0], "name": r[1], "kind": r[2], "schedule_time": r[3],
              "weekdays": r[4], "params": json.loads(r[5]) if r[5] else {},
              "enabled": r[6], "last_run_at": str(r[7]) if r[7] else None,
              "last_status": r[8], "last_rows": r[9],
-             "created_at": str(r[10]), "updated_at": str(r[11])} for r in rows]
+             "created_at": str(r[10]), "updated_at": str(r[11]),
+             "retry_count": int(r[12] or 0),
+             "next_retry_at": str(r[13]) if r[13] else None} for r in rows]
 
 
 def upsert_job(sync_id: str, name: str, kind: str, schedule_time: str,
@@ -204,16 +222,20 @@ def upsert_job(sync_id: str, name: str, kind: str, schedule_time: str,
         # 但 schedule_time 变了 → 旧轨迹对应旧调度，必须重置（否则改到更晚的
         # 时间后当天不再跑）。
         old = con.execute(
-            "SELECT last_run_at, last_status, last_rows FROM sync_job "
-            "WHERE sync_id = ? AND schedule_time = ?",
+            "SELECT last_run_at, last_status, last_rows, retry_count, next_retry_at "
+            "FROM sync_job WHERE sync_id = ? AND schedule_time = ?",
             [sync_id, schedule_time]).fetchone()
         con.execute("DELETE FROM sync_job WHERE sync_id = ?", [sync_id])
         con.execute(
-            "INSERT INTO sync_job VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO sync_job (sync_id, name, kind, schedule_time, weekdays, "
+            "params, enabled, last_run_at, last_status, last_rows, "
+            "created_at, updated_at, retry_count, next_retry_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [sync_id, name, kind, schedule_time, weekdays,
              json.dumps(params or {}), enabled,
              old[0] if old else None, old[1] if old else None,
-             old[2] if old else None, now, now])
+             old[2] if old else None, now, now,
+             old[3] if old else None, old[4] if old else None])
     return {"sync_id": sync_id}
 
 
@@ -232,6 +254,70 @@ def set_enabled(sync_id: str, enabled: bool) -> None:
 
 # ---------------------------------------------------------------- 执行
 
+def _checkpoint_lag_check(cp_name: str, biz_day, max_lag: int = 2) -> dict:
+    """checkpoint 覆盖对账：max(covered_end) 落后业务日 ≤ max_lag 个交易日 → 通过。
+
+    检查挂了 → ok（守门员不能成为炸点：一个检查挂掉让作业永远 partial
+    比漏报一次缺口更糟）。但「有 checkpoint 而覆盖明显滞后」如实返回不通过。
+    """
+    try:
+        from lquant.data.ingest.checkpoint import Checkpoint
+
+        cp = Checkpoint(cp_name)
+        spans = [cp.covered_window(s) for s in cp.done]
+        spans = [s for s in spans if s]
+        if not spans:
+            return {"ok": False, "reason": "no_checkpoint"}
+        covered_end = max(b for _, b in spans)
+        from lquant.data.store.catalog import TradeCalendarRepo
+
+        gap = TradeCalendarRepo().range(covered_end, biz_day)
+        lag = max(len(gap) - 1, 0)
+        return {"ok": lag <= max_lag, "covered_end": covered_end.isoformat(),
+                "lag_trading_days": lag}
+    except Exception as e:  # noqa: BLE001 - 检查降级，不误报
+        return {"ok": True, "reason": f"check_degraded: {type(e).__name__}: {e}"}
+
+
+def _post_sync_check(kind: str, status: str, detail: dict, params: dict) -> tuple[str, dict]:
+    """同步后完备性检查。返回 (status, checks)；检查不过 → partial（触发重试）。
+
+    - daily       : 覆盖度对账（scan_coverage，repair=True 自动建补齐任务）
+    - daily_basic : checkpoint 覆盖滞后对账（落后 >2 交易日 → 不过）
+    - financial   : checkpoint 覆盖滞后对账（同上）
+    - collect/news: 无独立检查（源错误已在 detail.errors/sources_status 暴露，
+      0 行降级 partial 已在 run_job 主体处理）
+    """
+    checks: dict = {}
+    if kind == "daily" and status != "failed":
+        try:
+            from lquant.data.quality.coverage import scan_coverage
+
+            cov = scan_coverage(days=int(params.get("coverage_days", 5)), repair=True)
+            daily_tbl = cov.get("tables", {}).get("daily", {})
+            daily_missing = daily_tbl.get("missing_dates", []) if daily_tbl else []
+            checks["coverage"] = {
+                "daily_missing_days": len(daily_missing),
+                "repair_created": bool(cov.get("repair", {}).get("created")),
+                "issues_recorded": cov.get("issues_recorded"),
+            }
+            if daily_missing:
+                status = "partial"
+        except Exception as cov_err:  # noqa: BLE001 - 检查降级不误报
+            checks["coverage"] = {"error": f"{type(cov_err).__name__}: {cov_err}"}
+    elif kind == "daily_basic":
+        c = _checkpoint_lag_check("daily_basic", today_cn())
+        checks["checkpoint"] = c
+        if not c.get("ok"):
+            status = "partial"
+    elif kind == "financial":
+        c = _checkpoint_lag_check("financial_pit_tushare", today_cn(), max_lag=3)
+        checks["checkpoint"] = c
+        if not c.get("ok"):
+            status = "partial"
+    return status, checks
+
+
 def run_job(job: dict, *, demo: bool | None = None) -> dict:
     """执行一个作业并记录 sync_run / 更新 sync_job 状态。失败不抛出。
 
@@ -244,6 +330,8 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
         started = now_cn_naive()
         # 业务日单独取（不依赖墙钟的日期部分，避免 tz 归一逻辑分散在多处）
         biz_day = today_cn()
+        # 重试轮次：来自 sync_job 的 retry_count（初始跑=1，重试跑=2/3）
+        attempt = int(job.get("retry_count") or 0) + 1
         params = job.get("params") or {}
         kind = job["kind"]
         rows, detail, status = 0, {}, "ok"
@@ -381,7 +469,18 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
             status = "failed"
             detail = {"error": f"{type(e).__name__}: {e}"}
 
+        # 完备性检查：作业本体成功（ok/partial）才检查；检查不过 → partial
+        # （落入重试/告警链路）。检查自身挂了不改变作业状态（只记录），
+        # 检查是守门员不是炸点。
+        if status in ("ok", "partial"):
+            status, checks = _post_sync_check(kind, status, detail, params)
+            detail = {**detail, "checks": checks}
+        else:
+            detail = {**detail, "checks": {"skipped": f"status={status}"}}
+
+        # 检查完成后统一取终态时间：告警/落库/重试排程共用
         finished = now_cn_naive()
+
         # 告警：终态非 ok/skipped → 监控错误环（monitor 错误环 → error_logs 可查）
         # skipped（撞活跃任务）是正常排队语义，不告警
         if status not in ("ok", "skipped"):
@@ -402,15 +501,30 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
                     "INSERT OR REPLACE INTO sync_run VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [run_id, job.get("sync_id"), job.get("name"), kind,
                      started, finished, rows, status, json.dumps(detail, default=str)])
-                con.execute(
-                    "UPDATE sync_job SET last_run_at = ?, last_status = ?, last_rows = ?, "
-                    "updated_at = ? WHERE sync_id = ?",
-                    [finished, status, rows, finished, job.get("sync_id")])
+                # 失败/部分失败排自动重试（skipped 不重试 —— 排队语义）。
+                # 重试耗尽 → 清空重试态，等下一档调度时刻自然再跑。
+                if status in ("failed", "partial") and attempt <= MAX_RETRIES:
+                    backoff_min = RETRY_BACKOFF_MIN[min(attempt, len(RETRY_BACKOFF_MIN)) - 1]
+                    next_retry = finished + timedelta(minutes=backoff_min)
+                    detail = {**detail, "attempt": attempt,
+                              "next_retry_at": next_retry.isoformat()}
+                    con.execute(
+                        "UPDATE sync_job SET last_run_at = ?, last_status = ?, "
+                        "last_rows = ?, retry_count = ?, next_retry_at = ?, "
+                        "updated_at = ? WHERE sync_id = ?",
+                        [finished, status, rows, attempt, next_retry, finished,
+                         job.get("sync_id")])
+                else:
+                    con.execute(
+                        "UPDATE sync_job SET last_run_at = ?, last_status = ?, "
+                        "last_rows = ?, retry_count = NULL, next_retry_at = NULL, "
+                        "updated_at = ? WHERE sync_id = ?",
+                        [finished, status, rows, finished, job.get("sync_id")])
         except Exception:  # noqa: BLE001  记录失败不影响主流程
             log.exception(f"sync_run 记录失败 sync_id={job.get('sync_id')} run_id={run_id}")
         return {"run_id": run_id, "status": status, "rows": rows,
                 "elapsed_sec": round((finished - started).total_seconds(), 1),
-                "detail": detail}
+                "attempt": attempt, "detail": detail}
 
 
 def _emit_sync_error(job: dict, kind: str, status: str, detail: dict) -> None:
@@ -441,9 +555,9 @@ def history(limit: int = 50) -> list[dict]:
     with reader() as con:
         _ensure_tables(con)
         rows = con.execute(
-            f"SELECT run_id, sync_id, job_name, kind, started_at, finished_at, "
-            f"rows, status, detail FROM sync_run ORDER BY started_at DESC LIMIT {limit}"
-        ).fetchall()
+            "SELECT run_id, sync_id, job_name, kind, started_at, finished_at, "
+            "rows, status, detail FROM sync_run ORDER BY started_at DESC LIMIT ?",
+            [int(limit)]).fetchall()
     return [{"run_id": r[0], "sync_id": r[1], "job_name": r[2], "kind": r[3],
              "started_at": str(r[4]), "finished_at": str(r[5]), "rows": r[6],
              "status": r[7], "detail": json.loads(r[8]) if r[8] else {}} for r in rows]
@@ -525,6 +639,16 @@ def _is_due(job: dict, now: datetime) -> bool:
     """
     if not job.get("enabled", False):
         return False
+    # 重试到期：next_retry_at 已到 → 必须重试（忽略 weekdays —— 重试发生的
+    # 当天基本就是业务日；跨天残留在节假日时 tick 的交易日过滤会兜底跳过）
+    next_retry = job.get("next_retry_at")
+    if next_retry:
+        retry_dt = next_retry if isinstance(next_retry, datetime) \
+            else datetime.fromisoformat(str(next_retry))
+        if retry_dt.tzinfo is not None:
+            retry_dt = retry_dt.astimezone(TZ).replace(tzinfo=None)
+        if now >= retry_dt:
+            return True
     weekdays = str(job.get("weekdays") or "1,2,3,4,5")
     if weekdays.strip() and str(now.isoweekday()) not in [w.strip() for w in weekdays.split(",")]:
         return False

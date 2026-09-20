@@ -150,6 +150,17 @@ def _startup() -> None:
     except Exception as e:  # noqa: BLE001 - 同上，不阻断启动
         print(f"[startup] 资讯任务中断标记跳过: {e}")
 
+    # 默认同步作业播种：无论 worker 开关如何都必须执行 —— LQ_SYNC_WORKER=0
+    # （如测试/单进程调试）时 GET /sync/jobs 也要有作业可看可编辑。
+    try:
+        from lquant.sync import manager
+
+        n = manager.seed_defaults()
+        if n:
+            print(f"[sync] 已种子 {n} 个默认同步作业")
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] sync 作业种子失败: {e}")
+
     # 定时同步 worker（daemon 线程，每 30s 检查到期作业；测试用 LQ_SYNC_WORKER=0 关闭）
     import os
     import threading
@@ -158,12 +169,6 @@ def _startup() -> None:
         def _sync_worker() -> None:
             from lquant.sync import manager
 
-            try:
-                n = manager.seed_defaults()
-                if n:
-                    print(f"[sync] 已种子 {n} 个默认同步作业")
-            except Exception as e:  # noqa: BLE001
-                print(f"[warn] sync 作业种子失败: {e}")
             manager.loop_forever(interval=30)
 
         threading.Thread(target=_sync_worker, name="sync-worker", daemon=True).start()
