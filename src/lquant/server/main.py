@@ -63,6 +63,17 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     def _monitor_startup() -> None:
         start_monitor()
+        # 默认同步作业播种（幂等）：每个 app 实例的 startup 都要执行 ——
+        # 只挂在模块级 _startup 上的话，TestClient(create_app()) 这类新建
+        # 实例不会播种，GET /sync/jobs 拿到空列表。
+        try:
+            from lquant.sync import manager
+
+            n = manager.seed_defaults()
+            if n:
+                print(f"[sync] 已种子 {n} 个默认同步作业")
+        except Exception as e:  # noqa: BLE001 - 播种失败不挡启动
+            print(f"[warn] sync 作业种子失败: {e}")
 
     @app.on_event("shutdown")
     async def _monitor_shutdown() -> None:
@@ -149,17 +160,6 @@ def _startup() -> None:
             print(f"[startup] {n} 个资讯任务标记为 interrupted（可 retry 续传）")
     except Exception as e:  # noqa: BLE001 - 同上，不阻断启动
         print(f"[startup] 资讯任务中断标记跳过: {e}")
-
-    # 默认同步作业播种：无论 worker 开关如何都必须执行 —— LQ_SYNC_WORKER=0
-    # （如测试/单进程调试）时 GET /sync/jobs 也要有作业可看可编辑。
-    try:
-        from lquant.sync import manager
-
-        n = manager.seed_defaults()
-        if n:
-            print(f"[sync] 已种子 {n} 个默认同步作业")
-    except Exception as e:  # noqa: BLE001
-        print(f"[warn] sync 作业种子失败: {e}")
 
     # 定时同步 worker（daemon 线程，每 30s 检查到期作业；测试用 LQ_SYNC_WORKER=0 关闭）
     import os
