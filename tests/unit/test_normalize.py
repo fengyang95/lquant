@@ -26,3 +26,35 @@ def test_ohlc_check():
     df = pl.DataFrame({"open": [10.0], "high": [9.0], "low": [11.0], "close": [10.0]})
     with pytest.raises(DataQualityError):
         assert_ohlc(df)
+
+
+def test_price_range_suspension_exempt():
+    """停牌行（is_suspended=True）价格 0/null 豁免：baostock 停牌行 OHLC 全 0。"""
+    df = pl.DataFrame({
+        "open": [10.0, 0.0, 0.0],
+        "high": [10.5, 0.0, 0.0],
+        "low": [9.5, 0.0, 0.0],
+        "close": [10.2, 0.0, 0.0],
+        "is_suspended": [False, True, True],
+    })
+    assert_plausible_prices(df)  # 不抛
+
+
+def test_price_range_null_still_fatal_when_not_suspended():
+    df = pl.DataFrame({
+        "close": [10.0, None],
+        "is_suspended": [False, False],
+    })
+    with pytest.raises(DataQualityError):
+        assert_plausible_prices(df)
+
+
+def test_ohlc_suspension_exempt():
+    df = pl.DataFrame({
+        "open": [10.0, 0.0],
+        "high": [10.5, 0.0],
+        "low": [9.5, 0.0],
+        "close": [10.2, 0.0],
+        "is_suspended": [False, True],
+    })
+    assert_ohlc(df)  # 不抛
