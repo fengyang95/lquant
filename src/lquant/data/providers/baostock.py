@@ -315,7 +315,20 @@ def _map_daily_raw(rows: list[list[str]]) -> pl.DataFrame:
             "is_suspended"
         ),  # "0"=停牌 → True；行保留不丢
         (pl.col("isST").cast(pl.Utf8).str.strip_chars() == "1").alias("is_st"),  # "1"=ST → True
-    ).drop("tradestatus", "isST")
+    )
+    # 停牌行 OHLC/preclose 为 0（baostock 部分停牌行的实测行为）→ null：
+    # 0 价入湖会让 change_pct 产生 -100% 假数据；fetch 侧 price_range 断言
+    # （normalize.assert_plausible_prices，含停牌豁免）也要求非停牌行无 0 价。
+    price_cols = [c for c in ("open", "high", "low", "close", "preclose") if c in df.columns]
+    if price_cols:
+        df = df.with_columns([
+            pl.when(pl.col("is_suspended") & (pl.col(c) == 0))
+            .then(pl.lit(None, dtype=pl.Float64))
+            .otherwise(pl.col(c))
+            .alias(c)
+            for c in price_cols
+        ])
+    df = df.drop("tradestatus", "isST")
     # 量纲归一：volume → 股、amount → 元（系数 1.0，契约固化见 VOLUME_UNIT 注释）
     return scale_unit(
         scale_unit(df, col="volume", unit=VOLUME_UNIT), col="amount", unit=AMOUNT_UNIT

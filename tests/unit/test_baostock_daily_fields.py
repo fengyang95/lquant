@@ -80,3 +80,39 @@ def test_map_daily_raw_is_picklable_module_function() -> None:
     """模块级函数：spawn 子进程 pickle 兼容（watchdog 约束）。"""
     fn = pickle.loads(pickle.dumps(_map_daily_raw))
     assert fn is _map_daily_raw
+
+
+# 停牌行 OHLC/preclose 全 "0"（baostock 实测行为）：保留行，0 价归一为 null，
+# 否则 fetch 侧 price_range 断言把整批拍死（2026-09-18 大盘页 20 只事故根因）
+RAW_SUSPENDED_ZERO = [
+    ["2024-01-02", "sz.000001", "11.5", "11.8", "11.4", "11.6", "11.4",
+     "1000000", "1.16e7", "0.5", "1", "0", "0.5", "6.0", "0.7", "1.2", "3.0"],
+    ["2024-01-03", "sz.000001", "0", "0", "0", "0", "0",
+     "0", "0", "0", "0", "0", "", "", "", "", ""],
+]
+
+
+def _mapped_zero() -> pl.DataFrame:
+    raw = _map_daily_raw(RAW_SUSPENDED_ZERO)
+    p = BaoStockProvider()
+    out = p.request("daily_bar", _raw=raw)  # fetch 侧断言在内，0 价停牌行不应炸
+    return _attach_is_st(out, raw)
+
+
+def test_suspended_zero_price_row_kept_and_prices_null() -> None:
+    df = _mapped_zero()
+    assert len(df) == 2  # 停牌行保留
+    susp = df.filter(pl.col("is_suspended")).row(0, named=True)
+    assert susp["open"] is None
+    assert susp["high"] is None
+    assert susp["low"] is None
+    assert susp["close"] is None
+    assert susp["pre_close"] is None
+
+
+def test_suspended_zero_row_passes_price_asserts() -> None:
+    from lquant.data.normalize import assert_ohlc, assert_plausible_prices
+
+    df = _mapped_zero()
+    assert_plausible_prices(df)  # 不抛
+    assert_ohlc(df)  # 不抛
