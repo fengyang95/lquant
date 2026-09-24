@@ -115,6 +115,11 @@ _DAILY_FIELDS = (
 )
 _MINUTE_FIELDS = "date,time,code,open,high,low,close,volume,amount,adjustflag"
 
+# 一次登录循环查询的标的数：与 ingest/daily.py 的 SUB_BATCH 对齐。
+# 全市场 7740 只 → ~390 次登录（旧实现逐只登录是 7740 次，数百次/分钟
+# 触发「黑名单用户」/「10001001 未登录」，重试无效）
+DAILY_GROUP_SIZE = 20
+
 
 # --------------------------------------------------------------------------
 # 模块级请求函数：只吃基本类型，保证 spawn 子进程可 pickle
@@ -151,6 +156,41 @@ def _bs_query(
         while rs.error_code == "0" and rs.next():
             rows.append(rs.get_row_data())
         return rows
+    finally:
+        bs.logout()
+
+
+def _bs_query_many(
+    codes: list[str], fields: str, start: str, end: str, freq: str, adjustflag: str = "3"
+) -> list[tuple[str, list[list[str]]]]:  # pragma: no cover
+    """一次登录循环查多只（每只一次 query）：登录次数 = ceil(N/组大小)。
+
+    baostock query_history_k_data_plus 只支持单 security，但同一登录会话
+    可以连续查 —— 组内任何一只查询失败都抛 RuntimeError（整组失败，
+    调用方按 _pull_group 语义缩批重试）。
+    """
+    bs = _bs_login()
+    try:
+        f = _FREQ_MAP.get(freq)
+        if f is None:
+            raise ValueError(f"baostock 不支持 {freq}")
+        out: list[tuple[str, list[list[str]]]] = []
+        for code in codes:
+            rs = bs.query_history_k_data_plus(
+                code,
+                fields,
+                start_date=start,
+                end_date=end,
+                frequency=f,
+                adjustflag=adjustflag,
+            )
+            if rs.error_code != "0":
+                raise RuntimeError(f"baostock {rs.error_code}: {rs.error_msg}")
+            rows: list[list[str]] = []
+            while rs.error_code == "0" and rs.next():
+                rows.append(rs.get_row_data())
+            out.append((code, rows))
+        return out
     finally:
         bs.logout()
 
@@ -424,20 +464,24 @@ class BaoStockProvider(MappingProvider):
 
         from lquant.data.watchdog import run_with_watchdog
 
-        def _one(sym: str) -> pl.DataFrame | None:
-            # 单只也要走看门狗：静默挂起是逐请求发生的
+        def _group(codes: list[str]) -> list[pl.DataFrame]:
+            # 一组一次登录：baostock query 只支持单 security，但同一会话可循环
+            # 查多只 —— 登录次数从 N 降到 ceil(N/组大小)，避免登录风暴
+            # （数百次/分钟会触发「黑名单用户」/「10001001 未登录」，重试无效）。
             for attempt in range(3):
                 try:
-                    rows = run_with_watchdog(
-                        _bs_query,
-                        _bs_code(sym),
+                    results = run_with_watchdog(
+                        _bs_query_many,
+                        [_bs_code(s) for s in codes],
                         _DAILY_FIELDS,
                         start.isoformat(),
                         end.isoformat(),
                         "1d",
                         "3",
+                        timeout=max(120, 15 * len(codes) + 60),
                     )
-                    return _map_daily_raw(rows) if rows else None
+                    return [_map_daily_raw(rows) for _c, rows in results if rows]
+                    # 空行的标的由调用方按 empty_response 标记（组内缺谁一目了然）
                 except RuntimeError as e:
                     # 并发子进程同时登录会间歇性触发「10001001 用户未登录」
                     # —— 退避重试；其余错误按原语义抛出（整组失败）
@@ -445,17 +489,18 @@ class BaoStockProvider(MappingProvider):
                         _time.sleep(1.5 * (attempt + 1))
                         continue
                     raise
-            return None
+            return []
 
-        # 每只一个 watchdog 子进程（spawn + baostock 登录 ~1.5s），串行是
-        # 回填吞吐瓶颈。并发上限 4：实测 8 路会频繁触发服务端并发登录
-        # 拒绝（10001001），4 路配合退避重试基本无损。
-        workers = min(4, max(1, len(symbols)))
+        # 组大小与 ingest/daily.py 的 SUB_BATCH 对齐：超时缩批重试不会二次分组
+        group_size = DAILY_GROUP_SIZE
+        groups = [symbols[i : i + group_size] for i in range(0, len(symbols), group_size)]
+        # 并发上限 4：实测 8 路会频繁触发服务端并发登录拒绝（10001001）
+        workers = min(4, max(1, len(groups)))
         if workers > 1:
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                frames = [f for f in ex.map(_one, symbols) if f is not None]
+                frames = [f for fs in ex.map(_group, groups) for f in fs]
         else:
-            frames = [f for f in map(_one, symbols) if f is not None]
+            frames = [f for fs in map(_group, groups) for f in fs]
         if not frames:
             return pl.DataFrame()
         # 停牌日 volume=0 —— 行保留，is_suspended 供门禁豁免/回测拒单

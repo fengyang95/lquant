@@ -116,3 +116,38 @@ def test_suspended_zero_row_passes_price_asserts() -> None:
     df = _mapped_zero()
     assert_plausible_prices(df)  # 不抛
     assert_ohlc(df)  # 不抛
+
+
+def test_bs_query_many_is_picklable_module_function() -> None:
+    """组查询函数模块级、可 pickle(spawn 子进程约束,同 _map_daily_raw)。"""
+    import pickle
+
+    from lquant.data.providers.baostock import _bs_query_many
+
+    fn = pickle.loads(pickle.dumps(_bs_query_many))
+    assert fn is _bs_query_many
+
+
+def test_fetch_daily_one_login_per_group(monkeypatch) -> None:
+    """_fetch_daily 每组(20 只)只登录一次:登录次数 = ceil(N/组大小),防登录风暴。"""
+    import lquant.data.watchdog as wd
+    from lquant.data.providers import baostock as bs_mod
+    from lquant.data.providers.baostock import BaoStockProvider
+
+    calls: list[list[str]] = []
+
+    def fake_watchdog(fn, *args, **kwargs):
+        codes = args[0]
+        calls.append(list(codes))
+        assert fn is bs_mod._bs_query_many
+        return [(c, []) for c in codes]  # 空行:符号只验证分组与调用形状
+
+    monkeypatch.setattr(wd, "run_with_watchdog", fake_watchdog)
+    p = BaoStockProvider()
+    syms = [f"0000{i:02d}.SZ" for i in range(45)]
+    out = p._fetch_daily(syms, __import__("datetime").date(2026, 9, 12),
+                         __import__("datetime").date(2026, 9, 22))
+    # 45 只 → 3 组,3 次登录(旧实现是 45 次)
+    assert len(calls) == 3
+    assert [len(c) for c in calls] == [20, 20, 5]
+    assert out.height == 0  # 全空行 → 空 df
