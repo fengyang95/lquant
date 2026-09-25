@@ -2,14 +2,17 @@
 
 /**
  * /factors/mine —— 挖掘会话台账 + Agent 管理面板。
- * 增强：Agent 下拉（替代写死）、幸存因子展示与一键注册、Agent 验收指引（guide）。
+ * 增强：Agent 下拉、幸存因子展示与一键注册、Agent 验收指引（guide）；
+ * 异步任务流（202 + WS 进度条）；台账行点击查看会话详情与修正日志。
  */
 import useSWR from 'swr';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Panel } from '@/components/Panel';
 import PageHeader from '@/components/PageHeader';
+import ProgressBar from '@/components/ProgressBar';
 import { Empty, Msg } from '@/components/States';
 import { get, post } from '@/lib/api';
+import { useJobStream } from '@/lib/streaming';
 
 type MineRun = {
   run_id: string; agent: string; generator: string;
@@ -23,6 +26,7 @@ type AgentRow = {
 };
 type Survivor = { expr: string; ic_neutral: number; t_stat: number; origin: string };
 type MineResult = Omit<MineRun, 'created_at'> & { survivors: Survivor[] };
+type MineRunDetail = MineRun & { corrections: Record<string, unknown> };
 type AgentGuide = {
   agent: string; kind: string; driver: string; quota_eval: number;
   can_submit: boolean; steps: string[]; acceptance: string;
@@ -30,15 +34,6 @@ type AgentGuide = {
 
 function KIND_COLOR(kind: string): string {
   return kind === 'builtin' ? '#31589E' : kind === 'skill' ? '#1E7C55' : '#B08A3E';
-}
-
-function StatRow({ label, value }: { label: string; value: number }) {
-  return (
-    <div className="flex items-center justify-between text-xs">
-      <span className="text-ink-dim">{label}</span>
-      <span className="font-mono">{value}</span>
-    </div>
-  );
 }
 
 export default function FactorsMinePage() {
@@ -51,23 +46,49 @@ export default function FactorsMinePage() {
   const [survivors, setSurvivors] = useState<Survivor[]>([]);
   const [currentRun, setCurrentRun] = useState('');
   const [guide, setGuide] = useState<AgentGuide | null>(null);
+  // 挖掘任务流：POST 202 {task_id} → WS 流式进度 → 终态 result 渲染（不再同步阻塞）
+  const [mineJob, setMineJob] = useState<string | null>(null);
+  const mineStream = useJobStream<MineResult>(mineJob);
+  // 台账详情
+  const [runDetail, setRunDetail] = useState<MineRunDetail | null>(null);
+
+  // 任务流终态回填：result → 幸存因子；error / done-无果 → 消息条
+  useEffect(() => {
+    if (!mineJob) return;
+    if (mineStream.error) {
+      setMsg(`✗ ${mineStream.error}`);
+      setMineJob(null);
+      setBusy('');
+    } else if (mineStream.result) {
+      const r = mineStream.result;
+      setMsg(`✓ run ${r.run_id}: 评估 ${r.n_evaluated} / 幸存 ${r.n_survivors}`);
+      setSurvivors(r.survivors ?? []);
+      setCurrentRun(r.run_id);
+      mutateRuns();
+      setMineJob(null);
+      setBusy('');
+    } else if (mineStream.done) {
+      setMsg(`✗ 挖掘任务异常结束（${mineStream.status ?? 'unknown'}）`);
+      setMineJob(null);
+      setBusy('');
+    }
+  }, [mineJob, mineStream.error, mineStream.result, mineStream.done, mineStream.status, mutateRuns]);
 
   async function runMining(generator: string) {
     setBusy(generator);
     setMsg('');
     try {
-      // 必须显式 sync:true：后端默认异步返回 202 {task_id}，前端没有任务轮询，
-      // 按同步结果解析会全部 undefined
-      const r = await post<MineResult>('/factors/mine/run', { agent, generator, n, sync: true });
-      setMsg(`✓ run ${r.run_id}: 评估 ${r.n_evaluated} / 幸存 ${r.n_survivors}`);
-      setSurvivors(r.survivors ?? []);
-      setCurrentRun(r.run_id);
-      mutateRuns();
+      // 异步入队：202 {task_id}，进度与结果经 /ws/jobs/{id} 流式回流；
+      // 同步模式会占死 HTTP 连接，大预算 n 下前端超时且无进度反馈
+      const r = await post<{ status: string; task_id: string }>(
+        '/factors/mine/run', { agent, generator, n, sync: false });
+      setMineJob(r.task_id);
+      setMsg('挖掘任务已排队，进度实时更新');
     } catch (e) {
       setMsg(`✗ ${e instanceof Error ? e.message : e}`);
-    } finally {
       setBusy('');
     }
+    // busy 在流式结果/错误回流时清除（见上方 effect）
   }
 
   async function registerSurvivor(expr: string, i: number) {
@@ -90,6 +111,18 @@ export default function FactorsMinePage() {
     setMsg('');
     try {
       setGuide(await get<AgentGuide>(`/factors/agents/${name}/guide`));
+    } catch (e) {
+      setMsg(`✗ ${e instanceof Error ? e.message : e}`);
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function loadRunDetail(runId: string) {
+    setBusy(`detail-${runId}`);
+    setMsg('');
+    try {
+      setRunDetail(await get<MineRunDetail>(`/factors/mine/runs/${runId}`));
     } catch (e) {
       setMsg(`✗ ${e instanceof Error ? e.message : e}`);
     } finally {
@@ -135,7 +168,7 @@ export default function FactorsMinePage() {
             </div>
           )}
         </Panel>
-        <Panel title="触发挖掘会话" meta="平台驱动：random 基线 / GP（受 Agent 配额约束）">
+        <Panel title="触发挖掘会话" meta="平台驱动：random 基线 / GP（受 Agent 配额约束）· 异步执行">
           <div className="flex flex-wrap items-center gap-2">
             <select value={agent} onChange={(e) => setAgent(e.target.value)} className="input w-40 py-1 text-xs">
               {(agents ?? []).filter((a) => a.enabled).map((a) => (
@@ -145,7 +178,7 @@ export default function FactorsMinePage() {
             {['random', 'gp'].map((g) => (
               <button key={g} onClick={() => runMining(g)} disabled={busy !== '' || !agent}
                 className="btn btn-sm">
-                {busy === g ? '运行中…' : `跑 ${n} 个 ${g.toUpperCase()} 候选`}
+                {busy === g ? '排队中…' : `跑 ${n} 个 ${g.toUpperCase()} 候选`}
               </button>
             ))}
             <input type="number" value={n} min={10} max={5000}
@@ -153,6 +186,15 @@ export default function FactorsMinePage() {
               className="input w-24 py-1 text-xs" />
             <span className="text-xs text-ink-faint">预算（受 Agent 配额约束）</span>
           </div>
+          {mineJob && mineStream.progress && mineStream.progress.total > 0 && (
+            <div className="mt-3 w-64">
+              <ProgressBar
+                pct={(mineStream.progress.done / mineStream.progress.total) * 100}
+                phase={mineStream.progress.phase}
+              />
+              <div className="text-[11px] text-ink-faint">任务 {mineJob.slice(0, 8)}…</div>
+            </div>
+          )}
           <Msg text={msg} />
         </Panel>
       </div>
@@ -194,7 +236,7 @@ export default function FactorsMinePage() {
         </>
       )}
 
-      <Panel title="挖掘台账" meta="漏斗：评估 → G0 / LOW_IC / 冗余 / 风格代理 → 幸存">
+      <Panel title="挖掘台账" meta="漏斗：评估 → G0 / LOW_IC / 冗余 / 风格代理 → 幸存 · 点击行看详情">
         {runs && runs.length > 0 ? (
           <table className="w-full text-xs">
             <thead><tr>
@@ -204,8 +246,13 @@ export default function FactorsMinePage() {
             </tr></thead>
             <tbody>
               {runs.map((r) => (
-                <tr key={r.run_id}>
-                  <td className="font-mono">{r.run_id}</td>
+                <tr key={r.run_id}
+                  onClick={() => loadRunDetail(r.run_id)}
+                  className={`cursor-pointer hover:bg-white ${runDetail?.run_id === r.run_id ? 'bg-white' : ''}`}>
+                  <td className="font-mono">
+                    {r.run_id}
+                    {busy === `detail-${r.run_id}` ? ' …' : ''}
+                  </td>
                   <td>{r.agent}</td>
                   <td className="text-center">{r.generator}</td>
                   <td className="text-center">{r.n_evaluated}</td>
@@ -220,6 +267,30 @@ export default function FactorsMinePage() {
           </table>
         ) : (
           <Empty>还没有挖掘会话 —— 上方触发一次</Empty>
+        )}
+        {runDetail && (
+          <div className="mt-3 border border-line bg-paper p-3 text-xs">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="font-semibold">
+                run {runDetail.run_id} · {runDetail.agent}/{runDetail.generator}
+                {' · '}{runDetail.created_at?.slice(0, 19)}
+              </span>
+              <button className="text-indigo hover:underline"
+                onClick={() => setRunDetail(null)}>收起</button>
+            </div>
+            {Object.keys(runDetail.corrections ?? {}).length > 0 ? (
+              <div>
+                <div className="mb-1 text-ink-faint">表达式修正日志（生成器产出 → 门禁修正）：</div>
+                <ul className="list-disc space-y-0.5 pl-4 font-mono">
+                  {Object.entries(runDetail.corrections).map(([k, v]) => (
+                    <li key={k}>{k} → {String(v)}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : (
+              <div className="text-ink-faint">本次会话无修正日志。</div>
+            )}
+          </div>
         )}
       </Panel>
     </div>

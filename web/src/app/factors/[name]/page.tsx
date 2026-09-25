@@ -7,14 +7,14 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
-import { useParams } from 'next/navigation';
+import { useParams, useRouter } from 'next/navigation';
 import useSWR from 'swr';
 import Chart from '@/components/Chart';
 import { Panel, Stat } from '@/components/Panel';
 import PageHeader from '@/components/PageHeader';
 import ProgressBar from '@/components/ProgressBar';
 import { Empty, ErrorNote, Loading, Msg } from '@/components/States';
-import { fetcher, post } from '@/lib/api';
+import { del, fetcher, get, post, put } from '@/lib/api';
 import { useJobStream } from '@/lib/streaming';
 import { C, axes, legend, tooltip } from '@/lib/chart';
 
@@ -23,6 +23,8 @@ type FactorDetail = {
   expression: string;
   description: string;
   created_at: string;
+  source?: string;
+  category?: string;
   reports: { name: string; url: string }[];
 };
 
@@ -52,16 +54,29 @@ type EvalSeries = {
 
 const FORMULAS = ['pct_change_5', 'pct_change_10', 'pct_change_20', 'rolling_std_20', 'turnover'];
 
+type BuiltinItem = { name: string; family: string; formula: string };
+
+/** 可编辑来源：与后端 PUT /factors/{name} 同口径 */
+const EDITABLE = new Set(['manual', 'mined', undefined]);
+
 export default function FactorDetailPage() {
   const { name = '' } = useParams<{ name: string }>();
+  const router = useRouter();
   const { data, error, isLoading, mutate } = useSWR<FactorDetail>(
     name ? `/factors/${name}` : null, fetcher,
   );
+  const { data: builtin } = useSWR<BuiltinItem[]>('/factors/builtin', get);
   const [formula, setFormula] = useState('pct_change_20');
   const [res, setRes] = useState<EvalResult | null>(null);
   const [series, setSeries] = useState<EvalSeries | null>(null);
   const [busy, setBusy] = useState(false);
+  const [editBusy, setEditBusy] = useState(false);
   const [msg, setMsg] = useState('');
+  // 编辑态：定义面板就地展开
+  const [editing, setEditing] = useState(false);
+  const [expr, setExpr] = useState('');
+  const [desc, setDesc] = useState('');
+  const [category, setCategory] = useState('');
   // 评价任务流：POST 202 → WS 流式进度 → 终态 result 渲染
   const [evalJob, setEvalJob] = useState<string | null>(null);
   const evalStream = useJobStream<EvalResult & { series?: EvalSeries }>(evalJob);
@@ -145,6 +160,38 @@ export default function FactorDetailPage() {
     };
   }, [series]);
 
+  async function remove() {
+    if (!window.confirm(`确认删除因子 ${name}？历史报告与挖掘台账会保留。`)) return;
+    setEditBusy(true);
+    setMsg('');
+    try {
+      await del(`/factors/${name}`);
+      router.push('/factors?tab=library');
+    } catch (e) {
+      setMsg(`✗ ${e instanceof Error ? e.message : e}`);
+      setEditBusy(false);
+    }
+  }
+
+  async function saveEdit() {
+    setEditBusy(true);
+    setMsg('');
+    try {
+      await put(`/factors/${name}`, {
+        expression: expr,
+        description: desc,
+        category: category.trim() || null,
+      });
+      setEditing(false);
+      await mutate();
+      setMsg('✓ 已保存');
+    } catch (e) {
+      setMsg(`✗ ${e instanceof Error ? e.message : e}`);
+    } finally {
+      setEditBusy(false);
+    }
+  }
+
   async function evaluate() {
     setBusy(true);
     setMsg('');
@@ -172,25 +219,100 @@ export default function FactorDetailPage() {
       />
 
       {/* 定义 */}
-      <Panel title="定义">
-        {data.expression ? (
-          <code className="block bg-paper px-3 py-2 font-mono text-sm">{data.expression}</code>
+      <Panel
+        title="定义"
+        actions={
+          EDITABLE.has(data.source) ? (
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => {
+                  setExpr(data.expression ?? '');
+                  setDesc(data.description ?? '');
+                  setCategory(data.category === '自定义' ? '' : (data.category ?? ''));
+                  setEditing(true);
+                }}
+                className="text-sm text-indigo hover:underline"
+                disabled={editBusy}
+              >
+                编辑
+              </button>
+              <button
+                onClick={remove}
+                className="text-sm text-down hover:underline"
+                disabled={editBusy}
+              >
+                删除
+              </button>
+            </div>
+          ) : (
+            <span className="text-xs text-ink-faint">种子灌入因子不可编辑</span>
+          )
+        }
+      >
+        {!editing ? (
+          <>
+            {data.expression ? (
+              <code className="block bg-paper px-3 py-2 font-mono text-sm">{data.expression}</code>
+            ) : (
+              <div className="text-sm text-ink-faint">未登记 DSL 表达式（快速评价可用现算公式）</div>
+            )}
+            {data.description && <p className="mt-2 text-sm text-ink-dim">{data.description}</p>}
+          </>
         ) : (
-          <div className="text-sm text-ink-faint">未登记 DSL 表达式（快速评价可用现算公式）</div>
+          <div className="space-y-3">
+            <label className="block">
+              <span className="mb-1 block text-xs text-ink-dim">DSL 表达式（AST 校验，留空 = 仅评分用现算公式）</span>
+              <input
+                value={expr}
+                onChange={(e) => setExpr(e.target.value)}
+                className="input input-mono w-full font-mono text-xs"
+                placeholder="Rank(Ts_Mean($close,5)/$close-1)"
+              />
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs text-ink-dim">描述</span>
+              <textarea value={desc} onChange={(e) => setDesc(e.target.value)}
+                rows={2} className="input w-full text-xs" />
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs text-ink-dim">类别（留空归入「自定义」）</span>
+              <input value={category} onChange={(e) => setCategory(e.target.value)}
+                className="input w-56 text-xs" placeholder="动量 / 波动率 / 量价 …" />
+            </label>
+            <div className="flex gap-2">
+              <button onClick={saveEdit} className="btn btn-sm btn-primary" disabled={editBusy}>
+                {editBusy ? '保存中…' : '保存'}
+              </button>
+              <button onClick={() => setEditing(false)} className="btn btn-sm" disabled={editBusy}>
+                取消
+              </button>
+            </div>
+          </div>
         )}
-        {data.description && <p className="mt-2 text-sm text-ink-dim">{data.description}</p>}
       </Panel>
 
       {/* 快速评价 */}
       <Panel title="快速评价" meta="基于数据湖日线现算，IC / 分层 / 衰减一次跑完">
         <div className="mb-4 flex flex-wrap items-center gap-2">
-          <select
+          <input
             value={formula}
             onChange={(e) => setFormula(e.target.value)}
-            className="input"
-          >
-            {FORMULAS.map((f) => <option key={f}>{f}</option>)}
-          </select>
+            list="builtin-factors-detail"
+            placeholder="MA20 / RSV10 / CORR60 / pct_change_20 …"
+            className="input input-mono w-64"
+          />
+          <datalist id="builtin-factors-detail">
+            {(builtin ?? []).map((b) => <option key={b.name} value={b.name}>{b.formula}</option>)}
+            {FORMULAS.map((f) => <option key={f} value={f} />)}
+          </datalist>
+          <div className="flex flex-wrap gap-1">
+            {FORMULAS.map((f) => (
+              <button key={f} onClick={() => setFormula(f)}
+                className={`tag ${formula === f ? 'tag-on' : ''}`}>
+                {f}
+              </button>
+            ))}
+          </div>
           <button
             onClick={evaluate}
             disabled={busy}
