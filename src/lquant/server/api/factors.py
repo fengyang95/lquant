@@ -1102,6 +1102,7 @@ class AnalyzeIn(BaseModel):
 @router.post("/analyze")
 def analyze(req: AnalyzeIn) -> dict:
     """多因子相关性 / 冗余分析（F6）。冗余因子不建议同时入库。"""
+    from lquant.core.errors import FactorError
     from lquant.factors.analysis import correlation
 
     df = read_daily(start=req.start, end=req.end,
@@ -1110,7 +1111,9 @@ def analyze(req: AnalyzeIn) -> dict:
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
     try:
         return correlation(df, req.formulas, threshold=req.threshold)
-    except ValueError as e:
+    except (ValueError, FactorError) as e:
+        # FactorError 不是 ValueError：公式本身写错（DSL 未知字段/算子）也是
+        # 客户端问题，不能放任它冒成 500
         raise HTTPException(422, str(e)) from e
 
 
@@ -1133,6 +1136,7 @@ class SynthesizeIn(BaseModel):
 @router.post("/synthesize")
 def synthesize(req: SynthesizeIn) -> dict:
     """因子合成（F7）：等权 / IC 加权 → 全套评价 → 存报告。"""
+    from lquant.core.errors import FactorError
     from lquant.factors import analysis as fa
 
     df = read_daily(start=req.start, end=req.end,
@@ -1142,7 +1146,7 @@ def synthesize(req: SynthesizeIn) -> dict:
     try:
         d = fa.synthesize(df, req.formulas, method=req.method,
                           ic_horizon=req.ic_horizon).drop_nulls(["_syn"])
-    except ValueError as e:
+    except (ValueError, FactorError) as e:
         raise HTTPException(422, str(e)) from e
     if not len(d):
         raise HTTPException(422, "合成因子为空 —— 公式与数据不匹配")

@@ -25,10 +25,19 @@ def decay_profile(df: pl.DataFrame, factor: str, horizons: list[int] | None = No
     """计算各持有期的 IC / RankIC / IR / t 值。
 
     会在内部补算前瞻收益，因此 df 里不必先有 fwd_ret_* 列。
+
+    **已有的 `fwd_ret_{h}` 列一律直接复用，只补算缺失的持有期。**
+    理由是「行过滤」：调用方（API 评价 / HTML 报告）常在
+    filter_zscore、drop_nonfinite 剔掉若干行**之后**才调本函数，此时重算
+    `forward_return` 的 ``shift(-h).over(symbol)`` 会跨过被剔掉的行 ——
+    「h 个交易日后的收益」被静默算成跨越更长区间的收益（实测删一行后
+    前一日收益从 0.0714 变成 0.1429），半衰期与调仓建议随之失真。
+    复用调用方在行完整帧上算好的列，等于把这一口径固定下来。
     """
     horizons = horizons or [1, 2, 3, 5, 10, 20, 40, 60]
-    d = forward_return(df, price_col=price_col, periods=horizons,
-                       by=symbol_col, date_col=date_col)
+    missing = [h for h in horizons if f"fwd_ret_{h}" not in df.columns]
+    d = (forward_return(df, price_col=price_col, periods=missing,
+                        by=symbol_col, date_col=date_col) if missing else df)
     rows = []
     for h in horizons:
         col = f"fwd_ret_{h}"
