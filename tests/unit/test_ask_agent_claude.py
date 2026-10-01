@@ -113,6 +113,25 @@ async def test_cancel_interrupts(tmp_path, fake_script):
     assert any(e.type == "error" and "已中断" in e.message for e in events)
 
 
+async def test_cancel_leaves_marker_in_assistant_message(tmp_path, fake_script):
+    """取消也要留痕（与超时路径同口径）：不留一条「有头无尾」的空 assistant 消息。"""
+    svc = _svc(tmp_path, fake_script, claude_args=["--mode", "hang"])
+    ses = await svc.create_session(None)
+
+    async def on_event(_e):
+        return None
+
+    task = asyncio.ensure_future(svc.send_message(ses.id, "慢慢想", on_event))
+    await asyncio.sleep(0.5)
+    await svc.cancel(ses.id)
+    with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+        await asyncio.wait_for(asyncio.shield(task), timeout=10)
+
+    msgs = await svc.get_messages(ses.id)
+    assistant = [m for m in msgs if m.role == "assistant"]
+    assert assistant and all("已中断" in m.content for m in assistant)
+
+
 async def test_timeout_terminates(tmp_path, fake_script):
     svc = _svc(tmp_path, fake_script, timeout_seconds=1,
                claude_args=["--mode", "hang"])
@@ -139,4 +158,77 @@ async def test_empty_message_rejected(tmp_path, fake_script):
     with pytest.raises(AgentError) as exc:
         await svc.send_message(ses.id, "  ", lambda e: None)
     assert exc.value.status_code == 400
+
+
+async def test_second_concurrent_message_same_session_rejected(tmp_path, fake_script):
+    """同会话单飞：运行时引用（task/子进程）按会话单槽存，放两条并发会互相踩。
+
+    回归 D1：旧实现第二条直接覆盖 _tasks[sid]，/cancel 会打到错的那个任务，
+    先结束的那条还会把 _procs[sid] 提前 pop 掉，留下孤儿进程。
+    """
+    svc = _svc(tmp_path, fake_script, claude_args=["--mode", "hang"])
+    ses = await svc.create_session(None)
+
+    async def on_event(_e):
+        return None
+
+    first = asyncio.ensure_future(svc.send_message(ses.id, "第一问", on_event))
+    for _ in range(100):
+        if svc.is_busy(ses.id):
+            break
+        await asyncio.sleep(0.02)
+    assert svc.is_busy(ses.id)
+
+    with pytest.raises(AgentError) as exc:
+        await svc.send_message(ses.id, "第二问", on_event)
+    assert exc.value.status_code == 409
+
+    # 槽位归第一个任务所有，取消要打到它（不是被覆盖后的引用）
+    owned = svc._tasks[ses.id]
+    await svc.cancel(ses.id)
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(first, timeout=10)
+    assert owned.done()
+    assert svc._tasks == {} and svc._procs == {}
+
+
+async def test_slot_released_after_completion(tmp_path, fake_script):
+    """跑完要释放槽位，否则同一会话再也发不出第二条消息。"""
+    svc = _svc(tmp_path, fake_script)
+    ses = await svc.create_session(None)
+    await _run(svc, ses.id, "第一问")
+    assert not svc.is_busy(ses.id)
+    events = await _run(svc, ses.id, "第二问")
+    assert events[-1].type == "done"
+
+
+async def test_attach_failure_reaps_spawned_child(tmp_path, fake_script, monkeypatch):
+    """回归 D2：attach() 失败时子进程已经起来了，必须 terminate + 回收。
+
+    旧实现只 raise，那个 claude 进程（全自主权限）会带着 stdout 管道一直跑下去。
+    """
+    from lquant.agent import claude_code as cc
+
+    svc = _svc(tmp_path, fake_script, claude_args=["--mode", "hang"])
+    ses = await svc.create_session(None)
+
+    spawned: list = []
+    real_init = cc._Child.__init__
+
+    def spy_init(self, argv, cwd):  # noqa: ANN001
+        real_init(self, argv, cwd)
+        spawned.append(self)
+
+    async def boom(_self):
+        raise OSError("pipe 断了")
+
+    monkeypatch.setattr(cc._Child, "__init__", spy_init)
+    monkeypatch.setattr(cc._Child, "attach", boom)
+
+    events = await _run(svc, ses.id, "hi")
+    assert any(e.type == "error" for e in events)
+    assert len(spawned) == 1
+    # 已被 waitpid 回收（returncode 有值 ≠ None）→ 不是孤儿
+    assert spawned[0].returncode is not None
+    assert svc._procs == {}
 

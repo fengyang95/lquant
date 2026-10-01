@@ -26,14 +26,65 @@ def test_initialize_returns_capabilities_and_server_info():
     assert res["serverInfo"]["name"] == "lquant-mcp"
 
 
-def test_tools_list_has_four_tools_with_schema():
+def test_tools_list_covers_market_and_factor_tools_with_schema():
     resp = mcp_server.handle_request(_req("tools/list"))
     tools = resp["result"]["tools"]
     names = {t["name"] for t in tools}
-    assert names == {"get_quotes", "get_daily", "list_factors", "get_factor_values"}
+    assert names == set(mcp_server.TOOL_HANDLERS)
+    # a-stock-data skill 覆盖的大盘/板块/资金流/涨停/龙虎榜/热榜/指数/ETF 都要有对应工具
+    assert {"get_market_overview", "get_market_breadth", "get_sectors", "get_money_flow",
+            "get_limit_up", "get_dragon_tiger", "get_heat", "get_index_quotes",
+            "get_etf_list"} <= names
     for t in tools:
         assert t["inputSchema"]["type"] == "object"
         assert "properties" in t["inputSchema"]
+
+
+def test_market_tools_delegate_to_market_module_with_explicit_args(monkeypatch):
+    """MCP 工具必须显式传参直调 market 路由函数。
+
+    那些函数的默认值是 FastAPI 的 ``Query(...)`` 对象 —— 漏传就会把 Query 实例
+    当业务值传下去（历史陷阱）。这里用哨兵断言每个工具都真的传了值。
+    """
+    from lquant.server.api import market
+
+    calls: list[tuple] = []
+
+    def spy(name):
+        def inner(*a, **kw):
+            calls.append((name, a, kw))
+            return []
+        return inner
+
+    for fn in ("overview", "breadth", "sectors", "money_flow", "limit_up",
+               "dragon_tiger", "heat", "index_quotes"):
+        monkeypatch.setattr(market, fn, spy(fn))
+
+    mcp_server._tool_market_overview()
+    mcp_server._tool_market_breadth()
+    mcp_server._tool_sectors()
+    mcp_server._tool_money_flow()
+    mcp_server._tool_limit_up()
+    mcp_server._tool_dragon_tiger()
+    mcp_server._tool_heat()
+    mcp_server._tool_index_quotes()
+
+    got = {name for name, _a, _kw in calls}
+    assert got == {"overview", "breadth", "sectors", "money_flow", "limit_up",
+                   "dragon_tiger", "heat", "index_quotes"}
+    for name, args, kwargs in calls:
+        assert not args, f"{name} 不应传位置参数"
+        assert all(not hasattr(v, "default") for v in kwargs.values()), \
+            f"{name} 传了 Query 默认值"
+    assert dict((n, kw) for n, _a, kw in calls)["money_flow"] == {"top": 20, "symbol": None}
+    assert dict((n, kw) for n, _a, kw in calls)["sectors"] == {"kind": "industry"}
+
+
+def test_etf_list_uses_meta_rows(monkeypatch):
+    from lquant.server.api import etf
+
+    monkeypatch.setattr(etf, "_meta_rows", lambda **kw: [{"symbol": "510300.SH", **kw}])
+    assert mcp_server._tool_etf_list(limit=5) == [{"symbol": "510300.SH", "limit": 5}]
 
 
 def test_unknown_tool_returns_minus_32602():

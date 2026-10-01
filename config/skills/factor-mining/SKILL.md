@@ -1,6 +1,7 @@
 ---
 name: factor-mining
 description: 在 lquant 平台上做因子挖掘与因子体检：从自然语言或模板产出 DSL 候选，走 lq factor check/eval/audit/robust/corr/mine/submit 门禁，做经济直觉复核后入库。触发词：挖掘因子、因子挖掘、找因子、设计因子、评估因子、跑因子分析、因子体检、因子衰减、mine factors、alpha 挖掘。
+tags: [factor-mining, alpha, factor-evaluation, dsl, quant-research]
 ---
 
 # factor-mining — 因子挖掘（lquant）

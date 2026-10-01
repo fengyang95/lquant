@@ -1,4 +1,9 @@
-"""会话/消息 SQLite 持久化（aiosqlite）。落库消息是事实源。"""
+"""会话/消息 SQLite 持久化（aiosqlite）。落库消息是事实源。
+
+`a2a_tasks` 表也在这里：A2A 的 `contextId` 就是 `ask_sessions.id`，
+两边共用同一会话事实源（外部 Agent 通过 A2A 问的问题，在 /ask 页面能看到），
+所以任务记录与消息放同一个库、同一个连接，不开第二个 aiosqlite 连接。
+"""
 from __future__ import annotations
 
 import json
@@ -27,6 +32,15 @@ CREATE TABLE IF NOT EXISTS ask_messages (
     created_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ask_messages_sid ON ask_messages(session_id, created_at);
+CREATE TABLE IF NOT EXISTS a2a_tasks (
+    task_id    TEXT PRIMARY KEY,
+    context_id TEXT NOT NULL,
+    state      TEXT NOT NULL,
+    message_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_a2a_tasks_ctx ON a2a_tasks(context_id, created_at);
 """
 
 
@@ -107,6 +121,8 @@ class SessionStore:
     async def delete(self, sid: str) -> None:
         con = await self._conn()
         await con.execute("DELETE FROM ask_messages WHERE session_id=?", (sid,))
+        # 会话是一致性边界：A2A 任务记录随会话一起清，别留孤儿行
+        await con.execute("DELETE FROM a2a_tasks WHERE context_id=?", (sid,))
         await con.execute("DELETE FROM ask_sessions WHERE id=?", (sid,))
         await con.commit()
 
@@ -159,3 +175,44 @@ class SessionStore:
         await con.execute(
             "UPDATE ask_sessions SET claude_session_id=? WHERE id=?", (claude_sid, sid))
         await con.commit()
+
+    # ---- A2A 任务记录（薄 SQL 层；状态机语义在 agent/a2a/tasks.py） -------
+
+    async def create_a2a_task(self, task_id: str, context_id: str, state: str,
+                              message_id: str = "") -> None:
+        con = await self._conn()
+        now = _now()
+        await con.execute(
+            "INSERT INTO a2a_tasks "
+            "(task_id, context_id, state, message_id, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (task_id, context_id, state, message_id, now, now))
+        await con.commit()
+
+    async def get_a2a_task(self, task_id: str) -> dict | None:
+        con = await self._conn()
+        cur = await con.execute(
+            "SELECT task_id, context_id, state, message_id, created_at, updated_at "
+            "FROM a2a_tasks WHERE task_id=?", (task_id,))
+        r = await cur.fetchone()
+        if r is None:
+            return None
+        return {"task_id": r[0], "context_id": r[1], "state": r[2],
+                "message_id": r[3], "created_at": r[4], "updated_at": r[5]}
+
+    async def set_a2a_task_state(self, task_id: str, state: str) -> None:
+        con = await self._conn()
+        await con.execute(
+            "UPDATE a2a_tasks SET state=?, updated_at=? WHERE task_id=?",
+            (state, _now(), task_id))
+        await con.commit()
+
+    async def list_a2a_tasks(self, context_id: str, limit: int = 50) -> list[dict]:
+        con = await self._conn()
+        cur = await con.execute(
+            "SELECT task_id, context_id, state, message_id, created_at, updated_at "
+            "FROM a2a_tasks WHERE context_id=? ORDER BY created_at DESC LIMIT ?",
+            (context_id, int(limit)))
+        return [{"task_id": r[0], "context_id": r[1], "state": r[2],
+                 "message_id": r[3], "created_at": r[4], "updated_at": r[5]}
+                for r in await cur.fetchall()]

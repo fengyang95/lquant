@@ -71,6 +71,10 @@ async def send_message(sid: str, body: dict):
         raise HTTPException(400, "消息不能为空")
     if await svc.store.get(sid) is None:
         raise HTTPException(404, "会话不存在")
+    # 同会话单飞：已经在跑就 409。运行时引用按会话单槽存，放两条并发进来
+    # 会互相覆盖 —— /cancel 打到错进程、先结束的把另一个 pop 成孤儿。
+    if svc.is_busy(sid):
+        raise HTTPException(409, "该会话已有正在执行的回答，请等待完成或先取消")
 
     bus = get_event_bus()
 

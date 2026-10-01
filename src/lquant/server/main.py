@@ -11,6 +11,7 @@ from lquant.monitor import start_monitor, stop_monitor
 from lquant.monitor.api_mw import MonitorMiddleware
 from lquant.server import ws
 from lquant.server.api import (
+    a2a,
     analyses,
     ask,
     backtests,
@@ -60,6 +61,13 @@ def create_app() -> FastAPI:
               qlib, task_center, monitor):
         app.include_router(r.router, prefix="/api")
     app.include_router(ws.router)  # /ws/jobs/{id}，无 /api 前缀（与前端代理一致）
+    # A2A：Agent Card 按 RFC 8615 挂在 /.well-known/，POST 落在 /a2a —— 两者都
+    # **不能**吃上面的 /api 前缀，所以单独 include（外部 A2A 客户端按规范位发现）。
+    app.include_router(a2a.router)
+
+    @app.on_event("startup")
+    def _a2a_startup_warning() -> None:
+        a2a.warn_if_unauthenticated()
 
     @app.on_event("startup")
     def _monitor_startup() -> None:

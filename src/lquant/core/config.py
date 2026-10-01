@@ -37,6 +37,17 @@ def find_root() -> Path:
     return Path.cwd()
 
 
+def api_base_url() -> str:
+    """本机 API 基址（与 lquant.sh 的 LQ_API_HOST / LQ_API_PORT 同一组开关）。
+
+    Agent Card 的自述地址、工作区 CLAUDE.md 里给 agent 的 HTTP base 都用它 ——
+    只有一处定义，改端口不会出现「文档说 8000、实际跑在 8001」。
+    """
+    host = os.getenv("LQ_API_HOST", "127.0.0.1")
+    port = os.getenv("LQ_API_PORT", "8000")
+    return f"http://{host}:{port}"
+
+
 BACKTEST_WORKERS_MAX = 4
 
 
@@ -45,7 +56,9 @@ def clamp_backtest_workers(n: int) -> int:
 
 
 class AgentConfig(BaseModel):
-    provider: str = "mock"
+    # 默认就是内置 Claude Code：「问 AI」= 问 Claude Code。
+    # mock 只是脚本化演示（不调 LLM），需要无 CLI 环境跑通链路时显式选它。
+    provider: str = "claude_code"
     claude_path: str = "claude"
     workspace_dir: str = "data/agent_workspace"
     timeout_seconds: int = 300
@@ -54,6 +67,9 @@ class AgentConfig(BaseModel):
     # 默认保持 True 以免破坏既有用法，service.py 启用时会打印告警。
     # 只要不需要 CLI 落盘/执行命令，就设成 false。
     skip_permissions: bool = True
+    # 模型不在这里配：直接复用 Claude Code 自身的模型配置
+    # （claude CLI 的 settings / 环境变量 ANTHROPIC_* 等），
+    # 子进程按原样继承环境，见 docs/AGENT_MODEL.md。
 
 
 class Settings(BaseModel):

@@ -125,3 +125,58 @@ async def test_agent_failure_keeps_user_message_and_202(client, monkeypatch):
     assert sid not in svc._tasks
 
     await client.delete(f"/api/ask/sessions/{sid}")
+
+
+async def test_concurrent_message_same_session_409(client, monkeypatch):
+    """同会话已有回答在跑 → 409，而不是两条并发互相踩运行时引用。
+
+    回归 D1：运行时引用（任务/子进程）按会话单槽存，没有这道门就会出现
+    「/cancel 打到错的任务」「先结束的 pop 掉别人的引用」。
+    """
+    svc = await get_agent_service()
+    r = await client.post("/api/ask/sessions", json=None)
+    sid = r.json()["data"]["id"]
+
+    async def _hang(sid_, _content, _on_event, user_msg=None):
+        svc._claim(sid_)
+        try:
+            await asyncio.sleep(30)
+        finally:
+            svc._release(sid_)
+
+    monkeypatch.setattr(svc, "send_message", _hang)
+
+    r1 = await client.post(f"/api/ask/sessions/{sid}/messages", json={"content": "第一问"})
+    assert r1.status_code == 202, r1.text
+    for _ in range(100):
+        if svc.is_busy(sid):
+            break
+        await asyncio.sleep(0.01)
+    assert svc.is_busy(sid)
+
+    r2 = await client.post(f"/api/ask/sessions/{sid}/messages", json={"content": "第二问"})
+    assert r2.status_code == 409, r2.text
+    assert "已有正在执行" in r2.json()["message"]
+
+    # 第二问不该落库（被门挡住，不是「先写后拒」）
+    msgs = await svc.store.messages(sid)
+    assert [m.content for m in msgs if m.role == "user"] == ["第一问"]
+
+    await client.post(f"/api/ask/sessions/{sid}/cancel")
+    await asyncio.sleep(0.2)
+    await client.delete(f"/api/ask/sessions/{sid}")
+
+
+async def test_message_slot_released_after_completion(client):
+    """跑完必须释放槽位，否则这个会话之后再也发不出消息。"""
+    r = await client.post("/api/ask/sessions", json=None)
+    sid = r.json()["data"]["id"]
+
+    r = await client.post(f"/api/ask/sessions/{sid}/messages", json={"content": "第一问"})
+    assert r.status_code == 202
+    await asyncio.sleep(1.5)
+    r = await client.post(f"/api/ask/sessions/{sid}/messages", json={"content": "第二问"})
+    assert r.status_code == 202, r.text
+    await asyncio.sleep(1.5)
+
+    await client.delete(f"/api/ask/sessions/{sid}")

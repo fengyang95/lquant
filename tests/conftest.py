@@ -15,6 +15,33 @@ def _skip_env_files(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LQ_ENV_SKIP", "1")
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _force_mock_agent_provider():
+    """整个测试会话固定 provider=mock。
+
+    生产默认已是 claude_code（「问 AI」= 问 Claude Code），但单测**不该**依赖
+    本机装没装 claude CLI，更不该真的拉起带 --dangerously-skip-permissions 的
+    子进程。需要真实 claude 语义的用例自己注入 fake 脚本
+    （见 tests/unit/test_ask_agent_claude.py）。
+
+    必须在任何 get_settings() 之前生效：app.yaml 的 `${LQ_AGENT_PROVIDER:...}`
+    是**加载时**插值的，缓存一旦建立就固化，所以这里同时清一次 lru_cache。
+    """
+    import os
+
+    from lquant.core.config import get_settings
+
+    prev = os.environ.get("LQ_AGENT_PROVIDER")
+    os.environ["LQ_AGENT_PROVIDER"] = "mock"
+    get_settings.cache_clear()
+    yield
+    if prev is None:
+        os.environ.pop("LQ_AGENT_PROVIDER", None)
+    else:
+        os.environ["LQ_AGENT_PROVIDER"] = prev
+    get_settings.cache_clear()
+
+
 def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
     """收尾：关掉 agent service 单例持有的 aiosqlite 连接。
 
