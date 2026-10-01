@@ -58,7 +58,8 @@ def test_queue_depths_no_redis(monkeypatch) -> None:
     _disable_redis(monkeypatch)
     out = q.queue_depths()
     assert [r["queue"] for r in out] == [
-        "lquant-default", "lquant-ingest", "lquant-backtest", "lquant-mining"]
+        "lquant-default", "lquant-ingest", "lquant-backtest", "lquant-mining",
+        "lquant-qlib"]
     assert all(r["pending"] is None for r in out)
 
 

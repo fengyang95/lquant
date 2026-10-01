@@ -284,6 +284,12 @@ def test_import_failure_not_registered(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delitem(sys.modules, "lquant.data.providers.akshare", raising=False)
     # baostock 可能已被其他测试文件导入（装饰器不再重跑），一并弹出让其重新注册
     monkeypatch.delitem(sys.modules, "lquant.data.providers.baostock", raising=False)
+    # delitem 只管 sys.modules；重新 import 会把新模块对象挂回 providers 包属性，
+    # 与 teardown 恢复的 sys.modules 条目分裂 —— 后续用例用 dotted 路径
+    # monkeypatch.setattr("lquant.data.providers.baostock.xxx") 会 resolve 到
+    # 这个孤儿对象，patch 落空（test_provider_baostock 顺序相关失败）。
+    monkeypatch.delattr(pv, "akshare", raising=False)
+    monkeypatch.delattr(pv, "baostock", raising=False)
 
     real_import = importlib.import_module
 

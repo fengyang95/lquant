@@ -6,22 +6,26 @@ import type { DataIssue } from '../types';
 
 const issues: DataIssue[] = [
   {
-    id: 1,
+    issue_id: 'i1',
     rule_code: 'CROSS_SRC_DIFF',
     dataset: 'daily',
     severity: 'fatal',
-    message: 'close 与对拍源偏差 5.2%',
-    detail: null,
+    symbol: '600000.SH',
+    trade_date: '2026-09-12',
+    detail: { message: 'close 与对拍源偏差 5.2%' },
+    count: 1,
     resolved: false,
     created_at: '2026-09-12T14:00:00',
   },
   {
-    id: 2,
+    issue_id: 'i2',
     rule_code: 'STALE_PRICE',
     dataset: 'daily',
     severity: 'warn',
-    message: '连续 5 日未更新',
-    detail: null,
+    symbol: null,
+    trade_date: null,
+    detail: { message: '连续 5 日未更新' },
+    count: 5,
     resolved: false,
     created_at: '2026-09-11T14:00:00',
   },
@@ -95,7 +99,7 @@ describe('IssuesPanel 质量问题历史', () => {
       return new Response('not found', { status: 404 });
     });
     await screen.findByText('CROSS_SRC_DIFF');
-    fireEvent.click(screen.getByLabelText('勾选 1'));
+    fireEvent.click(screen.getByLabelText('勾选 i1'));
     fireEvent.click(screen.getByText('标记已处理（1）'));
     await waitFor(() => {
       expect(screen.getByText(/✓ 已标记 1 条/)).toBeInTheDocument();
@@ -104,7 +108,7 @@ describe('IssuesPanel 质量问题历史', () => {
       ([u, i]) => String(u).includes('/data/issues/resolve') && (i as RequestInit).method === 'POST',
     );
     expect(postCalls).toHaveLength(1);
-    expect(JSON.parse((postCalls[0][1] as RequestInit).body as string)).toEqual({ ids: ['1'] });
+    expect(JSON.parse((postCalls[0][1] as RequestInit).body as string)).toEqual({ ids: ['i1'] });
   });
 
   it('加载失败：显式错误态', async () => {

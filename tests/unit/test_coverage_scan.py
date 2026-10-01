@@ -133,6 +133,27 @@ def test_symbol_sparse_gap(env) -> None:
     detail = issue["detail"]  # latest_issues 已把 detail JSON 解析成 dict
     assert issue["severity"] == "error"
     assert detail["dates"] == [d.isoformat() for d in days[2:]]
+    # 文案里的「共 N 天」是窗口交易日数，不能错写成标的只数
+    assert f"共 {len(days)} 天" in detail["message"]
+
+
+def test_expected_symbols_respects_window_bounds(env) -> None:
+    """上市/退市落在窗口内的标的也要计入应有标的 —— SQL 参数顺序不能反。"""
+    from lquant.core.db import writer
+    from lquant.data.quality.coverage import _expected_symbols
+
+    start, end = date(2026, 9, 7), date(2026, 9, 11)
+    _seed_calendar(start, end)
+    with writer() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO security (symbol, sec_type, list_date, delist_date) "
+            "VALUES ('600000.SH', 'stock', DATE '2000-01-01', NULL), "
+            "('301001.SZ', 'stock', DATE '2026-09-08', NULL), "
+            "('000002.SZ', 'stock', DATE '2000-01-01', DATE '2026-09-09')")
+    # 窗口内上市（301001）、窗口内退市（000002）都应出现在应有标的里
+    assert _expected_symbols(end, start) == [
+        "000002.SZ", "301001.SZ", "600000.SH",
+    ]
 
 
 def test_basic_empty_lake_info_no_repair(env) -> None:

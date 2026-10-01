@@ -144,13 +144,13 @@ def test_daily_fetch_keeps_suspended_and_converts_is_st(
     captured: dict[str, object] = {}
 
     def fake_query(fn: object, *args: object, **kw: object) -> list[list[str]]:
-        captured["code"] = args[0]
-        return DAILY_ROWS
+        captured["codes"] = args[0]
+        return [("sh.600000", DAILY_ROWS)]
 
     monkeypatch.setattr(wd, "run_with_watchdog", fake_query)
     p = BaoStockProvider()
     raw = p._fetch_daily(["600000.SH"], date(2024, 1, 1), date(2024, 1, 4))
-    assert captured["code"] == "sh.600000"
+    assert captured["codes"] == ["sh.600000"]
     assert len(raw) == 3  # 停牌行保留
     assert raw["is_suspended"].to_list() == [False, False, True]
     assert "tradestatus" not in raw.columns and "isST" not in raw.columns
@@ -278,7 +278,8 @@ def test_daily_bars_end_to_end_no_network(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """daily_bars 全链路（watchdog 打桩）：映射层出 is_st，停牌行保留。"""
-    monkeypatch.setattr(wd, "run_with_watchdog", lambda fn, *a, **k: DAILY_ROWS)
+    monkeypatch.setattr(
+        wd, "run_with_watchdog", lambda fn, *a, **k: [("sh.600000", DAILY_ROWS)])
     p = BaoStockProvider()
     out = p.daily_bars(["600000.SH"], date(2024, 1, 1), date(2024, 1, 4))
     assert out["is_st"].to_list() == [False, True, False]
@@ -406,19 +407,23 @@ def _fake_query_2024(code: str, *a, **k) -> list[list[str]]:
 
 
 def test_fetch_daily_parallel_preserves_order(monkeypatch) -> None:
-    """线程池并行拉取后必须按入参顺序拼接（顺序影响对拍与断点语义）。"""
+    """分组拉取后必须按入参顺序拼接（顺序影响对拍与断点语义）。"""
     import datetime
     import sys
 
     def _passthrough(fn, *a, **k):
+        k.pop("timeout", None)
         return fn(*a, **k)
+
+    def _fake_query_many(codes, *a, **k):
+        return [(code, _fake_query_2024(code)) for code in codes]
 
     # 直接 patch 方法实际读取的对象，不走 monkeypatch 字符串解析：
     # test_provider_akshare 的模块重导入会让 import 图分裂，字符串
     # target 经 getattr 链可能 resolve 到另一个模块对象，patch 落不到
-    # _one 闭包真正读取的 __globals__ → 全量套件下偶发走真登录。
+    # _group 闭包真正读取的 __globals__ → 全量套件下偶发走真登录。
     g = BaoStockProvider._fetch_daily.__globals__
-    monkeypatch.setitem(g, "_bs_query", _fake_query_2024)
+    monkeypatch.setitem(g, "_bs_query_many", _fake_query_many)
     monkeypatch.setattr(sys.modules["lquant.data.watchdog"], "run_with_watchdog", _passthrough)
     syms = [f"60000{i}.SH" for i in range(10)]
     df = BaoStockProvider()._fetch_daily(

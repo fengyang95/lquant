@@ -43,7 +43,7 @@ export default function RecentIssuesPanel() {
       ) : (
         <ul className="divide-y divide-line">
           {recent.map((it) => {
-            const id = String(it.id);
+            const id = it.issue_id;
             const isOpen = expanded === id;
             return (
               <li key={id}>
@@ -57,14 +57,14 @@ export default function RecentIssuesPanel() {
                       {it.severity}
                     </span>
                     <span className="font-mono text-xs">{it.rule_code}</span>
-                    <span className="truncate text-xs text-ink-dim">{it.message}</span>
+                    <span className="truncate text-xs text-ink-dim">{it.detail?.message}</span>
                   </div>
                   <span className="shrink-0 text-xs text-ink-faint">{it.created_at.slice(0, 16)}</span>
                 </button>
                 {isOpen && (
                   <div className="border-t border-line bg-paper px-3 py-2 text-xs text-ink-dim">
                     <div className="font-mono">#{id} · {it.dataset}</div>
-                    <div className="mt-1 whitespace-pre-wrap">{it.message}</div>
+                    <div className="mt-1 whitespace-pre-wrap">{it.detail?.message}</div>
                     {it.detail != null && (
                       <pre className="mt-1 overflow-auto font-mono text-[11px] text-ink-faint">
                         {JSON.stringify(it.detail, null, 2)}

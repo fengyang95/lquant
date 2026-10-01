@@ -46,6 +46,11 @@ def tmp_catalog(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setattr(catalog, "writer", _writer)
     monkeypatch.setattr(catalog, "reader", _reader)
+    # 估值列走真实日线湖（read_daily），本组单测只验缓存键、不依赖真实湖：
+    # 显式置空，避免 pre-push 在新 worktree 兜底生成的 demo 湖（无 pe_ttm 列）
+    # 让 _valuation_frame 的 select 抛 ColumnNotFoundError。
+    monkeypatch.setattr("lquant.data.store.parquet.lake_is_empty",
+                        lambda *a, **k: True)
 
 
 class _Counter:

@@ -48,7 +48,7 @@ def _expected_symbols(end: date, start: date) -> list[str]:
             "WHERE list_date <= ? "
             "AND (delist_date IS NULL OR delist_date > ?) "
             "AND sec_type IN ('stock', 'etf', 'lof') ORDER BY symbol",
-            [start, end],
+            [end, start],
         ).fetchall()
     return [r[0] for r in rows]
 
@@ -97,7 +97,7 @@ def _gap_report(table: str, days: list[date], expected: list[str],
             issues.append(Issue(
                 rule="COVERAGE_GAP", severity="error", dataset=table,
                 symbol=sym, count=len(gaps),
-                detail=f"窗口内缺失 {len(gaps)} 个交易日（共 {n_expected} 天）",
+                detail=f"窗口内缺失 {len(gaps)} 个交易日（共 {len(days)} 天）",
                 extra={"dates": truncated},
             ))
     report = {

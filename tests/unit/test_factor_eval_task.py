@@ -1,12 +1,39 @@
 """因子评价任务化：202 入队 → 进度流 → 结果落库 → 任务中心可见。"""
 from __future__ import annotations
 
+import os
 import time
 
 import pytest
 from fastapi.testclient import TestClient
 
 from lquant.server import jobs as jobs_mod
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _factor_eval_env(tmp_path_factory):
+    """自包含 demo 环境：因子评价需要非空日线湖。
+
+    此前依赖开发者本地 data/ 湖（未入库）—— CI 与全新 worktree 上必失败。
+    """
+    base = tmp_path_factory.mktemp("factor_eval_task")
+    prev_cwd = os.getcwd()
+    os.chdir(base)
+    from lquant.core.config import get_settings
+
+    get_settings.cache_clear()
+    from lquant.core.db import writer
+    from lquant.data.ingest.demo import generate_demo
+    from lquant.data.store.ddl import DDL_STATEMENTS, ensure_factor_def_columns
+
+    with writer() as con:
+        for stmt in DDL_STATEMENTS:
+            con.execute(stmt)
+        ensure_factor_def_columns(con)
+    generate_demo(start="2024-01-01", end="2026-06-30")
+    yield base
+    os.chdir(prev_cwd)
+    get_settings.cache_clear()
 
 
 @pytest.fixture(autouse=True)

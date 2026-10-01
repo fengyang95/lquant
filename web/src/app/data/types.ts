@@ -32,15 +32,18 @@ export type DataVersion = {
   created_at: string;
 };
 
-/** 质量问题历史（GET /data/issues）—— rule 级聚合 + 原始 issue 两用 */
+/** 质量问题历史（GET /data/issues，与 /data/crosscheck/issues 同源）。
+ *  后端 query_issues 输出 issue_id + detail 内嵌 message，不是 id/message。 */
 export type DataIssue = {
-  id: number | string;
+  issue_id: string;
   rule_code: string;
   dataset: string;
   severity: string; // fatal/error/warn/info
-  message: string;
-  /** 后端 JSON 明细，结构随 rule 而异 */
-  detail: Record<string, unknown> | null;
+  symbol: string | null;
+  trade_date: string | null;
+  /** 后端 JSON 明细，结构随 rule 而异；message 为人类可读摘要 */
+  detail: ({ message?: string } & Record<string, unknown>) | null;
+  count: number;
   resolved: boolean;
   created_at: string;
 };

@@ -137,12 +137,12 @@ def test_fetch_daily_success_and_retry(patch_wd) -> None:
     stub = patch_wd([
         RuntimeError("baostock 10001001: 用户未登录"),
         RuntimeError("baostock 10001001: 用户未登录"),
-        RAW_DAILY,
+        [("sz.000001", RAW_DAILY)],
     ])
     p = BaoStockProvider()
     df = p._fetch_daily(["000001.SZ"], date(2024, 1, 2), date(2024, 1, 2))
     assert len(df) == 1
-    assert stub.calls[0][0] == "_bs_query"
+    assert stub.calls[0][0] == "_bs_query_many"
 
 
 def test_fetch_daily_empty(patch_wd) -> None:
@@ -158,7 +158,7 @@ def test_fetch_daily_runtime_error_propagates(patch_wd) -> None:
 
 
 def test_daily_bars_end_to_end(patch_wd) -> None:
-    patch_wd([RAW_DAILY])
+    patch_wd([[("sz.000001", RAW_DAILY)]])
     df = BaoStockProvider().daily_bars(["000001.SZ"], date(2024, 1, 2), date(2024, 1, 2))
     assert "is_st" in df.columns
     assert df["symbol"][0] == "000001.SZ"

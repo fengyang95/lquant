@@ -35,7 +35,7 @@ export default function IssuesPanel() {
   const { data, error, isLoading, mutate } = useSWR<DataIssue[]>(`/data/issues?${query}`, fetcher);
 
   const issues = data ?? [];
-  const allChecked = issues.length > 0 && issues.every((i) => checked.has(String(i.id)));
+  const allChecked = issues.length > 0 && issues.every((i) => checked.has(i.issue_id));
 
   function setFilter(patch: Partial<typeof filters>) {
     setFilters({ ...filters, ...patch });
@@ -129,7 +129,7 @@ export default function IssuesPanel() {
                     type="checkbox"
                     checked={allChecked}
                     onChange={() =>
-                      setChecked(allChecked ? new Set() : new Set(issues.map((i) => String(i.id))))
+                      setChecked(allChecked ? new Set() : new Set(issues.map((i) => i.issue_id)))
                     }
                   />
                 </th>
@@ -142,7 +142,8 @@ export default function IssuesPanel() {
             </thead>
             <tbody>
               {issues.map((it) => {
-                const id = String(it.id);
+                const id = it.issue_id;
+                const message = it.detail?.message ?? '';
                 return (
                   <tr key={id} className={it.resolved ? 'opacity-50' : undefined}>
                     <td>
@@ -160,7 +161,7 @@ export default function IssuesPanel() {
                     </td>
                     <td className="font-mono text-xs">{it.rule_code}</td>
                     <td className="text-xs">{it.dataset}</td>
-                    <td className="max-w-80 truncate text-xs text-ink-dim" title={it.message}>{it.message}</td>
+                    <td className="max-w-80 truncate text-xs text-ink-dim" title={message}>{message}</td>
                     <td className="text-xs text-ink-faint">{it.created_at.slice(0, 19)}</td>
                   </tr>
                 );

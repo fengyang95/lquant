@@ -51,8 +51,13 @@ def sync_env(tmp_path_factory):
         from lquant.core.db import writer as _writer
 
         with _writer() as con:
-            con.execute(
-                "DELETE FROM data_task WHERE status IN ('pending', 'running')")
+            # 库可能根本没建过 data_task（全新库）—— 有表才清
+            has_task = bool(con.execute(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_name = 'data_task'").fetchall())
+            if has_task:
+                con.execute(
+                    "DELETE FROM data_task WHERE status IN ('pending', 'running')")
         get_settings.cache_clear()
         yield base
         get_settings.cache_clear()
