@@ -195,6 +195,26 @@ def register_factor(f: FactorIn) -> dict:
     return {"registered": f.name, "rows": n}
 
 
+class _ValidateIn(BaseModel):
+    expression: str
+
+
+@router.post("/validate")
+def validate_expression(v: _ValidateIn) -> dict:
+    """DSL 表达式 AST 校验（不落库），供前端注册 / 编辑表单实时校验。"""
+    expr = (v.expression or "").strip()
+    if not expr:
+        return {"ok": False, "error": "表达式为空"}
+    try:
+        from lquant.factors.dsl.analyzer import check
+        from lquant.factors.dsl.parser import parse
+
+        check(parse(expr, "validate"))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "error": None}
+
+
 class FactorUpdateIn(BaseModel):
     """部分更新：None 字段保持原值。expression 传空串表示清空 DSL。"""
     expression: str | None = None
