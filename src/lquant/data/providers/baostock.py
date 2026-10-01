@@ -489,7 +489,6 @@ class BaoStockProvider(MappingProvider):
                         _time.sleep(1.5 * (attempt + 1))
                         continue
                     raise
-            return []
 
         # 组大小与 ingest/daily.py 的 SUB_BATCH 对齐：超时缩批重试不会二次分组
         group_size = DAILY_GROUP_SIZE
