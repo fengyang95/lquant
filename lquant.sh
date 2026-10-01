@@ -228,6 +228,52 @@ free_port() {  # 端口被残留进程占用时先杀掉，确保能绑定
   [ -n "$pids" ] && echo "$pids" | xargs kill -9 2>/dev/null || true
 }
 
+# ---- Web 生命周期：dev 与 build 共用 web/.next，二者绝不能并发 --------------
+# 并发时 dev 的增量写会覆盖 build 的 manifest，构建期报
+#   PageNotFoundError: Cannot find module for page: /_document
+WEB_WAS_RUNNING=0
+
+stop_web() {  # 停 Web；「原本是否在跑」写入全局 WEB_WAS_RUNNING（日志走 stdout，不能靠 $(...) 取值）
+  WEB_WAS_RUNNING=0
+  if pid_ok "$RUN_DIR/web.pid"; then
+    WEB_WAS_RUNNING=1
+    local pid; pid="$(cat "$RUN_DIR/web.pid")"
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 10); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    kill -9 "$pid" 2>/dev/null || true
+    dim "web 已停止 (pid $pid)"
+  fi
+  rm -f "$RUN_DIR/web.pid"
+  # 兜底：pid 文件丢失时按命令行清理占用 Web 端口的 next dev/start（含 bash/npm 包装进程）
+  pkill -f "next dev -p $WEB_PORT" 2>/dev/null || true
+  pkill -f "next start -p $WEB_PORT" 2>/dev/null || true
+}
+
+start_web() {
+  if pid_ok "$RUN_DIR/web.pid"; then warn "Web 已在运行 (pid $(cat "$RUN_DIR/web.pid"))"; return 0; fi
+  free_port "$WEB_PORT"
+  if [ -d web/.next ] && [ -f web/.next/BUILD_ID ]; then
+    info "启动 Web（生产模式 next start, port ${WEB_PORT}）"
+    spawn web "$LOG_DIR/web.log" bash -c "cd web && npx next start -p $WEB_PORT"
+  else
+    warn "无生产构建，用 dev 模式（跑 ./lquant.sh build 可切生产模式）"
+    spawn web "$LOG_DIR/web.log" bash -c "cd web && npx next dev -p $WEB_PORT"
+  fi
+}
+
+run_next_build() {  # [--keep-stopped] 构建前停 Web（独占 .next），成功后按需恢复
+  local keep_stopped=0
+  if [ "${1:-}" = "--keep-stopped" ]; then keep_stopped=1; fi
+  stop_web
+  local rc=0
+  ( cd web && npx next build ) || rc=1
+  if [ "$WEB_WAS_RUNNING" = 1 ] && [ "$keep_stopped" = 0 ]; then
+    dim "构建完成，恢复 Web"
+    start_web
+  fi
+  return "$rc"
+}
+
 # ============================== 子命令 =====================================
 cmd_doctor() {
   echo "== lquant 环境体检 =="
@@ -343,7 +389,8 @@ cmd_update() {
         dim "前端源码未变化，跳过 next build"
       else
         info "前端生产构建 (next build)"
-        if ( cd web && npx next build ); then
+        # --keep-stopped：Web 交给下面第 4 步统一重启，避免重启两次
+        if run_next_build --keep-stopped; then
           web_build_inputs | shasum -a 256 | cut -d' ' -f1 > "$RUN_DIR/webbuild.sha"
         else
           warn "next build 失败，Web 将以旧构建或 dev 模式运行"
@@ -356,14 +403,20 @@ cmd_update() {
     dim "无生产构建，跳过 next build（Web 走 dev 模式，跑 --full 可强制构建）"
   fi
 
-  # 4) 运行中的服务是旧代码，重启加载
+  # 4) 运行中的服务是旧代码，重启加载；构建期为独占 .next 停掉的 Web 需恢复
   if [ "$no_restart" = 0 ]; then
     if pid_ok "$RUN_DIR/api.pid" || pid_ok "$RUN_DIR/web.pid" || pid_ok "$RUN_DIR/worker.pid"; then
       info "检测到服务运行中，重启以加载新代码"
       cmd_restart
+    elif [ "$WEB_WAS_RUNNING" = 1 ]; then
+      info "恢复构建期间停掉的 Web"
+      start_web
     else
       dim "服务未运行，跳过重启（./lquant.sh start 启动）"
     fi
+  elif [ "$WEB_WAS_RUNNING" = 1 ]; then
+    info "恢复构建期间停掉的 Web（--no-restart）"
+    start_web
   fi
   info "更新完成"
 }
@@ -376,9 +429,10 @@ cmd_build() {
   info "前端生产构建 (next build, standalone)"
   if ! changed_since "$RUN_DIR/webbuild.sha" <(web_build_inputs); then
     dim "前端源码未变化，跳过 next build（删 .run/webbuild.sha 或 ./lquant.sh update --full 可强制重建）"
-  else
-    ( cd web && npx next build )
+  elif run_next_build; then
     web_build_inputs | shasum -a 256 | cut -d' ' -f1 > "$RUN_DIR/webbuild.sha"
+  else
+    warn "next build 失败，后续打包将使用旧构建（修好后重跑 ./lquant.sh build）"
   fi
 
   info "后端 wheel"
@@ -473,16 +527,7 @@ sys.exit(0 if _redis_available() else 1)" 2>/dev/null; then
   fi
 
   if [ "$no_web" = 0 ]; then
-    if pid_ok "$RUN_DIR/web.pid"; then warn "Web 已在运行 (pid $(cat "$RUN_DIR/web.pid"))"; else
-      free_port "$WEB_PORT"
-      if [ -d web/.next ] && [ -f web/.next/BUILD_ID ]; then
-        info "启动 Web（生产模式 next start, port ${WEB_PORT}）"
-        spawn web "$LOG_DIR/web.log" bash -c "cd web && npx next start -p $WEB_PORT"
-      else
-        warn "无生产构建，用 dev 模式（跑 ./lquant.sh build 可切生产模式）"
-        spawn web "$LOG_DIR/web.log" bash -c "cd web && npx next dev -p $WEB_PORT"
-      fi
-    fi
+    start_web
   fi
 
   sleep 2
@@ -510,10 +555,12 @@ cmd_stop() {
     fi
     rm -f "$RUN_DIR/$name.pid"
   done
-  # uvicorn/rq/next 可能有残留子进程
+  # uvicorn/rq/next 可能有残留子进程（next 残留会与下次 build 抢 .next，必须清）
   pkill -f "uvicorn lquant.server.main" 2>/dev/null && dim "清理残留 uvicorn" || true
   pkill -f "rq worker lquant" 2>/dev/null || true
   pkill -f "lq worker" 2>/dev/null || true
+  pkill -f "next dev -p $WEB_PORT" 2>/dev/null || true
+  pkill -f "next start -p $WEB_PORT" 2>/dev/null || true
   info "done"
 }
 
