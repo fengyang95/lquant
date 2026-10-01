@@ -11,6 +11,9 @@ class Session(BaseModel):
     title: str = "新会话"
     context: dict[str, Any] = Field(default_factory=dict)
     created_at: str = ""
+    #: 会话级能力配置 ``{provider, skills, mcp_tools}``，创建时锁定、建后不可改；
+    #: 空 dict 表示「未指定」，由调用方回退到全局默认（老会话 / A2A 建的会话）。
+    agent_config: dict[str, Any] = Field(default_factory=dict)
 
 
 class Message(BaseModel):

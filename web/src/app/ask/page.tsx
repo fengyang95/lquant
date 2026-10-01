@@ -6,8 +6,11 @@ import PageHeader from '@/components/PageHeader';
 import { Empty, ErrorNote, Loading } from '@/components/States';
 import type { AskSession } from '@/lib/ask-api';
 import { createSession, deleteSession, listSessions } from '@/lib/ask-api';
+import type { AgentCapabilities, AgentConfig } from '@/lib/agent-api';
+import { getCapabilities } from '@/lib/agent-api';
 import ChatWindow from '@/components/ask/ChatWindow';
 import ContextChip from '@/components/ask/ContextChip';
+import NewSessionDialog from '@/components/ask/NewSessionDialog';
 import SessionList from '@/components/ask/SessionList';
 
 function AskWorkspace() {
@@ -17,6 +20,12 @@ function AskWorkspace() {
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [initState, setInitState] = useState<'loading' | 'ready' | 'error'>('loading');
   const [initError, setInitError] = useState('');
+  // 新建会话弹层：能力清单拉不到时降级为「直接建会话」（走全局默认），
+  // 不让一个可选的配置入口把「新建会话」这条主路径也堵死。
+  const [caps, setCaps] = useState<AgentCapabilities | null>(null);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
 
   const current = sessions.find((s) => s.id === currentId) ?? null;
 
@@ -52,12 +61,34 @@ function AskWorkspace() {
 
   const handleNew = useCallback(async () => {
     setInitError('');
+    setCreateError(null);
+    // 先拉能力清单再开弹层；拉不到就直接建（走全局默认），不挡住主路径
     try {
-      const created = await createSession();
+      const list = caps ?? (await getCapabilities());
+      setCaps(list);
+      setDialogOpen(true);
+    } catch {
+      await createSession().then((created) => {
+        setSessions((prev) => [created, ...prev]);
+        setCurrentId(created.id);
+      }).catch((e) => {
+        setInitError(e instanceof Error ? e.message : String(e));
+      });
+    }
+  }, [caps]);
+
+  const handleCreate = useCallback(async (cfg: AgentConfig) => {
+    setCreating(true);
+    setCreateError(null);
+    try {
+      const created = await createSession({}, cfg);
       setSessions((prev) => [created, ...prev]);
       setCurrentId(created.id);
+      setDialogOpen(false);
     } catch (e) {
-      setInitError(e instanceof Error ? e.message : String(e));
+      setCreateError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCreating(false);
     }
   }, []);
 
@@ -112,6 +143,15 @@ function AskWorkspace() {
           )}
         </div>
       </div>
+      {dialogOpen && caps ? (
+        <NewSessionDialog
+          caps={caps}
+          busy={creating}
+          error={createError}
+          onCancel={() => setDialogOpen(false)}
+          onCreate={(cfg) => void handleCreate(cfg)}
+        />
+      ) : null}
     </div>
   );
 }

@@ -25,13 +25,12 @@
 
 from __future__ import annotations
 
-import sys
+import json
 from pathlib import Path
 
 from lquant.agent.cli_agent import CliAgentService
 from lquant.agent.codex_json import parse_codex_line
 from lquant.agent.sessions import SessionStore
-from lquant.agent.workspace import mcp_server_spec
 
 #: 工作区 MCP 里的 server 名（与 claude 的 mcp.json 对齐）
 _MCP_SERVER_NAME = "lquant"
@@ -42,6 +41,7 @@ class CodexAgentService(CliAgentService):
 
     label = "codex"
     stderr_tag = "codex"
+    provider = "codex"
 
     def __init__(
         self,
@@ -72,9 +72,17 @@ class CodexAgentService(CliAgentService):
 
     # ---- 命令行 -----------------------------------------------------------
 
-    def _mcp_overrides(self) -> list[str]:
-        """把工作区 MCP 规格翻成 ``-c`` 覆盖项（value 按 TOML 解析）。"""
-        spec = mcp_server_spec(self._root, python=sys.executable)
+    def _mcp_overrides(self, workspace: Path) -> list[str]:
+        """把工作区的 mcp.json 翻成 ``-c`` 覆盖项（value 按 TOML 解析）。
+
+        读的是工作区里那份**与 claude 共用**的 ``mcp.json``（由
+        ``workspace.ensure_workspace`` 写出），而不是再调一次 ``mcp_server_spec``
+        现造：会话级工具白名单就写在那个文件里，两边各造一份必然分叉 ——
+        这正是本仓反复踩过的「同一套语义两个出口」。
+        """
+        cfg = json.loads(
+            (workspace / ".claude" / "mcp.json").read_text(encoding="utf-8"))
+        spec = cfg["mcpServers"][_MCP_SERVER_NAME]
         args_toml = "[" + ",".join(f'"{a}"' for a in spec["args"]) + "]"
         env_toml = "{" + ",".join(f'{k}="{v}"' for k, v in spec["env"].items()) + "}"
         return [
@@ -83,20 +91,21 @@ class CodexAgentService(CliAgentService):
             "-c", f"mcp_servers.{_MCP_SERVER_NAME}.env={env_toml}",
         ]
 
-    def _build_cmd(self, content: str, cli_sid: str | None) -> list[str]:
+    def _build_cmd(self, content: str, cli_sid: str | None,
+                   workspace: Path) -> list[str]:
         cmd = [
             self._codex_path,
             "exec",
             "--json",
             "--color", "never",
             "--skip-git-repo-check",
-            "-C", str(self._workspace),
+            "-C", str(workspace),
         ]
         if self._skip_permissions:
             cmd.append("--dangerously-bypass-approvals-and-sandbox")
         else:
             cmd += ["-s", "workspace-write"]
-        cmd += self._mcp_overrides()
+        cmd += self._mcp_overrides(workspace)
         cmd += self._codex_args
         if cli_sid:
             cmd += ["resume", cli_sid]

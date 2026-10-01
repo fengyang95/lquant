@@ -1,3 +1,4 @@
+import type { AgentConfig } from './agent-api';
 import { ApiError, delData, getData, post } from './api';
 
 /** 会话列表项 */
@@ -6,6 +7,8 @@ export interface AskSession {
   title: string;
   context: Record<string, unknown>;
   created_at: string;
+  /** 会话级能力配置（建会话时锁定，建后不可改）；{} = 未指定，走全局默认 */
+  agent_config?: AgentConfig;
 }
 
 /** 工具调用记录 */
@@ -58,8 +61,12 @@ export function listSessions(): Promise<AskSession[]> {
   return getData<AskSession[]>(`${BASE}/sessions`);
 }
 
-export function createSession(context: Record<string, unknown> = {}): Promise<AskSession> {
-  return post(`${BASE}/sessions`, { context }).then((body) => {
+/** 建会话；`agentConfig` 传了就在建会话时锁定能力集（建后不可改）。 */
+export function createSession(
+  context: Record<string, unknown> = {},
+  agentConfig?: AgentConfig,
+): Promise<AskSession> {
+  return post(`${BASE}/sessions`, { context, ...(agentConfig ?? {}) }).then((body) => {
     // /api/ask 为封套接口：post 不解包，这里自行取 data
     const env = body as unknown as Envelope<AskSession>;
     if (env && typeof env === 'object' && 'code' in env) {

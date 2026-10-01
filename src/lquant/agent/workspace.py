@@ -72,26 +72,36 @@ def _write_role_docs(workspace: Path, root: Path) -> None:
         (workspace / name).write_text(text, encoding="utf-8")
 
 
-def mcp_server_spec(root: Path, python: str | None = None) -> dict:
+def mcp_server_spec(root: Path, python: str | None = None,
+                    enabled_tools: set[str] | None = None) -> dict:
     """lquant MCP server 的启动规格 —— **两个 provider 共用这一份**。
 
     claude 把它写成 ``.claude/mcp.json``，codex 把它翻成
     ``-c mcp_servers.lquant.*``（见 agent/codex.py）。放在这里是为了避免
     「两套 MCP 配置各自演化」：host 解释器、模块入口、环境变量只有一处定义。
+
+    ``enabled_tools`` 为会话级工具白名单，经 ``LQ_MCP_ENABLED_TOOLS`` 注入给
+    server 进程。注意 **空集要写成存在但为空串** —— server 侧把「变量缺失」
+    读作全开、「存在」读作按名单裁剪，两者语义不同，不能合并成一个空值。
+    ``None`` 表示不注入该变量（全开）。
     """
+    env = {
+        "LQ_ROOT": str(root),
+        "PYTHONPATH": str(root / "src"),
+    }
+    if enabled_tools is not None:
+        env["LQ_MCP_ENABLED_TOOLS"] = ",".join(sorted(enabled_tools))
     return {
         "type": "stdio",
         "command": python or sys.executable,
         "args": list(_MCP_SERVER_ARGS),
-        "env": {
-            "LQ_ROOT": str(root),
-            "PYTHONPATH": str(root / "src"),
-        },
+        "env": env,
     }
 
 
-def _write_mcp_json(workspace: Path, root: Path) -> None:
-    mcp_config = {"mcpServers": {"lquant": mcp_server_spec(root)}}
+def _write_mcp_json(workspace: Path, root: Path,
+                    enabled_tools: set[str] | None = None) -> None:
+    mcp_config = {"mcpServers": {"lquant": mcp_server_spec(root, enabled_tools=enabled_tools)}}
     claude_dir = workspace / ".claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
     (claude_dir / "mcp.json").write_text(
@@ -99,11 +109,16 @@ def _write_mcp_json(workspace: Path, root: Path) -> None:
     )
 
 
-def _sync_skills(workspace: Path, root: Path) -> None:
+def _sync_skills(workspace: Path, root: Path,
+                 enabled: set[str] | None = None) -> None:
     """每次调用先删后拷，保证 skills 与 config/skills/ 一致。
 
     拷贝后把 ``${LQ_API_BASE}`` 替换成实际基址：skill 是跟着仓库分发的静态文件，
     不能把部署相关的主机端口写死在里面（换端口即失效）。
+
+    ``enabled`` 是会话级启用集：``None`` = 全量（老调用方行为不变），
+    否则只拷启用的。**按源目录实际子目录取交集**，不直接拼路径 —— 名单来自
+    请求体/数据库，拼路径会让 ``../`` 把任意目录拷进工作区。
     """
     skills_src = root / "config" / "skills"
     if not skills_src.is_dir():
@@ -111,7 +126,13 @@ def _sync_skills(workspace: Path, root: Path) -> None:
     skills_dst = workspace / ".claude" / "skills"
     if skills_dst.exists():
         shutil.rmtree(skills_dst)
-    shutil.copytree(skills_src, skills_dst)
+    skills_dst.mkdir(parents=True, exist_ok=True)
+    for src in sorted(skills_src.iterdir()):
+        if not src.is_dir():
+            continue
+        if enabled is not None and src.name not in enabled:
+            continue
+        shutil.copytree(src, skills_dst / src.name)
     base = api_base_url()
     for md in skills_dst.rglob("*.md"):
         text = md.read_text(encoding="utf-8")
@@ -119,12 +140,17 @@ def _sync_skills(workspace: Path, root: Path) -> None:
             md.write_text(text.replace(_API_BASE_PLACEHOLDER, base), encoding="utf-8")
 
 
-def ensure_workspace(workspace_dir: str, root: Path) -> Path:
-    """幂等创建 agent 工作区并生成脚手架文件，返回工作区路径。"""
+def ensure_workspace(workspace_dir: str, root: Path,
+                     enabled_skills: set[str] | None = None,
+                     enabled_tools: set[str] | None = None) -> Path:
+    """幂等创建 agent 工作区并生成脚手架文件，返回工作区路径。
+
+    ``enabled_skills`` / ``enabled_tools`` 是会话级能力裁剪（None = 不裁剪）。
+    """
     root = Path(root)
     workspace = root / workspace_dir
     workspace.mkdir(parents=True, exist_ok=True)
     _write_role_docs(workspace, root)
-    _write_mcp_json(workspace, root)
-    _sync_skills(workspace, root)
+    _write_mcp_json(workspace, root, enabled_tools=enabled_tools)
+    _sync_skills(workspace, root, enabled=enabled_skills)
     return workspace

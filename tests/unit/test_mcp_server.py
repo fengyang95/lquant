@@ -168,3 +168,45 @@ def test_main_loop_responds_valid_line(capsys):
     resp = json.loads(out.strip())
     assert resp["result"]["serverInfo"]["name"] == "lquant-mcp"
     assert out.endswith("\n")
+
+
+# ---- 工具白名单（会话级能力裁剪，由 workspace 注入 LQ_MCP_ENABLED_TOOLS） ----
+
+
+def test_whitelist_absent_exposes_all_tools(monkeypatch):
+    """未设环境变量 = 全开（老行为，A2A 与未配置的会话走这条）。"""
+    monkeypatch.delenv("LQ_MCP_ENABLED_TOOLS", raising=False)
+    names = {t["name"] for t in mcp_server.handle_request(
+        _req("tools/list"))["result"]["tools"]}
+    assert names == set(mcp_server.TOOL_HANDLERS)
+
+
+def test_whitelist_filters_tools_list(monkeypatch):
+    monkeypatch.setenv("LQ_MCP_ENABLED_TOOLS", "get_quotes,get_daily")
+    tools = mcp_server.handle_request(_req("tools/list"))["result"]["tools"]
+    assert {t["name"] for t in tools} == {"get_quotes", "get_daily"}
+    # 规格本身没被就地改动（白名单是视图，不是破坏性过滤）
+    assert len(mcp_server.TOOLS_SPEC) == len(mcp_server.TOOL_HANDLERS)
+
+
+def test_empty_whitelist_exposes_nothing(monkeypatch):
+    """空串 = 一个都不开；与「变量缺失 = 全开」必须区分开。"""
+    monkeypatch.setenv("LQ_MCP_ENABLED_TOOLS", "")
+    assert mcp_server.handle_request(_req("tools/list"))["result"]["tools"] == []
+
+
+def test_call_rejects_tool_outside_whitelist(monkeypatch):
+    """白名单外的工具即便被直接调用也要拒绝（list 过滤不是访问控制）。"""
+    monkeypatch.setenv("LQ_MCP_ENABLED_TOOLS", "get_quotes")
+    resp = mcp_server.handle_request(
+        _req("tools/call", {"name": "get_daily", "arguments": {"symbol": "000001.SZ"}}))
+    assert resp["error"]["code"] == -32602
+    assert "未启用" in resp["error"]["message"]
+
+
+def test_call_allows_tool_inside_whitelist(monkeypatch):
+    monkeypatch.setenv("LQ_MCP_ENABLED_TOOLS", "get_quotes")
+    monkeypatch.setitem(mcp_server.TOOL_HANDLERS, "get_quotes", lambda symbols: [{"s": 1}])
+    resp = mcp_server.handle_request(
+        _req("tools/call", {"name": "get_quotes", "arguments": {"symbols": ["600519"]}}))
+    assert json.loads(resp["result"]["content"][0]["text"]) == [{"s": 1}]

@@ -84,6 +84,34 @@ async def env(tmp_path, fake_script):
 
 # ---- 正常链路 ------------------------------------------------------------
 
+async def test_drives_session_by_its_locked_provider(env):
+    """A2A 驱动 /ask 建的会话时，必须按它**锁定的** provider 路由。
+
+    回归：执行器固定用注入的全局默认实例，于是 claude 会去答一个锁定到 codex
+    的会话，并把 claude 的 session_id 写进 ``ask_sessions.claude_session_id``
+    —— 下一轮 /ask 路由回 codex 时就会拿这个 id 去 resume 别人的线程；
+    单飞也会被劈成两半（槽位按 service 实例存，两个实例各看各的）。
+    """
+    svc, ex, store = env
+    assert svc.provider == "claude_code"
+    ses = await store.create({"source": "ask"}, {"provider": "mock"})
+
+    task = await ex.send(_msg("今天大盘怎么样"), ses.id)
+
+    assert task.status.state == TaskState.COMPLETED
+    answer = task.artifacts[0].parts[0].text
+    assert "provider=mock" in answer          # 由 mock 作答，不是 claude
+    assert await store.get_cli_session_id(ses.id) is None  # claude 没写串会话 id
+
+
+async def test_unlocked_session_uses_injected_service(env):
+    """未锁定 provider 的会话（A2A 自建 / 老会话）仍走注入的那个实例。"""
+    svc, ex, store = env
+    task = await ex.send(_msg("茅台怎么样"))
+    assert task.status.state == TaskState.COMPLETED
+    assert await store.get_cli_session_id(task.context_id) == "fake-sid"
+
+
 async def test_send_returns_completed_task(env):
     svc, ex, store = env
     task = await ex.send(_msg())

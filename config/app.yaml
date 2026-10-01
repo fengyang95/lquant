@@ -22,6 +22,13 @@ agent:
   # 模型不在平台侧配置：两个 CLI 都复用自身的模型配置
   # （claude 的 ANTHROPIC_* / settings；codex 的 ~/.codex/config.toml），
   # 见 docs/AGENT_MODEL.md
+  #
+  # 新建会话的默认能力集（逗号分隔或 YAML 列表）。
+  # all / 留空 = 全开；none = 一个都不启用（注意与工作区里的
+  # LQ_MCP_ENABLED_TOOLS 不同 —— 那个的空串表示「一个都不开」）。
+  # 「问 AI」页新建会话时按它预填，可逐会话覆盖（建后锁定）。
+  default_skills: ${LQ_AGENT_DEFAULT_SKILLS:all}
+  default_mcp_tools: ${LQ_AGENT_DEFAULT_MCP_TOOLS:all}
 
 store:
   # 日频按年单文件，不要按 symbol 分文件（小文件灾难）

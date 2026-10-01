@@ -33,6 +33,7 @@ class ClaudeCodeAgentService(CliAgentService):
 
     label = "claude_code"
     stderr_tag = "claude"
+    provider = "claude_code"
 
     def __init__(
         self,
@@ -61,14 +62,15 @@ class ClaudeCodeAgentService(CliAgentService):
             else s.agent.timeout_seconds,
         )
 
-    def _build_cmd(self, content: str, cli_sid: str | None) -> list[str]:
+    def _build_cmd(self, content: str, cli_sid: str | None,
+                   workspace: Path) -> list[str]:
         cmd = [
             self._claude_path,
             "-p", content,
             "--output-format", "stream-json",
             "--verbose",
             "--append-system-prompt", _SYSTEM_PROMPT,
-            "--mcp-config", str(self._workspace / ".claude" / "mcp.json"),
+            "--mcp-config", str(workspace / ".claude" / "mcp.json"),
         ]
         if self._skip_permissions:
             cmd.append("--dangerously-skip-permissions")

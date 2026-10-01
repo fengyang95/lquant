@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS ask_sessions (
     title        TEXT NOT NULL DEFAULT '新会话',
     context_json TEXT NOT NULL DEFAULT '{}',
     created_at   TEXT NOT NULL,
-    claude_session_id TEXT NOT NULL DEFAULT ''
+    claude_session_id TEXT NOT NULL DEFAULT '',
+    agent_config_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS ask_messages (
     id              TEXT PRIMARY KEY,
@@ -44,15 +45,28 @@ CREATE INDEX IF NOT EXISTS idx_a2a_tasks_ctx ON a2a_tasks(context_id, created_at
 """
 
 
+#: 幂等补列清单：(列名, DDL)。新建库由 _DDL 直接带列，老库靠这里补齐。
+#:
+#: **每列必须各自 try/except**：写在同一个 try 里的话，第一列抛 duplicate
+#: 会直接跳到 except，后面的列永远补不上 —— 而「只缺后面那一列」恰恰是
+#: 最常见的档位（每加一列，中间状态的老库就落在这一档）。
+_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("claude_session_id",
+     "ALTER TABLE ask_sessions ADD COLUMN claude_session_id TEXT NOT NULL DEFAULT ''"),
+    ("agent_config_json",
+     "ALTER TABLE ask_sessions ADD COLUMN agent_config_json TEXT NOT NULL DEFAULT '{}'"),
+)
+
+
 async def _migrate(db: aiosqlite.Connection) -> None:
     """幂等迁移：老库缺列则补上（新建库由 _DDL 直接带列）。"""
-    try:
-        await db.execute(
-            "ALTER TABLE ask_sessions ADD COLUMN claude_session_id TEXT NOT NULL DEFAULT ''")
-        await db.commit()
-    except aiosqlite.OperationalError as e:
-        if "duplicate column name" not in str(e):
-            raise  # 列已存在属预期；其他迁移错误向上抛
+    for _column, ddl in _MIGRATIONS:
+        try:
+            await db.execute(ddl)
+            await db.commit()
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise  # 列已存在属预期；其他迁移错误向上抛
 
 
 def _now() -> str:
@@ -64,6 +78,11 @@ class SessionStore:
         self._path = path
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._db: aiosqlite.Connection | None = None
+
+    @property
+    def path(self) -> str:
+        """库文件路径。service 的实例缓存按它区分库（见 service.get_agent_service）。"""
+        return self._path
 
     async def _conn(self) -> aiosqlite.Connection:
         if self._db is None:
@@ -89,34 +108,67 @@ class SessionStore:
 
     @staticmethod
     def _row_session(r) -> Session:
-        return Session(id=r[0], title=r[1], context=json.loads(r[2]), created_at=r[3])
+        return Session(id=r[0], title=r[1], context=json.loads(r[2]), created_at=r[3],
+                       agent_config=json.loads(r[4] or "{}"))
 
     @staticmethod
     def _row_message(r) -> Message:
         return Message(id=r[0], session_id=r[1], role=r[2], content=r[3],
                        tool_calls=json.loads(r[4]), created_at=r[5])
 
-    async def create(self, context: dict | None) -> Session:
+    async def create(self, context: dict | None,
+                     agent_config: dict | None = None) -> Session:
+        """建会话。``agent_config`` 是会话级能力配置（provider/skills/mcp_tools）。
+
+        建后不可改（不提供更新入口）：provider 决定 CLI 侧会话 id 的口径
+        （claude 的 session_id / codex 的 thread_id 共用一列），中途换 provider
+        续接的就是别人的会话，所以能力配置在创建时锁定。
+        """
         con = await self._conn()
-        ses = Session(id=uuid.uuid4().hex, context=context or {}, created_at=_now())
+        cfg = agent_config or {}
+        ses = Session(id=uuid.uuid4().hex, context=context or {}, created_at=_now(),
+                      agent_config=cfg)
         await con.execute(
-            "INSERT INTO ask_sessions (id, title, context_json, created_at) VALUES (?,?,?,?)",
-            (ses.id, ses.title, json.dumps(ses.context, ensure_ascii=False), ses.created_at))
+            "INSERT INTO ask_sessions "
+            "(id, title, context_json, created_at, agent_config_json) VALUES (?,?,?,?,?)",
+            (ses.id, ses.title, json.dumps(ses.context, ensure_ascii=False), ses.created_at,
+             json.dumps(cfg, ensure_ascii=False)))
         await con.commit()
         return ses
 
     async def list(self) -> list[Session]:
         con = await self._conn()
         cur = await con.execute(
-            "SELECT id,title,context_json,created_at FROM ask_sessions ORDER BY created_at DESC")
+            "SELECT id,title,context_json,created_at,agent_config_json FROM ask_sessions "
+            "ORDER BY created_at DESC")
         return [self._row_session(r) for r in await cur.fetchall()]
 
     async def get(self, sid: str) -> Session | None:
         con = await self._conn()
         cur = await con.execute(
-            "SELECT id,title,context_json,created_at FROM ask_sessions WHERE id=?", (sid,))
+            "SELECT id,title,context_json,created_at,agent_config_json FROM ask_sessions "
+            "WHERE id=?", (sid,))
         r = await cur.fetchone()
         return self._row_session(r) if r else None
+
+    async def get_agent_config(self, sid: str) -> dict:
+        """会话级能力配置；未设置（老会话 / A2A 建的）返回空 dict，由调用方回退全局默认。"""
+        con = await self._conn()
+        cur = await con.execute(
+            "SELECT agent_config_json FROM ask_sessions WHERE id=?", (sid,))
+        r = await cur.fetchone()
+        if r is None:
+            return {}
+        return json.loads(r[0] or "{}")
+
+    async def set_agent_config(self, sid: str, cfg: dict) -> None:
+        # `cfg or {}`：写成 "null" 的话读回来是 None，喂给 Session 的 dict 字段
+        # 会直接校验失败（整条会话都读不出来了）
+        con = await self._conn()
+        await con.execute(
+            "UPDATE ask_sessions SET agent_config_json=? WHERE id=?",
+            (json.dumps(cfg or {}, ensure_ascii=False), sid))
+        await con.commit()
 
     async def delete(self, sid: str) -> None:
         con = await self._conn()
