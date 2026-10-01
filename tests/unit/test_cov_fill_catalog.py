@@ -27,7 +27,6 @@ def db(fake_settings):
     with writer() as con:
         for ddl in DDL_STATEMENTS:
             con.execute(ddl)
-    return None
 
 
 def _cal_df():

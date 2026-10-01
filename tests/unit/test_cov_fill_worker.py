@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -52,7 +52,7 @@ def test_latest_error_non_failure_and_exception():
 
 def test_to_ts_variants():
     assert wk._to_ts(None) is None
-    dt = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    dt = datetime(2024, 1, 1, tzinfo=UTC)
     assert wk._to_ts(dt) == dt.timestamp()
     assert wk._to_ts("3.5") == 3.5  # 无 timestamp 属性 → float() 兜底
 
@@ -145,7 +145,7 @@ def test_run_supervisor_respawn_and_shutdown():
         handlers[sig] = fn
 
     killed = []
-    real_kill = os.kill
+    real_kill = os.kill  # noqa: F841  语义占位：fake_kill 恢复用（保守保留）
 
     def fake_kill(pid, sig):
         killed.append((pid, sig))

@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import date
 
 import polars as pl
-import pytest
 
 from lquant.paper.alert import DeviationReport, compare_nav, compare_trades
 

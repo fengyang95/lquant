@@ -11,7 +11,7 @@ from datetime import date
 import polars as pl
 import pytest
 
-import lquant.backtest.jqapi as jqapi
+from lquant.backtest import jqapi
 from lquant.backtest.events import Bar, Side
 from lquant.backtest.jqapi import (
     FixedSlippage,

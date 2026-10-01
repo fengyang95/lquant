@@ -9,7 +9,6 @@ from lquant.portfolio.weighting import (
     METHODS,
     _clean,
     _returns_matrix,
-    equal_weight,
     hrp_weight,
     inverse_vol_weight,
     market_cap_weight,
@@ -191,7 +190,6 @@ def test_weight_report_tiny_sample_uses_identity_cov():
 
 def test_risk_parity_nonconverged_degrades(monkeypatch):
     """SLSQP 报未收敛 → 降级逆波动率。"""
-    from scipy.optimize import minimize as real_minimize
 
     def fail_minimize(*a, **kw):
         class Res:
@@ -206,7 +204,6 @@ def test_risk_parity_nonconverged_degrades(monkeypatch):
 
 
 def test_min_variance_nonconverged_degrades(monkeypatch):
-    from scipy.optimize import minimize as real_minimize
 
     def fail_minimize(*a, **kw):
         class Res:

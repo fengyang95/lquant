@@ -4,7 +4,7 @@ quotes.fetch_snapshot 走 monkeypatch em_get；reconcile 用 fake store。
 """
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, datetime
 
 import polars as pl
 import pytest
@@ -13,7 +13,6 @@ from lquant.backtest import metrics as M
 from lquant.paper import quotes as Q
 from lquant.paper import reconcile as R
 from lquant.paper import store
-
 
 # ---------------------------------------------------------------- metrics
 
@@ -27,7 +26,6 @@ def test_drawdown_and_max_drawdown() -> None:
 
 
 def np_empty():
-    import numpy as np
     return []
 
 

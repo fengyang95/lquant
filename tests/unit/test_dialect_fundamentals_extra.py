@@ -224,8 +224,7 @@ def test_shim_history_no_pandas_fallback(_ctx, monkeypatch) -> None:
 def test_shim_history_empty_lake_raises(_ctx) -> None:
     from lquant.data.store import parquet as pq
 
-    monkey_empty = pq.lake_is_empty
-    # 湖非空但窗口内无该标的 → 第二种错误
+    monkey_empty = pq.lake_is_empty  # noqa: F841    # 湖非空但窗口内无该标的 → 第二种错误
     with pytest.raises(ValueError, match="无日线数据"):
         jq_shim.history(2, field="close", security_list=["000001.SZ"])
 

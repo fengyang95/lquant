@@ -27,8 +27,8 @@ def api_env(tmp_path_factory):
     from lquant.core.db import writer
     from lquant.data.ingest.demo import generate_demo
     from lquant.data.store.ddl import DDL_STATEMENTS
-    from lquant.market.schema import ensure_market_tables
     from lquant.market.scheduler import collect_and_save
+    from lquant.market.schema import ensure_market_tables
 
     with writer() as con:
         for stmt in DDL_STATEMENTS:
@@ -178,7 +178,6 @@ def test_endpoints_with_broken_reader(client, monkeypatch):
     """表缺失/查询异常 → 空结构兜底。"""
     from contextlib import contextmanager
 
-    from lquant.core import db as core_db
     from lquant.server.api import market as market_mod
 
     class _Proxy:
@@ -222,7 +221,6 @@ def test_daily_aggregate_exception_empty(client, monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("lake down")
     """_daily_aggregate 湖异常 → 空态（snapshot/heat/snapshot 不 500）。"""
-    from lquant.data.store import parquet as pq_mod
 
     def _boom(*a, **k):
         raise RuntimeError("lake down")

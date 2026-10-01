@@ -10,8 +10,8 @@ import math
 import os
 from types import SimpleNamespace
 
-import pytest
 import polars as pl
+import pytest
 import yaml
 from click.testing import CliRunner
 
