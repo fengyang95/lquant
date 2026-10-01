@@ -20,7 +20,7 @@ def test_clean_file(tmp_path):
 def test_unsupported_call_reported(tmp_path):
     p = _write(tmp_path, "def go():\n    run_daily(9)\n")
     probs = jq_import.scan(p)
-    assert probs == [f"L2: run_daily() 暂不支持（需改写成原生 on_bar）"]
+    assert probs == ["L2: run_daily() 暂不支持（需改写成原生 on_bar）"]
 
 
 def test_warning_call_reported(tmp_path):

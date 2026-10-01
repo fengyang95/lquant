@@ -10,7 +10,6 @@ from datetime import date, datetime
 import polars as pl
 import pytest
 
-import lquant.data.providers.baostock as bs_mod
 from lquant.data.providers.baostock import (
     BaoStockProvider,
     _add_years,
@@ -103,7 +102,9 @@ def test_bs_code_and_misc() -> None:
 
 def test_attach_is_st_raw_mismatch_raises() -> None:
     out = pl.DataFrame({"a": [1]})
-    with pytest.raises(Exception):
+    from lquant.core.errors import DataQualityError
+
+    with pytest.raises(DataQualityError):
         _attach_is_st(out, pl.DataFrame({"is_st": ["1", "0"]}))
 
 
@@ -333,7 +334,7 @@ def test_financial_pit_skip_paths(patch_wd) -> None:
               ["sz.000001", "", "2024-04-20", "1.0"]]           # 无报告期
     nonnum = [["code", "statDate", "pubDate", "roe"],
               ["sz.000001", "2024-03-31", "2024-04-20", "n/a"]]
-    stub = patch_wd([
+    patch_wd([
         TimeoutError("t"),          # 超时
         [HEAD],                     # 只有表头 <2 行
         bad,                        # 缺 pubDate

@@ -325,8 +325,8 @@ def test_evaluate_turnover_fail_silently(client, monkeypatch):
 
 def test_seed_yaml_and_translate_error(client, monkeypatch):
     """seed-yaml 成功路径 + seed-builtin 翻译失败 422。"""
-    from lquant.factors.sources import yaml_source as ys_mod
     from lquant.factors.sources import qlib_source as qs_mod
+    from lquant.factors.sources import yaml_source as ys_mod
 
     monkeypatch.setattr(ys_mod, "load_custom",
                         lambda: [{"name": "cov_yaml_f", "expression": "close",

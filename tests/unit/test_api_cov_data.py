@@ -6,8 +6,6 @@ import os
 
 import polars as pl
 import pytest
-
-import pytest
 from fastapi.testclient import TestClient
 
 os.environ.setdefault("LQ_SYNC_WORKER", "0")
@@ -371,7 +369,6 @@ def test_checkpoints_lifecycle(client):
 
 def test_crosscheck_endpoints(client, monkeypatch):
     from lquant.data.ingest import crosscheck as cc_mod
-    from lquant.data.quality import issues as issues_mod
     from lquant.data.quality.issues import Issue, ensure_table, save_issues
 
     def _ok(**k):
@@ -404,9 +401,9 @@ def test_crosscheck_endpoints(client, monkeypatch):
 
 def test_retry_claim_error_branches(client, monkeypatch):
     """claim_retry ValueError/TaskConflictError → 422/409；成功路径。"""
-    from lquant.data.ingest.tasks import TaskConflictError
     from lquant.core.db import writer
     from lquant.data.ingest import tasks as tasks_mod
+    from lquant.data.ingest.tasks import TaskConflictError
     from lquant.server.api import data as data_mod
 
     with writer() as con:

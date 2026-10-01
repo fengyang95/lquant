@@ -5,7 +5,6 @@ from datetime import date, timedelta
 
 import numpy as np
 import polars as pl
-import pytest
 
 from lquant.factors.preprocess.orthogonalize import gram_schmidt, none, pca, symmetric
 
@@ -202,8 +201,8 @@ def test_unsorted_input_rows_aligned():
     out_sorted = symmetric(df.sort("trade_date"), ["f1", "f2"])
     assert out["f1"].is_not_null().all() and out.height == 6
     # 按行键对齐比较：行序不同但每个 (symbol, date) 的值必须一致
-    a = dict(zip(zip(out["symbol"], out["trade_date"]), out["f1"]))
-    b = dict(zip(zip(out_sorted["symbol"], out_sorted["trade_date"]), out_sorted["f1"]))
+    a = dict(zip(zip(out["symbol"], out["trade_date"], strict=True), out["f1"], strict=True))
+    b = dict(zip(zip(out_sorted["symbol"], out_sorted["trade_date"], strict=True), out_sorted["f1"], strict=True))
     assert a.keys() == b.keys()
-    for k in a:
+    for k, _ in a.items():
         assert abs(a[k] - b[k]) < 1e-9, f"{k}: {a[k]} != {b[k]}"

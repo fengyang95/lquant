@@ -30,7 +30,6 @@ def lake(fake_settings):
 
 
 def _daily(rows):
-    base = pl.DataFrame(schema=pq.SCHEMAS["daily_bar"]) if False else None
     data = {
         "symbol": [r[0] for r in rows],
         "trade_date": [r[1] for r in rows],

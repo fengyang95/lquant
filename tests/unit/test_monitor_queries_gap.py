@@ -33,14 +33,14 @@ class _FakeRedis:
 
 
 def _enable_redis(monkeypatch, r):
-    import lquant.server.jobs as jobs
+    from lquant.server import jobs
 
     monkeypatch.setattr(jobs, "_redis_available", lambda: True)
     monkeypatch.setattr(jobs, "get_redis", lambda: r)
 
 
 def _disable_redis(monkeypatch):
-    import lquant.server.jobs as jobs
+    from lquant.server import jobs
 
     monkeypatch.setattr(jobs, "_redis_available", lambda: False)
 
