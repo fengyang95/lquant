@@ -222,6 +222,28 @@ def test_synthesize_success(client):
     assert client.get("/api/factors/reports/syn_2f_eq").status_code == 200
 
 
+def test_analyze_synthesize_builtin_names(client):
+    """内置因子名（MA20/RSV10）走相关性 / 合成：早先落到 DSL 分支抛 FactorError → 500。
+
+    前端「相关性 · 合成」页签把这些名字做成可点标签，点一下就 500。
+    """
+    r = client.post("/api/factors/analyze",
+                    json={"formulas": ["MA20", "RSV10"], "start": "2025-06-01"})
+    assert r.status_code == 200, r.text
+    assert r.json()["factors"] == ["MA20", "RSV10"]
+
+    r2 = client.post("/api/factors/synthesize",
+                     json={"formulas": ["MA20", "pct_change_5"], "method": "ic_weighted",
+                           "start": "2025-06-01"})
+    assert r2.status_code == 200, r2.text
+
+    # 未知裸字段名是客户端错误 → 422，绝不能是 500
+    r3 = client.post("/api/factors/analyze",
+                     json={"formulas": ["NoSuchField", "pct_change_5"],
+                           "start": "2025-06-01"})
+    assert r3.status_code == 422, r3.text
+
+
 # ---------------- 补充分支：列表类目 / universe 503 / 公式分支 ----------------
 
 def test_list_factors_qlib_category(client):

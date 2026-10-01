@@ -48,6 +48,27 @@ def test_corr_too_few_factors_rejected():
         correlation(_demo_daily(), ["pct_change_5"])
 
 
+def test_corr_insufficient_cross_section_rejected():
+    """每日有效样本 < 5 的薄截面：不产出相关矩阵，直接报错（不能静默给噪声）。"""
+    from lquant.factors.analysis import correlation
+
+    with pytest.raises(ValueError, match="有效截面不足"):
+        correlation(_demo_daily(n_syms=2), ["pct_change_5", "rolling_std_20"])
+
+
+def test_compute_factor_col_overwrites_same_name():
+    """同名二次计算 = 覆盖重算（与 DSL 路径语义一致，不因列已存在而抛 DuplicateError）。
+
+    用 KBAR 族（KMID）：它的 compute 分支保留原 df 的列，所以第二次调用时
+    输出帧里会同时有 `KMID` 与 `_factor`，必须先丢旧列再 rename。
+    """
+    from lquant.factors.analysis import compute_factor_col
+
+    once = compute_factor_col(_demo_daily(), "KMID", "KMID")
+    twice = compute_factor_col(once, "KMID", "KMID")
+    assert twice["KMID"].equals(once["KMID"])
+
+
 def test_synthesize_equal_and_ic_weighted():
     from lquant.factors.analysis import synthesize
 
@@ -57,6 +78,34 @@ def test_synthesize_equal_and_ic_weighted():
         assert "_syn" in out.columns
         assert out["_syn"].null_count() == 0
         assert len(out) > 0
+
+
+def test_compute_factor_col_supports_qlib_builtin_names():
+    """Qlib Alpha158 内置名（MA20 / RSV10）必须能在相关性 / 合成链路上算出来。
+
+    因子研究页的「相关性 · 合成」页签把这些名字做成可点标签；早先这里直接
+    落到 DSL 分支，抛 `字段 'MA20' 不在数据列中`（FactorError，不是 ValueError）
+    → /factors/analyze 与 /factors/synthesize 双双 500。
+    """
+    from lquant.factors.analysis import compute_factor_col, correlation
+
+    df = _demo_daily()
+    out = compute_factor_col(df, "MA20")
+    assert "MA20" in out.columns
+    assert out["MA20"].null_count() < len(out)      # warmup 之外应有值
+
+    r = correlation(df, ["MA20", "RSV10"])
+    assert r["factors"] == ["MA20", "RSV10"]
+    assert r["n_dates"] > 0
+    assert abs(r["matrix"][0][0] - 1.0) < 1e-6
+
+
+def test_synthesize_accepts_builtin_names():
+    from lquant.factors.analysis import synthesize
+
+    out = synthesize(_demo_daily(), ["MA20", "pct_change_5"], method="ic_weighted")
+    assert "_syn" in out.columns
+    assert len(out) > 0
 
 
 def test_indicators_values_sane():

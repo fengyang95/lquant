@@ -26,7 +26,12 @@ def _is_quick(formula: str) -> bool:
 
 
 def compute_factor_col(df: pl.DataFrame, formula: str, name: str | None = None) -> pl.DataFrame:
-    """在日线上现算一个因子列。返回带 name（缺省=formula）列的 DataFrame。"""
+    """在日线上现算一个因子列。返回带 name（缺省=formula）列的 DataFrame。
+
+    三种写法（与 ``server/api/factors.py::_compute_factor`` 同口径）：
+    快捷公式（pct_change_n / rolling_std_n / turnover）→ Qlib Alpha158 内置因子
+    白名单（MA20 / RSV10 / BETA20 …）→ 含 ``$`` 的 DSL 表达式。
+    """
     name = name or formula.replace(".", "_")
     if _is_quick(formula):
         if formula.startswith("pct_change_"):
@@ -43,6 +48,20 @@ def compute_factor_col(df: pl.DataFrame, formula: str, name: str | None = None) 
                 raise ValueError("turnover 因子需要 amount 列")
             return df.with_columns((pl.col("amount") / 1e8).alias(name))
         raise ValueError(f"未知快捷公式: {formula}")
+    # Qlib Alpha158 内置因子：白名单探测后走 qlib_alpha.compute（它产出 `_factor` 列，
+    # 再改名成调用方要的 name）。缺这一步时相关性 / 合成 / prepare_segment 会对内置
+    # 因子名抛 FactorError（「字段 'MA20' 不在数据列中」）——因子研究页的
+    # 「相关性 · 合成」页签正是把这些名字做成可点标签的，点一下就 500。
+    from lquant.factors.qlib_alpha import compute as qlib_compute
+    from lquant.factors.qlib_alpha import has_factor
+
+    if has_factor(formula):
+        out = qlib_compute(df, formula)
+        if name != "_factor":
+            if name in out.columns:      # 同名列 = 覆盖重算（与 DSL 路径语义一致）
+                out = out.drop(name)
+            out = out.rename({"_factor": name})
+        return out
     # DSL 表达式
     out = FactorEngine(df.lazy()).compute(formula, name=name)
     return out
@@ -92,7 +111,7 @@ def correlation(df: pl.DataFrame, formulas: list[str], *,
         sums += arr.T @ arr / len(arr)
         cnt += 1
     if cnt == 0:
-        raise ValueError("有效截面不足（每日可用样本 < 10）")
+        raise ValueError("有效截面不足（每日可用样本 < 5）")
     corr = (sums / cnt).tolist()
 
     pairs = []

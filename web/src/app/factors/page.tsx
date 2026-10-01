@@ -547,24 +547,28 @@ export default function FactorsPage() {
         >
           <div className="grid grid-cols-2 gap-y-4 divide-line md:grid-cols-4 lg:grid-cols-8 md:divide-x">
             <div className="pr-4">
-              <Stat label="IC 均值" value={evalRes.ic.mean}
-                tone={evalRes.ic.mean > 0 ? 'text-up' : 'text-down'} />
+              <Stat label="IC 均值" value={evalRes.ic.mean ?? '—'}
+                tone={(evalRes.ic.mean ?? 0) > 0 ? 'text-up' : 'text-down'} />
             </div>
             <div className="px-4">
-              <Stat label="ICIR" value={evalRes.ic.ir} />
+              <Stat label="ICIR" value={evalRes.ic.ir ?? '—'} />
             </div>
             <div className="px-4">
-              <Stat label="t 统计量" value={evalRes.ic.t_stat} />
+              <Stat label="t 统计量" value={evalRes.ic.t_stat ?? '—'} />
             </div>
             <div className="px-4">
-              <Stat label="多空年化" value={`${(evalRes.long_short.annual_return * 100).toFixed(2)}%`}
-                tone={evalRes.long_short.annual_return > 0 ? 'text-up' : 'text-down'} />
+              {/* 后端把非有限值统一转 null（_jf）：null 参与算术会变成 0.00%，
+                  必须显式判空，否则「算不出来」显示成「收益为 0」 */}
+              <Stat label="多空年化"
+                value={evalRes.long_short.annual_return != null
+                  ? `${(evalRes.long_short.annual_return * 100).toFixed(2)}%` : '—'}
+                tone={(evalRes.long_short.annual_return ?? 0) > 0 ? 'text-up' : 'text-down'} />
             </div>
             <div className="px-4">
-              <Stat label="多空夏普" value={evalRes.long_short.sharpe} />
+              <Stat label="多空夏普" value={evalRes.long_short.sharpe ?? '—'} />
             </div>
             <div className="px-4">
-              <Stat label="单调性" value={evalRes.monotonicity} />
+              <Stat label="单调性" value={evalRes.monotonicity ?? '—'} />
             </div>
             <div className="px-4">
               <Stat label="半衰期" value={evalRes.half_life ?? '—'} hint={evalRes.half_life != null ? '天' : undefined} />
@@ -949,17 +953,20 @@ export default function FactorsPage() {
             </div>
             <div className="grid grid-cols-2 gap-y-3 divide-line md:grid-cols-5 md:divide-x">
               <div className="pr-4">
-                <Stat label="IC 均值" value={syn.ic.mean} tone={syn.ic.mean > 0 ? 'text-up' : 'text-down'} />
+                <Stat label="IC 均值" value={syn.ic.mean ?? '—'}
+                  tone={(syn.ic.mean ?? 0) > 0 ? 'text-up' : 'text-down'} />
               </div>
               <div className="px-4">
-                <Stat label="ICIR" value={syn.ic.ir} />
+                <Stat label="ICIR" value={syn.ic.ir ?? '—'} />
               </div>
               <div className="px-4">
-                <Stat label="多空年化" value={`${(syn.long_short.annual_return * 100).toFixed(1)}%`}
-                  tone={syn.long_short.annual_return > 0 ? 'text-up' : 'text-down'} />
+                <Stat label="多空年化"
+                  value={syn.long_short.annual_return != null
+                    ? `${(syn.long_short.annual_return * 100).toFixed(1)}%` : '—'}
+                  tone={(syn.long_short.annual_return ?? 0) > 0 ? 'text-up' : 'text-down'} />
               </div>
               <div className="px-4">
-                <Stat label="夏普" value={syn.long_short.sharpe} />
+                <Stat label="夏普" value={syn.long_short.sharpe ?? '—'} />
               </div>
               <div className="px-4">
                 <Stat label="样本" value={syn.n_samples.toLocaleString()} />
