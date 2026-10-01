@@ -82,4 +82,34 @@ describe('FactorLibrary 编辑 / 删除', () => {
     fireEvent.click(await screen.findByText('删除'));
     expect(mockDel).not.toHaveBeenCalled();
   });
+
+  it('默认按 IC(中性化) 保持服务端顺序，可切换为按名称', async () => {
+    // 服务端已按 ic_neutral DESC 返回：zzz 在前（IC 高），名字序相反
+    const ordered: FactorRow[] = [
+      { name: 'zzz_mom', expression: 'x', description: '', created_at: '2026-09-01',
+        source: 'manual', ic_neutral: 0.05, category: '动量' },
+      { name: 'aaa_vol', expression: 'y', description: '', created_at: '2026-09-02',
+        source: 'manual', ic_neutral: -0.02, category: '波动' },
+    ];
+    renderLib(ordered);
+    const rowNames = () => screen.getAllByRole('link')
+      .map((a) => a.textContent ?? '')
+      .filter((t) => t === 'zzz_mom' || t === 'aaa_vol');
+
+    await screen.findByText('zzz_mom');
+    expect(rowNames()).toEqual(['zzz_mom', 'aaa_vol']);
+
+    fireEvent.click(screen.getByRole('button', { name: '按名称' }));
+    await waitFor(() => expect(rowNames()).toEqual(['aaa_vol', 'zzz_mom']));
+  });
+
+  it('来源 Tab 优先取 /factors/sources', async () => {
+    mockGet.mockImplementation((path: string) => Promise.resolve(
+      path.includes('/factors/sources')
+        ? [{ name: 'qlib', label: 'Qlib' }, { name: 'agent', label: 'Agent' }]
+        : [],
+    ));
+    renderLib(ROWS);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'agent' })).toBeInTheDocument());
+  });
 });

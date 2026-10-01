@@ -35,6 +35,18 @@ def normalize_steps(steps: list[dict]) -> list[dict]:
     return sorted(out, key=lambda s: STAGE_ORDER[s["op"]])
 
 
+def validate_steps(steps: list[dict]) -> list[dict]:
+    """校验并归一化配方，非法步骤抛 ``ValueError``（供 API 层映射 422）。
+
+    与 ``normalize_steps`` 同一实现，只是把 ``FactorError`` 翻成 ``ValueError`` ——
+    pydantic 校验器只接 ValueError，别的异常会穿透成 500 而不是 422。
+    """
+    try:
+        return normalize_steps(steps)
+    except FactorError as e:
+        raise ValueError(str(e)) from e
+
+
 def run(df: pl.DataFrame, cols: str | list[str], steps: list[dict] | None = None,
         *, by: str = "trade_date", keep_original: bool = False) -> pl.DataFrame:
     """执行预处理流水线。

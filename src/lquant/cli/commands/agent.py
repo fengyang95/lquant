@@ -65,6 +65,29 @@ def test(name: str) -> None:
 
 @agent.command()
 @click.argument("name")
+@click.option("--generator", default="gp", type=click.Choice(["gp", "random", "proposals"]))
+@click.option("--n", default=100, help="候选数量（预算）")
+@click.option("--proposals", default=None, help="JSONL 提案文件（generator=proposals）")
+@click.option("--start", default=None, help="数据窗口起点 YYYY-MM-DD")
+def run(name: str, generator: str, n: int, proposals: str | None,
+        start: str | None) -> None:
+    """平台驱动跑批：以该 Agent 身份跑一次挖掘会话（等价 `lq factor mine --agent`）。
+
+    与 `lq factor mine` 共用同一套配额账、G0-G3 门禁与台账 ——
+    「谁按回车」不改变契约（方案 6.4 公共不变量）。
+    """
+    import json
+
+    from lquant.cli.commands.factor import _mine_session
+
+    payload, warning = _mine_session(name, generator, n, proposals, start)
+    if warning:
+        click.echo(f"[warn] {warning}")
+    click.echo(json.dumps(payload, ensure_ascii=False))
+
+
+@agent.command()
+@click.argument("name")
 @click.option("--enable/--disable", default=None)
 def freeze(name: str, enable: bool | None) -> None:
     """冻结/解冻 Agent（enabled 开关写回 yaml）。"""

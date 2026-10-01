@@ -131,9 +131,3 @@ def quantile_excess_nav(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1
 
 def _cum_nav_col(col: str) -> pl.Expr:
     return (pl.col(col).fill_null(0.0) + 1.0).cum_prod()
-
-
-def np_cumprod(arr) -> list[float]:
-    a = np.asarray(arr, dtype=float)
-    a = np.nan_to_num(a, nan=0.0)
-    return list(np.cumprod(1.0 + a))

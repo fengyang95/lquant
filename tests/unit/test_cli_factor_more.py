@@ -196,10 +196,29 @@ def test_mine_db_write_failure_warns(monkeypatch, stub_mining):
 
 
 def test_series_cmd():
+    """`lq factor series` 必须真回逐日序列（此前只回 3 个标量，与文档不符）。"""
     r = _invoke("series", "Ts_Mean($close,5)")
     assert r.exit_code == 0, r.output
     body = json.loads(r.output)
     assert body["n_days"] > 0
+    n = body["n_days"]
+    assert len(body["dates"]) == n
+    assert len(body["ic"]) == n
+    assert len(body["rank_ic"]) == n
+    assert len(body["cum_ic"]) == n
+    assert isinstance(body["dates"][0], str)
+    assert body["neutralized"] is True
+
+
+def test_eval_cmd_has_icir_quantile_turnover():
+    """`lq factor eval` 补齐 ICIR / 分层 / 换手（方案 6.2 的 eval 契约）。"""
+    r = _invoke("eval", "Ts_Mean($close,5)", "--n-groups", "5")
+    assert r.exit_code == 0, r.output
+    body = json.loads(r.output)
+    for key in ("icir", "quantile", "annual_turnover", "errors"):
+        assert key in body, f"eval 输出缺 {key}"
+    assert body["quantile"]["n_groups"] == 5
+    assert "monotonicity" in body["quantile"]
 
 
 def test_corr_cmd():
@@ -248,9 +267,23 @@ def test_clean_and_parse_floats():
 
 
 def test_run_cmd():
+    """`lq factor run --name` 不再空壳：未注册名报错，注册后返回 L2 深度校验 JSON。"""
     r = _invoke("run", "--name", "whatever")
-    assert r.exit_code == 0, r.output
-    assert "compute whatever" in r.output
+    assert r.exit_code != 0
+    assert "未注册的因子" in r.output
+
+    # 注册一个真实表达式后再跑：应给出与 audit 同构的深度校验载荷
+    from lquant.data.store.catalog import upsert
+
+    upsert("factor_def", pl.DataFrame([{
+        "name": "runprobe", "expression": "Ts_Mean($close,5)",
+        "description": "run probe", "source": "manual",
+    }]))
+    r2 = _invoke("run", "--name", "runprobe")
+    assert r2.exit_code == 0, r2.output
+    body = json.loads(r2.output)
+    assert body["name"] == "runprobe"
+    assert "rating" in body and "quantile" in body and "decay" in body
 
 
 def test_eval_low_t_hint(monkeypatch):
@@ -283,9 +316,9 @@ def test_eval_train_empty(monkeypatch):
     import lquant.factors.mining.submit as submit_mod
 
     monkeypatch.setattr(submit_mod, "_panel_with_covs",
-                        lambda start=None: (pl.DataFrame({"x": [1]}), []))
-    monkeypatch.setattr(submit_mod, "_split_eval",
-                        lambda df, covs, expr: {"train": pl.DataFrame()})
+                        lambda start=None: (pl.DataFrame({"trade_date": ["2024-01-02"]}), []))
+    monkeypatch.setattr(submit_mod, "prepare_segment",
+                        lambda *a, **k: pl.DataFrame())
     r = _invoke("eval", "Ts_Mean($close,5)")
     assert r.exit_code != 0
     assert "train 段 IC 序列为空" in r.output
@@ -294,9 +327,10 @@ def test_eval_train_empty(monkeypatch):
 def test_series_empty(monkeypatch):
     import lquant.factors.mining.submit as submit_mod
 
-    _empty_panel(monkeypatch)
-    monkeypatch.setattr(submit_mod, "_split_eval",
-                        lambda df, covs, expr: {"train": pl.DataFrame()})
+    monkeypatch.setattr(submit_mod, "_panel_with_covs",
+                        lambda start=None: (pl.DataFrame({"trade_date": ["2024-01-02"]}), []))
+    monkeypatch.setattr(submit_mod, "prepare_segment",
+                        lambda *a, **k: pl.DataFrame())
     r = _invoke("series", "Ts_Mean($close,5)")
     assert r.exit_code != 0
     assert "train 段 IC 序列为空" in r.output

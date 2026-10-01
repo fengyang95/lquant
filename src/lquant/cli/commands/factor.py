@@ -30,7 +30,11 @@ def add(expr: str, name: str | None) -> None:
 @factor.command("check")
 @click.argument("expr")
 def check_expr(expr: str) -> None:
-    """G0 静态校验（毫秒，永远第一步）。退出码非 0 = 校验失败。"""
+    """G0 静态校验（毫秒，永远第一步）。退出码非 0 = 校验失败。
+
+    失败时结构化原因码**同时**写 stderr（方案 6.2 契约：Agent 读 stderr 即自我修正），
+    stdout 保持一份完整 JSON 供管道解析。
+    """
     import json
     import sys
 
@@ -40,8 +44,10 @@ def check_expr(expr: str) -> None:
     r = g0_static(expr, allowed_fields=_daily_fields())
     payload = {"passed": r.passed, "stage": r.stage,
                "reason_code": r.reason_code, "hint": r.hint}
-    click.echo(json.dumps(payload, ensure_ascii=False))
+    line = json.dumps(payload, ensure_ascii=False)
+    click.echo(line)
     if not r.passed:
+        click.echo(line, err=True)
         sys.exit(1)
 
 
@@ -49,40 +55,78 @@ def check_expr(expr: str) -> None:
 @click.argument("expr")
 @click.option("--start", default=None, help="数据窗口起点 YYYY-MM-DD")
 @click.option("--neutral/--raw", default=True, help="是否中性化（默认中性化）")
+@click.option("--n-groups", default=10, help="分层组数")
 @click.option("--agent", default=None, help="Agent 名（配额记账 + 校正门槛）")
-def eval_(expr: str, start: str | None, neutral: bool, agent: str | None) -> None:
-    """IC JSON + 中性化对照 + n_trials/校正门槛/剩余配额（方案 6.2/6.3）。"""
+def eval_(expr: str, start: str | None, neutral: bool, n_groups: int,
+          agent: str | None) -> None:
+    """L1 快筛：IC/ICIR + 分层 + 换手 + 中性化对照 + 校正门槛/配额（方案 6.2/6.3）。
+
+    train 段（前 70%）上一次算完，与 audit/submit 共用 ``prepare_segment``，
+    口径不允许分叉。
+    """
     import json
 
     import polars as pl
 
+    from lquant.factors.evaluate.ic import _summarize, ic_series
     from lquant.factors.mining.fitness import corrected_threshold
-    from lquant.factors.mining.submit import _panel_with_covs, _split_eval
+    from lquant.factors.mining.runner import split_dates
+    from lquant.factors.mining.submit import _panel_with_covs, prepare_segment
 
     df, cov_cols = _panel_with_covs(start=start)
     if not len(df):
         raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")
-    splits = _split_eval(df, cov_cols, expr)
-    s_tr = splits["train"]
-    if not len(s_tr):
+    dates = sorted(df["trade_date"].unique().to_list())
+    tr_d, _val_d, _test_d = split_dates(dates)
+    train = prepare_segment(df, cov_cols, expr, tr_d)
+    try:
+        s_tr = ic_series(train, "f", "fwd_ret_1")
+    except Exception:  # noqa: BLE001 - 帧不可用（缺列/空帧）统一收敛成同一条出口
+        s_tr = None
+    if s_tr is None or not len(s_tr):
         raise click.ClickException("train 段 IC 序列为空 —— 数据或表达式问题")
-    from lquant.factors.evaluate.ic import _t_stat as tstat
+    st = _summarize(s_tr["ic"])
+    sr = _summarize(s_tr["rank_ic"])
+    ic = st["mean"]
+    t = st["t_stat"]
 
-    ic = float(s_tr["ic"].mean())
-    t = tstat(ic, float(s_tr["ic"].std()), len(s_tr))
+    # 分层 + 换手：同一 train 帧上算，失败不阻断快筛（但要在 errors 里可见）
+    errors: dict[str, str] = {}
+    quant: dict = {}
+    annual_turnover = None
+    try:
+        from lquant.factors.evaluate.quantile import quantile_summary
+
+        qs = quantile_summary(train, "f", "fwd_ret_1", n_groups)
+        quant = {"n_groups": n_groups,
+                 "monotonicity": _clean_num(qs.get("monotonicity")),
+                 "top_bottom_spread": _clean_num(qs.get("top_bottom_spread")),
+                 "long_short": {k: _clean_num(v)
+                                for k, v in (qs.get("long_short") or {}).items()}}
+    except Exception as e:  # noqa: BLE001
+        errors["quantile"] = f"{type(e).__name__}: {e}"
+    try:
+        from lquant.factors.evaluate.costs import factor_turnover
+
+        to_df = factor_turnover(train, "f", n_groups)
+        mean_to = to_df["turnover_avg"].drop_nulls().mean() if len(to_df) else None
+        annual_turnover = (round(float(mean_to) * 252, 2)
+                           if mean_to is not None else None)
+    except Exception as e:  # noqa: BLE001
+        errors["turnover"] = f"{type(e).__name__}: {e}"
+
     # 中性化对照：同口径再算一遍 raw IC
     ic_raw = None
     if cov_cols:
         from lquant.factors.analysis import compute_factor_col
         from lquant.factors.evaluate import forward_return as _fr
-        from lquant.factors.evaluate.ic import ic_series
-        from lquant.factors.mining.runner import split_dates
 
-        tr_d, _v, _t = split_dates(df["trade_date"].unique().to_list())
         raw_sub = df.filter(pl.col("trade_date").is_in(tr_d))
         raw_sub = _fr(raw_sub.sort(["symbol", "trade_date"]), "close", periods=[1])
         d_raw = compute_factor_col(raw_sub, expr, "f").drop_nulls(["f", "fwd_ret_1"])
-        ic_raw = round(float(ic_series(d_raw, "f", "fwd_ret_1")["ic"].mean()), 4)
+        raw_ic_s = ic_series(d_raw, "f", "fwd_ret_1")
+        if len(raw_ic_s):
+            ic_raw = round(float(raw_ic_s["ic"].mean()), 4)
     # 预算内建：n_trials（eval+挖掘评估总账）、校正门槛、剩余配额
     n_trials, remaining, hints, thr = 0, None, [], None
     if agent:
@@ -106,13 +150,33 @@ def eval_(expr: str, start: str | None, neutral: bool, agent: str | None) -> Non
         if abs(t) < thr:
             hints.append(f"|t|={abs(t):.2f} 低于校正门槛 {thr:.2f}（n_trials={n_trials}）")
         hints.append(f"剩余配额 {remaining} 次")
-    click.echo(json.dumps({
-        "ic_mean": round(ic, 4), "rank_ic_mean": round(float(s_tr["rank_ic"].mean()), 4),
-        "t_stat": round(t, 2), "n_days": len(s_tr),
+    click.echo(json.dumps(_clean({
+        "ic_mean": round(ic, 4),
+        "rank_ic_mean": round(sr["mean"], 4),
+        "icir": _clean_num(st["ir"]),
+        "rank_icir": _clean_num(sr["ir"]),
+        "t_stat": round(t, 2) if t is not None and math.isfinite(t) else None,
+        "t_stat_nw": _clean_num(st.get("t_stat_nw")),
+        "positive_rate": _clean_num(st.get("positive_rate")),
+        "ic_autocorr": _clean_num(st.get("ic_autocorr")),
+        "n_days": len(s_tr),
+        "quantile": quant,
+        "annual_turnover": annual_turnover,
         "ic_raw_mean": ic_raw, "neutralized": bool(cov_cols),
         "n_trials": n_trials, "corrected_threshold": round(thr, 2) if thr else None,
-        "quota_remaining": remaining, "hints": hints,
-    }, ensure_ascii=False))
+        "quota_remaining": remaining, "hints": hints, "errors": errors,
+    }), ensure_ascii=False))
+
+
+def _clean_num(v):
+    """非有限值 → None（CLI JSON 里不能出现 NaN 字面量，Agent 的 json.loads 会炸）。"""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
 
 
 @factor.command()
@@ -138,9 +202,29 @@ def submit(spec_path: str) -> None:
 
 
 @factor.command()
-@click.option("--name", required=True)
-def run(name: str) -> None:
-    click.echo(f"compute {name}")
+@click.option("--name", required=True, help="已注册因子名（factor_def.name）")
+@click.option("--start", default=None, help="数据窗口起点 YYYY-MM-DD")
+@click.option("--n-groups", default=10, help="分层组数")
+@click.option("--horizons", default="1,2,3,5,10,20", help="衰减曲线持有期（逗号分隔）")
+@click.option("--agent", default=None, help="Agent 名（配额记账 + 校正门槛）")
+def run(name: str, start: str | None, n_groups: int, horizons: str,
+        agent: str | None) -> None:
+    """按注册名跑 L2 深度校验（从 factor_def 取表达式，与 ``audit`` 同一实现）。
+
+    此前是空壳（只 echo 一行），命令名暗示能算却没有计算也没有入库。
+    """
+    import json
+
+    from lquant.core.db import reader
+
+    with reader() as con:
+        row = con.execute(
+            "SELECT expression FROM factor_def WHERE name = ?", [name]).fetchone()
+    if not row or not row[0]:
+        raise click.ClickException(f"未注册的因子或表达式为空: {name}（见 lq factor add）")
+    payload = _audit_payload(row[0], start, n_groups, horizons, agent)
+    payload["name"] = name
+    click.echo(json.dumps(payload, ensure_ascii=False))
 
 
 @factor.command()
@@ -151,6 +235,21 @@ def run(name: str) -> None:
 @click.option("--start", default=None)
 def mine(agent: str, generator: str, n: int, proposals: str | None, start: str | None) -> None:
     """平台驱动挖掘会话：G0-G3 门禁 + 记账落 factor_mining_run。"""
+    import json
+
+    payload, warning = _mine_session(agent, generator, n, proposals, start)
+    if warning:
+        click.echo(f"[warn] {warning}")
+    click.echo(json.dumps(payload, ensure_ascii=False))
+
+
+def _mine_session(agent: str, generator: str, n: int, proposals: str | None,
+                  start: str | None) -> tuple[dict, str | None]:
+    """平台驱动挖掘会话的实现体 —— ``lq factor mine`` 与 ``lq agent run`` 共用。
+
+    返回 (结果载荷, 记账告警或 None)。两条入口共用一套配额账、一套门禁、
+    一份台账（方案 6.4 的公共不变量）。
+    """
     import json
     import uuid
 
@@ -213,7 +312,7 @@ def mine(agent: str, generator: str, n: int, proposals: str | None, start: str |
     run_id = uuid.uuid4().hex[:12]
     import datetime as dt
 
-
+    warning = None
     try:
         with writer() as con:
             con.execute(
@@ -222,34 +321,59 @@ def mine(agent: str, generator: str, n: int, proposals: str | None, start: str |
                  res.n_low_ic, res.n_redundant, res.n_size_proxy, res.n_survivors,
                  json.dumps(res.corrections, ensure_ascii=False)[:10000], dt.datetime.now()])
     except Exception as e:  # noqa: BLE001
-        click.echo(f"[warn] 记账落库失败（结果仍有效）: {e}")
-    click.echo(json.dumps({
+        warning = f"记账落库失败（结果仍有效）: {e}"
+    return {
         "run_id": run_id, "agent": agent, "generator": generator,
         "n_evaluated": res.n_evaluated, "n_static_fail": res.n_static_fail,
         "n_low_ic": res.n_low_ic, "n_redundant": res.n_redundant,
         "n_size_proxy": res.n_size_proxy, "n_survivors": res.n_survivors,
         "survivors": survivors[:10],
-    }, ensure_ascii=False))
+    }, warning
 
 
 @factor.command()
 @click.argument("expr")
 @click.option("--start", default=None)
 def series(expr: str, start: str | None) -> None:
-    """逐日 IC/RankIC/累计 IC 序列 JSON（图表数据，平台算）。"""
+    """逐日 IC/RankIC/累计 IC 序列 JSON（图表数据，平台算）。
+
+    train 段（前 70%）上逐日序列；``dates[i]`` 与 ``ic[i]`` / ``rank_ic[i]`` /
+    ``cum_ic[i]`` 一一对应。此前只回三个标量，「看什么时候失效」根本做不到。
+    """
     import json
 
-    from lquant.factors.mining.submit import _panel_with_covs, _split_eval
+    import numpy as np
+
+    from lquant.factors.mining.runner import split_dates
+    from lquant.factors.mining.submit import _panel_with_covs, prepare_segment
 
     df, cov_cols = _panel_with_covs(start=start)
-    splits = _split_eval(df, cov_cols, expr)
-    s = splits["train"]
-    if not len(s):
-        raise click.ClickException("train 段 IC 序列为空")
+    if not len(df):
+        raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")
+    tr_d, _val_d, _test_d = split_dates(sorted(df["trade_date"].unique().to_list()))
+    train = prepare_segment(df, cov_cols, expr, tr_d)
+    from lquant.factors.evaluate.ic import ic_series
+
+    try:
+        s = ic_series(train, "f", "fwd_ret_1")
+    except Exception:  # noqa: BLE001 - 帧不可用（缺列/空帧）统一收敛成同一条出口
+        s = None
+    if s is None or not len(s):
+        raise click.ClickException("train 段 IC 序列为空 —— 数据或表达式问题")
+    ic = [_clean_num(v) for v in s["ic"].to_list()]
+    rank_ic = [_clean_num(v) for v in s["rank_ic"].to_list()]
+    cum = np.nancumsum(np.array([v if v is not None else 0.0 for v in ic], dtype=float))
     click.echo(json.dumps({
+        "expr": expr,
         "n_days": len(s),
-        "ic_mean": round(float(s["ic"].mean()), 4),
-        "rank_ic_mean": round(float(s["rank_ic"].mean()), 4),
+        "neutralized": bool(cov_cols),
+        "covariates": cov_cols,
+        "dates": [str(x) for x in s["trade_date"].to_list()],
+        "ic": ic,
+        "rank_ic": rank_ic,
+        "cum_ic": [round(float(v), 6) for v in cum],
+        "ic_mean": _clean_num(s["ic"].mean()),
+        "rank_ic_mean": _clean_num(s["rank_ic"].mean()),
     }, ensure_ascii=False))
 
 
@@ -370,6 +494,14 @@ def audit(expr: str, start: str | None, n_groups: int, horizons: str, agent: str
     """
     import json
 
+    click.echo(json.dumps(_audit_payload(expr, start, n_groups, horizons, agent),
+                          ensure_ascii=False))
+
+
+def _audit_payload(expr: str, start: str | None, n_groups: int, horizons: str,
+                   agent: str | None) -> dict:
+    """L2 深度校验的载荷构造 —— ``audit`` 与 ``run``（按注册名）共用同一实现，
+    保证「按名字跑」和「按表达式跑」拿到的是同一份数字。"""
     from lquant.factors.dsl.printer import canonical_id
     from lquant.factors.evaluate import (
         attribution_summary,
@@ -416,7 +548,7 @@ def audit(expr: str, start: str | None, n_groups: int, horizons: str, agent: str
             # 归因失败必须可见：静默成 null 会被读成「这个因子没有行业暴露」
             attr = {"by": cat, "error": f"{type(e).__name__}: {e}"}
 
-    click.echo(json.dumps(_clean({
+    return _clean({
         "factor": expr,
         "factor_id": canonical_id(expr),
         "n_days": days,
@@ -442,7 +574,7 @@ def audit(expr: str, start: str | None, n_groups: int, horizons: str, agent: str
         "corrected_threshold": q["corrected_threshold"],
         "quota_remaining": q["quota_remaining"],
         "hints": q["hints"],
-    }), ensure_ascii=False))
+    })
 
 
 @factor.command()
@@ -507,8 +639,10 @@ def report(expr: str, out: str | None, start: str | None, n_groups: int, bps: st
         raise click.ClickException("train 段为空 —— 数据或表达式问题")
 
     cat = next((c for c in ("cov_industry_sw1", "industry_sw1") if c in train.columns), None)
+    # 分组 IC：按行业分组（有行业列时）。此前硬编码 None，导致报告里
+    # 「分组 IC」这一节永远不出现 —— 引擎有能力，接线处丢了参数。
     html = factor_report(train, "f", "fwd_ret_1", n_groups=n_groups,
-                         cat_col=cat, group_col=None,
+                         cat_col=cat, group_col=cat,
                          bps_list=list(_parse_floats(bps)))
     path = Path(out) if out else Path("data/reports") / f"factor_{canonical_id(expr)}.html"
     p = save_report(html, path)

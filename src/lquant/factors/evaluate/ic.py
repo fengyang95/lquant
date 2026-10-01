@@ -19,7 +19,7 @@ import polars as pl
 # 凡 std < STD_EPS 一律按零方差处理（t/IR 无定义，不能进显著性门槛）
 STD_EPS = 1e-9
 
-__all__ = ["ic_series", "ic_summary", "ic_by_year", "ic_decay_table", "newey_west_tstat",
+__all__ = ["ic_series", "ic_summary", "ic_by_year", "newey_west_tstat",
            "ic_autocorr"]
 
 
@@ -214,14 +214,3 @@ def ic_by_year(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", **kw) 
         )
         .sort("year")
     )
-
-
-def ic_decay_table(df: pl.DataFrame, factor: str, ret_cols: list[str]) -> pl.DataFrame:
-    """不同持有期的 IC 对照。交给 decay.py 做半衰期拟合。"""
-    rows = []
-    for rc in ret_cols:
-        if rc not in df.columns:
-            continue
-        r = _summarize(ic_series(df, factor, rc)["ic"])
-        rows.append({"ret_col": rc, **{k: v for k, v in r.items() if k != "n_days"}})
-    return pl.DataFrame(rows)

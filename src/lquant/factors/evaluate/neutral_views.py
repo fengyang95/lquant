@@ -6,12 +6,17 @@
 """
 from __future__ import annotations
 
+import math
+
 import polars as pl
 
 from lquant.factors.evaluate.ic import ic_series
 from lquant.factors.preprocess._regress import (
     residual_by_day,
 )
+
+__all__ = ["return_neutral_ic", "industry_group_quantile",
+           "industry_group_quantile_summary", "neutral_views"]
 
 
 def return_neutral_ic(df: pl.DataFrame, factor: str, ret_col: str,
@@ -32,14 +37,61 @@ def return_neutral_ic(df: pl.DataFrame, factor: str, ret_col: str,
 
 def industry_group_quantile(df: pl.DataFrame, factor: str, ret_col: str,
                             group_col: str, n_groups: int = 5) -> pl.DataFrame:
-    """行业内分组：在 [trade_date, 行业] 组内按因子分位，返回带 q 列的 df。"""
+    """行业内分组：在 [trade_date, 行业] 组内按因子分位，返回带 q 列的 df。
+
+    NaN 不是 null：polars rank 会把 NaN 排到最大（与 ``add_quantile`` 同款防护），
+    不挡的话 NaN 行全进最高桶且 count() 分母被计入。
+    """
     if group_col not in df.columns:
         raise ValueError(f"行业内分组需要行业列 {group_col}（cov_industry_sw1）")
-    # 组内分位桶：[trade_date, 行业] 组内 rank → 1..n_groups 桶
-    return df.with_columns(
-        ((((pl.col(factor).rank().over(["trade_date", group_col]) - 1)
-           * n_groups) // pl.col(factor).count().over(["trade_date", group_col])) + 1)
-        .cast(pl.Int64).alias("q"))
+    key = ["trade_date", group_col]
+    fin = pl.col(factor).is_finite()
+    cnt = fin.sum().over(key)
+    q = (pl.when(fin)
+         .then(((pl.col(factor).rank().over(key) - 1) * n_groups) / cnt)
+         .otherwise(None)
+         .floor() + 1)
+    return df.with_columns(q.cast(pl.Int64).clip(1, n_groups).alias("q"))
+
+
+def industry_group_quantile_summary(df: pl.DataFrame, factor: str, ret_col: str,
+                                    group_col: str, n_groups: int = 5, *,
+                                    date_col: str = "trade_date") -> dict:
+    """行业内分组分层的**结果**（不是标记）：各组平均收益 + 首尾差 + 单调性。
+
+    这是 §5.1 的第三种视图，与前两种数学不等价：它既不改因子值（不同于
+    factor_neutral），也不改收益（不同于 return_neutral_ic），而是把选股
+    限制在行业内部 —— 因此不受行业 beta 干扰，也不把行业信息从因子里抹掉。
+    返回 ``insufficient=True`` 表示样本不足，调用方应显示「样本不足」而非空表。
+    """
+    from lquant.factors.evaluate.quantile import _spearman
+
+    empty = {"n_groups": n_groups, "groups": [], "top_bottom_spread": float("nan"),
+             "monotonicity": float("nan"), "n_obs": 0, "insufficient": True}
+    if group_col not in df.columns or ret_col not in df.columns or factor not in df.columns:
+        return empty
+    gq = industry_group_quantile(df, factor, ret_col, group_col, n_groups)
+    d = gq.drop_nulls(["q", ret_col])
+    if not len(d):
+        return empty
+    agg = (d.group_by("q")
+           .agg([pl.len().alias("n"), pl.col(ret_col).mean().alias("mean_ret")])
+           .sort("q"))
+    groups = [{"q": int(r["q"]), "n": int(r["n"]), "mean_ret": float(r["mean_ret"])}
+              for r in agg.to_dicts() if r["mean_ret"] is not None]
+    if len(groups) < 2:
+        return {**empty, "groups": groups, "n_obs": len(d)}
+    pairs = [(g["q"], g["mean_ret"]) for g in groups if math.isfinite(g["mean_ret"])]
+    mono = _spearman([q for q, _ in pairs], [m for _, m in pairs]) if len(pairs) >= 3 \
+        else float("nan")
+    return {
+        "n_groups": n_groups,
+        "groups": groups,
+        "top_bottom_spread": pairs[-1][1] - pairs[0][1] if len(pairs) >= 2 else float("nan"),
+        "monotonicity": mono,
+        "n_obs": len(d),
+        "insufficient": False,
+    }
 
 
 def neutral_views(df: pl.DataFrame, factor: str, ret_col: str,
@@ -53,6 +105,7 @@ def neutral_views(df: pl.DataFrame, factor: str, ret_col: str,
         if len(s):
             out["return_neutral_ic"] = round(float(s["ic"].mean()), 4)
     if group_col:
-        industry_group_quantile(df, factor, ret_col, group_col, n_groups)
-        out["industry_group_quantile"] = True
+        # 返回真实结果而非 True 标记 —— 只给布尔值等于「能力存在但没数据」
+        out["industry_group_quantile"] = industry_group_quantile_summary(
+            df, factor, ret_col, group_col, n_groups)
     return out

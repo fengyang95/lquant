@@ -27,15 +27,17 @@ tags: [factor-mining, alpha, factor-evaluation, dsl, quant-research]
 |---|---|---|
 | `lq data fields` | 字段白名单 + 覆盖率 | **第一步**：先看数据里到底有什么 |
 | `lq factor check "<expr>"` | G0 静态校验（未来函数 / 未注册算子 / 字段白名单） | 每条候选的第一关 |
-| `lq factor eval "<expr>" [--agent NAME]` | L1 快筛：IC + 中性化对照 + 校正门槛 + 剩余配额 | 候选太多时批量过一遍 |
+| `lq factor eval "<expr>" [--agent NAME]` | L1 快筛：IC/ICIR + 分层 + 换手 + 中性化对照 + 校正门槛 + 配额 | 候选太多时批量过一遍 |
 | `lq factor audit "<expr>" [--agent NAME]` | L2 深度校验：IC/ICIR + 分层 + 衰减 + 归因 + 评级 + 样本外衰减 | 通过快筛的少数候选 |
 | `lq factor robust "<expr>"` | L3 鲁棒性：窗口扰动 / 分段稳定 / 起点敏感 / 剔除最佳月份 / OOS 衰减 | 准备入库之前 |
-| `lq factor series "<expr>"` | 逐日 IC 序列（平台算） | 想看"什么时候失效" |
+| `lq factor series "<expr>"` | 逐日 IC/RankIC/累计 IC 序列（含 dates，平台算） | 想看"什么时候失效" |
 | `lq factor corr "<e1>" "<e2>" ...` | 两两横截面 Spearman + 冗余对 | 入库前查重 |
 | `lq factor mine --generator proposals --proposals f.jsonl --n N` | 批量走 G0–G3 门禁 + 记账落库 | 一批候选一次跑完 |
 | `lq factor report "<expr>" --out x.html` | 自包含 HTML 研究报告 | 要给研报式交付 |
+| `lq factor run --name <因子名>` | 按注册名跑 L2 深度校验（与 `audit` 同一实现） | 想复跑库内已有因子 |
 | `lq factor submit spec.yaml` | ★ 唯一入库通道：服务端重跑 G0–G3，A/B 级入库 | 最后一步 |
 | `lq agent list` / `lq agent test <name>` | Agent 注册与接入验收 | 首次接入、或不确定用哪个 Agent 名 |
+| `lq agent run <name> --n N` | 以该 Agent 身份平台驱动跑一次挖掘会话 | 无人值守批量挖掘 |
 | `lq backtest run --factor "<expr>"` | 分层多空回测（复现工作流的验证终点） | 要能落到组合收益上时 |
 
 语法 / 算子 / 字段 / 候选模板 → 见本目录 `reference.md`（**写表达式前先读它**）。

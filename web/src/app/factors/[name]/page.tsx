@@ -17,6 +17,12 @@ import { Empty, ErrorNote, Loading, Msg } from '@/components/States';
 import { del, fetcher, get, post, put } from '@/lib/api';
 import { useJobStream } from '@/lib/streaming';
 import { C, axes, legend, tooltip } from '@/lib/chart';
+import {
+  ErrorBanner, GroupIcSection, NeutralLadderPanel, NeutralViewsSection,
+  QuantileCharts, RatingPanel, RecipeSteps, RobustnessPanel, StyleCorrPanel, TopNTable,
+  decayOption as decayOptionShared, eventStudyOption, excessNavOption, icByYearOption,
+  type EvalErrors, type EvalSeries, type PreprocessStep, type RatingInfo, type RobustnessInfo,
+} from '../shared';
 
 type FactorDetail = {
   name: string;
@@ -32,24 +38,21 @@ type EvalResult = {
   factor: string;
   formula: string;
   n_samples: number;
-  ic: { mean: number; ir: number; t_stat: number; positive_rate: number; ic_gt_002_rate: number };
+  ic: {
+    mean: number; ir: number; t_stat: number; positive_rate: number;
+    ic_gt_002_rate: number; t_stat_nw?: number | null; ic_autocorr?: number | null;
+  };
   rank_ic_mean: number;
   long_short: { annual_return: number; sharpe: number; max_drawdown: number };
   monotonicity: number;
   half_life: number | null;
   suggested_rebalance: string;
   report_url: string;
-};
-
-type EvalSeries = {
-  ic: { dates: string[]; ic: (number | null)[]; rank_ic: (number | null)[]; cum_ic: number[] };
-  rolling: {
-    window: number;
-    dates: string[];
-    ic: (number | null)[];
-    rank_ic: (number | null)[];
-    ir: (number | null)[];
-  };
+  // 本轮新增暴露的字段（详情页同样渲染，避免只算不显示）
+  rating?: RatingInfo | null;
+  robustness?: RobustnessInfo | null;
+  steps?: PreprocessStep[] | null;
+  errors?: EvalErrors;
 };
 
 const FORMULAS = ['pct_change_5', 'pct_change_10', 'pct_change_20', 'rolling_std_20', 'turnover'];
@@ -80,6 +83,8 @@ export default function FactorDetailPage() {
   // 评价任务流：POST 202 → WS 流式进度 → 终态 result 渲染
   const [evalJob, setEvalJob] = useState<string | null>(null);
   const evalStream = useJobStream<EvalResult & { series?: EvalSeries }>(evalJob);
+  // 图表数据包缺失/失败显式提示（与页面主结果分开，避免被当成「样本不足」）
+  const [seriesError, setSeriesError] = useState<string | null>(null);
 
   // 终态回填：result → 指标/图表；error 或 done-无果 → 消息条（busy 防悬挂）
   useEffect(() => {
@@ -92,6 +97,9 @@ export default function FactorDetailPage() {
       setRes(evalStream.result);
       // 图表数据包随主评价一次返回（失败不阻塞主结果）
       setSeries(evalStream.result.series ?? null);
+      setSeriesError(evalStream.result.series
+        ? null
+        : '图表数据缺失：评价响应未包含 series 字段');
       mutate(); // 评价后 reports 列表可能新增
       setEvalJob(null);
       setBusy(false);
@@ -159,6 +167,16 @@ export default function FactorDetailPage() {
       }],
     };
   }, [series]);
+
+  // 其余序列图统一走共享 option 工厂，与快速评价页维持同一口径
+  const decayChartOption = useMemo(
+    () => (series ? decayOptionShared(series) : null), [series]);
+  const icYearOption = useMemo(
+    () => (series ? icByYearOption(series) : null), [series]);
+  const excessOption = useMemo(
+    () => (series ? excessNavOption(series) : null), [series]);
+  const eventOption = useMemo(
+    () => (series ? eventStudyOption(series) : null), [series]);
 
   async function remove() {
     if (!window.confirm(`确认删除因子 ${name}？历史报告与挖掘台账会保留。`)) return;
@@ -384,7 +402,34 @@ export default function FactorDetailPage() {
         )}
       </Panel>
 
-      {/* 图表区：累计 IC + 滚动窗口 */}
+      {/* 评级 / 稳健性 / 配方：详情页同样展示，避免「后端算了、前端看不到」 */}
+      {res && (
+        <div className="grid gap-5 lg:grid-cols-2">
+          <RatingPanel rating={res.rating} />
+          <RobustnessPanel robustness={res.robustness} />
+        </div>
+      )}
+
+      {res && (
+        <Panel title="预处理配方" meta="本次评价实际生效的 steps">
+          <RecipeSteps steps={res.steps} />
+        </Panel>
+      )}
+
+      {/* 计算失败显式可见（metrics.errors 与 series.errors 合并去重） */}
+      <ErrorBanner
+        errors={{ ...res?.errors, ...series?.errors }}
+        title="评价过程有计算失败"
+      />
+
+      {/* 图表数据包缺失/失败：与主结果分开提示 */}
+      {seriesError && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {seriesError}
+        </div>
+      )}
+
+      {/* 图表区：IC 序列 / 滚动窗口 / 分层 / 衰减 / 归因 / 中性化 / 分组 IC */}
       {series && (
         <div className="grid gap-5 lg:grid-cols-2">
           <Panel title="IC 序列与累计 IC">
@@ -392,7 +437,7 @@ export default function FactorDetailPage() {
               ? <Chart option={cumOption} height={260} />
               : <Empty>样本不足</Empty>}
           </Panel>
-          <Panel title="滚动窗口指标" meta={`窗口 ${series.rolling.window} 交易日 · 掉头向下/转负 = 阶段性失效预警`}>
+          <Panel title="滚动窗口指标" meta={`窗口 ${series.rolling?.window ?? '—'} 交易日 · 掉头向下/转负 = 阶段性失效预警`}>
             {rollingOption
               ? <Chart option={rollingOption} height={260} />
               : <Empty>样本不足（需要 ≥ 60 个交易日）</Empty>}
@@ -402,7 +447,49 @@ export default function FactorDetailPage() {
               ? <Chart option={rollingIrOption} height={260} />
               : <Empty>样本不足</Empty>}
           </Panel>
+          <QuantileCharts series={series} />
+          <Panel title="IC 衰减" meta={`半衰期 ${res?.half_life ?? '—'} 天 → 建议 ${res?.suggested_rebalance ?? '—'}`}>
+            {decayChartOption
+              ? <Chart option={decayChartOption} height={240} />
+              : <Empty>样本不足</Empty>}
+          </Panel>
+          <Panel title="分年度 IC" meta="突降 = 因子反转预警">
+            {icYearOption
+              ? <Chart option={icYearOption} height={240} />
+              : <Empty>样本不足</Empty>}
+          </Panel>
+          <Panel title="超额净值曲线" meta={`相对${series.excess?.benchmark ?? '股票池等权'}基准 · 稳定上行 = 真超额`}>
+            {excessOption
+              ? <Chart option={excessOption} height={260} />
+              : <Empty>样本不足</Empty>}
+          </Panel>
+          <Panel
+            title="事件式分层收益"
+            meta={series.event_study?.rel_periods.length
+              ? `事件日 ±${series.event_study.after} 日 · 事前/事后发散比 ${
+                series.event_study.look_ahead_ratio?.toFixed(2) ?? '—'}（<1 才是预测信号）`
+              : '事件日前后各 N 日'}
+          >
+            {eventOption
+              ? <Chart option={eventOption} height={260} />
+              : <Empty>样本不足</Empty>}
+          </Panel>
+          <div className="space-y-5">
+            <NeutralLadderPanel
+              rows={series.neutral_ladder}
+              returnNeutralIc={series.neutral_views?.return_neutral_ic}
+            />
+            <NeutralViewsSection views={series.neutral_views} />
+            <GroupIcSection groupIc={series.group_ic} />
+            <StyleCorrPanel styleCorr={series.style_corr} />
+          </div>
         </div>
+      )}
+
+      {series && (series.top_n?.length ?? 0) > 0 && (
+        <Panel title="Top-N 持仓收缩">
+          <TopNTable rows={series.top_n} />
+        </Panel>
       )}
 
       {/* 历史报告 */}
