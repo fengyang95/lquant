@@ -66,7 +66,9 @@ def test_invalid_expr_fail_fast(yaml_root):
             "    expr: 'Ts_Mean($close 5)'\n"
         ),
     )
-    with pytest.raises(Exception):
+    from lquant.core.errors import DSLParseError
+
+    with pytest.raises(DSLParseError):
         yaml_source.load_custom()
 
 

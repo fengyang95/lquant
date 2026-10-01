@@ -104,7 +104,7 @@ def test_enrich_fetch_fail(fake_repo, monkeypatch):
         raise RuntimeError("net down")
 
     ak.fund_etf_spot_em = boom
-    monkeypatch.setitem(__import__("sys").modules, "akshare", fake_ok := ak)
+    monkeypatch.setitem(__import__("sys").modules, "akshare", ak)
     n = em.enrich_from_akshare()
     assert n == 0
 

@@ -50,7 +50,6 @@ def _rec(job_id, expect: str | None = None):
 
 def _rec_none(job_id) -> None:
     """flusher 异步落库：确认「无记录」前先等队列排空。"""
-    import time as _t
 
     from lquant.server.jobs import _RECORD_QUEUE, get_job_record
 

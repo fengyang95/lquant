@@ -38,12 +38,9 @@ def _patch_chain(monkeypatch, *, qsum=None, empty_df=False, cov=True):
     df = pl.DataFrame() if empty_df else _daily_df()
     monkeypatch.setattr("lquant.data.store.parquet.read_daily",
                         lambda **kw: df.lazy())
-    import lquant.factors.analysis as analysis
-    import lquant.factors.covariates as covariates
-    import lquant.factors.evaluate as evaluate
-    import lquant.factors.evaluate.quantile as quantile
-    import lquant.factors.preprocess.pipeline as pipeline
-    import lquant.factors.replication as replication
+    from lquant.factors import analysis, covariates, evaluate, replication
+    from lquant.factors.evaluate import quantile
+    from lquant.factors.preprocess import pipeline
 
     monkeypatch.setattr(analysis, "compute_factor_col",
                         lambda df, expr, name: df.with_columns(

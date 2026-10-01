@@ -119,7 +119,7 @@ def test_score_multi_factor_weighted_sum():
     s = df["score"].to_list()
     single_mom = score(_df(), {"mom20": 1.0})["score"].to_list()
     single_close = score(_df(), {"close": 1.0})["score"].to_list()
-    for a, b, c in zip(s, single_mom, single_close):
+    for a, b, c in zip(s, single_mom, single_close, strict=True):
         assert a == pytest.approx(0.6 * b + 0.4 * c)
 
 

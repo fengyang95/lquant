@@ -4,9 +4,6 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-import polars as pl
-import pytest
-
 from lquant.market.collectors import sector as sec
 
 
