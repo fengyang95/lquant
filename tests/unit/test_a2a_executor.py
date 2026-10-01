@@ -32,12 +32,17 @@ _FAKE_CLAUDE = textwrap.dedent(
         sys.exit(3)
     prompt = argv[argv.index("-p") + 1] if "-p" in argv else ""
     prefix = "续聊：" if "--resume" in argv else ""
-    for piece in ("第一段 ", "第二段"):
-        print(json.dumps({"type": "assistant", "message": {"content": [
-            {"type": "text", "text": piece},
-            {"type": "tool_use", "name": "get_quotes",
-             "input": {"symbols": ["600519"]}},
-        ]}}, ensure_ascii=False), flush=True)
+    print(json.dumps({"type": "system", "subtype": "init", "model": "fake-model",
+                      "cwd": "/Users/lyp/work", "session_id": "fake-sid"},
+                     ensure_ascii=False), flush=True)
+    for idx, piece in enumerate(("第一段 ", "第二段")):
+        blocks = [{"type": "text", "text": piece},
+                  {"type": "tool_use", "name": "get_quotes",
+                   "input": {"symbols": ["600519"]}}]
+        if idx == 0:
+            blocks.insert(0, {"type": "thinking", "thinking": "先查行情再下结论"})
+        print(json.dumps({"type": "assistant", "message": {"content": blocks}},
+                         ensure_ascii=False), flush=True)
         print(json.dumps({"type": "user", "message": {"content": [
             {"type": "tool_result", "content": "收盘价 1700.0"}]}},
             ensure_ascii=False), flush=True)
@@ -129,17 +134,27 @@ async def test_open_stream_frame_sequence(env):
     assert kinds[0] == "task" and kinds[-1] == "statusUpdate"
     assert "artifactUpdate" in kinds
 
-    # 增量正文按序拼接 = 最终答案；末帧为终态且 final=True
-    text = "".join(f["artifactUpdate"]["artifact"]["parts"][0]["text"]
-                   for f in frames if "artifactUpdate" in f)
-    assert text == _ANSWER
+    # 回答正文 = `-answer` artifact 的增量按序拼接；末帧为终态且 final=True
+    def _chunks(suffix: str) -> list[str]:
+        return [f["artifactUpdate"]["artifact"]["parts"][0]["text"]
+                for f in frames if "artifactUpdate" in f
+                and f["artifactUpdate"]["artifact"]["artifactId"].endswith(suffix)]
+
+    assert "".join(_chunks("-answer")) == _ANSWER
     assert frames[-1]["statusUpdate"]["status"]["state"] == TaskState.COMPLETED
     assert frames[-1]["statusUpdate"]["final"] is True
-    # 工具进度帧带工具名，且不含工具入参
+
+    # 过程数据挂在独立的 -trace artifact 上：thinking 全文 + system 白名单字段
+    trace = "".join(_chunks("-trace"))
+    assert "先查行情再下结论" in trace
+    assert "fake-model" in trace
+    assert "/Users/lyp/work" not in trace and "<path>" in trace   # 本机路径已脱敏
+
+    # statusUpdate 的进度帧仍只带工具名（入参在 trace 帧里，不在这条通道）
     tool_frames = [f for f in frames
                    if f.get("statusUpdate", {}).get("metadata", {}).get("tool")]
     assert tool_frames and all(
-        "600519" not in str(f) for f in tool_frames)
+        "600519" not in str(f["statusUpdate"]) for f in tool_frames)
 
 
 async def test_sink_receives_events(env):

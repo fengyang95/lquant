@@ -27,6 +27,31 @@ def test_creates_workspace_and_files(root: Path, tmp_path: Path) -> None:
     assert (ws / ".claude" / "skills" / "demo-skill" / "SKILL.md").is_file()
 
 
+def test_writes_agents_md_for_codex_with_same_content(root: Path) -> None:
+    """claude 读 CLAUDE.md、codex 读 AGENTS.md —— 两个都要有，且内容同源。
+
+    只写一个的话，另一个 provider 起来就是个「没有口径的裸 agent」。
+    """
+    ws = ensure_workspace("ws", root)
+    claude_md = ws / "CLAUDE.md"
+    agents_md = ws / "AGENTS.md"
+    assert claude_md.is_file() and agents_md.is_file()
+    assert agents_md.read_text(encoding="utf-8") == claude_md.read_text(encoding="utf-8")
+    assert "MCP" in agents_md.read_text(encoding="utf-8")
+
+
+def test_mcp_server_spec_is_shared_between_providers(root: Path) -> None:
+    """codex 的 -c 覆盖项由 mcp_server_spec 生成，不能是第二份手写配置。"""
+    from lquant.agent.workspace import mcp_server_spec
+
+    spec = mcp_server_spec(root, python="/opt/python")
+    assert spec["command"] == "/opt/python"
+    assert spec["args"] == ["-m", "lquant.agent.mcp_server"]
+    assert spec["env"] == {"LQ_ROOT": str(root), "PYTHONPATH": str(root / "src")}
+    # 不传 python 时退回当前解释器（与 mcp.json 一致）
+    assert mcp_server_spec(root)["command"] == sys.executable
+
+
 def test_claude_md_contains_role_and_priority(root: Path) -> None:
     ws = ensure_workspace("ws", root)
     content = (ws / "CLAUDE.md").read_text(encoding="utf-8")

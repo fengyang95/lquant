@@ -12,19 +12,23 @@ def test_agent_config_defaults() -> None:
     # 默认就是内置 Claude Code（「问 AI」= 问 Claude Code）
     assert cfg.provider == "claude_code"
     assert cfg.claude_path == "claude"
+    # 第二个无头 CLI provider：OpenAI Codex（同一套骨架，见 agent/codex.py）
+    assert cfg.codex_path == "codex"
     assert cfg.workspace_dir == "data/agent_workspace"
     assert cfg.timeout_seconds == 300
 
 
 def test_agent_config_custom_values() -> None:
     cfg = AgentConfig(
-        provider="claude_code",
+        provider="codex",
         claude_path="/usr/local/bin/claude",
+        codex_path="/opt/codex",
         workspace_dir="/tmp/ws",
         timeout_seconds=60,
     )
-    assert cfg.provider == "claude_code"
+    assert cfg.provider == "codex"
     assert cfg.claude_path == "/usr/local/bin/claude"
+    assert cfg.codex_path == "/opt/codex"
     assert cfg.workspace_dir == "/tmp/ws"
     assert cfg.timeout_seconds == 60
 

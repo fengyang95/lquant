@@ -3,8 +3,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from lquant.agent.a2a.card import (
     build_agent_card,
+    default_description,
     load_skills,
     parse_frontmatter,
 )
@@ -61,7 +64,8 @@ def test_load_skills_on_repo_config():
 
 def test_build_agent_card_shape():
     skills = load_skills(_REPO_ROOT / "config" / "skills")
-    card = build_agent_card(base_url="http://127.0.0.1:8000", skills=skills).to_a2a()
+    card = build_agent_card(base_url="http://127.0.0.1:8000", skills=skills,
+                            description=default_description("claude_code")).to_a2a()
 
     assert card["supportedInterfaces"] == [
         {"url": "http://127.0.0.1:8000/a2a", "protocolBinding": "JSONRPC",
@@ -72,8 +76,25 @@ def test_build_agent_card_shape():
     assert "securitySchemes" not in card
 
 
+def test_default_description_follows_provider():
+    """卡片是给外部调用方看的**发现文档**，不能写死某一个执行体。"""
+    assert "Claude Code" in default_description("claude_code")
+    assert "Codex" in default_description("codex")
+    assert "Claude Code" not in default_description("codex")
+    assert "非 LLM" in default_description("mock")
+    # 未知取值原样展示（不静默吞掉）
+    assert "future_cli" in default_description("future_cli")
+
+
+def test_description_is_required_not_hardcoded():
+    """留默认值就等于留一处会随 provider 过期的假描述，故 description 必填。"""
+    with pytest.raises(TypeError):
+        build_agent_card(base_url="http://h", skills=[])  # type: ignore[call-arg]
+
+
 def test_build_agent_card_with_bearer_auth():
     card = build_agent_card(base_url="http://h", skills=[],
+                            description=default_description("claude_code"),
                             with_bearer_auth=True).to_a2a()
     assert card["securitySchemes"]["bearer"]["scheme"] == "bearer"
     assert card["securityRequirements"] == [{"bearer": []}]

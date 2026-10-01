@@ -75,6 +75,8 @@ def test_agent_card_discoverable_without_api_prefix():
     assert card["supportedInterfaces"][0]["url"].endswith("/a2a")
     assert card["capabilities"]["streaming"] is True
     assert {"a-stock-data", "factor-mining"} <= {s["id"] for s in card["skills"]}
+    # 描述随配置的 provider 走（本套件强制 provider=mock），不是写死的某一家
+    assert "非 LLM" in card["description"]
 
 
 # ---- JSON-RPC：message/send ---------------------------------------------
@@ -148,6 +150,66 @@ def test_message_stream_sse_frame_order():
     assert frames[0]["result"]["task"]["status"]["state"] == "TASK_STATE_SUBMITTED"
     last = frames[-1]["result"]["statusUpdate"]
     assert last["status"]["state"] == "TASK_STATE_COMPLETED" and last["final"] is True
+
+
+def test_stream_exposes_process_trace_redacted(monkeypatch: pytest.MonkeyPatch):
+    """流式把过程数据透到独立 ``-trace`` artifact，且出站已脱敏。"""
+    from lquant.agent.schemas import AgentEvent
+    from lquant.agent.service import get_agent_service
+
+    with TestClient(app) as c:
+        svc = c.portal.call(get_agent_service)
+
+        async def _fake(sid, content, on_event, user_msg=None):
+            await on_event(AgentEvent(type="system", data={
+                "subtype": "init", "model": "claude-sonnet-4-5",
+                "cwd": "/Users/lyp/code/lquant"}))
+            await on_event(AgentEvent(type="thinking", text="先查行情"))
+            await on_event(AgentEvent(type="tool_call", name="get_quote",
+                                      args={"symbols": ["600519"],
+                                            "auth_token": "sk-abcdefghijkl"}))
+            await on_event(AgentEvent(
+                type="tool_result", name="get_quote",
+                text="收盘价 1702.5；本机缓存 /Users/lyp/cache/x.parquet",
+                summary="收盘价 1702.5"))
+            await on_event(AgentEvent(type="assistant_delta", text="答案"))
+            await on_event(AgentEvent(type="done"))
+            return user_msg
+
+        monkeypatch.setattr(svc, "send_message", _fake)
+        r = c.post(_A2A_URL, json={**_SEND, "id": 9, "method": "message/stream"})
+        assert r.status_code == 200
+
+    updates = [f["result"]["artifactUpdate"] for f in _frames(r.text)
+               if "artifactUpdate" in f["result"]]
+    trace = [u for u in updates if u["artifact"]["artifactId"].endswith("-trace")]
+    answer = [u for u in updates if u["artifact"]["artifactId"].endswith("-answer")]
+
+    # 过程数据按事件顺序：system → thinking → tool_call → tool_result → 收尾
+    assert [u["metadata"]["kind"] for u in trace] == [
+        "system", "thinking", "tool_call", "tool_result", "trace_end"]
+    assert trace[-1]["lastChunk"] is True
+    assert trace[2]["metadata"]["name"] == "get_quote"
+
+    # 回答正文单独一条通道，不混入过程数据
+    assert "".join(u["artifact"]["parts"][0]["text"] for u in answer) == "答案"
+
+    blob = json.dumps(trace, ensure_ascii=False)
+    assert "先查行情" in blob and "600519" in blob and "收盘价 1702.5" in blob
+    assert "sk-abcdefghijkl" not in blob and "***" in blob     # 令牌已打码
+    assert "/Users/lyp" not in blob and "<path>" in blob       # 本机路径已打码
+
+
+def test_non_streaming_reply_still_text_only():
+    """非流式与 tasks/get 维持现状：只有最终答案文本，无过程数据。"""
+    with TestClient(app) as c:
+        task = c.post(_A2A_URL, json=_SEND).json()["result"]
+    assert [a["artifactId"] for a in task["artifacts"]] == [f"{task['id']}-answer"]
+    assert task["history"], "history 应含落库的问答文本"
+    for m in task["history"]:
+        for p in m["parts"]:
+            assert set(p) == {"text"}, "history 只回文本 part"
+    assert "-trace" not in json.dumps(task, ensure_ascii=False)
 
 
 def test_stream_start_error_is_jsonrpc_error_not_sse():

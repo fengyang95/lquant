@@ -12,8 +12,17 @@ API 无鉴权，且以下端点会 **exec 用户提供的 Python 代码**：
 | `POST /api/analyses`、`PUT /api/analyses/{id}` | `backtest/analysis.py` | 自定义分析片段（保存前冒烟即执行） |
 | `POST /api/strategies`、`PUT /api/strategies/{id}` | `backtest/strategy_store.py` | 策略源码保存前校验 |
 
-另外，当 `agent.provider = claude_code`（**默认值**）时，问 AI 会以
-`--dangerously-skip-permissions` 拉起 claude CLI 子进程（可任意读写本机）。
+另外，当 `agent.provider` 是 `claude_code`（**默认值**）或 `codex` 时，问 AI 会拉起
+对应的 CLI 子进程，并在 `skip_permissions=true`（默认）下带全自主权限：
+
+| provider | 全自主旗标 | 效果 |
+|---|---|---|
+| `claude_code` | `--dangerously-skip-permissions` | 不弹授权，可任意读写本机 |
+| `codex` | `--dangerously-bypass-approvals-and-sandbox` | 跳过审批**并关掉沙箱**，同上 |
+
+> codex 侧还有一层：审批策略不 bypass 时，**MCP 工具调用会被直接拒绝**
+> （`MCP tool call requires approval, but approval policy is never`），
+> 即 `skip_permissions=false` 时 MCP 取数不可用。详见 `docs/AGENT_MODEL.md`。
 
 **结论：谁能访问这个 API，谁就能在这台机器上执行代码。**
 
@@ -46,7 +55,8 @@ exec 语义下，只要能触达任意对象，对象图遍历逃逸
 
 `GET /.well-known/agent-card.json` + `POST /a2a`（JSON-RPC，支持 SSE 流式）。
 它把上面那条结论从「本机进程」**扩大到「网络」**：A2A 客户端发一条消息，
-等价于在你这台机器上跑一次 Claude Code（`skip_permissions=true` 时带全自主权限）。
+等价于在你这台机器上跑一次 CLI 执行体（`agent.provider` 是哪个就是哪个，
+`skip_permissions=true` 时带全自主权限）。
 
 收口措施（都在默认配置里生效）：
 
@@ -55,8 +65,19 @@ exec 语义下，只要能触达任意对象，对象图遍历逃逸
    `Authorization: Bearer <token>`；Agent Card 里会随之声明 `securitySchemes`。
    **未设置时启动会打 warning**（"A2A 端点已开放且未配置 LQ_A2A_TOKEN…"），
    把「现在这个口子是敞的」明确写在日志里，而不是靠部署者记得。
-3. **回给调用方的内容做了裁剪** —— `Task.history` 只回文本 part，不回 tool 调用与
-   原始入参（工具参数可能含本机路径/命令）；流式帧里的工具进度也只带工具名与截断后的结果摘要。
+3. **回给调用方的内容做了分级**：
+   - `Task.history`（非流式的 `message/send` 与 `tasks/get`）**只回文本 part**，不回 tool 调用。
+   - 流式 `message/stream` 会透出**过程数据**：回答正文之外，还有 `thinking` 推理、
+     工具入参、工具结果全文、`system` 初始化事件 —— 挂在独立的 `{taskId}-trace`
+     artifact 上（`metadata.kind` 标明类型），与 `-answer` 分开，只想要答案的消费方
+     可以只读 `-answer`。工具进度仍在 `statusUpdate` 里带工具名与截断后的结果摘要。
+   - **过程数据一律先过脱敏**（`src/lquant/agent/redact.py`，黑名单口径）：
+     键名命中 `token/secret/password/api_key/credential/authorization/...` 的整棵子树打码；
+     值里的常见凭据形态（`sk-*`、`ghp_*`、`AKIA*`、JWT、`Bearer ...`、`xox?-`）
+     与**本机绝对路径**（`/Users`、`/home`、`/var`、`/tmp`…）替换为占位符。
+     任意单帧文本超 64 KiB 会截断并置 `metadata.truncated`。
+   - ⚠️ 脱敏是**黑名单**：安全性取决于名单覆盖是否完整。把 A2A 暴露给不受信调用方时，
+     应假定「名单外的敏感字段可能原样外泄」；新增敏感键名要同步 `redact.py`。
 4. **不对批量 JSON-RPC 请求做支持**（直接回 `-32600`），减少一次请求里混入多种操作的攻击面。
 
 **仍然挡不住的**：A2A 会话与 web 的 `/ask` 共用同一份 `ask.db`，所以通过 A2A 提的问题
@@ -80,8 +101,9 @@ export LQ_A2A_TOKEN="$(openssl rand -hex 24)"
   ```yaml
   # config/app.yaml
   agent:
-    provider: claude_code
-    skip_permissions: false    # 不传 --dangerously-skip-permissions
+    provider: claude_code      # 或 codex
+    skip_permissions: false    # claude：不传 --dangerously-skip-permissions
+                               # codex ：退到 -s workspace-write（代价：MCP 工具不可用）
   ```
 - CORS 只允许 `http://localhost:3000`（见 `server/main.py`）。改动它等于放宽浏览器侧的
   跨站访问面，谨慎。

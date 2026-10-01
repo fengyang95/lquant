@@ -57,18 +57,24 @@ def clamp_backtest_workers(n: int) -> int:
 
 class AgentConfig(BaseModel):
     # 默认就是内置 Claude Code：「问 AI」= 问 Claude Code。
-    # mock 只是脚本化演示（不调 LLM），需要无 CLI 环境跑通链路时显式选它。
+    # codex 复用同一套无头 CLI 骨架（agent/codex.py）；mock 只是脚本化演示
+    # （不调 LLM），需要无 CLI 环境跑通链路时显式选它。
     provider: str = "claude_code"
     claude_path: str = "claude"
+    codex_path: str = "codex"
     workspace_dir: str = "data/agent_workspace"
     timeout_seconds: int = 300
-    # 无头 claude CLI 需要跳过交互式授权，否则会挂在确认提示上；
+    # 无头 CLI 需要跳过交互式授权，否则会挂在确认提示上；
     # 但那是「全自主」权限，等价于让 CLI 任意读写本机。
     # 默认保持 True 以免破坏既有用法，service.py 启用时会打印告警。
     # 只要不需要 CLI 落盘/执行命令，就设成 false。
+    #
+    # codex 侧另有一层：实测审批策略为 never 时 **MCP 工具调用会被直接拒绝**
+    # （MCP tool call requires approval），所以 True 时用
+    # --dangerously-bypass-approvals-and-sandbox，false 时退到 -s workspace-write。
     skip_permissions: bool = True
-    # 模型不在这里配：直接复用 Claude Code 自身的模型配置
-    # （claude CLI 的 settings / 环境变量 ANTHROPIC_* 等），
+    # 模型不在这里配：两个 CLI 都复用自身的模型配置
+    # （claude 的 settings / ANTHROPIC_*；codex 的 ~/.codex/config.toml），
     # 子进程按原样继承环境，见 docs/AGENT_MODEL.md。
 
 
