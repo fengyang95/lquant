@@ -385,7 +385,8 @@ def test_tick_runs_due_jobs_only():
     manager.upsert_job(
         "adj", "复权因子", "adj_factor", "23:59", weekdays=str(other_day), params={"days": 60}
     )
-    res = manager.tick()
+    # 用注入时钟取下一个交易日（本周六日历为非交易日，真实时钟会让 tick 全跳）
+    res = manager.tick(now=_dt(2026, 9, 21, 9, 0))
     ids = {r["sync_id"] for r in res}
     assert "close" in ids
     assert "daily" not in ids and "adj" not in ids
@@ -507,7 +508,112 @@ def test_emit_sync_error_survives_ring_failure(sync_env, monkeypatch):
     records: list = []
     hid = logger.add(_sink := records.append, level="DEBUG")
     try:
-        manager._emit_sync_error({"sync_id": "probe"}, "collect", "failed", {"error": "boom"})
+        manager._emit_sync_error({"sync_id": "probe"}, "collect", " failed", {"error": "boom"})
         assert any("错误环写入失败" in str(m) for m in records)
     finally:
         logger.remove(hid)
+
+
+# ---------------------------------------------------------------- 失败自动重试
+
+def test_retry_scheduling_on_repeated_failure():
+    """failed 终态按退避排重试：attempt 递增、退避 5→15 分钟、耗尽清零。"""
+    from lquant.core.db import reader
+    from lquant.sync import manager
+
+    manager.upsert_job("rt", "重试探针", "collect", "03:00", enabled=False)
+    job = next(j for j in manager.list_jobs() if j["sync_id"] == "rt")
+
+    res1 = manager.run_job({**job, "kind": "nope", "params": {}})
+    assert res1["status"] == "failed"
+    assert res1["attempt"] == 1
+    assert res1["detail"]["attempt"] == 1
+    assert res1["detail"]["next_retry_at"]
+    with reader() as con:
+        rc, nra = con.execute(
+            "SELECT retry_count, next_retry_at FROM sync_job WHERE sync_id = 'rt'"
+        ).fetchone()
+    assert rc == 1 and nra is not None
+    first_retry = datetime.fromisoformat(res1["detail"]["next_retry_at"])
+
+    res2 = manager.run_job({**job, "kind": "nope", "retry_count": 1})
+    assert res2["attempt"] == 2
+    with reader() as con:
+        rc2, _ = con.execute(
+            "SELECT retry_count, next_retry_at FROM sync_job WHERE sync_id = 'rt'"
+        ).fetchone()
+    assert rc2 == 2
+    second_retry = datetime.fromisoformat(res2["detail"]["next_retry_at"])
+    # 退避 5 → 15 分钟：两次排程间隔必须远大于 9 分钟
+    assert (second_retry - first_retry).total_seconds() > 9 * 60
+
+    res3 = manager.run_job({**job, "kind": "nope", "retry_count": 2})
+    assert res3["attempt"] == 3
+    with reader() as con:
+        rc3, nra3 = con.execute(
+            "SELECT retry_count, next_retry_at FROM sync_job WHERE sync_id = 'rt'"
+        ).fetchone()
+    assert (rc3 in (0, None)) and nra3 is None  # 耗尽清零，等下一档调度
+
+
+def test_retry_due_triggers_even_off_schedule():
+    """重试到期忽略 weekdays：非档位日、时刻一到（>=）即触发。"""
+    from lquant.sync.manager import _is_due
+
+    base = _job(weekdays="3",
+                next_retry_at=datetime(2026, 9, 8, 15, 20),
+                last_run_at=datetime(2026, 9, 8, 15, 6))
+    # 2026-9-8 是周二（weekdays=3 不含），但重试时刻已到 → 必须触发
+    assert _is_due(base, datetime(2026, 9, 8, 15, 21)) is True
+    # now >= retry_dt 才触发：15:19 未到、15:20 恰好到
+    assert _is_due(base, datetime(2026, 9, 8, 15, 19)) is False
+    assert _is_due(base, datetime(2026, 9, 8, 15, 20)) is True
+
+
+def test_successful_run_resets_retry_state():
+    """成功一次后重试态清零（NULL → list_jobs 读出 0）。"""
+    from lquant.core.db import reader
+    from lquant.sync import manager
+
+    manager.upsert_job("rt2", "重试清零探针", "collect", "03:30", enabled=False)
+    job = next(j for j in manager.list_jobs() if j["sync_id"] == "rt2")
+    res_fail = manager.run_job({**job, "kind": "nope", "params": {}})
+    assert res_fail["status"] == "failed"
+
+    job2 = next(j for j in manager.list_jobs() if j["sync_id"] == "rt2")
+    res_ok = manager.run_job({**job2, "params": {"schedule": "close", "demo": True}})
+    assert res_ok["status"] in ("ok", "partial")
+    assert {j["sync_id"]: j for j in manager.list_jobs()}["rt2"]["retry_count"] == 0
+    with reader() as con:
+        nra = con.execute(
+            "SELECT next_retry_at FROM sync_job WHERE sync_id = 'rt2'").fetchone()[0]
+    assert nra is None
+
+
+def test_partial_from_check_is_retryable(monkeypatch):
+    """完备性检查不过 → partial 同样排重试。"""
+    import lquant.data.ingest.checkpoint as cp_mod
+    from lquant.core.db import reader
+    from lquant.data.ingest import daily_basic as db_mod
+    from lquant.sync import manager
+
+    class FakeCp:
+        def __init__(self, *a, **kw):
+            self.done = {"x": 1}
+
+        def covered_window(self, *a, **kw):
+            return None
+
+    monkeypatch.setattr(cp_mod, "Checkpoint", FakeCp)
+    monkeypatch.setattr(db_mod, "backfill_daily_basic",
+                        lambda *a, **kw: {"rows": 0})
+
+    manager.upsert_job("rt5", "检查重试探针", "daily_basic", "03:45", enabled=False)
+    job = next(j for j in manager.list_jobs() if j["sync_id"] == "rt5")
+    res = manager.run_job({**job, "params": {"days": 1, "merge": False}})
+    assert res["status"] == "partial"
+    with reader() as con:
+        rc, nra = con.execute(
+            "SELECT retry_count, next_retry_at FROM sync_job WHERE sync_id = 'rt5'"
+        ).fetchone()
+    assert rc == 1 and nra is not None

@@ -79,8 +79,17 @@ def scale_unit(df: pl.DataFrame, *, col: str, unit: str) -> pl.DataFrame:
     return df.with_columns((pl.col(col) * factor).alias(col))
 
 
+def _active_rows(df: pl.DataFrame) -> pl.DataFrame:
+    """剔除停牌行（有 is_suspended 列时）：停牌日零量零价是源站常态，
+    不豁免会把 baostock 停牌行（OHLC 全 0）误判成坏数据。"""
+    if "is_suspended" in df.columns:
+        return df.filter(~pl.col("is_suspended").fill_null(False))
+    return df
+
+
 def assert_plausible_prices(df: pl.DataFrame, cols: tuple[str, ...] = ("open", "high", "low", "close")) -> None:
-    """fatal 级断言：价格应在 0.1 – 10000 元。"""
+    """fatal 级断言：价格应在 0.1 – 10000 元（停牌行豁免）。"""
+    df = _active_rows(df)
     exprs = []
     for c in cols:
         if c in df.columns:
@@ -92,7 +101,8 @@ def assert_plausible_prices(df: pl.DataFrame, cols: tuple[str, ...] = ("open", "
 
 
 def assert_ohlc(df: pl.DataFrame) -> None:
-    """fatal 级：high >= max(open, close)，low <= min(open, close)。"""
+    """fatal 级：high >= max(open, close)，low <= min(open, close)（停牌行豁免）。"""
+    df = _active_rows(df)
     bad = df.filter(
         (pl.col("high") < pl.max_horizontal("open", "close"))
         | (pl.col("low") > pl.min_horizontal("open", "close"))

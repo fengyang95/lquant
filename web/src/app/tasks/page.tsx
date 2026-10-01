@@ -10,16 +10,18 @@ import DataPanel from './panels/DataPanel';
 import SyncPanel from './panels/SyncPanel';
 import BacktestPanel from './panels/BacktestPanel';
 import FactorPanel from './panels/FactorPanel';
+import QlibTaskPanel from './panels/QlibTaskPanel';
 import { KIND_TEXT } from './types';
 import type { TaskSummary, TaskItem } from './types';
 
-const TABS: TaskItem['kind'][] = ['data', 'sync', 'backtest', 'factor'];
+const TABS: TaskItem['kind'][] = ['data', 'sync', 'backtest', 'factor', 'qlib'];
 
 const TAB_LABEL: Record<TaskItem['kind'], string> = {
   data: '数据',
   sync: '同步',
   backtest: '回测',
   factor: '因子挖掘',
+  qlib: 'Qlib',
 };
 
 /** summary 数字 → 语气色：失败红、运行中蓝 */
@@ -77,6 +79,7 @@ export default function TasksPage() {
         {tab === 'sync' && <SyncPanel />}
         {tab === 'backtest' && <BacktestPanel />}
         {tab === 'factor' && <FactorPanel />}
+        {tab === 'qlib' && <QlibTaskPanel />}
       </div>
     </div>
   );

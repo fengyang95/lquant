@@ -11,11 +11,11 @@ export type TaskProgress = {
 /** 统一任务项（后端 /api/tasks 归一结构） */
 export type TaskItem = {
   id: string;
-  kind: 'data' | 'sync' | 'backtest' | 'factor';
+  kind: 'data' | 'sync' | 'backtest' | 'factor' | 'qlib';
   name: string;
   status: string;
   state: 'queued' | 'running' | 'finished' | 'failed' | 'canceled';
-  created_at: string | null;
+  created_at: string | number | null;
   params: Record<string, unknown>;
   error: string | null;
   progress?: TaskProgress | null;
@@ -39,6 +39,7 @@ export const KIND_TEXT: Record<TaskItem['kind'], string> = {
   sync: '同步任务',
   backtest: '回测任务',
   factor: '因子挖掘',
+  qlib: 'Qlib',
 };
 
 /** 统一状态 → 徽章配色（沿用 TaskBadge 语义：running=蓝、failed=红、finished=绿） */
@@ -71,7 +72,14 @@ export function paramsBrief(params: Record<string, unknown> | null | undefined):
   return rest > 0 ? `${head} +${rest}` : head;
 }
 
-/** 时间展示：created_at 截到 分（缺省 —） */
-export function createdText(t: string | null): string {
-  return t ? t.slice(0, 16).replace('T', ' ') : '—';
+/** 时间展示：created_at（ISO 串或 epoch 秒）截到 分（缺省 —） */
+export function createdText(t: string | number | null): string {
+  if (t === null || t === undefined || t === '') return '—';
+  if (typeof t === 'number') {
+    const d = new Date(t * 1000);
+    if (Number.isNaN(d.getTime())) return '—';
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+  return t.slice(0, 16).replace('T', ' ');
 }

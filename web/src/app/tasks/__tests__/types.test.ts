@@ -37,11 +37,22 @@ describe('createdText 时间展示', () => {
   it('不足 16 位原样截取不报错', () => {
     expect(createdText('2024-06-01')).toBe('2024-06-01');
   });
+
+  it('epoch 秒数字时间戳 → 本地时间截到分（/api/tasks 实际返回格式）', () => {
+    // 2026-09-20T10:00:00Z（UTC）→ 本地时区渲染，只断言格式与稳定性
+    const out = createdText(1789869600);
+    expect(out).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+    expect(createdText(out as unknown as number)).toBe(out); // 字符串路径不受影响
+  });
+
+  it('非法数字（NaN 时间戳）→ —', () => {
+    expect(createdText(8.64e15 * 2)).toBe('—');
+  });
 });
 
 describe('映射表完整性', () => {
   it('KIND_TEXT / STATE_TEXT / STATE_BADGE 覆盖全部枚举键', () => {
-    const kinds = ['data', 'sync', 'backtest', 'factor'] as const;
+    const kinds = ['data', 'sync', 'backtest', 'factor', 'qlib'] as const;
     const states = ['queued', 'running', 'finished', 'failed', 'canceled'] as const;
     for (const k of kinds) expect(KIND_TEXT[k]).toBeTruthy();
     for (const s of states) {

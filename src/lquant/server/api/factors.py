@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import re
@@ -192,6 +193,95 @@ def register_factor(f: FactorIn) -> dict:
         "description": f.description, "created_at": datetime.now(),
     }]))
     return {"registered": f.name, "rows": n}
+
+
+class _ValidateIn(BaseModel):
+    expression: str
+
+
+@router.post("/validate")
+def validate_expression(v: _ValidateIn) -> dict:
+    """DSL 表达式 AST 校验（不落库），供前端注册 / 编辑表单实时校验。"""
+    expr = (v.expression or "").strip()
+    if not expr:
+        return {"ok": False, "error": "表达式为空"}
+    try:
+        from lquant.factors.dsl.analyzer import check
+        from lquant.factors.dsl.parser import parse
+
+        check(parse(expr, "validate"))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "error": None}
+
+
+class FactorUpdateIn(BaseModel):
+    """部分更新：None 字段保持原值。expression 传空串表示清空 DSL。"""
+    expression: str | None = None
+    description: str | None = None
+    category: str | None = Field(default=None, max_length=64)
+
+
+@router.put("/{name}")
+def update_factor(name: str, f: FactorUpdateIn) -> dict:
+    """编辑因子定义（表达式 / 描述 / 类别）。
+
+    口径：只允许改 manual / mined 来源的因子 —— qlib / yaml 因子是种子
+    批量灌入的，改了会在下次 seed 时被覆盖，属假编辑。
+    """
+    with reader() as con:
+        try:
+            r = con.execute(
+                "SELECT name, expression, description, enabled, created_at, "
+                "source, source_ref, factor_id, category "
+                "FROM factor_def WHERE name = ?", [name]).fetchone()
+        except Exception:  # noqa: BLE001
+            r = None
+    if not r:
+        raise HTTPException(404, f"因子不存在: {name}")
+    cur = {"name": r[0], "expression": r[1] or "", "description": r[2] or "",
+           "enabled": r[3], "created_at": r[4], "source": r[5] or "manual",
+           "source_ref": r[6], "factor_id": r[7], "category": r[8] or ""}
+    if (cur["source"] or "manual") not in ("manual", "mined"):
+        raise HTTPException(422, f"{cur['source']} 来源因子为种子灌入，不可编辑（可复制为新因子）")
+    new_expr = cur["expression"] if f.expression is None else f.expression.strip()
+    if new_expr and new_expr != cur["expression"]:
+        try:
+            from lquant.factors.dsl.analyzer import check
+            from lquant.factors.dsl.parser import parse
+
+            check(parse(new_expr, name))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(422, f"DSL 校验失败: {e}") from e
+    row = {**cur,
+           "expression": new_expr,
+           "description": cur["description"] if f.description is None else f.description,
+           "category": cur["category"] if f.category is None else f.category.strip()}
+    n = upsert("factor_def", pl.DataFrame([row]))
+    return {"updated": name, "rows": n}
+
+
+@router.delete("/{name}")
+def delete_factor(name: str) -> dict:
+    """删除因子定义，并连带清掉 factor_ic 指标缓存（派生数据）。
+
+    挖掘台账 / 历史报告不删 —— 它们是研究留痕。
+    """
+    from lquant.core.db import writer
+
+    with reader() as con:
+        try:
+            exists = con.execute(
+                "SELECT 1 FROM factor_def WHERE name = ?", [name]).fetchone()
+        except Exception:  # noqa: BLE001
+            exists = None
+    if not exists:
+        raise HTTPException(404, f"因子不存在: {name}")
+    with writer() as con:
+        con.execute("DELETE FROM factor_def WHERE name = ?", [name])
+        with contextlib.suppress(Exception):
+            con.execute("DELETE FROM factor_ic WHERE factor = ?", [name])  # 指标缓存清理失败不阻断删除
+    return {"deleted": name}
 
 
 def _universe_symbols(universe: str | None) -> list[str] | None:
@@ -801,6 +891,31 @@ def list_mining_runs(limit: int = Query(default=50, ge=1, le=500)) -> list[dict]
              "created_at": str(r[9])} for r in rows]
 
 
+@router.get("/mine/runs/{run_id}")
+def get_mining_run(run_id: str) -> dict:
+    """单次挖掘会话详情：漏斗计数 + 表达式修正日志（corrections）。"""
+    import json
+
+    with reader() as con:
+        try:
+            r = con.execute(
+                "SELECT run_id, agent, generator, n_evaluated, n_static_fail, n_low_ic, "
+                "n_redundant, n_size_proxy, n_survivors, corrections, created_at "
+                "FROM factor_mining_run WHERE run_id = ?", [run_id]).fetchone()
+        except Exception:  # noqa: BLE001
+            r = None
+    if not r:
+        raise HTTPException(404, f"挖掘会话不存在: {run_id}")
+    try:
+        corrections = json.loads(r[9] or "{}")
+    except Exception:  # noqa: BLE001
+        corrections = {}
+    return {"run_id": r[0], "agent": r[1], "generator": r[2],
+            "n_evaluated": r[3], "n_static_fail": r[4], "n_low_ic": r[5],
+            "n_redundant": r[6], "n_size_proxy": r[7], "n_survivors": r[8],
+            "corrections": corrections, "created_at": str(r[10])}
+
+
 class MineIn(BaseModel):
     agent: str = "gp-internal"
     generator: str = Field(default="gp", pattern="^(gp|random)$")
@@ -950,7 +1065,7 @@ def get_factor(name: str) -> dict:
     with reader() as con:
         try:
             r = con.execute(
-                "SELECT name, expression, description, created_at "
+                "SELECT name, expression, description, created_at, source, category "
                 "FROM factor_def WHERE name = ?", [name]).fetchone()
         except Exception:  # noqa: BLE001
             r = None
@@ -961,7 +1076,8 @@ def get_factor(name: str) -> dict:
         for p in sorted(REPORT_DIR.glob(f"{name}*.html"), key=lambda x: -x.stat().st_mtime):
             reports.append({"name": p.stem, "url": f"/api/factors/reports/{p.stem}"})
     return {"name": r[0], "expression": r[1], "description": r[2],
-            "created_at": str(r[3]), "reports": reports}
+            "created_at": str(r[3]), "source": r[4] or "manual",
+            "category": r[5] or "", "reports": reports}
 
 
 class AnalyzeIn(BaseModel):
@@ -986,6 +1102,7 @@ class AnalyzeIn(BaseModel):
 @router.post("/analyze")
 def analyze(req: AnalyzeIn) -> dict:
     """多因子相关性 / 冗余分析（F6）。冗余因子不建议同时入库。"""
+    from lquant.core.errors import FactorError
     from lquant.factors.analysis import correlation
 
     df = read_daily(start=req.start, end=req.end,
@@ -994,7 +1111,9 @@ def analyze(req: AnalyzeIn) -> dict:
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
     try:
         return correlation(df, req.formulas, threshold=req.threshold)
-    except ValueError as e:
+    except (ValueError, FactorError) as e:
+        # FactorError 不是 ValueError：公式本身写错（DSL 未知字段/算子）也是
+        # 客户端问题，不能放任它冒成 500
         raise HTTPException(422, str(e)) from e
 
 
@@ -1017,6 +1136,7 @@ class SynthesizeIn(BaseModel):
 @router.post("/synthesize")
 def synthesize(req: SynthesizeIn) -> dict:
     """因子合成（F7）：等权 / IC 加权 → 全套评价 → 存报告。"""
+    from lquant.core.errors import FactorError
     from lquant.factors import analysis as fa
 
     df = read_daily(start=req.start, end=req.end,
@@ -1026,7 +1146,7 @@ def synthesize(req: SynthesizeIn) -> dict:
     try:
         d = fa.synthesize(df, req.formulas, method=req.method,
                           ic_horizon=req.ic_horizon).drop_nulls(["_syn"])
-    except ValueError as e:
+    except (ValueError, FactorError) as e:
         raise HTTPException(422, str(e)) from e
     if not len(d):
         raise HTTPException(422, "合成因子为空 —— 公式与数据不匹配")
