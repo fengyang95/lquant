@@ -18,6 +18,7 @@ import { useJobStream } from '@/lib/streaming';
 import { C, axes, legend, tooltip } from '@/lib/chart';
 import FactorLibrary from './FactorLibrary';
 import QlibWorkflowPanel from './QlibWorkflowPanel';
+import SaveAsFactor from './SaveAsFactor';
 
 type FactorRow = {
   name: string; expression: string; description: string; created_at: string;
@@ -531,14 +532,17 @@ export default function FactorsPage() {
           title="评价结果"
           meta={<>{evalRes.factor} · 样本 {evalRes.n_samples}</>}
           actions={
-            <a
-              href={evalRes.report_url}
-              target="_blank"
-              className="text-sm text-indigo hover:underline"
-              rel="noreferrer"
-            >
-              查看完整报告 ↗
-            </a>
+            <div className="flex items-center gap-3">
+              <SaveAsFactor formula={formula} onSaved={mutate} />
+              <a
+                href={evalRes.report_url}
+                target="_blank"
+                className="text-sm text-indigo hover:underline"
+                rel="noreferrer"
+              >
+                查看完整报告 ↗
+              </a>
+            </div>
           }
         >
           <div className="grid grid-cols-2 gap-y-4 divide-line md:grid-cols-4 lg:grid-cols-8 md:divide-x">

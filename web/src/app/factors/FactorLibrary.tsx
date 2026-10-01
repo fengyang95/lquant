@@ -11,6 +11,7 @@ import useSWR from 'swr';
 import { Panel, Stat } from '@/components/Panel';
 import { Empty, Msg } from '@/components/States';
 import { del, get, post, put } from '@/lib/api';
+import RegisterForm from './RegisterForm';
 
 export type FactorRow = {
   name: string; expression: string; description: string; created_at: string;
@@ -35,30 +36,14 @@ export default function FactorLibrary({
 }) {
   const [sourceTab, setSourceTab] = useState<string>('全部');
   const [query, setQuery] = useState('');
-  const [busy, setBusy] = useState<'' | 'reg' | 'seed' | 'edit' | 'del'>('');
+  const [busy, setBusy] = useState<'' | 'seed' | 'edit' | 'del'>('');
   const [msg, setMsg] = useState('');
-  // 注册表单
-  const [name, setName] = useState('mom20');
-  const [expression, setExpression] = useState('Rank(Ts_Mean($close,5)/$close-1)');
+  // 注册表单收进 RegisterForm（算子面板 + 实时校验）
   // 编辑弹层
   const [editing, setEditing] = useState<EditTarget | null>(null);
 
   const { data: builtin } = useSWR<{ name: string; family: string; formula: string }[]>(
     '/factors/builtin', get);
-
-  async function register() {
-    setBusy('reg');
-    setMsg('');
-    try {
-      await post('/factors', { name, expression, description: '' });
-      setMsg('✓ 已注册');
-      mutate();
-    } catch (e) {
-      setMsg(`✗ ${e instanceof Error ? e.message : e}`);
-    } finally {
-      setBusy('');
-    }
-  }
 
   async function saveEdit() {
     if (!editing) return;
@@ -309,26 +294,9 @@ export default function FactorLibrary({
         </div>
       )}
 
-      {/* 注册表单 */}
+      {/* 注册表单（算子面板 + 实时 DSL 校验，见 RegisterForm） */}
       <div className="mt-5 border-t border-line pt-4">
-        <div className="mb-2 text-[13px] font-semibold">注册新因子（DSL，AST 校验）</div>
-        <div className="flex flex-wrap items-center gap-2">
-          <input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="因子名"
-            className="input w-44"
-          />
-          <input
-            value={expression}
-            onChange={(e) => setExpression(e.target.value)}
-            placeholder="Rank(Ts_Mean($close,5)/$close-1)"
-            className="input input-mono min-w-72 flex-1"
-          />
-          <button onClick={register} disabled={busy === 'reg' || !name} className="btn btn-primary">
-            {busy === 'reg' ? '注册中…' : '注册'}
-          </button>
-        </div>
+        <RegisterForm onSaved={mutate} />
       </div>
     </Panel>
   );
