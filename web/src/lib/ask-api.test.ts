@@ -83,6 +83,18 @@ describe('reduceMessages', () => {
     expect(msgs[0].tool_calls).toContainEqual({ name: 'get_quote', args: { symbols: ['600519'] } });
   });
 
+  it('3c. thinking / system 是过程数据，不进正文', () => {
+    const base = reduceMessages([], {
+      type: 'assistant_delta',
+      text: 'A',
+      message_id: 'a1',
+    });
+    // 原样返回（同一引用）：否则会掉进 assistant_delta 分支被当成正文累积
+    expect(reduceMessages(base, { type: 'thinking', text: '先查行情' })).toBe(base);
+    expect(reduceMessages(base, { type: 'system', data: { model: 'm' } })).toBe(base);
+    expect(base[0].content).toBe('A');
+  });
+
   it('4. tool_result 置 toolDone=true 且不进 content', () => {
     let msgs: AskMessage[] = reduceMessages([], {
       type: 'assistant_delta',

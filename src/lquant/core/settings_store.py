@@ -32,8 +32,9 @@ SETTING_DEFS: dict[str, SettingDef] = {
     "timezone": SettingDef(default="Asia/Shanghai", ty="str", label="时区"),
     "crosscheck_peers": SettingDef(default=(), ty="list", label="对拍 peer 源（跨源印证）"),
     "agent.provider": SettingDef(
-        default="claude_code", ty="enum", choices=("claude_code", "mock"),
-        label="问 AI 后端 provider（claude_code=内置 Claude Code；mock=脚本化演示，不调 LLM）"),
+        default="claude_code", ty="enum", choices=("claude_code", "codex", "mock"),
+        label="问 AI 后端 provider（claude_code=内置 Claude Code；codex=OpenAI Codex CLI；"
+              "mock=脚本化演示，不调 LLM）"),
     "coverage_drop_warn_pct": SettingDef(
         default=30, ty="int", label="覆盖度环比下降告警阈值（%，前端标橙线）"),
 }

@@ -6,8 +6,8 @@
 
 安全：``LQ_A2A_TOKEN`` 未设置时按本机单人使用，启动会打 warning；
 设置后 ``POST /a2a`` 必须带 ``Authorization: Bearer <token>``。
-注意 A2A 端点等于「可执行本机代码」的入口（provider=claude_code 时 CLI 带
---dangerously-skip-permissions），细则见 docs/SECURITY.md。
+注意 A2A 端点等于「可执行本机代码」的入口：CLI 执行体（``agent.provider``，
+claude_code / codex 都会带全自主旗标），细则见 docs/SECURITY.md。
 """
 from __future__ import annotations
 
@@ -21,7 +21,12 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from lquant.agent.a2a import rpc
-from lquant.agent.a2a.card import PROTOCOL_VERSION, build_agent_card, load_skills
+from lquant.agent.a2a.card import (
+    PROTOCOL_VERSION,
+    build_agent_card,
+    default_description,
+    load_skills,
+)
 from lquant.agent.a2a.executor import get_a2a_executor
 from lquant.agent.schemas import AgentEvent
 from lquant.core.config import api_base_url, get_settings
@@ -59,7 +64,7 @@ def warn_if_unauthenticated() -> None:
     _warned_unauthenticated = True
     _LOG.warning(
         "A2A 端点已开放且未配置 LQ_A2A_TOKEN：能访问 %s/a2a 的调用方，"
-        "就能通过内置 Claude Code 在本机执行代码（provider=%s）。"
+        "就能通过内置执行体在本机执行代码（provider=%s）。"
         "共享网络/生产环境请设置 LQ_A2A_TOKEN 并保持只绑回环（LQ_API_HOST 默认 127.0.0.1）。",
         api_base_url(), get_settings().agent.provider)
 
@@ -75,6 +80,7 @@ async def agent_card() -> JSONResponse:
     card = build_agent_card(
         base_url=api_base_url(),
         skills=load_skills(skills_dir()),
+        description=default_description(get_settings().agent.provider),
         with_bearer_auth=bool(a2a_token()),
     )
     return JSONResponse(

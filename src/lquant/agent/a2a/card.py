@@ -26,6 +26,24 @@ PROTOCOL_VERSION = "1.0"
 AGENT_VERSION = "0.1.0"
 AGENT_NAME = "lquant A股量化研究助手"
 
+#: provider → 卡片描述里用的执行体名。卡片是给**外部调用方**看的发现文档，
+#: 写死某一个 provider 会在换后端后变成假信息（本仓 provider 已有两个真后端）。
+_PROVIDER_LABELS = {
+    "claude_code": "Claude Code",
+    "codex": "Codex",
+    "mock": "Mock（脚本化演示，非 LLM）",
+}
+
+
+def default_description(provider: str) -> str:
+    """按当前 provider 生成卡片描述（未知取值直接原样展示，别吞掉）。"""
+    label = _PROVIDER_LABELS.get(provider, provider)
+    return (
+        f"基于 lquant 数据湖回答 A 股行情的 AI 助手，内置 {label} 执行体："
+        "大盘概览、涨跌家数、板块、资金流、涨停池、龙虎榜、指数与 ETF 数据查询，"
+        "以及因子挖掘与评估。回答会标注数据时点。"
+    )
+
 
 def parse_frontmatter(text: str) -> dict | None:
     """抽取 SKILL.md 顶部的 YAML frontmatter（``---`` 包裹）。无则 None。"""
@@ -71,13 +89,15 @@ def build_agent_card(
     *,
     base_url: str,
     skills: list[AgentSkill],
-    description: str = (
-        "基于 lquant 数据湖回答 A 股行情的 AI 助手，内置 Claude Code 执行体："
-        "大盘概览、涨跌家数、板块、资金流、涨停池、龙虎榜、指数与 ETF 数据查询，"
-        "以及因子挖掘与评估。回答会标注数据时点。"
-    ),
+    description: str,
     with_bearer_auth: bool = False,
 ) -> AgentCard:
+    """组装 Agent Card。
+
+    ``description`` 是必填而不是给个写死的默认值：它要随 provider 变
+    （见 :func:`default_description`），留默认值就等于留一处会过期的假描述。
+    本函数保持纯函数（不读 settings），provider 由调用方传入。
+    """
     card = AgentCard(
         name=AGENT_NAME,
         description=description,

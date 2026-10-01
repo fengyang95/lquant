@@ -88,20 +88,28 @@ async def get_agent_service() -> AgentService:
             from lquant.agent.mock import MockAgentService  # noqa: PLC0415
 
             _cache["service"] = MockAgentService(store)
-        elif provider == "claude_code":
-            from lquant.agent.claude_code import (  # noqa: PLC0415
-                ClaudeCodeAgentService,
-            )
-
+        elif provider in ("claude_code", "codex"):
             if provider not in _WARNED_PROVIDERS:
                 if s.agent.skip_permissions:
                     logging.getLogger(__name__).warning(
-                        "claude_code provider 以 --dangerously-skip-permissions 全自主运行："
+                        "%s provider 以「全自主」权限运行"
+                        "（claude_code: --dangerously-skip-permissions / "
+                        "codex: --dangerously-bypass-approvals-and-sandbox）："
                         "该权限边界仅限本地单人环境，勿将服务暴露到非本机地址"
                         "（API 绑定由 LQ_API_HOST 控制，默认 127.0.0.1）。"
-                        "不需要 CLI 落盘/执行命令时，设 agent.skip_permissions=false")
+                        "不需要 CLI 落盘/执行命令时，设 agent.skip_permissions=false",
+                        provider)
                 _WARNED_PROVIDERS.add(provider)
-            _cache["service"] = ClaudeCodeAgentService(store)
+            if provider == "claude_code":
+                from lquant.agent.claude_code import (  # noqa: PLC0415
+                    ClaudeCodeAgentService,
+                )
+
+                _cache["service"] = ClaudeCodeAgentService(store)
+            else:
+                from lquant.agent.codex import CodexAgentService  # noqa: PLC0415
+
+                _cache["service"] = CodexAgentService(store)
         else:
             raise AgentError(f"未知 agent provider: {provider}")
     return _cache["service"]

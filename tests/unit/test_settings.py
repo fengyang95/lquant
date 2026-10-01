@@ -25,6 +25,15 @@ def test_coerce_enum():
     assert err and "取值必须" in err
 
 
+def test_agent_provider_enum_accepts_codex():
+    """两个无头 CLI 后端都必须是合法取值（claude_code 为默认）。"""
+    assert coerce_setting("agent.provider", "codex") == ("codex", None)
+    assert coerce_setting("agent.provider", "claude_code") == ("claude_code", None)
+    assert coerce_setting("agent.provider", "mock") == ("mock", None)
+    _v, err = coerce_setting("agent.provider", "gpt")
+    assert err and "取值必须" in err
+
+
 def test_coerce_list():
     assert coerce_setting("providers_order", "baostock,tencent") == ("baostock,tencent", None)
     v, err = coerce_setting("providers_order", "  ,  ")

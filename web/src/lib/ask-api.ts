@@ -27,11 +27,19 @@ export interface AskMessage {
 
 /** Agent 事件流消息（WebSocket 下发） */
 export interface AgentEventMsg {
-  type: 'assistant_delta' | 'tool_call' | 'tool_result' | 'done' | 'error';
+  type:
+    | 'assistant_delta'
+    | 'thinking'
+    | 'tool_call'
+    | 'tool_result'
+    | 'system'
+    | 'done'
+    | 'error';
   text?: string;
   name?: string;
   summary?: string;
   args?: Record<string, unknown>;
+  data?: Record<string, unknown>;
   message_id?: string;
   message?: string;
 }
@@ -88,6 +96,10 @@ export async function sendMessage(
  *  done/error 原样返回——落库消息的最终替换由调用方拉取完成。 */
 export function reduceMessages(msgs: AskMessage[], ev: AgentEventMsg): AskMessage[] {
   if (ev.type === 'done' || ev.type === 'error') return msgs;
+
+  // 过程数据（thinking / system）只给外部 A2A 消费方；本页面不渲染，
+  // 且必须显式忽略 —— 否则会掉进下面的 assistant_delta 分支被当成正文累积。
+  if (ev.type === 'thinking' || ev.type === 'system') return msgs;
 
   if (ev.type === 'tool_result') {
     // 给最后一条 assistant 消息打标记；没有 assistant 消息则忽略

@@ -1,10 +1,17 @@
 """agent 运行时工作区脚手架。
 
-为 claude_code provider 在磁盘上准备一次性的 Claude Code 工作区：
-CLAUDE.md（角色与数据访问优先级）、.claude/mcp.json（lquant MCP server）、
-.claude/skills/（从 config/skills/ 同步，并把 ``${LQ_API_BASE}`` 换成实际基址）。
+为 CLI provider 在磁盘上准备一次性的工作区：
 
-为什么指引只能有一处：CLAUDE.md、``--append-system-prompt``、skill 文件
+- ``CLAUDE.md`` + ``AGENTS.md`` —— 同一份角色与数据访问优先级说明。两个文件
+  内容一致、各写一份，是因为 **claude 读 CLAUDE.md、codex 读 AGENTS.md**；
+  只写一个的话另一个 provider 起来就是个「没有口径的裸 agent」。
+- ``.claude/mcp.json`` —— lquant MCP server（claude 用 ``--mcp-config`` 指过来；
+  codex 把同一份规格翻成 ``-c mcp_servers.lquant.*``，见 ``mcp_server_spec``）。
+- ``.claude/skills/`` —— 从 ``config/skills/`` 同步，并把 ``${LQ_API_BASE}``
+  换成实际基址（codex 没有原生 skill 机制，但能读这里的文件，故 AGENTS.md
+  直接指向同一目录，不另存一份）。
+
+为什么指引只能有一处：CLAUDE.md/AGENTS.md、``--append-system-prompt``、skill 文件
 三者都写给模型看。历史上它们口径互斥（一个只说 MCP、一个只说 HTTP、base URL
 还硬编码 localhost:8000），agent 只能自己猜。现在统一为
 **MCP → skill/HTTP → CLI → 临时脚本** 的四级优先级，base 由部署环境注入。
@@ -54,26 +61,37 @@ _CLAUDE_MD_TEMPLATE = """\
 """
 
 
-def _write_claude_md(workspace: Path, root: Path) -> None:
-    (workspace / "CLAUDE.md").write_text(
-        _CLAUDE_MD_TEMPLATE.format(root=root, api_base=api_base_url()), encoding="utf-8"
-    )
+#: 角色说明要落到两个文件名：claude 认 CLAUDE.md，codex 认 AGENTS.md
+_ROLE_DOC_NAMES = ("CLAUDE.md", "AGENTS.md")
+
+
+def _write_role_docs(workspace: Path, root: Path) -> None:
+    """两个文件名写同一份内容（内容只有一处模板，避免两个 provider 口径分叉）。"""
+    text = _CLAUDE_MD_TEMPLATE.format(root=root, api_base=api_base_url())
+    for name in _ROLE_DOC_NAMES:
+        (workspace / name).write_text(text, encoding="utf-8")
+
+
+def mcp_server_spec(root: Path, python: str | None = None) -> dict:
+    """lquant MCP server 的启动规格 —— **两个 provider 共用这一份**。
+
+    claude 把它写成 ``.claude/mcp.json``，codex 把它翻成
+    ``-c mcp_servers.lquant.*``（见 agent/codex.py）。放在这里是为了避免
+    「两套 MCP 配置各自演化」：host 解释器、模块入口、环境变量只有一处定义。
+    """
+    return {
+        "type": "stdio",
+        "command": python or sys.executable,
+        "args": list(_MCP_SERVER_ARGS),
+        "env": {
+            "LQ_ROOT": str(root),
+            "PYTHONPATH": str(root / "src"),
+        },
+    }
 
 
 def _write_mcp_json(workspace: Path, root: Path) -> None:
-    mcp_config = {
-        "mcpServers": {
-            "lquant": {
-                "type": "stdio",
-                "command": sys.executable,
-                "args": _MCP_SERVER_ARGS,
-                "env": {
-                    "LQ_ROOT": str(root),
-                    "PYTHONPATH": str(root / "src"),
-                },
-            }
-        }
-    }
+    mcp_config = {"mcpServers": {"lquant": mcp_server_spec(root)}}
     claude_dir = workspace / ".claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
     (claude_dir / "mcp.json").write_text(
@@ -106,7 +124,7 @@ def ensure_workspace(workspace_dir: str, root: Path) -> Path:
     root = Path(root)
     workspace = root / workspace_dir
     workspace.mkdir(parents=True, exist_ok=True)
-    _write_claude_md(workspace, root)
+    _write_role_docs(workspace, root)
     _write_mcp_json(workspace, root)
     _sync_skills(workspace, root)
     return workspace

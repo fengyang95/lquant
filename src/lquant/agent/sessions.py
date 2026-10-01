@@ -161,7 +161,15 @@ class SessionStore:
         await con.execute("DELETE FROM ask_messages WHERE session_id=?", (sid,))
         await con.commit()
 
-    async def get_claude_session_id(self, sid: str) -> str | None:
+    # ---- CLI 侧会话 id（provider 无关；列名是历史遗留的 claude_session_id）----
+    #
+    # 语义：**当前 provider 的 CLI 会话 id**（claude 的 session_id / codex 的
+    # thread_id）—— 一个 ask 会话同时只由配置里的那一个 provider 作答，
+    # 所以两种 id 共用一列。列名带着 SQLite 无法直接改名的历史包袱，
+    # 代码里一律用中性名 get/set_cli_session_id，别再新增第二个访问器
+    # （两个名字读同一列正是「口径分叉」的温床）。
+
+    async def get_cli_session_id(self, sid: str) -> str | None:
         con = await self._conn()
         cur = await con.execute(
             "SELECT claude_session_id FROM ask_sessions WHERE id=?", (sid,))
@@ -170,11 +178,15 @@ class SessionStore:
             return None
         return r[0] or None
 
-    async def set_claude_session_id(self, sid: str, claude_sid: str) -> None:
+    async def set_cli_session_id(self, sid: str, cli_sid: str) -> None:
         con = await self._conn()
         await con.execute(
-            "UPDATE ask_sessions SET claude_session_id=? WHERE id=?", (claude_sid, sid))
+            "UPDATE ask_sessions SET claude_session_id=? WHERE id=?", (cli_sid, sid))
         await con.commit()
+
+    # 旧名保留（既有调用方与用例仍可用），实现只有上面一份
+    get_claude_session_id = get_cli_session_id
+    set_claude_session_id = set_cli_session_id
 
     # ---- A2A 任务记录（薄 SQL 层；状态机语义在 agent/a2a/tasks.py） -------
 
