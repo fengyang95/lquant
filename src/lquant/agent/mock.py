@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 
 from lquant.agent.errors import AgentError
 from lquant.agent.schemas import AgentEvent, Message, Session
 from lquant.agent.service import AgentService
-from lquant.agent.sessions import SessionStore
 from lquant.market.ticks import fetch_quotes
 
 _LOG = logging.getLogger(__name__)
@@ -23,10 +23,6 @@ def _extract_symbol(text: str, context: dict) -> str | None:
 
 
 class MockAgentService(AgentService):
-    def __init__(self, store: SessionStore) -> None:
-        super().__init__(store)
-        self._tasks: dict[str, asyncio.Task] = {}
-
     async def create_session(self, context: dict | None) -> Session:
         return await self.store.create(context)
 
@@ -48,7 +44,7 @@ class MockAgentService(AgentService):
             raise AgentError("会话不存在", status_code=404)
         # API 路径已同步落库并传入，避免二次写入（也避免轮询等待）
         user_msg = user_msg or await self.persist_user_message(sid, content)
-        self._tasks[sid] = asyncio.current_task()
+        self._claim(sid)  # 同会话单飞（与 claude_code provider 同一条纪律）
         try:
             await self._run(sid, content, ses.context, on_event)
         except asyncio.CancelledError:
@@ -59,6 +55,8 @@ class MockAgentService(AgentService):
             err = await self.store.add_message(sid, "assistant", f"出错了：{e}")
             await on_event(AgentEvent(type="error", message=str(e)))
             return err
+        finally:
+            self._release(sid)
         return user_msg
 
     async def _run(self, sid, content, context, on_event) -> None:
@@ -80,7 +78,7 @@ class MockAgentService(AgentService):
                                       summary="大盘概览已获取"))
 
         ans_msg = await self.store.add_message(sid, "assistant", "", tool_calls=[tc])
-        parts = ["（Mock 回答）"]
+        parts = ["（Mock 回答 | provider=mock，非 LLM 生成）"]
         if symbol:
             q = rows[0] if rows else None
             price = q.get("price") if q else None
@@ -91,15 +89,21 @@ class MockAgentService(AgentService):
         else:
             parts.append("今天大盘整体平稳。")
         parts.append("数据时点：实时快照（Mock 演示，正式实现由 claude code 生成分析）。")
-        for chunk in "".join(parts):
-            await self.store.append_assistant_delta(sid, ans_msg.id, chunk)
-            await on_event(AgentEvent(type="assistant_delta", text=chunk,
-                                      message_id=ans_msg.id))
-            await asyncio.sleep(0.01)
+        try:
+            for chunk in "".join(parts):
+                await self.store.append_assistant_delta(sid, ans_msg.id, chunk)
+                await on_event(AgentEvent(type="assistant_delta", text=chunk,
+                                          message_id=ans_msg.id))
+                await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            # 与 claude_code provider 同口径：取消也要留下明确标记
+            with contextlib.suppress(Exception):  # noqa: BLE001
+                await self.store.append_assistant_delta(sid, ans_msg.id, "（已中断）")
+            raise
         await self.store.finish_assistant(sid, ans_msg.id)
         await on_event(AgentEvent(type="done", message_id=ans_msg.id))
 
     async def cancel(self, sid: str) -> None:
         t = self._tasks.pop(sid, None)
-        if t and not t.done():
+        if t is not None and not t.done():
             t.cancel()

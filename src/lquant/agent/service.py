@@ -1,6 +1,7 @@
 """AgentService 抽象与工厂。claude code 接入方实现同一接口。"""
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
@@ -15,6 +16,8 @@ Emit = Callable[[AgentEvent], Awaitable[None]]
 class AgentService(ABC):
     def __init__(self, store: SessionStore) -> None:
         self.store = store
+        #: 会话 → 正在跑的回答任务（单槽：同一会话同时只允许一个，见 _claim）
+        self._tasks: dict[str, asyncio.Task | None] = {}
 
     @abstractmethod
     async def create_session(self, context: dict | None) -> Session: ...
@@ -34,6 +37,29 @@ class AgentService(ABC):
 
     @abstractmethod
     async def cancel(self, sid: str) -> None: ...
+
+    def is_busy(self, sid: str) -> bool:
+        """该会话是否有未结束的回答。"""
+        t = self._tasks.get(sid)
+        return t is not None and not t.done()
+
+    def _claim(self, sid: str) -> None:
+        """占住会话的执行槽位；已被占用 → 409。
+
+        为什么必须挡：运行时引用（任务 / 子进程）是按会话**单槽**存的，
+        同会话两条并发消息会互相覆盖引用 —— `/cancel` 打到错的那个进程、
+        先结束的那个把另一个的引用 pop 掉变成孤儿，前端还会看到两条回答的事件交错。
+        单飞（one in-flight per session）是唯一说得清的语义。
+        """
+        if self.is_busy(sid):
+            raise AgentError("该会话已有正在执行的回答，请等待完成或先取消",
+                             status_code=409)
+        self._tasks[sid] = asyncio.current_task()
+
+    def _release(self, sid: str) -> None:
+        """只释放**自己的**槽位：别人接手后不能被我们 pop 掉。"""
+        if self._tasks.get(sid) is asyncio.current_task():
+            self._tasks.pop(sid, None)
 
     async def persist_user_message(self, sid: str, content: str) -> Message:
         """同步落库 user 消息并返回。
@@ -96,3 +122,8 @@ async def shutdown_agent_service() -> None:
         await svc.store.close()
     except Exception:  # noqa: BLE001 - 收尾失败只记日志，不阻断停机
         logging.getLogger(__name__).warning("关闭 agent 会话存储失败", exc_info=True)
+    finally:
+        # A2A 执行器单例持有同一个 store，必须一起放掉
+        from lquant.agent.a2a.executor import reset_a2a_executor  # noqa: PLC0415
+
+        reset_a2a_executor()

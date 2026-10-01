@@ -12,7 +12,7 @@ API 无鉴权，且以下端点会 **exec 用户提供的 Python 代码**：
 | `POST /api/analyses`、`PUT /api/analyses/{id}` | `backtest/analysis.py` | 自定义分析片段（保存前冒烟即执行） |
 | `POST /api/strategies`、`PUT /api/strategies/{id}` | `backtest/strategy_store.py` | 策略源码保存前校验 |
 
-另外，当 `agent.provider = claude_code` 时，问 AI 会以
+另外，当 `agent.provider = claude_code`（**默认值**）时，问 AI 会以
 `--dangerously-skip-permissions` 拉起 claude CLI 子进程（可任意读写本机）。
 
 **结论：谁能访问这个 API，谁就能在这台机器上执行代码。**
@@ -41,6 +41,33 @@ exec 语义下，只要能触达任意对象，对象图遍历逃逸
 要真正隔离，需要第四层：把用户代码丢进受限子进程
 （`resource.setrlimit` 限 CPU/内存/进程数 + 禁网 + 超时强杀）。
 本仓库已为 BaoStock 做过同构的 watchdog 子进程强杀（`data/watchdog.py`），可复用。
+
+## A2A 端点（2026-10 新增）
+
+`GET /.well-known/agent-card.json` + `POST /a2a`（JSON-RPC，支持 SSE 流式）。
+它把上面那条结论从「本机进程」**扩大到「网络」**：A2A 客户端发一条消息，
+等价于在你这台机器上跑一次 Claude Code（`skip_permissions=true` 时带全自主权限）。
+
+收口措施（都在默认配置里生效）：
+
+1. **默认只绑回环** —— `LQ_API_HOST` 默认 `127.0.0.1`（`lquant.sh`）。A2A 不额外开监听。
+2. **可选 Bearer 鉴权** —— 设 `LQ_A2A_TOKEN=<随机串>` 后，`POST /a2a` 必须带
+   `Authorization: Bearer <token>`；Agent Card 里会随之声明 `securitySchemes`。
+   **未设置时启动会打 warning**（"A2A 端点已开放且未配置 LQ_A2A_TOKEN…"），
+   把「现在这个口子是敞的」明确写在日志里，而不是靠部署者记得。
+3. **回给调用方的内容做了裁剪** —— `Task.history` 只回文本 part，不回 tool 调用与
+   原始入参（工具参数可能含本机路径/命令）；流式帧里的工具进度也只带工具名与截断后的结果摘要。
+4. **不对批量 JSON-RPC 请求做支持**（直接回 `-32600`），减少一次请求里混入多种操作的攻击面。
+
+**仍然挡不住的**：A2A 会话与 web 的 `/ask` 共用同一份 `ask.db`，所以通过 A2A 提的问题
+会出现在 `/ask` 页面（这是有意为之的可观测性，不是漏洞，但要知道别人问过什么你都看得到）。
+
+需要暴露给外部 Agent 时的建议：
+
+```bash
+export LQ_A2A_TOKEN="$(openssl rand -hex 24)"
+./lquant.sh start        # 仍绑回环；外部通过 SSH 隧道或反代 + HTTPS 进来
+```
 
 ## 部署建议
 

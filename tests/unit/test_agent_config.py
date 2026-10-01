@@ -9,7 +9,8 @@ from lquant.core.config import AgentConfig
 
 def test_agent_config_defaults() -> None:
     cfg = AgentConfig()
-    assert cfg.provider == "mock"
+    # 默认就是内置 Claude Code（「问 AI」= 问 Claude Code）
+    assert cfg.provider == "claude_code"
     assert cfg.claude_path == "claude"
     assert cfg.workspace_dir == "data/agent_workspace"
     assert cfg.timeout_seconds == 300

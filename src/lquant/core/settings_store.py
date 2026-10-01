@@ -32,7 +32,8 @@ SETTING_DEFS: dict[str, SettingDef] = {
     "timezone": SettingDef(default="Asia/Shanghai", ty="str", label="时区"),
     "crosscheck_peers": SettingDef(default=(), ty="list", label="对拍 peer 源（跨源印证）"),
     "agent.provider": SettingDef(
-        default="mock", ty="str", label="问 AI 后端 provider（mock / claude_code 等）"),
+        default="claude_code", ty="enum", choices=("claude_code", "mock"),
+        label="问 AI 后端 provider（claude_code=内置 Claude Code；mock=脚本化演示，不调 LLM）"),
     "coverage_drop_warn_pct": SettingDef(
         default=30, ty="int", label="覆盖度环比下降告警阈值（%，前端标橙线）"),
 }
@@ -97,14 +98,23 @@ def _config_default_providers() -> tuple[str, ...]:
         return ()
 
 
-def _config_default_agent_provider() -> str:
-    """从 config/app.yaml 取 agent.provider 默认值（读不到回退 mock）。"""
+def _config_default_agent_provider() -> tuple[str, str]:
+    """config/app.yaml **显式声明**的 agent.provider → (值, "config")。
+
+    没声明（或读不到）就回退代码默认值，source 标 "default" —— 之前是拿
+    解析结果跟写死的 "mock" 比，默认值一改语义就错位，这里改成看原始 yaml 键。
+    """
+    default = str(SETTING_DEFS["agent.provider"].default)
     try:
         from lquant.core.config import get_settings  # noqa: PLC0415
 
-        return get_settings().agent.provider or "mock"
-    except Exception:  # noqa: BLE001
-        return "mock"
+        raw = get_settings().raw.get("agent") or {}
+        declared = raw.get("provider")
+        if declared:
+            return str(declared), "config"
+    except Exception:  # noqa: BLE001 - 读不到配置就回退默认
+        pass
+    return default, "default"
 
 
 def defaults() -> dict[str, tuple[object, str]]:
@@ -115,8 +125,7 @@ def defaults() -> dict[str, tuple[object, str]]:
             cfg = _config_default_providers()
             out[k] = (cfg, "config" if cfg else "default")
         elif k == "agent.provider":
-            cfg = _config_default_agent_provider()
-            out[k] = (cfg, "config" if cfg != "mock" else "default")
+            out[k] = _config_default_agent_provider()
         else:
             out[k] = (d.default, "default")
     return out

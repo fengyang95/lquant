@@ -3,11 +3,28 @@
 协议：JSON-RPC 2.0，换行分隔（每行一个请求/响应），stdout 只输出响应，
 日志一律走 stderr。仅实现 initialize / tools/list / tools/call。
 
-工具全部只读：
+工具**全部只读**，且都直接调函数、不走 HTTP（不要求 API 服务在跑）：
+
+行情 / 日线 / 因子
 - get_quotes(symbols)                        实时快照（lquant.market.ticks.fetch_quotes）
 - get_daily(symbol, days=60)                 日线（lquant.data.store.parquet.read_daily）
 - list_factors()                             内置 Alpha158 因子清单
 - get_factor_values(symbol, names, days=60)  日线 + qlib_alpha.compute → _factor 列
+
+大盘 / 板块 / 资金流（复用 server/api 的纯逻辑函数，避免两套口径）
+- get_market_overview()                      情绪分 + 涨跌停 + 北向
+- get_market_breadth(days=60)                涨跌家数（基于日线截面统计）
+- get_sectors(kind="industry")               板块行情（industry/concept/area）
+- get_money_flow(top=20, symbol="")          全市场资金流 Top / 单票历史
+- get_limit_up(limit=50)                     涨停池
+- get_dragon_tiger(limit=50)                 龙虎榜
+- get_heat(top=15)                           热榜（涨/跌/放量/龙虎榜）
+- get_index_quotes(days=20)                  主要指数行情 + 近 N 日收盘
+- get_etf_list(limit=200)                    ETF 元数据（跟踪指数/规模/申赎 T+N）
+
+⚠️ 这些函数内部用 ``reader()`` 打开 DuckDB，而 reader 是**读写模式**连接：
+   主服务正在写库时可能撞锁（bounded retry 之后仍失败会退化成空数据）。
+   读不到时按空态返回，不要把它当成「市场真的没有数据」。
 """
 from __future__ import annotations
 
@@ -91,11 +108,72 @@ def _tool_get_factor_values(symbol: str, names: list[str], days: int = 60) -> di
     return out
 
 
+def _market():
+    """延迟导入 market 路由模块，直接调它的纯逻辑函数（不经 HTTP）。
+
+    刻意复用而不是另写一套：``/api/market/*`` 的口径（涨跌停阈值、空态处理、
+    单位）只能有一处定义，否则 MCP 与 HTTP 会给出不一致的数字。
+
+    注意**必须显式传参**：那些函数的默认值是 FastAPI 的 ``Query(...)`` 对象，
+    漏传会把 Query 实例当业务值传下去。
+    """
+    from lquant.server.api import market
+
+    return market
+
+
+def _tool_market_overview() -> dict:
+    return _market().overview()
+
+
+def _tool_market_breadth(days: int = 60) -> dict:
+    return _market().breadth(days=days)
+
+
+def _tool_sectors(kind: str = "industry") -> list[dict]:
+    return _market().sectors(kind=kind)
+
+
+def _tool_money_flow(top: int = 20, symbol: str = "") -> list[dict]:
+    return _market().money_flow(top=top, symbol=symbol.strip() or None)
+
+
+def _tool_limit_up(limit: int = 50) -> list[dict]:
+    return _market().limit_up(limit=limit)
+
+
+def _tool_dragon_tiger(limit: int = 50) -> list[dict]:
+    return _market().dragon_tiger(limit=limit)
+
+
+def _tool_heat(top: int = 15) -> dict:
+    return _market().heat(top=top)
+
+
+def _tool_index_quotes(days: int = 20) -> list[dict]:
+    return _market().index_quotes(days=days)
+
+
+def _tool_etf_list(limit: int = 200) -> list[dict]:
+    from lquant.server.api.etf import _meta_rows
+
+    return _meta_rows(limit=limit)
+
+
 TOOL_HANDLERS: dict[str, Callable[..., Any]] = {
     "get_quotes": _tool_get_quotes,
     "get_daily": _tool_get_daily,
     "list_factors": _tool_list_factors,
     "get_factor_values": _tool_get_factor_values,
+    "get_market_overview": _tool_market_overview,
+    "get_market_breadth": _tool_market_breadth,
+    "get_sectors": _tool_sectors,
+    "get_money_flow": _tool_money_flow,
+    "get_limit_up": _tool_limit_up,
+    "get_dragon_tiger": _tool_dragon_tiger,
+    "get_heat": _tool_heat,
+    "get_index_quotes": _tool_index_quotes,
+    "get_etf_list": _tool_etf_list,
 }
 
 
@@ -138,6 +216,80 @@ TOOLS_SPEC: list[dict] = [
              "days": {"type": "integer", "default": 60, "minimum": 1,
                       "maximum": 250}},
             ["symbol", "names"],
+        ),
+    },
+    {
+        "name": "get_market_overview",
+        "description": "大盘概览：情绪分 + 涨跌停家数 + 破板率 + 北向资金（看板首屏）",
+        "inputSchema": _input_schema({}, []),
+    },
+    {
+        "name": "get_market_breadth",
+        "description": "市场宽度：逐日涨跌家数、涨跌停家数近似、中位涨跌幅、总成交额（基于日线截面）",
+        "inputSchema": _input_schema(
+            {"days": {"type": "integer", "default": 60, "minimum": 1,
+                      "maximum": 250, "description": "回看的交易日数"}},
+            [],
+        ),
+    },
+    {
+        "name": "get_sectors",
+        "description": "板块行情（按涨跌幅降序），kind=industry 行业 / concept 概念 / area 地域",
+        "inputSchema": _input_schema(
+            {"kind": {"type": "string", "enum": ["industry", "concept", "area"],
+                      "default": "industry", "description": "板块类型"}},
+            [],
+        ),
+    },
+    {
+        "name": "get_money_flow",
+        "description": "资金流：不传 symbol 返回最新交易日全市场主力净流入 Top；传 symbol 返回该票近 30 日历史",
+        "inputSchema": _input_schema(
+            {"top": {"type": "integer", "default": 20, "minimum": 1, "maximum": 200,
+                     "description": "全市场榜单条数（传 symbol 时忽略）"},
+             "symbol": {"type": "string", "default": "",
+                        "description": "证券代码，如 600519；留空查全市场 Top"}},
+            [],
+        ),
+    },
+    {
+        "name": "get_limit_up",
+        "description": "涨停池：最新交易日涨停个股（含首次封板时间/连板数/所属行业）",
+        "inputSchema": _input_schema(
+            {"limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500}},
+            [],
+        ),
+    },
+    {
+        "name": "get_dragon_tiger",
+        "description": "龙虎榜：最新交易日上榜个股与上榜原因",
+        "inputSchema": _input_schema(
+            {"limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500}},
+            [],
+        ),
+    },
+    {
+        "name": "get_heat",
+        "description": "热榜：当日涨幅/跌幅/放量 Top 与龙虎榜要点（一句话答「今天盘面看点」）",
+        "inputSchema": _input_schema(
+            {"top": {"type": "integer", "default": 15, "minimum": 1, "maximum": 100}},
+            [],
+        ),
+    },
+    {
+        "name": "get_index_quotes",
+        "description": "主要指数最新行情（收盘/涨跌）与近 N 日收盘序列，用于回答大盘走势",
+        "inputSchema": _input_schema(
+            {"days": {"type": "integer", "default": 20, "minimum": 1, "maximum": 250}},
+            [],
+        ),
+    },
+    {
+        "name": "get_etf_list",
+        "description": "ETF 元数据列表：跟踪指数、类型、是否跨境、申赎 T+N、管理费、规模",
+        "inputSchema": _input_schema(
+            {"limit": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000}},
+            [],
         ),
     },
 ]

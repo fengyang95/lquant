@@ -20,7 +20,9 @@ _LOG = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
     "你是 lquant 量化研究平台的 AI 助手。回答 A 股相关问题时："
-    "优先使用 lquant MCP 工具查询数据，先查数、结论先行，用中文回答。"
+    "数据访问优先级见工作区 CLAUDE.md（MCP 工具 → .claude/skills 里的 skill 或本机 HTTP API "
+    "→ lquant CLI → 临时脚本）；先查数、结论先行，标注数据来源与时点，"
+    "读不到数据就如实说「暂无数据」不编造数字，用中文回答。"
 )
 
 
@@ -133,7 +135,6 @@ class ClaudeCodeAgentService(AgentService):
             s.agent.skip_permissions if skip_permissions is None else skip_permissions)
         super().__init__(store)
         self._workspace = ensure_workspace(self._workspace_dir, self._root)
-        self._tasks: dict[str, asyncio.Task] = {}
         self._procs: dict[str, _Child] = {}
 
     async def create_session(self, context: dict | None) -> Session:
@@ -158,7 +159,7 @@ class ClaudeCodeAgentService(AgentService):
             raise AgentError("会话不存在", status_code=404)
         # API 路径已同步落库并传入，避免二次写入（也避免轮询等待）
         user_msg = user_msg or await self.persist_user_message(sid, content)
-        self._tasks[sid] = asyncio.current_task()
+        self._claim(sid)  # 同会话单飞：并发再来一条 → 409，不许互相踩运行时引用
         try:
             await self._run(sid, content, on_event)
         except asyncio.CancelledError:
@@ -170,15 +171,16 @@ class ClaudeCodeAgentService(AgentService):
                 # _fail_with 已把错误写入增量消息；此处兜底其他异常
                 await self.store.add_message(sid, "assistant", f"出错了：{e}")
             await on_event(AgentEvent(type="error", message=str(e)))
-            return user_msg
+        finally:
+            self._release(sid)
         return user_msg
 
     async def cancel(self, sid: str) -> None:
         t = self._tasks.pop(sid, None)
-        if t and not t.done():
+        if t is not None and not t.done():
             t.cancel()
         proc = self._procs.pop(sid, None)
-        if proc and proc.returncode is None:
+        if proc is not None and proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 proc.terminate()
 
@@ -197,13 +199,26 @@ class ClaudeCodeAgentService(AgentService):
         if claude_sid:
             cmd += ["--resume", claude_sid]
         cmd += self._claude_args
+        proc: _Child | None = None
         try:
             proc = _Child(cmd, cwd=str(self._workspace))
             await proc.attach()
         except OSError as e:
+            # 子进程可能已经起来了（posix_spawn 成功、attach 才失败）：
+            # 不回收就会留下没人管的 claude 进程（全自主权限，还会继续跑）
+            if proc is not None:
+                await self._reap(proc)
             raise AgentError(f"无法启动 claude CLI：{e}") from e
         self._procs[sid] = proc
         await self._consume(sid, proc, on_event)
+
+    @staticmethod
+    async def _reap(proc: _Child) -> None:
+        """terminate + waitpid 回收（半启动的子进程必须收干净）。"""
+        with contextlib.suppress(ProcessLookupError, OSError):
+            proc.terminate()
+        with contextlib.suppress(Exception):  # noqa: BLE001 - 回收失败不改写原始错误
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
 
     async def _consume(self, sid: str, proc, on_event) -> None:
         stderr_lines: list[str] = []
@@ -265,6 +280,12 @@ class ClaudeCodeAgentService(AgentService):
                         await self.store.finish_assistant(sid, ans_msg.id)
                         await on_event(AgentEvent(
                             type="error", message=ev["text"]))
+        except asyncio.CancelledError:
+            # 用户取消：给增量消息补一个明确标记，别留下一条「有头无尾」的空记录
+            # （与超时路径 _fail_with 的「不留空 assistant 消息」口径一致）
+            with contextlib.suppress(Exception):  # noqa: BLE001 - 标记失败不改写取消语义
+                await self.store.append_assistant_delta(sid, ans_msg.id, "（已中断）")
+            raise
         finally:
             if proc.returncode is None:
                 with contextlib.suppress(ProcessLookupError):
@@ -274,7 +295,10 @@ class ClaudeCodeAgentService(AgentService):
             stderr_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, TimeoutError):
                 await asyncio.wait_for(stderr_task, timeout=2.0)
-            self._procs.pop(sid, None)
+            # 只回收自己的引用：取消路径可能已被 cancel() 提前 pop，
+            # 那种情况下不能再动（否则会误伤后续接手的那个 run）
+            if self._procs.get(sid) is proc:
+                self._procs.pop(sid, None)
         if not saw_done and not error_text:
             tail = "\n".join(stderr_lines[-5:])[-400:]
             await self._fail_with(sid, ans_msg.id,

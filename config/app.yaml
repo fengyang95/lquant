@@ -8,6 +8,18 @@ paths:
 
 timezone: Asia/Shanghai
 
+agent:
+  # 「问 AI」= 问内置 Claude Code。mock 是脚本化演示（不调 LLM），
+  # 只用于无 claude CLI 的环境跑通链路。
+  provider: ${LQ_AGENT_PROVIDER:claude_code}
+  claude_path: ${LQ_CLAUDE_PATH:claude}
+  workspace_dir: ${LQ_AGENT_WORKSPACE:data/agent_workspace}
+  timeout_seconds: ${LQ_AGENT_TIMEOUT:300}
+  # 无头 CLI 必须跳过交互授权（等价于全自主权限，仅限本机单人使用）
+  skip_permissions: ${LQ_AGENT_SKIP_PERMISSIONS:true}
+  # 模型不在平台侧配置：直接复用 Claude Code 自身的模型配置
+  # （ANTHROPIC_MODEL / ANTHROPIC_BASE_URL / claude 的 settings），见 docs/AGENT_MODEL.md
+
 store:
   # 日频按年单文件，不要按 symbol 分文件（小文件灾难）
   daily_partition: year
