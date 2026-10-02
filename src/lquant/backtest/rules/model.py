@@ -1,29 +1,97 @@
 """规则模型。
 
-三处设计修正（来自 akquant / rqalpha 源码）：
+设计要点（多处来自 akquant / rqalpha 源码对账）：
 1. T+N 是 per-instrument 属性（sellable_after_days），不是按 sec_type
-2. 印花税有生效区间（2023-08-28 从千一降到万五）
+2. 印花税有生效区间**和买卖方向**：2008-09-19 起才改单边征收（仅卖方），
+   此前双边都收 —— 早期回测一律按单边会系统性低估一半成本
 3. 最低佣金按订单累计，不是按成交
+4. 涨跌停价必须**按最小变动价位取整**：前收 3.63 × 1.1 = 3.993，
+   交易所挂牌涨停价是 3.99。用 3.993 判定会把「开盘即涨停」放行，
+   等于把买不进去的收益算进回测
+5. ST 的涨跌幅不是一律 5%：创业板/科创板 ST 仍 20%，北交所 ST 仍 30%
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import date
 
 from lquant.core.errors import RuleNotFound
 from lquant.core.types import Board, SecType, Symbol
 
+__all__ = [
+    "Commission", "InstrumentRules", "PriceLimit", "RuleSet", "TaxSchedule",
+    "infer_fund_type", "round_tick",
+]
+
+_SELL_ONLY = frozenset({"sell"})
+_BOTH_SIDES = frozenset({"buy", "sell"})
+
+_SIDE_ALIASES: dict[str, frozenset[str]] = {
+    "sell": _SELL_ONLY,
+    "sell_only": _SELL_ONLY,
+    "buy": frozenset({"buy"}),
+    "both": _BOTH_SIDES,
+    "all": _BOTH_SIDES,
+    "double": _BOTH_SIDES,
+}
+
+
+def _side_key(side) -> str:
+    """把 Side 枚举 / 字符串统一成 'buy' / 'sell'。"""
+    return str(getattr(side, "value", side)).strip().lower()
+
+
+def _parse_sides(raw) -> frozenset[str]:
+    """解析税档适用方向；缺省 = 仅卖方（现行 A 股口径）。"""
+    if raw is None:
+        return _SELL_ONLY
+    if isinstance(raw, str):
+        key = raw.strip().lower()
+        return _SIDE_ALIASES.get(key, frozenset({key}))
+    return frozenset(_side_key(x) for x in raw)
+
+
+def round_tick(px: float, tick: float) -> float:
+    """把价格四舍五入到最小变动价位（交易所挂牌价口径）。
+
+    股票 tick=0.01、基金 tick=0.001。浮点噪声用 tick 的小数位再 round 一次清掉，
+    否则 3.99 会变成 3.9900000000000002，与 bar.open 的相等比较失守。
+    """
+    if tick is None or tick <= 0 or not math.isfinite(px):
+        return px
+    nd = max(0, -int(math.floor(math.log10(tick))))
+    return round(round(px / tick) * tick, nd)
+
 
 @dataclass
 class TaxSchedule:
-    """按日期区间取税率。历史回测若统一用当前税率，2023 年前成本被系统性低估一半。"""
+    """按日期区间 + 买卖方向取税率。
 
-    schedule: list[tuple[date, date, float]]
+    历史回测若统一用当前税率，2023 年前成本被低估一半；
+    若统一按单边，2008-09-19 前又被低估一半。
 
-    def rate_at(self, d: date) -> float:
-        for s, e, r in self.schedule:
+    构造兼容 3 元组 (from, to, rate) —— 缺省方向 = 仅卖方（现行 A 股口径），
+    这样既有调用方（单测 / selfcheck）不需要改。
+    """
+
+    schedule: list[tuple]
+
+    def __post_init__(self) -> None:
+        norm: list[tuple[date, date, float, frozenset[str]]] = []
+        for item in self.schedule:
+            s, e, r = item[0], item[1], item[2]
+            sides = item[3] if len(item) > 3 else None
+            norm.append((s, e, float(r),
+                         _SELL_ONLY if sides is None else _parse_sides(sides)))
+        self.schedule = norm
+
+    def rate_at(self, d: date, side=None) -> float:
+        for s, e, r, sides in self.schedule:
             if s <= d <= e:
-                return r
+                if side is None:
+                    return r
+                return r if _side_key(side) in sides else 0.0
         raise RuleNotFound(f"无匹配的税率区间: {d}")
 
 
@@ -36,15 +104,54 @@ class Commission:
 
 @dataclass
 class PriceLimit:
+    """涨跌幅比例表。
+
+    mode=by_board：按板块取值（个股）。
+    mode=by_track_index：ETF 取决于跟踪指数，指数未知时按代码段/代码兜底 ——
+    数据层没有「跟踪指数」字段，所以只能显式登记（见 cn_a_share.yaml）。
+    """
+
     mode: str                    # by_board | by_track_index
     values: dict[str, float] = field(default_factory=dict)
+    st_by_board: dict[str, float] = field(default_factory=dict)
+    by_code_prefix: dict[str, float] = field(default_factory=dict)
+    by_code: dict[str, float] = field(default_factory=dict)
 
-    def for_symbol(self, sym: Symbol, board: Board, is_st: bool, track_index_limit: float | None = None) -> float:
-        if self.mode == "by_track_index" and track_index_limit is not None:
-            return track_index_limit
+    def for_symbol(self, sym: Symbol, board: Board, is_st: bool,
+                   track_index_limit: float | None = None) -> float:
+        if self.mode == "by_track_index":
+            if track_index_limit is not None:
+                return float(track_index_limit)
+            hit = self.by_code.get(sym.code)
+            if hit is None:
+                # 长前缀优先，避免 "58" 抢在 "588" 前面
+                for pref in sorted(self.by_code_prefix, key=len, reverse=True):
+                    if sym.code.startswith(pref):
+                        hit = self.by_code_prefix[pref]
+                        break
+            if hit is not None:
+                return float(hit)
         if is_st:
-            return self.values.get("st", 0.05)
-        return self.values.get(board.value, self.values.get("main", 0.10))
+            # 主板 ST 5%，但创业板/科创板 ST 仍 20%、北交所 ST 仍 30%
+            return float(self.st_by_board.get(board.value,
+                                              self.values.get("st", 0.05)))
+        return float(self.values.get(board.value, self.values.get("main", 0.10)))
+
+
+def infer_fund_type(name: str, keywords: dict[str, list[str]]) -> str | None:
+    """按基金名称关键字推断 fund_type（qdii/commodity/bond/money）。
+
+    数据层没有 fund_type 字段，T+0 判定只能靠名称 —— 关键词表在 rules yaml 里，
+    可随新基金补充，不需要改代码。
+    """
+    if not name:
+        return None
+    upper = str(name).upper()
+    for ftype, kws in (keywords or {}).items():
+        for kw in kws or []:
+            if str(kw).upper() in upper:
+                return str(ftype)
+    return None
 
 
 @dataclass
@@ -60,9 +167,34 @@ class InstrumentRules:
     lot_size: int
     sellable_after_days: int      # T+0 for QDII/黄金/债券/货币 ETF
     is_st: bool = False           # 涨跌停 5% 判定依据（PriceLimit.for_symbol）
+    price_tick: float = 0.01      # 最小变动价位：股票 0.01 / 基金 0.001
+    no_price_limit: bool = False  # IPO 首日 / 复牌首日 / ST 变更日
+    track_index_limit: float | None = None   # ETF 跟踪指数涨跌幅
 
-    def tax_rate(self, d: date) -> float:
-        return self.tax.rate_at(d)
+    def tax_rate(self, d: date, side=None) -> float:
+        return self.tax.rate_at(d, side)
+
+    def limit_ratio(self) -> float | None:
+        """当日涨跌幅比例；None = 不设涨跌停约束。"""
+        if self.no_price_limit:
+            return None
+        return self.price_limit.for_symbol(
+            self.symbol, self.symbol.board, is_st=self.is_st,
+            track_index_limit=self.track_index_limit)
+
+    def limit_up(self, pre_close: float) -> float | None:
+        """涨停价（已按 tick 取整）；None = 无涨跌停约束。"""
+        r = self.limit_ratio()
+        if r is None:
+            return None
+        return round_tick(pre_close * (1.0 + r), self.price_tick)
+
+    def limit_down(self, pre_close: float) -> float | None:
+        """跌停价（已按 tick 取整）；None = 无涨跌停约束。"""
+        r = self.limit_ratio()
+        if r is None:
+            return None
+        return round_tick(pre_close * (1.0 - r), self.price_tick)
 
 
 @dataclass
@@ -72,6 +204,7 @@ class RuleSet:
     default: dict
     etf: dict
     exceptions: dict
+    fund_type_keywords: dict = field(default_factory=dict)
 
     def for_symbol(
         self,
@@ -82,20 +215,30 @@ class RuleSet:
         fund_type: str | None = None,
         sellable_after_days: int | None = None,
         track_index_limit: float | None = None,
+        no_price_limit: bool = False,
+        name: str | None = None,
     ) -> InstrumentRules:
         base = self.etf if sec_type in (SecType.ETF, SecType.LOF) else self.default
         comm = base.get("commission", {})
         tax_sched = [
-            (date.fromisoformat(x["from"]), date.fromisoformat(x["to"]), float(x["rate"]))
+            (date.fromisoformat(str(x["from"])), date.fromisoformat(str(x["to"])),
+             float(x["rate"]), _parse_sides(x.get("side", x.get("sides"))))
             for x in base.get("tax", {}).get("schedule", [])
-        ] or [(date(2000, 1, 1), date(9999, 12, 31), float(base.get("tax", {}).get("rate", 0.0)))]
+        ] or [(date(2000, 1, 1), date(9999, 12, 31),
+               float(base.get("tax", {}).get("rate", 0.0)),
+               _parse_sides(base.get("tax", {}).get("side")))]
 
         t_plus = base.get("t_plus", 1)
         if isinstance(t_plus, dict):
-            t_plus = t_plus.get(fund_type or "", t_plus.get("default", 1))
+            # 名称推断只在调用方没显式给 fund_type 时兜底
+            ft = fund_type or infer_fund_type(name or "", self.fund_type_keywords)
+            t_plus = t_plus.get(ft or "", t_plus.get("default", 1))
         if sellable_after_days is not None:
             t_plus = sellable_after_days      # per-instrument 优先
 
+        pl_raw = base.get("price_limit", {}) or {}
+        values = pl_raw.get("values") or {
+            k: float(v) for k, v in pl_raw.items() if isinstance(v, (int, float))}
         return InstrumentRules(
             symbol=Symbol(*symbol.split(".")),
             sec_type=sec_type,
@@ -103,11 +246,20 @@ class RuleSet:
                                   per_order=comm.get("per_order", True)),
             tax=TaxSchedule(tax_sched),
             transfer_fee_rate=base.get("transfer_fee", {}).get("rate", 0.0),
-            price_limit=PriceLimit(base.get("price_limit", {}).get("mode", "by_board"),
-                                   base.get("price_limit", {}).get("values", {})
-                                   or {k: v for k, v in base.get("price_limit", {}).items()
-                                       if isinstance(v, (int, float))}),
+            price_limit=PriceLimit(
+                mode=pl_raw.get("mode", "by_board"),
+                values={str(k): float(v) for k, v in values.items()},
+                st_by_board={str(k): float(v)
+                             for k, v in (pl_raw.get("st_by_board") or {}).items()},
+                by_code_prefix={str(k): float(v)
+                                for k, v in (pl_raw.get("by_code_prefix") or {}).items()},
+                by_code={str(k): float(v)
+                         for k, v in (pl_raw.get("by_code") or {}).items()},
+            ),
             lot_size=base.get("lot_size", 100),
             sellable_after_days=int(t_plus),
             is_st=is_st,
+            price_tick=float(base.get("price_tick", 0.01)),
+            no_price_limit=no_price_limit,
+            track_index_limit=track_index_limit,
         )

@@ -56,12 +56,38 @@ from lquant.backtest.engine import Engine, build_rules
 from lquant.backtest.events import Bar, Fill, Order, Side
 from lquant.backtest.jq_fundamentals import JQFundamentalsState
 from lquant.backtest.metrics import perf_from_returns, turnover_from_trades
+from lquant.backtest.rules.loader import default_slippage
 from lquant.backtest.sandbox import run_with_deadline, safe_builtins
-from lquant.backtest.slippage import PctSlippage
+from lquant.backtest.security_meta import load_security_meta, merge_meta
+from lquant.backtest.slippage import make_slippage
 from lquant.core.types import parse_symbol, today_cn
 from lquant.factors.panel import compute_factor_columns
 
 __all__ = ["JQRunner", "JQResult"]
+
+# 复权只作用于价格类字段；成交量/成交额/换手率不随复权因子缩放
+_FQ_PRICE_FIELDS = frozenset({"open", "high", "low", "close", "pre_close", "avg"})
+_FQ_MODES = (None, "none", "pre", "post")
+
+# run_daily 允许的语义化时点（其余必须能解析成合法 'HH:MM'）
+_RUN_DAILY_KEYWORDS = frozenset({"every_bar", "open", "close", "after_close",
+                                 "before_open"})
+
+
+def _parse_clock(t: str) -> int:
+    """把 'HH:MM' 解析成当日分钟数；非法时刻抛错（不静默兜底）。"""
+    hh, sep, mm = t.partition(":")
+    if not sep:
+        raise ValueError(
+            f"run_daily time 非法: {t!r}（可选 every_bar/open/close/after_close "
+            "或 'HH:MM' 时刻）")
+    try:
+        h, m = int(hh), int(mm)
+    except ValueError as e:
+        raise ValueError(f"run_daily time 非法: {t!r}（时刻需为 'HH:MM'）") from e
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        raise ValueError(f"run_daily time 非法: {t!r}（时刻需在 00:00~23:59）")
+    return h * 60 + m
 
 
 # ---------- 结果 ----------
@@ -163,12 +189,48 @@ class PriceRelatedSlippage:
         return price * (1 + self.rate) if side == Side.BUY else price * (1 - self.rate)
 
 
+@dataclass(frozen=True)
+class MarketOrder:
+    """聚宽 order(..., style=MarketOrder())：市价单（默认行为）。"""
+
+    price: float | None = None
+
+
+@dataclass(frozen=True)
+class LimitOrder:
+    """聚宽 order(..., style=LimitOrder(price))：限价单。
+
+    此前沙箱里没有这两个 style 对象（`order(s, n, style=LimitOrder(p))` 直接
+    NameError），且 `Order.limit_price` 从未被撮合读取 —— 设了限价仍按市价成交。
+    """
+
+    price: float
+
+    @property
+    def limit_price(self) -> float:
+        return float(self.price)
+
+
+def _style_limit(style) -> float | None:
+    """从聚宽 style 对象取限价；市价/None → None。"""
+    if style is None:
+        return None
+    lp = getattr(style, "limit_price", None)
+    if lp is None:
+        return None
+    try:
+        return float(lp)
+    except (TypeError, ValueError):
+        return None
+
+
 class _SecData:
     """get_current_data()[sym] 的返回：当日参考行情。"""
     __slots__ = ("paused", "is_st", "name", "day_open", "last_price",
                  "high_limit", "low_limit")
 
-    def __init__(self, bar: Bar | None, ref: float, is_st: bool = False, name: str = ""):
+    def __init__(self, bar: Bar | None, ref: float, is_st: bool = False, name: str = "",
+                 rules=None):
         if bar is None:
             self.last_price = float("nan")
             self.day_open = float("nan")
@@ -179,8 +241,13 @@ class _SecData:
             self.last_price = ref
             self.paused = bar.halted
             base = bar.pre_close or bar.close
-            self.high_limit = round(base * 1.1, 2)
-            self.low_limit = round(base * 0.9, 2)
+            # 涨跌停价必须与撮合口径同源（含 tick 取整与 ST 分板规则）：
+            # 此前硬编码 ±10%，ST 股显示 11.0/9.0 而撮合实际按 10.5/9.5 拒单，
+            # 策略看到的上限与真实可成交边界不一致。
+            up = rules.limit_up(base) if rules is not None else None
+            down = rules.limit_down(base) if rules is not None else None
+            self.high_limit = up if up is not None else round(base * 1.1, 2)
+            self.low_limit = down if down is not None else round(base * 0.9, 2)
         self.is_st = is_st
         self.name = name
 
@@ -352,19 +419,13 @@ class _Log:
 # ---------- 运行器 ----------
 
 def _load_security_meta() -> dict[str, dict]:
-    """从 security 表读 is_st 元数据（只取 ST 行）。
+    """从 security 表读 per-instrument 元数据（is_st / 退市日 / 名称）。
 
     任何异常（表不存在 / 无库连接）与空表都返回 {} —— JQRunner 必须能
     在无 security 表的沙箱数据上照常回测，绝不因元数据缺失而抛错。
+    与原生 Engine 路径共用 security_meta 模块，两条路径拿到同一套元数据。
     """
-    try:
-        from lquant.data.store import catalog
-        with catalog.reader() as con:
-            rows = con.execute(
-                "SELECT symbol, is_st FROM security WHERE is_st").fetchall()
-        return {str(r[0]): {"is_st": bool(r[1])} for r in rows}
-    except Exception:                     # noqa: BLE001 - 元数据缺失不致命
-        return {}
+    return load_security_meta()
 
 
 class JQRunner:
@@ -375,7 +436,8 @@ class JQRunner:
                  participation: float = 0.1, ruleset=None,
                  factor_formulas: list[str] | None = None,
                  security_meta: dict[str, dict] | None = None,
-                 timeout_s: float | None = None) -> None:
+                 timeout_s: float | None = None,
+                 delist_recovery: float = 0.0) -> None:
         self.code = code
         self.initial_cash = initial_cash
         # 用户代码墙钟预算（秒）。None = 不限；服务端入口必须设置（防死循环 DoS）。
@@ -385,8 +447,9 @@ class JQRunner:
         self._ruleset = ruleset
         self._participation = participation
         self._factor_formulas = [str(f) for f in (factor_formulas or [])]
-        # security 表 is_st 元数据：参数注入优先，缺省 run() 时自查 security 表。
+        # security 表元数据：参数注入逐键覆盖 DB（is_st / 退市日 / 名称）
         self._security_meta = security_meta
+        self._delist_recovery = float(delist_recovery)
         self._jf_state: JQFundamentalsState = JQFundamentalsState()
         self._security_meta_resolved: dict[str, dict] = {}
 
@@ -404,6 +467,9 @@ class JQRunner:
         self._dates: list[date] = []
         self._bars_by_day: dict[date, dict[str, Bar]] = {}
         self._factor_panels: dict[str, dict[tuple[date, str], float]] = {}
+        self._last_factor: dict[str, float] = {}
+        self._date_index: dict[date, int] = {}
+        self._delisted: set[str] = set()
 
         # 用户代码命名空间（exec 共享 globals，模块级变量等价聚宽的 g.*）
         # __builtins__ 显式收口：不设的话 CPython 会注入完整内建，用户代码可直接
@@ -430,7 +496,7 @@ class JQRunner:
         """调度表必须在 initialize 之后构建（run_daily 在 initialize 里注册）。"""
         self._sched = list(self._sched_reg)
         if self._handle_data_fn:
-            self._sched.append((self._handle_data_fn, "every_bar"))
+            self._sched.append((self._handle_data_fn, "d:every_bar"))
         self.benchmark = self._set_benchmark_arg or self.default_benchmark
 
     # ---- API 注册 ----
@@ -441,7 +507,10 @@ class JQRunner:
         self._sched_reg = []
         self._set_benchmark_arg = None
         self._fee_override: dict | None = None
-        self._slippage = PctSlippage(0.0005)
+        # 默认滑点来自规则表（cn_a_share.yaml default.slippage）—— 与原生 Engine
+        # 路径同一个真源；策略调用 set_slippage 时仍完全覆盖。
+        _slip_mode, _slip_params = default_slippage(self._ruleset)
+        self._slippage = make_slippage(_slip_mode, **_slip_params)
 
         def set_benchmark(security: str) -> None:
             self._set_benchmark_arg = str(security)
@@ -472,7 +541,14 @@ class JQRunner:
                 self._slippage = s
 
         def run_daily(fn, time: str = "every_bar") -> None:    # noqa: A002
-            self._sched_reg.append((fn, str(time)))
+            # 调度键必须与 run_weekly/run_monthly 的 'wN:'/'mN:' 前缀区分开。
+            # 历史 bug：'14:50' 直接进调度表后，_due_funcs 按 ':' 切分得到
+            # kind='14' → int('4') → 被当成「每月第 4 个交易日」，
+            # 日频任务被静默改写成月频。
+            t = str(time)
+            if t not in _RUN_DAILY_KEYWORDS:
+                _parse_clock(t)      # 非法时刻立即报错，绝不静默跑偏
+            self._sched_reg.append((fn, f"d:{t}"))
 
         def run_weekly(fn, weekday: int = 1, time: str = "open") -> None:  # noqa: A002
             self._sched_reg.append((fn, f"w{int(weekday)}:{time}"))
@@ -480,27 +556,47 @@ class JQRunner:
         def run_monthly(fn, monthday: int = 1, time: str = "open") -> None:  # noqa: A002
             self._sched_reg.append((fn, f"m{int(monthday)}:{time}"))
 
-        def order(security: str, amount: float, **kw):
-            return r._submit(str(security), float(amount))
+        def order(security: str, amount: float, style=None, **kw):
+            return r._submit(str(security), float(amount),
+                             limit_price=_style_limit(style))
 
-        def order_value(security: str, value: float, **kw):
+        def order_value(security: str, value: float, style=None, **kw):
             px = r._ref_price(str(security))
             if not px or px <= 0 or not math.isfinite(px):
                 return None
-            return r._submit(str(security), float(value) / px)
+            return r._submit(str(security), float(value) / px,
+                             limit_price=_style_limit(style))
 
-        def order_target(security: str, amount: float, **kw):
+        def order_target(security: str, amount: float, style=None, **kw):
             cur = r.account.positions.get(str(security))
             held = cur.qty if cur else 0.0
-            return r._submit(str(security), float(amount) - held)
+            return r._submit(str(security), float(amount) - held,
+                             limit_price=_style_limit(style))
 
-        def order_target_value(security: str, value: float, **kw):
+        def order_target_value(security: str, value: float, style=None, **kw):
             px = r._ref_price(str(security))
             if not px or px <= 0 or not math.isfinite(px):
                 return None
             cur = r.account.positions.get(str(security))
             held_val = cur.qty * px if cur else 0.0
-            return r._submit(str(security), (float(value) - held_val) / px)
+            return r._submit(str(security), (float(value) - held_val) / px,
+                             limit_price=_style_limit(style))
+
+        def order_target_percent(security: str, percent: float, style=None, **kw):
+            """目标市值 = 组合总市值 × percent（聚宽最常用的下单 API）。
+
+            此前未注入沙箱 → 策略里一调用就 NameError；这是聚宽示例代码
+            出现频率最高的下单函数之一。
+            """
+            sym = str(security)
+            px = r._ref_price(sym)
+            if not px or px <= 0 or not math.isfinite(px):
+                return None
+            total = r.account.nav(r._prices_map(), r._last_close)
+            cur = r.account.positions.get(sym)
+            held_val = cur.qty * px if cur else 0.0
+            return r._submit(sym, (total * float(percent) - held_val) / px,
+                             limit_price=_style_limit(style))
 
         def cancel_order(order_obj) -> None:
             pass                              # 委托即时撮合，无挂单可撤
@@ -509,20 +605,33 @@ class JQRunner:
             return _CurrentData(r)
 
         def history(count: int, unit: str = "1d", field="close",                    # noqa: A002
-                    security_list=None, df: bool = True, skip_paused: bool = True):
+                    security_list=None, df: bool = True, skip_paused: bool = True,
+                    fq="pre"):
             return r._history(int(count), field, security_list, df,
-                              skip_paused=skip_paused)
+                              skip_paused=skip_paused, fq=fq)
 
         def attribute_history(security: str, count: int, unit: str = "1d",         # noqa: A002
-                              fields=("close",), skip_paused: bool = True):
+                              fields=("close",), skip_paused: bool = True, fq="pre"):
             return r._attribute_history(str(security), int(count), fields,
-                                        skip_paused=skip_paused)
+                                        skip_paused=skip_paused, fq=fq)
 
         def get_price(security, start_date=None, end_date=None,
                       frequency: str = "daily", fields=None, count: int | None = None,
-                      panel: bool = True):
+                      panel: bool = True, fq="pre"):
             return r._get_price(security, start_date, end_date, fields, count,
-                                panel=panel)
+                                panel=panel, fq=fq)
+
+        def get_trade_days(start_date=None, end_date=None, count=None):
+            """交易日列表：优先用回测自身的日历（无需库、与模拟盘一致）。"""
+            return r._get_trade_days(start_date, end_date, count)
+
+        def get_index_stocks(index_symbol, date=None):
+            """指数成分股（PIT：按 date 已生效成分）。缺省用当前交易日。"""
+            return r._get_index_stocks(index_symbol, date)
+
+        def get_all_securities(types=None, date=None):
+            """证券列表。优先 security 表；无库时退回回测数据集内的标的。"""
+            return r._get_all_securities(types, date)
 
         def get_current_user_query_result(*a, **kw):   # 未支持项给清晰报错
             raise NotImplementedError("该聚宽 API 未支持（当前兼容日频核心子集）")
@@ -547,9 +656,13 @@ class JQRunner:
             get_current_data=get_current_data, history=history,
             attribute_history=attribute_history, get_price=get_price,
             get_factor_values=r._get_factor_values,
-            get_all_securities=get_current_user_query_result,
+            order_target_percent=order_target_percent,
+            get_trade_days=get_trade_days,
+            get_index_stocks=get_index_stocks,
+            get_all_securities=get_all_securities,
             get_Ashares=get_current_user_query_result,
             FixedSlippage=FixedSlippage, PriceRelatedSlippage=PriceRelatedSlippage,
+            MarketOrder=MarketOrder, LimitOrder=LimitOrder,
             log=_Log(self.res.logs),
         )
         self.context = _JQContext(self)
@@ -603,8 +716,117 @@ class JQRunner:
         return self.account.nav(self._prices_map(), self._last_close)
 
     def _sec_data(self, sym: str) -> _SecData:
+        m = self._security_meta_resolved.get(sym, {})
         return _SecData(self._bars_today.get(sym), self._ref_price(sym),
-                        is_st=self._security_meta_resolved.get(sym, {}).get("is_st", False))
+                        is_st=m.get("is_st", False), name=m.get("name", ""),
+                        rules=self._rules.get(sym))
+
+    # ---- 聚宽数据接口补充实现 ----
+
+    def _get_trade_days(self, start_date=None, end_date=None, count=None) -> list:
+        """交易日列表。
+
+        优先用回测自身的日历（与撮合/模拟盘完全一致，且不需要库连接）——
+        策略据此判断「下一个交易日」不会与引擎实际推进的日期错位。
+        回测日历为空时退回库里的官方交易日历。
+        """
+        if self._dates:
+            days = list(self._dates)
+            sd = self._as_date(start_date)
+            ed = self._as_date(end_date)
+            if sd is not None:
+                days = [d for d in days if d >= sd]
+            if ed is not None:
+                days = [d for d in days if d <= ed]
+            if count is not None:
+                n = int(count)
+                days = days[-n:] if n >= 0 else days[:-n] if n else []
+            return days
+        from lquant.research.dialect import jq_shim
+        return list(jq_shim.get_trade_days(start_date, end_date))
+
+    def _get_index_stocks(self, index_symbol, date=None) -> list:
+        """指数成分股，PIT：按 date 已生效成分。缺省 = 当前交易日（防前视）。
+
+        成分表未同步时给可操作的报错 —— 绝不静默返回空（"回测跑通了但
+        选股池是空的" 是最糟的结果：策略静默空仓，指标却正常）。
+        """
+        from lquant.core.errors import DataError
+        from lquant.research.dialect import jq_shim
+
+        day = self._as_date(date) or self._today
+        try:
+            return list(jq_shim.get_index_stocks(index_symbol, day))
+        except Exception as e:                 # noqa: BLE001 - 换成可操作的报错
+            raise DataError(
+                f"get_index_stocks({index_symbol!r}, {day}) 取不到成分股：{e}。"
+                "请先同步指数成分（index_cons 表）") from e
+
+    def _get_all_securities(self, types=None, date=None) -> object:
+        """证券列表。无库（合成数据沙箱）时退回本次回测数据集内的标的。"""
+        try:
+            from lquant.research.dialect import jq_shim
+            out = jq_shim.get_all_securities(types, date)
+            if out is not None and len(out):
+                return out
+        except Exception:                 # noqa: BLE001 - 元数据缺失不致命
+            pass
+        return pl.DataFrame({"symbol": sorted(self._bars_by_day_date_symbols())})
+
+    def _bars_by_day_date_symbols(self) -> set[str]:
+        return {s for bars in self._bars_by_day.values() for s in bars}
+
+    @staticmethod
+    def _as_date(v) -> date | None:
+        """把 str / date / None 归一成 date（get_fundamentals 曾因未归一而崩）。"""
+        if v is None:
+            return None
+        if isinstance(v, date):
+            return v
+        return date.fromisoformat(str(v)[:10])
+
+    # ---- 公司行为 / 退市（与 engine.Engine 同一套语义） ----
+
+    def _apply_corporate_actions(self, bars: dict[str, Bar]) -> None:
+        """除权日按复权因子比放大持仓份额（分红默认再投资的份额调整法）。
+
+        与 Engine._apply_corporate_actions 同口径：ratio = 今日因子 / 昨日因子。
+        JQ 路径委托是即时撮合的、没有挂单，所以只需要调整持仓。
+        """
+        for sym, bar in bars.items():
+            if bar.adj_factor <= 0:
+                continue
+            prev = self._last_factor.get(sym, bar.adj_factor)
+            if prev <= 0:
+                continue
+            ratio = bar.adj_factor / prev
+            if abs(ratio - 1.0) > 1e-12:
+                self.account.apply_corporate_action(sym, ratio)
+
+    def _apply_delistings(self, d: date) -> None:
+        """退市核销：退市日起把持仓按残值变现，避免按最后收盘价永久冻结。"""
+        for sym, m in self._security_meta_resolved.items():
+            delist = m.get("delist_date")
+            if delist is None or d < delist or sym in self._delisted:
+                continue
+            self._delisted.add(sym)
+            pos = self.account.positions.get(sym)
+            if pos is None or pos.qty <= 0:
+                continue
+            px = self._last_close.get(sym) or pos.avg_cost
+            self.account.cash += pos.qty * px * float(self._delist_recovery)
+            self.res.rejected.append(
+                (str(d), sym, f"退市核销 qty={pos.qty:.0f} 残值率={self._delist_recovery}"))
+            pos.qty = 0.0
+            pos.lots = []
+
+    def _is_delisted_now(self, sym: str) -> bool:
+        """该标的是否已到退市日（到了就不可再交易）。"""
+        m = self._security_meta_resolved.get(sym)
+        if not m:
+            return False
+        delist = m.get("delist_date")
+        return delist is not None and self._today >= delist
 
     def _history_df(self, secs: list[str], fields: list[str], rows: list[dict]) -> object:
         """rows 为时间升序窗口 [{sec: {field: v}, 'day': d}]；优先 pandas。
@@ -650,8 +872,28 @@ class JQRunner:
             return bar.volume
         return float(getattr(bar, f, float("nan")))
 
+    def _fq_ref(self, sym: str) -> float:
+        """pre 复权的归一基准 = 今日复权因子；今日无 bar 时退回最近可见因子。"""
+        bar = self._bars_today.get(sym)
+        if bar is not None and bar.adj_factor > 0:
+            return bar.adj_factor
+        f = self._last_factor.get(sym, 1.0)
+        return f if f and f > 0 else 1.0
+
+    def _bar_field_fq(self, sym: str, bar: Bar, f: str, fq, f_now: float):
+        """取 bar 字段并按 fq 复权。"""
+        raw = self._bar_field(bar, f)
+        if fq in (None, "none") or f not in _FQ_PRICE_FIELDS:
+            return raw
+        fday = bar.adj_factor if bar.adj_factor and bar.adj_factor > 0 else f_now
+        if not math.isfinite(raw):
+            return raw
+        return raw * fday / f_now if fq == "pre" else raw * fday
+
     def _history(self, count: int, field, security_list, df: bool = True,
-                 skip_paused: bool = True):
+                 skip_paused: bool = True, fq="pre"):
+        # 字符串 fields 必须当单字段处理 —— list('close') 会拆成
+        # ['c','l','o','s','e'] 五个列，随后报迷惑的 KeyError('close')
         fields = [field] if isinstance(field, str) else list(field or ["close"])
         secs = list(security_list) if security_list else sorted(self._bars_today)
         i = self._day_index
@@ -668,17 +910,20 @@ class JQRunner:
             days = [d for d in self._dates[:i] if _traded(d)][-count:]
         else:
             days = self._dates[max(0, i - count):i]
+        f_now = {s: self._fq_ref(s) for s in secs}
         rows = []
         for day in days:
             bars = self._bars_by_day.get(day, {})
-            rows.append({s: {f: self._bar_field(b, f) for f in fields}
+            rows.append({s: {f: self._bar_field_fq(s, b, f, fq, f_now[s])
+                             for f in fields}
                          for s, b in ((s, bars.get(s)) for s in secs) if b})
             rows[-1]["day"] = day
         return self._history_df(secs, fields, rows)
 
     def _attribute_history(self, sec: str, count: int, fields,
-                           skip_paused: bool = True):
-        fields = list(fields or ["close"])
+                           skip_paused: bool = True, fq="pre"):
+        # 与 _history 同理：字符串 fields 是「一个字段」，不是字符序列
+        fields = [fields] if isinstance(fields, str) else list(fields or ["close"])
         try:
             import pandas as pd
         except ImportError:
@@ -697,18 +942,21 @@ class JQRunner:
             js.reverse()
         else:
             js = range(max(0, i - count), i)
+        f_now = self._fq_ref(sec)
         rows = []
         for j in js:
             b = self._bars_by_day.get(self._dates[j], {}).get(sec)
             if b:
-                rows.append({"day": self._dates[j], **{f: self._bar_field(b, f) for f in fields}})
+                rows.append({"day": self._dates[j],
+                             **{f: self._bar_field_fq(sec, b, f, fq, f_now)
+                                for f in fields}})
         if pd is None:
             return {f: [r[f] for r in rows] for f in fields}
         return _JQFrame([{**r, "day": str(r["day"])} for r in rows]
                         ).set_index("day") if rows else _JQFrame(columns=fields)
 
     def _get_price(self, security, start_date=None, end_date=None,
-                   fields=None, count=None, panel: bool = True):
+                   fields=None, count=None, panel: bool = True, fq="pre"):
         secs = [security] if isinstance(security, str) else list(security)
         fields = list(fields or ["open", "close", "high", "low", "volume"])
         dates = self._dates
@@ -729,6 +977,7 @@ class JQRunner:
             lo = next((k for k, d in enumerate(dates) if d >= sd), 0)
             hi = next((k for k, d in enumerate(dates) if d > ed), len(dates))
         rows = []
+        f_now = {s: self._fq_ref(s) for s in secs}
         for j in range(lo, min(hi, len(dates))):
             day = dates[j]
             bars = self._bars_by_day.get(day, {})
@@ -736,7 +985,8 @@ class JQRunner:
             for s in secs:
                 b = bars.get(s)
                 if b:
-                    row[s] = {f: self._bar_field(b, f) for f in fields}
+                    row[s] = {f: self._bar_field_fq(s, b, f, fq, f_now[s])
+                              for f in fields}
             rows.append(row)
         # 聚宽语义：单标的 → 列=fields（history 才是单字段→列=证券，二者不同）；
         # 多标的 → (标的, 字段) MultiIndex。
@@ -783,8 +1033,11 @@ class JQRunner:
 
     # ---- 下单 ----
 
-    def _submit(self, sym: str, amount: float):
-        """聚宽 order：按股数下单，即时以当前时点参考价撮合。"""
+    def _submit(self, sym: str, amount: float, limit_price: float | None = None):
+        """聚宽 order：按股数下单，即时以当前时点参考价撮合。
+
+        limit_price 非空 = 限价单（当日有效）：成交价劣于限价则作废。
+        """
         if abs(amount) < 1:
             return None
         try:
@@ -795,6 +1048,9 @@ class JQRunner:
         if rules is None:
             self.res.rejected.append((str(self._today), sym, "不在数据集"))
             return None
+        if self._is_delisted_now(sym):
+            self.res.rejected.append((str(self._today), sym, "已退市"))
+            return None
         side = Side.BUY if amount > 0 else Side.SELL
         qty = abs(amount)
         px = self._ref_price(sym)
@@ -803,7 +1059,7 @@ class JQRunner:
             return None
         if side == Side.SELL:
             pos = self.account.positions.get(sym)
-            avail = pos.available_at(self._today, rules) if pos else 0.0
+            avail = pos.available_at(self._today, rules, self._date_index) if pos else 0.0
             qty = min(qty, avail)
         else:
             # 资金约束：按参考价 + 粗略费用能买多少买多少
@@ -815,7 +1071,8 @@ class JQRunner:
                                       "可卖不足一手或资金不足" if side == Side.SELL else "资金不足一手"))
             return None
         self._touched.add(sym)
-        o = Order(order_id=f"jq{self._seq}", symbol=sym, side=side, qty=qty)
+        o = Order(order_id=f"jq{self._seq}", symbol=sym, side=side, qty=qty,
+                  limit_price=limit_price)
         self._seq += 1
         bar = self._bars_today.get(sym)
         if bar is None:
@@ -831,33 +1088,74 @@ class JQRunner:
         return o
 
     def _synth_bar(self, bar: Bar, ref: float) -> Bar:
-        """以参考价为撮合价的合成 bar（撮合器取 bar.open 作成交价）。"""
+        """以参考价为撮合价的合成 bar（撮合器取 bar.open 作成交价）。
+
+        停牌/零成交标记必须透传 —— 丢了就会把不可交易的 bar 当成可成交。
+        """
         return Bar(symbol=bar.symbol, trade_date=bar.trade_date, open=ref, high=bar.high,
                    low=bar.low, close=bar.close, pre_close=bar.pre_close,
-                   volume=bar.volume, amount=bar.amount, halted=bar.halted)
+                   volume=bar.volume, amount=bar.amount, halted=bar.halted,
+                   suspended=bar.suspended, no_volume=bar.no_volume)
 
     # ---- 调度 ----
 
+    # 日频引擎只有「开盘 / 收盘」两个执行桶。显式时刻据此归档：
+    # 尾盘时刻（>= 14:30）按收盘价成交，否则按开盘价 —— 把 '14:50' 一律塞进
+    # open 桶会让「尾盘下单」用开盘价成交，语义系统性偏离。
+    _TAIL_BUCKET_MINUTES = 14 * 60 + 30
+
+    @classmethod
+    def _bucket_of(cls, t: str) -> str:
+        if t in ("close", "after_close"):
+            return "close"
+        if t not in _RUN_DAILY_KEYWORDS and _parse_clock(t) >= cls._TAIL_BUCKET_MINUTES:
+            return "close"
+        return "open"
+
     def _due_funcs(self, d: date, i: int) -> list:
-        """当日到期 [(fn, 时点桶)]。周按 ISO 周几，月按「第 N 个交易日」。"""
+        """当日到期 [(fn, 时点桶)]。周按 ISO 周几，月按「第 N 个交易日」。
+
+        调度键格式：
+          d:<every_bar|open|close|after_close|HH:MM>   日频
+          w<1-7>:<time>                                周频（ISO 周几）
+          m<N>:<time>                                  月频（N>0 第 N 个交易日）
+          m<-N>:<time>                                 月频（N<0 倒数第 |N| 个交易日）
+        """
         week = d.isocalendar().weekday
-        k = i - 1
-        while k >= 0 and self._dates[k].month == d.month:
-            k -= 1
-        nth_in_month = i - k              # 月内第几个交易日（1-based）
+        ym = (d.year, d.month)
+        # 本月在交易日序列中的 [lo, hi] 闭区间 —— 必须用整月长度算「倒数第 N 个」，
+        # 只从当天往后数会得到「今天到月末 = 1 天」这种错值。
+        lo = i
+        while lo > 0 and (self._dates[lo - 1].year, self._dates[lo - 1].month) == ym:
+            lo -= 1
+        hi = i
+        while hi + 1 < len(self._dates) and \
+                (self._dates[hi + 1].year, self._dates[hi + 1].month) == ym:
+            hi += 1
+        nth_in_month = i - lo + 1        # 月内第几个交易日（1-based）
+        n_in_month = hi - lo + 1         # 本月交易日总数
+        back_from_end = n_in_month - nth_in_month + 1   # 倒数第几个（1-based）
 
         out = []
         for fn, when in self._sched:
-            if ":" in when:                # w{1-5}:{time} 或 m{N}:{time}
-                kind, t = when.split(":", 1)
-                if kind.startswith("w"):
-                    if int(kind[1:]) != week:
+            kind, _, t = when.partition(":")
+            if kind == "d":
+                pass                                  # 日频：每天都到期
+            elif kind.startswith("w"):
+                if int(kind[1:]) != week:
+                    continue
+            elif kind.startswith("m"):
+                n = int(kind[1:])
+                if n < 0:
+                    # 月末倒数：run_monthly(fn, -1) = 本月最后一个交易日。
+                    # 历史 bug：只比较正数，负数永远不等于 nth_in_month → 静默不触发。
+                    if n != -back_from_end:
                         continue
-                elif int(kind[1:]) != nth_in_month:
+                elif n != nth_in_month:
                     continue
             else:
                 t = when
-            out.append((fn, "close" if t in ("close", "after_close") else "open"))
+            out.append((fn, self._bucket_of(t)))
         return out
 
     # ---- 主循环 ----
@@ -944,18 +1242,31 @@ class JQRunner:
             ruleset.default["commission"] = {"rate": fo["comm_rate"], "min": fo["min"],
                                              "per_order": True}
             ruleset.default["tax"] = {"rate": fo["tax_rate"]}
-        # is_st 元数据同源：注入优先，否则自查 security 表；驱动
-        # get_current_data()[sym].is_st 与涨跌停 5% 两条路径。
-        self._security_meta_resolved = (
-            dict(self._security_meta) if self._security_meta is not None
-            else _load_security_meta())
-        self._rules = build_rules(symbols, ruleset, self._security_meta_resolved)
+        # per-instrument 元数据同源：显式注入优先，逐键覆盖 DB（security 表）。
+        # 驱动 get_current_data()[sym] 的 is_st / 名称、ST 分板涨跌停、
+        # fund_type→T+0、ETF 跟踪指数涨跌幅、退市核销。
+        self._security_meta_resolved = merge_meta(
+            _load_security_meta(), self._security_meta)
+        self._rules = build_rules(symbols, ruleset, self._security_meta_resolved,
+                                  with_db_meta=False)
         self._broker = Broker(self._rules, self._slippage)
+        self._date_index = {d: i for i, d in enumerate(self._dates)}
+        self._last_factor = {}
+        self._delisted = set()
 
         for i, d in enumerate(self._dates):
             self._today = d
             self._day_index = i
             self._bars_today = bars_by_day[d]
+            # 0) 公司行为：除权日按复权因子比放大持仓份额。
+            # JQ 路径此前完全没有这一步 —— 同一天同一持仓，Engine 路径净值连续、
+            # JQ 路径在除权日凭空跳空（2:1 拆股即 -50%），两条路径不可比。
+            self._apply_corporate_actions(self._bars_today)
+            for _s, _b in self._bars_today.items():
+                if _b.adj_factor > 0:
+                    self._last_factor[_s] = _b.adj_factor
+            # 0b) 退市核销
+            self._apply_delistings(d)
             # 每日执行策略前绑定 get_fundamentals 的当日交易日与股票池（per-runner 状态）
             self._jf_state.set_day(d, sorted(self._bars_today))
             self.context.current_dt = datetime.combine(d, dtime(9, 30))

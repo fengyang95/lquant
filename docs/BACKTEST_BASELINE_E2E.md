@@ -118,16 +118,47 @@ financial_pit 中与"同比/yoy"相关的 DISTINCT item:['indicator.cfps_yoy', '
 | G13 | 全市场 `get_fundamentals` 单次 ~170s(financial_pit 72M 行,无日期/标的缓存;每日调用 = E2E 20h)。热帧:duckdb 全表扫描 | 回测正确性(性能) | `python - <<EOF` 计时复现:单次 172s/168s/167s ×3 | P1(性能专项) | 是(复杂策略每日盘前选股不可用) |
 | G14 | 复杂策略 E2E 实跑完成(2025-01-02~2026-09-11,600 标的×411 交易日,月度调仓 top15 等权+止损止盈):总收益 +9.51%,336 笔成交/6 笔拒单(拒单原因分布合理:涨停不可买/跌停不可卖/资金不足一手),**审计 PASS**(停牌日无成交、无 T+1 双向成交、无涨停买入/跌停卖出)。耗时 3831s(大头是 14 次 monthly get_fundamentals×170s,即 G13) | 回测正确性 | `PYTHONPATH=src python scripts/run_complex_e2e.py` | 已闭环 | 否 |
 
-### 2026-09-14 双路审查新增(聚宽兼容面 + 引擎正确性)
+### 2026-09-14 双路审查新增(聚宽兼容面 + 引擎正确性) —— 2026-10-02 收口
 
-| 编号 | 现象 | 归属 | 复现 | 优先级 | 阻塞 |
-|---|---|---|---|---|---|
-| G15 | **阻塞**:get_price/history/attribute_history 无 `fq` 参数(传 fq='pre' 直接 TypeError);回测行情全程不复权,跨除权日动量/均线与聚宽系统性发散(adj_factor 已在数据中,jq_shim.py:57-78 有可搬实现) | 兼容面 | 策略内 `history(10, '1d', 'close', fq='pre')` | P1 | 是 |
-| G16 | **阻塞**:order_target_percent 未注入沙箱(NameError);get_trade_days/get_index_stocks 有实现未注入 | 兼容面 | 策略内调 order_target_percent | P1 | 是 |
-| G17 | run_monthly 负数 monthday(月末倒数)静默永不触发;run_daily 具体时刻('14:50')一律归 open 桶,尾盘委托语义丢失 | 兼容面 | run_monthly(fn, monthday=-1) | P2 | 否 |
-| G18 | JQ 路径无公司行为处理(Engine 路径有 _apply_corporate_actions,两路径除权日 NAV 分叉);涨跌停判定未按交易所 tick 取整(pre_close=3.63 涨停价应 3.99,现判定 3.993 → 涨停价买入放行);停牌/退市持仓按 avg_cost 估值,亏损头寸冻结、长回测虚高 | 回测正确性 | 构造含 adj_factor 跳变/3.63→3.99 用例;退市票 3 年回测 | P1 | 是(长回测 NAV 失真) |
-| G19 | 默认值偏离聚宽:history field='close'(JQ 'avg')、history skip_paused=True(JQ False)、attribute_history fields 单列(JQ 六字段);夏普为几何口径(聚宽算术×250);默认费率/滑点低于聚宽默认(无 preset) | 兼容面/回测正确性 | 对照 jqdatasdk api.py 签名 | P2 | 否(对账时需注意) |
-| G20 | get_fundamentals(q, date='2025-08-01' 字符串) 崩(min(str,date) TypeError,应先 fromisoformat);get_current_data ST 股 high_limit 显示 ±10% 而撮合实际 ±5%;Engine 整单拒单 vs jqapi 截量成交,同策略两路径不可比;is_st 全期恒定不随戴帽/摘帽变化 | 兼容面/回测正确性 | get_fundamentals(q, date='2025-08-01') | P2 | 否 |
+> G15/G16/G17/G18/G20(前三项) 已修复并锁定测试；G19 为**口径差异**（刻意保留
+> 部分偏离），G20(d) `is_st` 全期恒定仍开放（需数据层先加 ST 变更历史，见文末）。
+
+| 编号 | 现象 | 状态 | 锁定测试 |
+|---|---|---|---|
+| G15 | **阻塞**:get_price/history/attribute_history 无 `fq` 参数(传 fq='pre' 直接 TypeError);回测行情全程不复权,跨除权日动量/均线与聚宽系统性发散 | **已闭环**:三个 API 均支持 `fq=None/'pre'/'post'`(默认 'pre'，与聚宽一致)；复权只作用于价格字段(open/high/low/close/pre_close/avg)，量额不缩放。`pre` 以**今日**复权因子为基准归一，跨除权日序列连续 | `test_backtest_defect_fixes.py::test_history_fq_pre_adjusts_across_ex_dividend` / `::test_fq_param_accepted_on_all_three_data_apis` |
+| G16 | **阻塞**:order_target_percent 未注入沙箱(NameError);get_trade_days/get_index_stocks 有实现未注入 | **已闭环**:四个 API 全部注入。`get_trade_days` 用回测自身日历(与引擎推进一致)；`get_index_stocks` 走 index_cons 表且成分表缺失时抛**可操作**的 DataError(绝不静默返回空) | `::test_order_target_percent_injected_and_targets_percent_of_portfolio` / `::test_get_trade_days_uses_backtest_calendar` |
+| G17 | run_monthly 负数 monthday(月末倒数)静默永不触发;run_daily 具体时刻('14:50')一律归 open 桶 | **已闭环**(且比原描述更严重)：'14:50' 原先被解析成「每月第 4 个交易日」；现调度键加 `d:` 前缀区分，非法时刻显式报错；`monthday<0` 按整月长度取倒数；尾盘时刻(>=14:30)归 close 桶 | `::test_run_daily_with_clock_time_stays_daily` / `::test_run_daily_invalid_time_raises` / `::test_run_monthly_negative_monthday_fires_on_last_trading_day` |
+| G18 | JQ 路径无公司行为处理；涨跌停未按 tick 取整；停牌/退市持仓按 avg_cost 估值 | **已闭环**：(a) JQ 路径补 `_apply_corporate_actions`，两路径拆股日净值一致；(b) 涨跌停改为 `InstrumentRules.limit_up/limit_down`，按 tick 取整(股票 0.01/基金 0.001)，前收 3.63 涨停价 = 3.99；(c) 停牌估值早已用最近可见收盘价(原描述已过时)，**退市**改为按残值核销(默认 0)且退市日起不可再交易 | `::test_jq_path_applies_corporate_actions` / `::test_jq_path_engine_path_agree_on_split_nav` / `::test_limit_up_price_is_tick_rounded_and_rejects_fill` / `::test_delisted_position_is_written_off_not_frozen` |
+| G19 | 默认值偏离聚宽(history field/skip_paused/attribute_history fields、夏普口径、默认费率滑点) | **部分闭环**：默认滑点改为读规则表(单一真源，见下方 D9)；`skip_paused` 保持 True —— 这是 G5 的正确修复方向(按**交易**窗口前推)，刻意不与聚宽 False 对齐。夏普保持几何口径(selfcheck 锁定)。其余差异属**口径差异非缺陷**，对账时按此表校正 | `::test_yaml_slippage_config_is_live` |
+| G20 | get_fundamentals 字符串 date 崩；get_current_data ST high_limit 与撮合不一致；两路径拒单口径不可比；is_st 全期恒定 | **已闭环(前三项)**：(a) date 先 `fromisoformat` 归一，字符串/date/None 全部可用；(b) `_SecData` 的 high_limit/low_limit 与撮合同源(ST 显示 10.5/9.5)；(c) 资金不足口径提为显式配置 `EngineConfig.insufficient_cash`(reject=券商/backtrader,truncate=聚宽)，两路径差异由**配置**表达而非偶然实现分歧。(d) is_st 全期恒定仍开放 —— security 表无 ST 变更日期维度，需数据层新增 st_history 后接线 | `::test_get_fundamentals_string_date_does_not_crash` / `::test_get_current_data_st_limit_matches_matching_rule` / `::test_insufficient_cash_modes_are_explicit_and_documented` |
+
+### 2026-10-02 引擎正确性复审新增
+
+| 编号 | 现象 | 修复 | 锁定测试 |
+|---|---|---|---|
+| D1 | **除权日新建仓只建到 1/ratio 仓位**：挂单缩放逻辑嵌在「遍历持仓」循环内，除权日还没持仓 → 永不执行(ratio=1.3 时 100% 目标只成交 76.8%)；日频次日自愈，周频/月频一直错 | 缩放改为按「今日因子 vs 昨日因子」对所有标的计算 ratio，再分别作用于持仓与挂单 | `test_backtest_defect_fixes.py::test_ex_dividend_entry_not_undersized` |
+| D2 | 清仓单向下取整到整手，**零股永远卖不掉**(10 送 9 后剩 11.11 股) | `Order.allow_odd_lot` + `Broker._max_qty` 放行清仓零股(A 股规则要求零股一次性卖出) | `::test_full_liquidation_sells_odd_lot` |
+| D3 | T+N 用**自然日**：周五买入 T+2 周一就「到期」，T+5 类锁定系统性偏松 | `Account.available_at` 支持交易日序号表，引擎按交易日算 | `::test_t_plus_n_uses_trading_days_not_calendar_days` |
+| D4 | ST 涨跌幅一律 5%：创业板/科创板 ST 实际仍 20%、北交所 ST 仍 30% | `PriceLimit.st_by_board`，按板块取值 | `::test_st_price_limit_is_per_board_not_always_5pct` |
+| D5 | ETF 涨跌停一律 10%：科创/创业板 ETF 实际 20%(`by_track_index` 声明了但无人传参) | 代码段/代码显式登记(yaml `by_code_prefix`/`by_code`)，并支持 meta 注入跟踪指数 | `::test_etf_price_limit_resolved_by_code_not_always_10pct` |
+| D6 | 原生 Engine 路径**从不注入** is_st/fund_type：ST 按 10%、QDII/黄金/债券 ETF 按 T+1 | 两条路径共用 `security_meta` 模块；fund_type 按名称关键字推断(yaml 可配) | `::test_native_engine_injects_security_meta` / `::test_etf_t0_inferred_from_name_for_gold_and_qdii` |
+| D7 | `exceptions.no_price_limit_on`(IPO 首日/复牌首日/ST 变更日)载入后无人读 | `InstrumentRules.no_price_limit` → `limit_up/down` 返回 None，broker 跳过涨跌停校验 | `::test_no_price_limit_flag_disables_limit_check` |
+| D8 | 印花税只配了 2008-09-19 之后，且**恒为单边**：早期回测要么崩、要么成本低估一半 | 补全 2000 年起历史区间 + **买卖方向**维度(2008-09-19 起才单边)；早年区间不再抛 RuleNotFound | `::test_stamp_duty_history_covers_both_sides_and_2023_cut` |
+| D9 | `config/rules/cn_a_share.yaml` 的 `slippage` 是死配置(写 2bp，实际用代码里硬编码的 5bp) | 规则表成为滑点唯一真源(Engine 与 JQ 路径同源)；配置值校准为实际生效的 5bp | `::test_yaml_slippage_config_is_live` |
+| D10 | `attribute_history(fields='close')` 把字符串拆成 `['c','l','o','s','e']` 再抛迷惑的 `KeyError('close')` | 字符串按单字段处理(与 `history` 一致) | `::test_attribute_history_string_fields_not_split_into_chars` |
+| D11 | 基本面查询 DSL 的 `表.字段 == 值`(聚宽惯用)退化成 Python bool，抛 `'bool' object has no attribute 'column'` | `Query.filter` 对非条件对象给出**可操作报错**引导到 `.in_([...])`；不重载 `Column.__eq__`(Column 是 dict/set 键，重载会破坏缓存查找) | `::test_fundamentals_filter_rejects_non_condition_with_clear_error` |
+| D12 | `volume==0` 与「停牌」混用同一个 `halted` 标记，拒单 reason 一律写「停牌或无行情」—— 归因错误导致「为什么没成交」永远查不清 | `Bar.no_volume` 独立标记，零成交日记「无成交量」、真停牌仍记 `suspended`/「停牌或无行情」；`_synth_bar` 透传该标记 | `::test_zero_volume_day_rejected_with_accurate_reason` / `::test_suspended_day_keeps_suspended_reason` |
+| D13 | **无限价单**：`Order.limit_price` 字段存在但撮合从未读取（设了限价仍按市价成交）；JQ 沙箱里也没有 `LimitOrder`/`MarketOrder` style 对象 | 撮合按限价判定：以**不含滑点**的基准价判断是否可成交，成交价封顶/保底到限价（限价单绝不成交在更差价位）；当日有效（A 股默认）不成交即作废。沙箱注入 `MarketOrder`/`LimitOrder`，`order`/`order_value`/`order_target`/`order_target_value`/`order_target_percent` 全部支持 `style=` | `::test_limit_order_not_filled_when_price_worse_than_limit` / `::test_limit_order_fills_at_limit_or_better` / `::test_jq_limit_order_style_is_available_and_honored` |
+
+### 仍未闭环（需要数据层先动，非回测模块可独立修）
+
+| 编号 | 现象 | 为什么本轮没修 | 建议 |
+|---|---|---|---|
+| G20d | `is_st` 全期恒定：不随戴帽/摘帽变化，ST 剔除与 5% 涨跌停判定在整段回测里用同一个值 | `security` 表只有一列 `is_st BOOLEAN`（每标的单行），**没有日期维度也没有 st_history 表** —— 回测模块拿不到「某日是否 ST」，无法在不猜数据的前提下修 | 数据层新增 `st_history(symbol, eff_date, is_st, source)`；回测侧接线点已经就绪(`build_rules(meta=...)` 已支持 per-instrument `is_st`，只需改成按日查询) |
+| L5 | 交叉引擎对照无测试：`adapter.py` 零注册、零调用方 | 需要接第三方引擎(vectorbt/RQAlpha)且放开 pip 依赖 | 见 `docs/BACKTEST_VALIDATION.md` L5 节；**另注意** backtrader 对账现有 2 个 FAIL 仍是未通过项 |
+| L6 | 回测 vs 模拟盘对账无测试 | 需要先对齐 `PaperBroker`（第三套独立撮合实现）的公司行为/退市/tick 取整语义，否则对账无法归因 | 见 `docs/BACKTEST_VALIDATION.md` L6 节 |
+| B5 | 参数扫描未向量化：`/api/backtests/sweep` 端点已在，但仍逐档调用事件引擎 | 属性能工程，不影响正确性 | 见 `docs/BACKTEST_ENGINES.md` 行动项 |
+
 
 ## 人工补注
 

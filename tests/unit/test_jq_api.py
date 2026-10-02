@@ -484,14 +484,8 @@ def trade(context):
 
 # ---------- 涨跌停按板块参数化锁定（rules/model.py × cn_a_share.yaml） ----------
 
-_BOARD_LIMITS = [
-    pytest.param("600000.SH", 0.10, id="main-10pct"),
-    pytest.param("300001.SZ", 0.20, id="gem-20pct"),
-    pytest.param("688001.SH", 0.20, id="star-20pct"),
-    pytest.param("830001.BJ", 0.30, id="bse-30pct"),
-]
-_ST_LIMIT = 0.05
-_LIMITS = {"600000.SH": 0.10, "300001.SZ": 0.20, "688001.SH": 0.20, "830001.BJ": 0.30}
+# ST 的涨跌幅不是一律 5%：只有主板 ST 是 5%，创业板/科创板 ST 仍 20%，
+# 北交所 ST 仍 30%（板块本身的涨跌幅不因 ST 而收窄）。见下方参数化用例。
 
 
 def _limit_bars(symbol: str, limit: float, *, touched: bool) -> pl.DataFrame:
@@ -518,33 +512,37 @@ def trade(context):
 '''
 
 
-def _run_limit_case(symbol: str, *, is_st: bool, touched: bool):
+def _run_limit_case(symbol: str, *, limit: float, is_st: bool, touched: bool):
     code = f"g.sym = {symbol!r}\n" + _BUY_CODE
     meta = {symbol: {"is_st": True}} if is_st else None
     runner = JQRunner(code, initial_cash=1_000_000, security_meta=meta)
-    return runner.run(_limit_bars(symbol, _ST_LIMIT if is_st else _LIMITS[symbol],
-                                  touched=touched))
+    return runner.run(_limit_bars(symbol, limit, touched=touched))
 
 
-@pytest.mark.parametrize("symbol,limit", _BOARD_LIMITS + [
-    pytest.param("600000.SH", _ST_LIMIT, id="main-st-5pct"),
-    pytest.param("300001.SZ", _ST_LIMIT, id="gem-st-5pct"),
-    pytest.param("688001.SH", _ST_LIMIT, id="star-st-5pct"),
-    pytest.param("830001.BJ", _ST_LIMIT, id="bse-st-5pct"),
+@pytest.mark.parametrize("symbol,limit,is_st", [
+    pytest.param("600000.SH", 0.10, False, id="main-10pct"),
+    pytest.param("300001.SZ", 0.20, False, id="gem-20pct"),
+    pytest.param("688001.SH", 0.20, False, id="star-20pct"),
+    pytest.param("830001.BJ", 0.30, False, id="bse-30pct"),
+    pytest.param("600000.SH", 0.05, True, id="main-st-5pct"),
+    pytest.param("300001.SZ", 0.20, True, id="gem-st-20pct"),
+    pytest.param("688001.SH", 0.20, True, id="star-st-20pct"),
+    pytest.param("830001.BJ", 0.30, True, id="bse-st-30pct"),
 ])
-def test_price_limit_by_board_rejects_at_limit_and_fills_below(symbol, limit):
+def test_price_limit_by_board_rejects_at_limit_and_fills_below(symbol, limit, is_st):
     """恰好触板（open=pre_close×(1+limit)）拒单；×0.99 板内成交。
 
-    ST 格通过 security_meta 注入 is_st=True（5% 板对全板块生效）。
+    ST 通过 security_meta 注入 is_st=True。ST 只在主板收窄到 5%，
+    创业板/科创板仍是 20%、北交所仍是 30%（板块涨跌幅不因 ST 收窄）。
     """
     # 触板 → 拒单
-    res = _run_limit_case(symbol, is_st=(limit == _ST_LIMIT), touched=True)
+    res = _run_limit_case(symbol, limit=limit, is_st=is_st, touched=True)
     assert res.error is None, res.error
     assert res.trades == [], f"{symbol} 触板不应成交: {res.trades}"
     assert [r for r in res.rejected if "涨停" in r[2]], \
         f"{symbol} 预期涨停拒单，实际 {res.rejected}"
 
     # 板内 → 成交
-    res = _run_limit_case(symbol, is_st=(limit == _ST_LIMIT), touched=False)
+    res = _run_limit_case(symbol, limit=limit, is_st=is_st, touched=False)
     assert res.error is None, res.error
     assert len(res.trades) == 1, f"{symbol} 板内应成交: {res.trades} {res.rejected}"

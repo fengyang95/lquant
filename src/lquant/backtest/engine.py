@@ -21,8 +21,9 @@ from lquant.backtest.account import Account
 from lquant.backtest.broker import Broker
 from lquant.backtest.events import Bar, Fill, Order, OrderStatus, Side
 from lquant.backtest.metrics import perf_from_returns, turnover_from_trades
-from lquant.backtest.rules.loader import load_ruleset
+from lquant.backtest.rules.loader import default_slippage, load_ruleset
 from lquant.backtest.rules.model import InstrumentRules, RuleSet
+from lquant.backtest.security_meta import load_security_meta, merge_meta
 from lquant.backtest.slippage import make_slippage
 from lquant.backtest.strategy.base import Context, Strategy
 from lquant.core.types import parse_symbol
@@ -41,6 +42,11 @@ class EngineConfig:
     max_position_weight: float = 1.0        # 单标的最大权重
     cash_buffer: float = 0.001              # 留一点现金，避免全额买满后无法扣费
     min_order_value: float = 1000.0         # 小于此金额的委托不下单
+    # 退市残值率：退市股按最后可见收盘价 × 该比例一次性核销（0 = 全额损失，
+    # 保守口径）。不核销会让退市持仓按最后收盘价永久冻结，长回测 NAV 虚高。
+    delist_recovery: float = 0.0
+    # 资金不足口径：reject（真实券商/backtrader）| truncate（聚宽 order_value）
+    insufficient_cash: str = "reject"
 
 
 @dataclass
@@ -71,13 +77,19 @@ class BacktestResult:
 
 
 def build_rules(symbols: list[str], ruleset: RuleSet | None = None,
-                meta: dict[str, dict] | None = None) -> dict[str, InstrumentRules]:
+                meta: dict[str, dict] | None = None,
+                *, with_db_meta: bool = True) -> dict[str, InstrumentRules]:
     """给每个标的生成撮合规则。
 
-    meta 可覆盖 per-instrument 属性（sellable_after_days / fund_type / is_st）。
+    meta 可覆盖 per-instrument 属性（sellable_after_days / fund_type / is_st /
+    track_index_limit / no_price_limit）。缺省时从 security 表读 is_st、
+    退市日、名称（名称用于推断 fund_type → ETF 的 T+0）——
+    这样原生 Engine 路径与 JQ 路径拿到的是同一套 per-instrument 元数据，
+    ST 股不再按 10% 涨跌停、黄金/QDII ETF 不再按 T+1。
     """
     rs = ruleset or load_ruleset()
-    meta = meta or {}
+    base_meta = load_security_meta() if with_db_meta else {}
+    meta = merge_meta(base_meta, meta)
     out = {}
     for s in symbols:
         try:
@@ -90,6 +102,9 @@ def build_rules(symbols: list[str], ruleset: RuleSet | None = None,
             is_st=m.get("is_st", False),
             fund_type=m.get("fund_type"),
             sellable_after_days=m.get("sellable_after_days"),
+            track_index_limit=m.get("track_index_limit"),
+            no_price_limit=m.get("no_price_limit", False),
+            name=m.get("name"),
         )
     return out
 
@@ -99,20 +114,37 @@ class Engine:
 
     def __init__(self, strategy: Strategy, ruleset: RuleSet | None = None,
                  config: EngineConfig | None = None,
-                 slippage=None, meta: dict[str, dict] | None = None) -> None:
+                 slippage=None, meta: dict[str, dict] | None = None,
+                 with_db_meta: bool = True) -> None:
         self.strategy = strategy
         self.ruleset = ruleset or load_ruleset()
         self.cfg = config or EngineConfig()
-        self.slippage = slippage or make_slippage(self.cfg.slippage,
-                                                  **self.cfg.slippage_params)
+        # 滑点默认值来自规则表（cn_a_share.yaml 的 default.slippage），
+        # 不再把成本假设硬编码在代码里；显式 slippage= 仍最高优先。
+        if slippage is not None:
+            self.slippage = slippage
+        else:
+            mode, params = default_slippage(self.ruleset)
+            kind = self.cfg.slippage or mode
+            # 只有「选中的模型 == 规则表配置的模型」时才继承规则表参数 ——
+            # 否则会把 pct 的 rate 塞给 NoSlippage 之类的其它模型。
+            merged = dict(self.cfg.slippage_params)
+            if kind == mode:
+                merged = {**params, **merged}
+            self.slippage = make_slippage(kind, **merged)
         self._meta = meta or {}
+        self._with_db_meta = with_db_meta
         self._rules: dict[str, InstrumentRules] = {}
+        self._meta_resolved: dict[str, dict] = {}
         self.broker: Broker | None = None
         self.account = Account(cash=self.cfg.initial_cash)
         self._pending: list[Order] = []
         self._seq = 0
         self._last_rebal_key: str | None = None
         self._last_factor: dict[str, float] = {}
+        self._date_index: dict[date, int] = {}
+        self._delisted: set[str] = set()
+        self._delist_schedule: dict[str, date] = {}
 
     # ---------- 数据准备 ----------
 
@@ -148,11 +180,14 @@ class Engine:
              | (pl.col("halted").fill_null(False)
                 | (vol.is_not_null() & (vol == 0.0)))).alias("halted"),
             pl.col("is_suspended").fill_null(False).alias("suspended"),
+            (vol.is_not_null() & (vol == 0.0)
+              & ~pl.col("is_suspended").fill_null(False)
+              & ~pl.col("halted").fill_null(False)).alias("no_volume"),
         )
 
         out: dict[date, dict[str, Bar]] = {}
         cols = ["open", "high", "low", "close", "pre_close",
-                "volume", "amount", "adj_factor", "halted", "suspended"]
+                "volume", "amount", "adj_factor", "halted", "suspended", "no_volume"]
         for sub in df.sort([date_col, symbol_col]).partition_by(date_col, as_dict=False):
             d = sub[date_col][0]
             syms = sub[symbol_col].to_list()
@@ -169,6 +204,7 @@ class Engine:
                     adj_factor=float(cvals["adj_factor"][k]),
                     halted=bool(cvals["halted"][k]),
                     suspended=bool(cvals["suspended"][k]),
+                    no_volume=bool(cvals["no_volume"][k]),
                     fields={c: fvals[c][k] for c in fields},
                 )
             out[d] = bars
@@ -183,11 +219,22 @@ class Engine:
             return BacktestResult()
 
         symbols = sorted({s for b in bars_by_day.values() for s in b})
-        self._rules = build_rules(symbols, self.ruleset, self._meta)
-        self.broker = Broker(self._rules, self.slippage, price_mode=self.cfg.price_mode)
+        self._meta_resolved = merge_meta(
+            load_security_meta() if self._with_db_meta else {}, self._meta)
+        self._rules = build_rules(symbols, self.ruleset, self._meta_resolved,
+                                  with_db_meta=False)
+        self.broker = Broker(self._rules, self.slippage, price_mode=self.cfg.price_mode,
+                             insufficient_cash=self.cfg.insufficient_cash)
         self.account = Account(cash=self.cfg.initial_cash)
         self._last_factor = {}
         self._last_close: dict[str, float] = {}   # 每只股票最近一次有 bar 的 close
+        # 交易日序号：T+N 可卖约束按**交易日**算，不是自然日
+        self._date_index = {d: i for i, d in enumerate(dates)}
+        self._delisted = set()
+        # 退市计划预筛：只保留真正有退市日的标的，避免日循环遍历全量元数据
+        self._delist_schedule = {
+            s: m["delist_date"] for s, m in self._meta_resolved.items()
+            if m.get("delist_date") is not None}
         # 多次 run() 必须从干净状态开始：调仓周期标记、订单序号与残留挂单都重置，
         # 否则第二次 run 会因周期 key 相同而跳过首个调仓日，或把上一次 run 的
         # PARTIAL 残单在首日撮合（结果静默错位）。
@@ -207,6 +254,9 @@ class Engine:
                     self._last_factor[s] = b.adj_factor
                 # 停牌估值口径：记录每只股票最近一次有 bar 的 close
                 self._last_close[s] = b.close
+
+            # 0b) 退市核销：退市日当天把持仓按残值率变现，不再按最后收盘价冻结
+            self._apply_delistings(d, res)
 
             # 1) 撮合上一日挂单（用今日开盘价，防未来函数）
             if self._pending:
@@ -237,26 +287,71 @@ class Engine:
 
         数据层只提供后复权因子（无分红现金金额），因此采用份额调整法 ——
         等价于假设分红全部再投资。停牌日无 bar 不调整，复牌后按累计因子比一次性补齐。
+
+        关键：**挂单也要按同一比例调整，且与是否已持仓无关**。除权日新建仓时
+        持仓还是空的，若把挂单调整嵌在「遍历持仓」循环里就永远不会执行 ——
+        当日买入量会少买 1/ratio（ratio=1.3 时只建到 77% 仓位），
+        日频调仓次日自愈，周频/月频策略会一直错。
         """
         assert self.broker is not None
-        for sym, pos in self.account.positions.items():
-            if pos.qty <= 0:
-                continue
-            bar = bars.get(sym)
-            if bar is None:
+        ratios: dict[str, float] = {}
+        for sym, bar in bars.items():
+            if bar.adj_factor <= 0:
                 continue
             prev = self._last_factor.get(sym, bar.adj_factor)
-            if prev <= 0 or bar.adj_factor <= 0:
+            if prev <= 0:
                 continue
             ratio = bar.adj_factor / prev
             if abs(ratio - 1.0) > 1e-12:
-                self.account.apply_corporate_action(sym, ratio)
-                # 待成交挂单同步按比例调整股数（券商对存量委托的除权调整语义）：
-                # 送股后按旧股数撮合会偏离目标仓位，缩股则可能超额卖出。
-                for o in self._pending:
-                    if o.symbol == sym:
-                        o.qty *= ratio
-                        o.filled_qty *= ratio
+                ratios[sym] = ratio
+        if not ratios:
+            return
+        for sym, ratio in ratios.items():
+            self.account.apply_corporate_action(sym, ratio)
+            # 待成交挂单同步按比例调整股数（券商对存量委托的除权调整语义）：
+            # 送股后按旧股数撮合会偏离目标仓位，缩股则可能超额卖出。
+            for o in self._pending:
+                if o.symbol == sym:
+                    o.qty *= ratio
+                    o.filled_qty *= ratio
+
+    def _is_delisted(self, sym: str, d: date) -> bool:
+        """该标的是否已到退市日（到了就不可再买入）。"""
+        m = self._meta_resolved.get(sym)
+        if not m:
+            return False
+        delist = m.get("delist_date")
+        return delist is not None and d >= delist
+
+    def _apply_delistings(self, d: date, res: BacktestResult) -> None:
+        """退市核销：退市日起把持仓按残值变现，避免按最后收盘价永久冻结。
+
+        不做核销时，退市股会一直以最后可见收盘价计入 NAV —— 亏损头寸永远
+        不实现，长区间回测的净值系统性虚高（幸存者偏差的另一种形态）。
+
+        只遍历**有退市日**的标的（`_delist_schedule` 预筛）。若直接遍历全量
+        元数据，5000 标的 × 千日会给日循环白加数百万次无用迭代。
+        """
+        if not self._delist_schedule:
+            return
+        for sym, delist in self._delist_schedule.items():
+            if d < delist or sym in self._delisted:
+                continue
+            self._delisted.add(sym)
+            pos = self.account.positions.get(sym)
+            if pos is None or pos.qty <= 0:
+                # 退市日尚无持仓：挂单**不在这里清理** —— 留给 _fill_pending 按
+                # 「已退市」明确拒单并记账。静默丢弃挂单等于让策略少一笔委托。
+                continue
+            # 平仓后未成交的挂单作废（已无持仓可卖）
+            self._pending = [o for o in self._pending if o.symbol != sym]
+            px = self._last_close.get(sym) or pos.avg_cost
+            proceeds = pos.qty * px * float(self.cfg.delist_recovery)
+            self.account.cash += proceeds
+            res.rejected.append((str(d), sym,
+                                 f"退市核销 qty={pos.qty:.0f} 残值率={self.cfg.delist_recovery}"))
+            pos.qty = 0.0
+            pos.lots = []
 
     # ---------- 撮合 ----------
 
@@ -270,6 +365,12 @@ class Engine:
                 order.reason = "无行情"
                 res.rejected.append((str(d), order.symbol, order.reason))
                 continue
+            if self._is_delisted(order.symbol, d):
+                # 退市后不可交易：否则会在已核销的标的上重新建仓
+                order.status = OrderStatus.REJECTED
+                order.reason = "已退市"
+                res.rejected.append((str(d), order.symbol, order.reason))
+                continue
             if bar.suspended:
                 order.status = OrderStatus.REJECTED
                 order.reason = "suspended"
@@ -277,7 +378,9 @@ class Engine:
                 continue
             if bar.halted:
                 order.status = OrderStatus.REJECTED
-                order.reason = "停牌或无行情"
+                # 零成交与停牌都不可成交，但归因必须分开 —— 否则「为什么没成交」
+                # 永远查不清（零成交是流动性问题，不是停牌）
+                order.reason = "无成交量" if bar.no_volume else "停牌或无行情"
                 res.rejected.append((str(d), order.symbol, order.reason))
                 continue
             # 成交量约束：单只最多吃掉 participation 比例的当日成交量
@@ -325,10 +428,11 @@ class Engine:
         orders: list[Order] = []
         planned_proceeds = 0.0     # 本轮卖出在 T+1 释放的资金（按 T 收盘价预估）
 
-        def _plan_sell(sym: str, qty: float, px: float) -> None:
+        def _plan_sell(sym: str, want: float, px: float) -> None:
             nonlocal planned_proceeds
+            qty, odd_ok = self._sell_qty(sym, want, d)
             if qty > 0:
-                orders.append(self._order(sym, Side.SELL, qty))
+                orders.append(self._order(sym, Side.SELL, qty, allow_odd_lot=odd_ok))
                 planned_proceeds += qty * px
 
         # 先卖（减仓 + 清仓都必须在买单之前 —— 换仓时新买单依赖旧持仓的卖出资金）
@@ -345,7 +449,7 @@ class Engine:
                 if abs(delta_value) < self.cfg.min_order_value:
                     continue
                 if delta_value < 0:
-                    _plan_sell(sym, self._sell_qty(sym, -delta_value / px, d), px)
+                    _plan_sell(sym, -delta_value / px, px)
         # 清仓：不在买入目标里的持仓（含显式 w<=0 的清仓目标）
         buy_set = {s for s, _ in targets}
         for sym, pos in self.account.positions.items():
@@ -354,7 +458,7 @@ class Engine:
             px = prices.get(sym)
             if px is None or px <= 0:
                 continue
-            _plan_sell(sym, self._sell_qty(sym, pos.qty, d), px)
+            _plan_sell(sym, pos.qty, px)
         # 后买：现金 + 卖出释放的预期资金（A 股卖出资金当日可用，
         # 与聚宽「先卖后买」撮合语义一致）。买与卖都在 T+1 开盘成交，
         # 两边按同一开盘价缩放，预估缺口只在「现金残余 × 跳空幅度」量级。
@@ -389,6 +493,11 @@ class Engine:
                     o.reason = "无行情"
                     res.rejected.append((str(d), o.symbol, o.reason))
                     continue
+                if self._is_delisted(o.symbol, d):
+                    o.status = OrderStatus.REJECTED
+                    o.reason = "已退市"
+                    res.rejected.append((str(d), o.symbol, o.reason))
+                    continue
                 if bar.suspended:
                     o.status = OrderStatus.REJECTED
                     o.reason = "suspended"
@@ -396,7 +505,7 @@ class Engine:
                     continue
                 if bar.halted:
                     o.status = OrderStatus.REJECTED
-                    o.reason = "停牌或无行情"
+                    o.reason = "无成交量" if bar.no_volume else "停牌或无行情"
                     res.rejected.append((str(d), o.symbol, o.reason))
                     continue
                 max_qty = bar.volume * self.cfg.participation if bar.volume > 0 else None
@@ -408,15 +517,25 @@ class Engine:
                     self.account.apply_fill(f)
                     res.trades.append(f)
 
-    def _sell_qty(self, sym: str, want: float, d: date) -> float:
-        """T+N 约束下能卖的最大数量。"""
+    def _sell_qty(self, sym: str, want: float, d: date) -> tuple[float, bool]:
+        """T+N 约束下能卖的最大数量，以及是否属于「清仓」（允许卖零股）。
+
+        返回 (qty, allow_odd_lot)。A 股规则是零股必须一次性全部卖出，
+        所以清仓时不做整手取整，否则 10 送 9 之后剩的 11.11 股会永远卖不掉。
+        """
         pos = self.account.positions.get(sym)
         if pos is None or pos.qty <= 0:
-            return 0.0
+            return 0.0, False
         rules = self._rules.get(sym)
-        avail = pos.available_at(d, rules) if rules else pos.available_qty
+        avail = (pos.available_at(d, rules, self._date_index) if rules
+                 else pos.available_qty)
         qty = min(want, pos.qty, avail)
-        return self._round_lot(sym, qty, floor=True)
+        if qty <= 0:
+            return 0.0, False
+        if qty >= pos.qty - 1e-9:
+            # 全量卖出：零股一次性卖出，不取整
+            return qty, True
+        return self._round_lot(sym, qty, floor=True), False
 
     def _round_lot(self, sym: str, qty: float, floor: bool = True) -> float:
         lot = self._rules.get(sym).lot_size if sym in self._rules else 100
@@ -424,9 +543,11 @@ class Engine:
             return qty
         return (qty // lot) * lot if floor else math.ceil(qty / lot) * lot
 
-    def _order(self, sym: str, side: Side, qty: float) -> Order:
+    def _order(self, sym: str, side: Side, qty: float,
+               allow_odd_lot: bool = False) -> Order:
         self._seq += 1
-        return Order(order_id=f"o{self._seq}", symbol=sym, side=side, qty=float(qty))
+        return Order(order_id=f"o{self._seq}", symbol=sym, side=side, qty=float(qty),
+                     allow_odd_lot=allow_odd_lot)
 
     # ---------- 调仓频率 ----------
 

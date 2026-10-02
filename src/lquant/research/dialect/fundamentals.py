@@ -109,6 +109,14 @@ def _norm(name: str) -> str:
 
 @dataclass(frozen=True)
 class Column:
+    """表字段。
+
+    注意：Column 被当作 dict/set 的键使用（fin_cache/val_cache、列集合去重），
+    因此**不能**重载 __eq__（返回条件对象会让 `col in dict` / `col in list`
+    全部误判为真）。聚宽的 `==` 过滤写法由 Query.filter 给出明确报错引导到
+    `.in_([...])`，见下。
+    """
+
     table: str
     name: str
 
@@ -152,6 +160,15 @@ class Query:
     limit_n: int | None = None
 
     def filter(self, *conds: _Cond) -> Query:
+        # 宁可明确失败：非条件对象（聚宽惯用的 `表.字段 == 值` 会退化成 Python
+        # bool）一律给出可操作的报错，而不是让下游抛
+        # 「'bool' object has no attribute 'column'」这种迷惑错误。
+        for c in conds:
+            if not isinstance(c, _Cond):
+                raise TypeError(
+                    "filter() 需要条件对象：本 DSL 用 `表.字段.in_([值])` 表达等于，"
+                    "例如 valuation.code.in_(['600000.SH'])；"
+                    f"收到 {type(c).__name__}({c!r})")
         return replace(self, conds=self.conds + tuple(conds))
 
     def order_by(self, col: Column, ascending: bool = True) -> Query:
