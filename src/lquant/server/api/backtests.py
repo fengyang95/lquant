@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from lquant.backtest.engine import Engine, EngineConfig
 from lquant.backtest.strategy.factor_topn import FactorTopNStrategy
-from lquant.backtest.sweep import SweepSpec, run_sweep
+from lquant.backtest.sweep import VECTOR_AUTO_MIN_POINTS, SweepSpec, run_sweep_auto
 from lquant.core.db import reader, writer
 from lquant.data.store.parquet import read_daily
 from lquant.server.jobs import enqueue, get_job
@@ -248,26 +248,41 @@ class SweepIn(BaseModel):
     rebalance: str = Field(default="monthly", pattern="^(daily|weekly|monthly|none)$")
     initial_cash: float = Field(default=1_000_000, gt=0)
     start: str = Field(default="2026-01-01", pattern=r"^\d{4}-\d{2}-\d{2}$")
+    # auto：小网格走事件引擎（真源），大网格自动切 Polars 向量化近似快扫（只筛参数）
+    engine: str = Field(default="auto", pattern="^(auto|event|vector)$")
     tag: str | None = None
+
+
+def _resolve_sweep_engine(engine: str, n_points: int) -> str:
+    """解析 sweep 实际引擎：auto 时档数 ≥ 阈值走向量化近似快扫，否则事件引擎（真源）。"""
+    if engine in ("event", "vector"):
+        return engine
+    return "vector" if n_points >= VECTOR_AUTO_MIN_POINTS else "event"
 
 
 def _run_sweep_job(formula: str, param: str, values: list, cfg: dict,
                    cancel_check=None, progress=None) -> list[dict]:
-    """后台执行体：读数据 → 逐档回测 → 返回网格表（JSON 安全 dict）。
+    """后台执行体：读数据 → 扫参 → 返回网格表（JSON 安全 dict）。
 
+    engine 选择（cfg["engine"]）：event 真源 / vector 向量化近似 / auto 按档数切。
     progress：阶段/逐档进度上报（done = 已完成档数，total = 总档数）。
     """
+    engine = cfg.get("engine", "auto") or "auto"
+    # auto 的解析结果回传前端，便于标注「这一列是近似值」
+    resolved = _resolve_sweep_engine(engine, len(values))
     if progress is not None:
         progress(done=0, total=len(values), phase="读取日线")
     df = read_daily(start=cfg["start"]).collect()
     col = formula.replace("_", "")
     d = _compute_factor(df, formula).drop_nulls([col])
     if progress is not None:
-        progress(done=0, total=len(values), phase="逐档回测")
-    grid = run_sweep(
+        progress(done=0, total=len(values),
+                 phase="向量化快筛" if resolved == "vector" else "逐档回测")
+    grid = run_sweep_auto(
         d, param, values,
         SweepSpec(factor=col, rebalance=cfg["rebalance"],
                   initial_cash=cfg["initial_cash"]),
+        engine=engine,
         strategy_kwargs={"top_n": cfg.get("top_n", 5)},
         cancel_check=cancel_check,
     )
@@ -277,6 +292,7 @@ def _run_sweep_job(formula: str, param: str, values: list, cfg: dict,
         r["value"] = float(r["value"])
         r["rebalance"] = cfg["rebalance"]
         r["param"] = param
+        r["engine"] = resolved
     return rows
 
 
@@ -286,14 +302,16 @@ def run_sweep_api(req: SweepIn) -> dict:
 
     单档数据量小时逐档秒级；这里统一走 jobs 队列（Redis 或本地降级），
     与 /run 现阶段同步执行的口径不同 —— 扫描档数多，不值得占住请求线程。
+    engine=auto 时按档数阈值自动选事件/向量化路径（返回值回传实际选择）。
     """
+    resolved = _resolve_sweep_engine(req.engine, len(req.values))
     cfg = {"formula": req.formula, "param": req.param, "values": list(req.values),
            "rebalance": req.rebalance, "initial_cash": req.initial_cash,
-           "start": req.start, "top_n": req.top_n}
+           "start": req.start, "top_n": req.top_n, "engine": req.engine}
     job = enqueue("lquant-backtest", _run_sweep_job, req.formula, req.param,
                   list(req.values), cfg)
     # 直接用任务 id 当 sweep_id：本地降级（JobRegistry）和 RQ 模式都能 get_job 查到
-    return {"sweep_id": job.id, "status": "queued",
+    return {"sweep_id": job.id, "status": "queued", "engine": resolved,
             "param": req.param, "n_points": len(req.values), "tag": req.tag}
 
 

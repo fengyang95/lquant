@@ -120,8 +120,8 @@ financial_pit 中与"同比/yoy"相关的 DISTINCT item:['indicator.cfps_yoy', '
 
 ### 2026-09-14 双路审查新增(聚宽兼容面 + 引擎正确性) —— 2026-10-02 收口
 
-> G15/G16/G17/G18/G20(前三项) 已修复并锁定测试；G19 为**口径差异**（刻意保留
-> 部分偏离），G20(d) `is_st` 全期恒定仍开放（需数据层先加 ST 变更历史，见文末）。
+> G15/G16/G17/G18/G20(全部四项) 已修复并锁定测试；G19 为**口径差异**（刻意保留
+> 部分偏离）。其余开放项见文末「仍未闭环」表。
 
 | 编号 | 现象 | 状态 | 锁定测试 |
 |---|---|---|---|
@@ -147,17 +147,20 @@ financial_pit 中与"同比/yoy"相关的 DISTINCT item:['indicator.cfps_yoy', '
 | D9 | `config/rules/cn_a_share.yaml` 的 `slippage` 是死配置(写 2bp，实际用代码里硬编码的 5bp) | 规则表成为滑点唯一真源(Engine 与 JQ 路径同源)；配置值校准为实际生效的 5bp | `::test_yaml_slippage_config_is_live` |
 | D10 | `attribute_history(fields='close')` 把字符串拆成 `['c','l','o','s','e']` 再抛迷惑的 `KeyError('close')` | 字符串按单字段处理(与 `history` 一致) | `::test_attribute_history_string_fields_not_split_into_chars` |
 | D11 | 基本面查询 DSL 的 `表.字段 == 值`(聚宽惯用)退化成 Python bool，抛 `'bool' object has no attribute 'column'` | `Query.filter` 对非条件对象给出**可操作报错**引导到 `.in_([...])`；不重载 `Column.__eq__`(Column 是 dict/set 键，重载会破坏缓存查找) | `::test_fundamentals_filter_rejects_non_condition_with_clear_error` |
+| D15 | **涨跌停阈值有第四份重复实现**：`server/api/market.py::_limit_threshold` 硬编码「300/301/688/689→20%，43/83/87/92→30%，其余→10%」，漏了主板 ST 的 5% 与 ETF 跟踪指数 —— 涨跌停家数（市场宽度）系统性偏差 | 改为复用 `build_rules`（与回测/模拟盘同一份规则表），并按当日 `is_st` 切换；`is_st` 列缺失时补 null（老湖/合成湖不再让接口退化成 None）。实测 2026-09-04（当日 1843 只 ST）：涨停 46→**51**、跌停 17→**14** | `tests/unit/test_api_cov_market.py::test_limit_ratio_map_by_board_and_st` |
 | D12 | `volume==0` 与「停牌」混用同一个 `halted` 标记，拒单 reason 一律写「停牌或无行情」—— 归因错误导致「为什么没成交」永远查不清 | `Bar.no_volume` 独立标记，零成交日记「无成交量」、真停牌仍记 `suspended`/「停牌或无行情」；`_synth_bar` 透传该标记 | `::test_zero_volume_day_rejected_with_accurate_reason` / `::test_suspended_day_keeps_suspended_reason` |
 | D13 | **无限价单**：`Order.limit_price` 字段存在但撮合从未读取（设了限价仍按市价成交）；JQ 沙箱里也没有 `LimitOrder`/`MarketOrder` style 对象 | 撮合按限价判定：以**不含滑点**的基准价判断是否可成交，成交价封顶/保底到限价（限价单绝不成交在更差价位）；当日有效（A 股默认）不成交即作废。沙箱注入 `MarketOrder`/`LimitOrder`，`order`/`order_value`/`order_target`/`order_target_value`/`order_target_percent` 全部支持 `style=` | `::test_limit_order_not_filled_when_price_worse_than_limit` / `::test_limit_order_fills_at_limit_or_better` / `::test_jq_limit_order_style_is_available_and_honored` |
 
-### 仍未闭环（需要数据层先动，非回测模块可独立修）
+| D14 | **G20d `is_st` 全期恒定**：不随戴帽/摘帽变化，ST 剔除与 5% 涨跌停判定整段回测用同一个值。而 `security.is_st` **全表 0 行为 True** → 原生路径实际完全没做 ST 处理 | 改为读**日线湖逐日的 `is_st`**（baostock `isST`，已入库）：`Bar.is_st` 逐日携带，`InstrumentRules.limit_up/limit_down/limit_ratio(is_st=...)` 按当日覆盖，`Broker` 与 `_SecData` 均以当日值为准，`None` 才退回 `security` 表静态值。**无需新建 st_history 表——数据早就在每日 bar 里** | `::test_per_day_is_st_drives_limit_price_not_static_flag` / `::test_is_st_flip_mid_backtest_changes_limit` / `::test_get_current_data_is_st_is_per_day` |
+
+### 仍未闭环（需要数据层或外部依赖先动，非回测模块可独立修）
 
 | 编号 | 现象 | 为什么本轮没修 | 建议 |
 |---|---|---|---|
-| G20d | `is_st` 全期恒定：不随戴帽/摘帽变化，ST 剔除与 5% 涨跌停判定在整段回测里用同一个值 | `security` 表只有一列 `is_st BOOLEAN`（每标的单行），**没有日期维度也没有 st_history 表** —— 回测模块拿不到「某日是否 ST」，无法在不猜数据的前提下修 | 数据层新增 `st_history(symbol, eff_date, is_st, source)`；回测侧接线点已经就绪(`build_rules(meta=...)` 已支持 per-instrument `is_st`，只需改成按日查询) |
-| L5 | 交叉引擎对照无测试：`adapter.py` 零注册、零调用方 | 需要接第三方引擎(vectorbt/RQAlpha)且放开 pip 依赖 | 见 `docs/BACKTEST_VALIDATION.md` L5 节；**另注意** backtrader 对账现有 2 个 FAIL 仍是未通过项 |
-| L6 | 回测 vs 模拟盘对账无测试 | 需要先对齐 `PaperBroker`（第三套独立撮合实现）的公司行为/退市/tick 取整语义，否则对账无法归因 | 见 `docs/BACKTEST_VALIDATION.md` L6 节 |
+| **测试顺序/环境污染**（阻断全量 `pytest tests/`） | 全量跑 `pytest tests/` 时**失败用例每次轮换**，且**未改动的 `main` 上同样失败**。实测对照：`pytest tests/unit` 全绿；`pytest tests/`（integration 先跑）在不同次分别挂在 `test_paper_live` / `test_api_data_tasks` / `test_api_data_admin`；错误形态多为 `DataQualityError` 与「期望空库却读到真实行」（如 `test_version_latest_empty` 读到 `data_version=20261002.1`）。**本地 pre-push 钩子跑的就是这条命令，所以它对所有人都是红的** | 测试隔离缺陷，非本次改动引入（已用 pristine `main` 复现）。疑似机制：部分 fixture 只 monkeypatch `catalog.writer/reader`，而部分代码路径直接按 `get_settings()` 解析库/湖路径（`get_settings` 是 lru_cache，且路径按 CWD 解析）→ 跨文件 chdir/缓存残留后读到真实库；另有测试改动 `os.chdir` 但未完全还原 | 统一「库/湖路径」的注入方式：让所有测试走同一个 fixture（monkeypatch `get_settings` 的路径字段而非仅 `catalog`），或在 session 级 fixture 里强制清 `get_settings` 缓存 + 还原 CWD；给 `pytest tests/` 加 `-p no:randomly` 无用（本项目未装），需从注入层解决 |
+| **退市股无行情**（性存者偏差的真正来源） | 引擎侧的退市核销已修（D8），但**日线湖里 339 只退市标的的日线一行都没有**（实测：`security` 有 339 条 `delist_date`，其中在 `data/parquet/daily` 出现过的 = **0**）。所以退市股永远不会进入持仓 → 长回测仍然只含「活下来的股票」，**幸存者偏差依旧存在**，且引擎修好也测不出来 | 数据层回填，不是引擎问题 | 回填退市标的（含退市前 N 年）的日线；回填后 D8 的核销逻辑才会真正被走到（单测已锁定该分支） |
 | B5 | 参数扫描未向量化：`/api/backtests/sweep` 端点已在，但仍逐档调用事件引擎 | 属性能工程，不影响正确性 | 见 `docs/BACKTEST_ENGINES.md` 行动项 |
+| 对账重跑 | backtrader 对账的 3 个任务（baseline_multifactor / momentum_rotation / grid_trading）**当前无法重跑** —— 依赖的 510300.SH / 159915.SZ 在湖里只有 2026 年起的数据。其中 2 个历史上是 ❌ FAIL，因此既没变好也没变坏 | 数据缺口，不是代码问题 | 先回填这两只 ETF 的 2024 起日线，再跑 `scripts/backtest_validation/validate_accuracy.py`（详见 `docs/BACKTEST_VALIDATION.md`） |
 
 
 ## 人工补注

@@ -2,7 +2,7 @@
 
 ## 结论（TL;DR）
 
-**自研事件引擎保留为唯一「执行真源」；参数扫描走 Polars 向量化快扫（B5 待做）；外部引擎通过适配器协议接入，结果与原生引擎同构、可直接 /compare。**
+**自研事件引擎保留为唯一「执行真源」；参数扫描走 Polars 向量化快扫（B5 已落地，近似、只筛参数，须回事件引擎复核）；外部引擎通过适配器协议接入，结果与原生引擎同构、可直接 /compare。**
 
 不引入 backtrader / zipline / qlib backtest 作为核心执行器。
 
@@ -43,11 +43,52 @@ register_adapter(RQAlphaAdapter)
 ## 行动项
 
 - [x] 适配器协议 + 注册表（backtest/adapter.py，本轮落地）
-- [ ] B5：Polars 向量化参数扫描（`/api/backtests/sweep`，TopN 网格 + 近似成本）
-      —— **当前状态：端点已落地（异步队列 + 逐档返网格），但未向量化**：
-      `backtest/sweep.py` 仍是逐档调用事件引擎，没有任何 Polars 向量化。
-      档数少时够用，万级网格需按本项补向量化近似成本模型。
+- [x] B5：Polars 向量化参数扫描（`/api/backtests/sweep`，TopN 网格 + 近似成本）
+      —— **已落地**：`backtest/sweep.py::run_sweep_vectorized` 一次成型地对整个
+      网格出结果（排名 cum_sum 覆盖所有 top_n 档位，不对 values 做逐档事件循环）；
+      端点在 `SweepIn.engine` 上提供 `event|vector|auto`（auto 按档数阈值
+      `VECTOR_AUTO_MIN_POINTS=12` 自动切）。详见下方「B5：向量化参数扫描」。
 - [ ] 如需撮合交叉验证：RQAlphaAdapter（pip 依赖放开后）
+
+## B5：向量化参数扫描（`backtest/sweep.py`）
+
+两条路径输出**同一张网格契约**（`_OUT_COLS`：value / total_return / annual_return /
+sharpe / max_drawdown / n_trades / turnover），前端无需区分；差别在**语义权威性**：
+
+| 路径 | 函数 | 定位 |
+|---|---|---|
+| 事件引擎 | `run_sweep`（逐档 `Engine`） | **唯一执行真源**：T+1 可卖、涨跌停/停牌/退市拒单、手数取整、资金不足拒单、除权复权全真实 |
+| 向量化快扫 | `run_sweep_vectorized`（Polars） | **近似，只筛参数**：万级网格先粗筛，候选回事件引擎复核 |
+| 选路 | `run_sweep_auto(engine=event\|vector\|auto)` | `auto`：档数 ≥ `VECTOR_AUTO_MIN_POINTS`(12) 走向量化，否则走事件引擎 |
+
+**向量化的策略语义**：每个调仓日按因子降序排名取前 `top_n` 等权；T 日收盘定信号、
+T+1 **开盘**建仓（防未来函数），持有到下一个调仓日开盘，区间内买入持有、换仓时恢复等权。
+收益用开盘价比值 `open(T+1)/open(建仓日)`，与引擎「T+1 开盘成交、收盘估值」在无隔夜
+跳空时严格等价。效率关键：排名 `cum_sum` 一次覆盖**所有** top_n 档位（topN 集合嵌套），
+不做逐档事件循环，也不做逐日 Python 循环。
+
+**近似成本模型**（`_approx_cost_rates`，全部按成交额线性化）：
+- 佣金 + 过户费 + `pct` 滑点 = 买入单边率；再加印花税（取回测末日税率档）= 卖出单边率；
+- 每个换仓日按换手 `turn = (top_n − 名单重叠数) / top_n`，扣
+  `turn × 买入率 + turn × 卖出率`；首次建仓只扣买入，不假设期末清仓；
+- 未建模：最低佣金（5 元/单，小额单被低估）、`tick`/`volume_pct` 滑点（按 0）、
+  等权漂移再平衡产生的日常小额委托、T+1 可卖、涨跌停/停牌/退市、手数取整、
+  participation 成交量上限、资金不足拒单、除权复权、并列因子的稳定排序。
+
+**screen → verify 工作流**（务必遵守）：
+1. `POST /api/backtests/sweep` 用大网格 + `engine=vector`（或 `auto`）粗筛；
+2. 取收益/夏普头部若干档（以及邻域），改成 `engine=event` 重新扫，得到可对外引用的结论；
+3. 只有事件引擎的数字可以进报告 / 实盘决策；向量化数字仅用于缩小搜索空间。
+
+**正确性闸**：`tests/unit/test_sweep.py::test_sweep_vectorized_ranking_matches_event_engine`
+在无隔夜跳空 + 持续信号的合成面板上同时跑两条路径，断言 total_return 秩相关 ≥ 0.9、
+argmax 一致、绝对差 ≤ 2pp（实测秩相关 1.0、绝对差 < 1pp；残差来自上面的近似成本项）。
+高换手 / 大幅隔夜跳空的数据上近似会变差（资金不足拒单等路径依赖行为不可向量化），
+这正是「必须回事件引擎复核」的原因。
+
+**实测速度**（120 标的 × 500 交易日、60k 行、monthly）：
+事件引擎约 **528 ms/档**，向量化约 **7.2 ms/档**（20 档快 ~73×）；
+10,000 档向量化 **2.7 s**，按事件引擎单档耗时外推需 **~88 分钟**（约 2000×）。
 
 ## 本轮（2026-10-02）成本与撮合口径已修正项
 
@@ -70,4 +111,5 @@ register_adapter(RQAlphaAdapter)
 | 涨跌停豁免 | `no_price_limit` 标记真正生效（IPO 首日/复牌首日/ST 变更日） |
 | 限价单 | `Order.limit_price` 真正被撮合读取（此前是死字段：设了限价仍按市价成交）。判定用不含滑点的基准价，成交价封顶/保底到限价；JQ 沙箱注入 `MarketOrder`/`LimitOrder` |
 | 零成交 vs 停牌 | 归因分开：`无成交量`（流动性为零）≠ `停牌`。此前一律记「停牌或无行情」 |
+| **逐日 ST** | 涨跌停按**当日**戴帽状态（`Bar.is_st`，来自日线湖的 `is_st`/baostock isST）。此前用 `security.is_st` 静态值，而该列全表 0 行为 True → 原生路径实际完全没做 ST 处理（真实数据有 **377,292 个 ST bar-日 / 2,070 只标的**被按 10% 处理）。`None` 才退回静态值 |
 | 退市 | 按残值核销 + 退市日起不可交易；元数据经 `security_meta` 与 DB 同源 |

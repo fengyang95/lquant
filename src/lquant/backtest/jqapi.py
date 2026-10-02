@@ -229,8 +229,11 @@ class _SecData:
     __slots__ = ("paused", "is_st", "name", "day_open", "last_price",
                  "high_limit", "low_limit")
 
-    def __init__(self, bar: Bar | None, ref: float, is_st: bool = False, name: str = "",
-                 rules=None):
+    def __init__(self, bar: Bar | None, ref: float, is_st: bool | None = False,
+                 name: str = "", rules=None):
+        # 当日 ST 以 bar 上的逐日标记为准（策略据此剔除 ST），规则静态值兜底
+        per_day = getattr(bar, "is_st", None) if bar is not None else None
+        self.is_st = bool(is_st if per_day is None else per_day)
         if bar is None:
             self.last_price = float("nan")
             self.day_open = float("nan")
@@ -244,11 +247,10 @@ class _SecData:
             # 涨跌停价必须与撮合口径同源（含 tick 取整与 ST 分板规则）：
             # 此前硬编码 ±10%，ST 股显示 11.0/9.0 而撮合实际按 10.5/9.5 拒单，
             # 策略看到的上限与真实可成交边界不一致。
-            up = rules.limit_up(base) if rules is not None else None
-            down = rules.limit_down(base) if rules is not None else None
+            up = rules.limit_up(base, is_st=bar.is_st) if rules is not None else None
+            down = rules.limit_down(base, is_st=bar.is_st) if rules is not None else None
             self.high_limit = up if up is not None else round(base * 1.1, 2)
             self.low_limit = down if down is not None else round(base * 0.9, 2)
-        self.is_st = is_st
         self.name = name
 
 
@@ -1095,7 +1097,7 @@ class JQRunner:
         return Bar(symbol=bar.symbol, trade_date=bar.trade_date, open=ref, high=bar.high,
                    low=bar.low, close=bar.close, pre_close=bar.pre_close,
                    volume=bar.volume, amount=bar.amount, halted=bar.halted,
-                   suspended=bar.suspended, no_volume=bar.no_volume)
+                   suspended=bar.suspended, no_volume=bar.no_volume, is_st=bar.is_st)
 
     # ---- 调度 ----
 
