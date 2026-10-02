@@ -155,3 +155,35 @@ def test_registry_strategy_runs_end_to_end():
 
 def test_exit_overlay_type_is_strategy():
     assert isinstance(ExitOverlay(BuyOnce(), SimpleExitStrategy()), Strategy)
+
+
+# ---------- T+N 口径：必须按交易日，不能按自然日 ----------
+
+def test_available_qty_uses_trading_days_not_calendar_days():
+    """回归：周四下单、T+3 锁定（成交在周五开盘）。
+
+    成交日 = 周五。交易日口径下 index 差需满 3：周五(0) → 周一(1) → 周二(2) → 周三(3)。
+    自然日口径下 周五 + 3 天 = 周一，**周一就会误判为可卖** —— 这正是本用例的判别点。
+    """
+    days = [date(2026, 3, 5),    # 周四（下单日）
+            date(2026, 3, 6),    # 周五（成交日）
+            date(2026, 3, 9),    # 周一 ← 自然日口径会误判为可卖
+            date(2026, 3, 10),   # 周二
+            date(2026, 3, 11)]   # 周三（满 3 个交易日）
+    data = {d: {SYM: Bar(symbol=SYM, trade_date=d, open=100.0, high=100.0,
+                         low=100.0, close=100.0, pre_close=100.0,
+                         volume=1e9, amount=1e9)} for d in days}
+
+    rec = RecordingExit()
+    ov = ExitOverlay(BuyOnce(), rec)
+    Engine(ov, meta={SYM: {"sellable_after_days": 3}},
+           config=EngineConfig(initial_cash=1_000_000)).run(data)
+
+    by_date = {c.trade_date: (c.positions[0].available_qty if c.positions else None)
+               for c in rec.calls}
+    assert by_date[days[1]] == 0        # 成交当日不可卖
+    assert by_date[days[2]] == 0        # 周一：交易日口径不可卖（自然日口径会放行）
+    assert by_date[days[3]] == 0
+    assert by_date[days[4]] > 0         # 周三满 3 个交易日
+
+

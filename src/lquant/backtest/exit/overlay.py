@@ -120,7 +120,10 @@ class ExitOverlay(Strategy):
                 continue
             self._entry_bar.setdefault(sym, self._bar_count)
             rules = ctx.rules.get(sym)
-            available = pos.available_at(d, rules) if rules is not None else pos.available_qty
+            # 传 date_index 走**交易日** T+N 口径；不传会退回自然日口径，
+            # 周四买的 T+2 到周六就被当成可卖 —— 退出信号会提前放行。
+            available = (pos.available_at(d, rules, ctx.date_index)
+                         if rules is not None else pos.available_qty)
             positions.append(PositionView(
                 symbol=sym,
                 qty=pos.qty,

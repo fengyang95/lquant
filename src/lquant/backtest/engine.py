@@ -401,7 +401,8 @@ class Engine:
 
     def _schedule_rebalance(self, bars: dict[str, Bar], d: date, res: BacktestResult) -> None:
         ctx = Context(account=self.account, trade_date=d,
-                      rules=self._rules, params=self.strategy.params)
+                      rules=self._rules, params=self.strategy.params,
+                      date_index=self._date_index)
         raw = self.strategy.on_bar(ctx, bars) or []
         if not raw:
             # 空列表 = 无操作（保留持仓）。这是因子策略「当日无信号」的常态。
