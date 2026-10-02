@@ -323,6 +323,96 @@ def test_evaluate_turnover_fail_silently(client, monkeypatch):
     assert r.status_code == 200
 
 
+# ---------------- 审计修复：配方端点 / 参数转发 / 故障可见 ----------------
+
+def test_preprocess_methods_endpoint(client):
+    """M2.5「配方接入 API」：方法枚举 + 默认配方，前端不必硬编码。"""
+    r = client.get("/api/factors/preprocess/methods")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body["stages"]) == {"winsorize", "standardize", "neutralize",
+                                   "orthogonalize"}
+    names = {(m["stage"], m["name"]) for m in body["methods"]}
+    assert ("neutralize", "ols") in names
+    assert ("orthogonalize", "symmetric") in names
+    assert isinstance(body["default_recipe"], list) and body["default_recipe"]
+
+    # 已解耦的对照：按阶段过滤 + 未知阶段 422
+    r2 = client.get("/api/factors/preprocess/methods", params={"stage": "neutralize"})
+    assert r2.status_code == 200
+    assert all(m["stage"] == "neutralize" for m in r2.json()["methods"])
+    assert client.get("/api/factors/preprocess/methods",
+                      params={"stage": "nope"}).status_code == 422
+
+
+def test_evaluate_rejects_unknown_recipe_step(client):
+    """坏配方必须 422（静默忽略 = 「改了参数没反应」）。"""
+    r = client.post("/api/factors/evaluate/series",
+                    json={"factor": "covsteps", "formula": "pct_change_5",
+                          "start": "2026-04-01",
+                          "steps": [{"op": "winsorize", "method": "no_such_method"}]})
+    assert r.status_code == 422, r.text
+
+
+def test_evaluate_series_exposes_group_ic_and_errors(client):
+    """分组 IC（行业 + 市值）接入 series；errors 字段让故障可见。"""
+    r = client.post("/api/factors/evaluate/series",
+                    json={"factor": "covgic", "formula": "pct_change_5",
+                          "start": "2026-04-01"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "group_ic" in body and "errors" in body
+    gic = body["group_ic"]
+    assert set(gic) >= {"by", "industry", "size", "error"}
+    # 市值分组一定可算（amount/float_mv 都在面板上）
+    assert gic["size"], "市值分组 IC 应为非空"
+    assert gic["size_col"] in ("cov_market_cap", "float_mv", "amount")
+
+
+def test_evaluate_series_surfaces_block_failures(client, monkeypatch):
+    """协变量构建失败必须写进 errors，而不是把页面变成「数据不足」。"""
+    import importlib
+
+    cov_mod = importlib.import_module("lquant.factors.covariates")
+
+    def _boom(*a, **k):
+        raise RuntimeError("covariates down")
+
+    monkeypatch.setattr(cov_mod, "build_covariates", _boom)
+    r = client.post("/api/factors/evaluate/series",
+                    json={"factor": "covfail", "formula": "pct_change_5",
+                          "start": "2026-04-01"})
+    assert r.status_code == 200, r.text
+    errs = r.json()["errors"]
+    assert "covariates" in errs and "covariates down" in errs["covariates"]
+
+
+def test_evaluate_full_metrics_include_rating_and_steps(client):
+    """metrics 带评级；steps 回显本次实际使用的配方（None = 原始因子）。"""
+    from lquant.server.api.factors import EvaluateIn, _evaluate_full
+
+    req = EvaluateIn(factor="covrate", formula="pct_change_5", start="2026-04-01")
+    metrics, series = _evaluate_full(req)
+    assert metrics["rating"]["rating"] in ("weak", "moderate", "strong")
+    assert metrics["steps"] is None
+    assert "errors" in metrics and "errors" in series
+    # 与 CLI audit 对齐：NW t 值 / IC 自相关也要在 API metrics 里
+    assert "t_stat_nw" in metrics["ic"] and "ic_autocorr" in metrics["ic"]
+
+
+def test_evaluate_full_applies_user_recipe(client):
+    """显式配方（去极值 + 标准化）应被应用并在 metrics 里回显。"""
+    from lquant.server.api.factors import EvaluateIn, _evaluate_full
+
+    steps = [{"op": "winsorize", "method": "mad", "n": 5},
+             {"op": "standardize", "method": "zscore"}]
+    req = EvaluateIn(factor="covrecipe", formula="pct_change_5",
+                     start="2026-04-01", steps=steps)
+    metrics, _series = _evaluate_full(req)
+    assert metrics["steps"] == steps
+    assert metrics["n_samples"] > 0
+
+
 def test_seed_yaml_and_translate_error(client, monkeypatch):
     """seed-yaml 成功路径 + seed-builtin 翻译失败 422。"""
     from lquant.factors.sources import qlib_source as qs_mod
@@ -394,7 +484,12 @@ def test_mine_runs_query_broken(client, monkeypatch):
             yield _Proxy(con)
 
     monkeypatch.setattr(fmod, "reader", fake)
-    assert client.get("/api/factors/mine/runs").json() == []
+    # 台账读不出来 ≠ 没有台账：必须 503，否则 UI 显示「暂无挖掘记录」误导用户
+    r = client.get("/api/factors/mine/runs")
+    assert r.status_code == 503
+    assert "挖掘台账读取失败" in r.json()["detail"]
+    # 详情端点同理：DB 故障不能被伪装成 404（那会被读成「记录不存在」）
+    assert client.get("/api/factors/mine/runs/ghost").status_code == 503
     assert client.get("/api/factors/ghost2").status_code == 404
 
 
@@ -426,15 +521,17 @@ def test_list_factors_builtin_stub_only(client, monkeypatch):
 
 
 def test_list_factors_and_reports_branches(client, monkeypatch):
-    """列表查询异常 / builtin 枚举失败 / 报告目录缺失 / 因子详情带报告。"""
+    """列表查询异常→503 / 详情不存在→404 / builtin 枚举失败不挡列表 / 报告目录缺失→空列表。"""
     from lquant.factors import qlib_alpha as qa_mod
 
     class _Proxy:
+        """只打桩**列表**查询 —— 详情走真实路径，验证 404 语义没被 503 污染。"""
+
         def __init__(self, con):
             self._con = con
 
         def execute(self, sql, *a, **k):
-            if "factor_def" in sql:
+            if "FROM factor_def d" in sql:
                 raise RuntimeError("factor_def broken")
             return self._con.execute(sql, *a, **k)
 
@@ -445,10 +542,19 @@ def test_list_factors_and_reports_branches(client, monkeypatch):
         with real_reader() as con:
             yield _Proxy(con)
 
-    monkeypatch.setattr(factors_mod(), "reader", fake)
-    assert client.get("/api/factors").json() == []
+    f = factors_mod()
+    monkeypatch.setattr(f, "reader", fake)
+    # 库读不出来 != 一个因子都没注册：必须 503，否则 UI 显示「暂无因子」误导用户
+    r = client.get("/api/factors")
+    assert r.status_code == 503
+    assert "因子列表读取失败" in r.json()["detail"]
 
-    # builtin 枚举失败 → 类目推导跳过
+    # 详情：查询正常但记录不存在 → 404（不能被上一条的 503 语义污染）
+    assert client.get("/api/factors/covser").status_code == 404
+
+    # 解除列表打桩；builtin 枚举失败 → 类目推导跳过，列表仍 200
+    monkeypatch.setattr(f, "reader", real_reader)
+
     def _boom():
         raise RuntimeError("builtin down")
 
@@ -458,17 +564,12 @@ def test_list_factors_and_reports_branches(client, monkeypatch):
     # 报告目录缺失 → 空列表
     from pathlib import Path
 
-    f = factors_mod()
     old_dir = f.REPORT_DIR
     f.REPORT_DIR = Path("data/no_such_reports_dir")
     try:
         assert client.get("/api/factors/reports").json() == []
     finally:
         f.REPORT_DIR = old_dir
-
-    # 因子详情：查询异常 → 404（except 分支）
-    d = client.get("/api/factors/covser")
-    assert d.status_code == 404
 
 
 def test_factor_detail_with_reports(client):

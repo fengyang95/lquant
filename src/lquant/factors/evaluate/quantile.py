@@ -92,13 +92,6 @@ def quantile_nav(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
     return out.with_columns((pl.col(f"q{n_groups}") - pl.col("q1")).alias("long_short"))
 
 
-def np_cumprod(arr) -> list[float]:
-    import numpy as np
-    a = np.asarray(arr, dtype=float)
-    a = np.nan_to_num(a, nan=0.0)
-    return list(np.cumprod(1.0 + a))
-
-
 def long_short_nav(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
                    n_groups: int = 10, *, date_col: str = "trade_date",
                    top: int | None = None, bottom: int | None = None) -> pl.DataFrame:

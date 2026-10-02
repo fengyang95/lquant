@@ -19,65 +19,56 @@ import { C, axes, legend, tooltip } from '@/lib/chart';
 import FactorLibrary from './FactorLibrary';
 import QlibWorkflowPanel from './QlibWorkflowPanel';
 import SaveAsFactor from './SaveAsFactor';
+import {
+  ErrorBanner, NeutralLadderPanel, NeutralViewsSection,
+  RatingPanel, RecipeSteps, RobustnessPanel, StyleCorrPanel, GroupIcSection, TopNTable,
+  decayOption as decayOptionShared, icByYearOption,
+  eventStudyOption, excessNavOption, groupReturnOption, quantileNavOption,
+  type EvalErrors, type EvalSeries, type PreprocessStep, type RatingInfo,
+  type RobustnessInfo, type TopNRow,
+} from './shared';
 
 type FactorRow = {
   name: string; expression: string; description: string; created_at: string;
   source?: string; ic_neutral?: number | null; category?: string;
 };
-type TopNRow = {
-  n: number; annual_return: number | null; annual_excess: number | null;
-  excess_sharpe: number | null; max_drawdown: number | null; annual_turnover: number | null;
-};
-type StyleRow = {
-  style: string; kind: string; corr_mean: number | null;
-  corr_abs_max: number | null; passed: boolean | null;
-};
 type EvalResult = {
   factor: string;
+  formula: string;
   n_samples: number;
-  ic: { mean: number; ir: number; t_stat: number; positive_rate: number };
-  rank_ic_mean: number;
-  long_short: { annual_return: number; sharpe: number; max_drawdown: number };
-  monotonicity: number;
+  ic: {
+    mean: number | null; ir: number | null; t_stat: number | null;
+    positive_rate: number | null; ic_gt_002_rate?: number | null;
+    t_stat_nw?: number | null; ic_autocorr?: number | null;
+  };
+  rank_ic_mean: number | null;
+  long_short: { annual_return: number | null; sharpe: number | null; max_drawdown: number | null };
+  monotonicity: number | null;
   half_life: number | null;
   suggested_rebalance: string;
-  excess: { annual_excess: number | null; excess_sharpe: number | null; excess_mdd: number | null };
+  excess: { annual_excess?: number | null; excess_sharpe?: number | null; excess_mdd?: number | null };
   annual_turnover: number | null;
   top_n: TopNRow[];
   style_corr: { max_abs: number | null; passed: boolean | null };
   outlier?: { threshold: number; n_dropped: number; dropped_rate: number } | null;
   report_url: string;
+  // —— 本轮新增暴露的字段 ——
+  rating?: RatingInfo | null;
+  robustness?: RobustnessInfo | null;
+  /** 实际生效的预处理配方；null = 未显式传 steps（内置默认口径） */
+  steps?: PreprocessStep[] | null;
+  covariates?: Record<string, number>;
+  errors?: EvalErrors;
 };
-type EvalSeries = {
-  factor: string; formula: string; n_groups: number; n_samples: number;
-  ic: { dates: string[]; ic: (number | null)[]; rank_ic: (number | null)[]; cum_ic: number[] };
-  quantile: {
-    dates: string[];
-    curves: Record<string, (number | null)[]>;
-    groups: { q: number; annual_return: number | null; sharpe: number | null; mean_ret: number | null }[];
-    monotonicity: number | null;
-  };
-  decay: { horizons: number[]; ic: (number | null)[]; rank_ic: (number | null)[] };
-  ic_by_year: { year: number; ic_mean: number | null; ir: number | null; positive_rate: number | null }[];
-  neutral_ladder?: { label: string; covs: string[]; ic_mean: number | null; rank_ic_mean: number | null; n_days: number }[];
-  neutral_views?: unknown;   // 上游按需断言取字段（如 return_neutral_ic）
-  rolling?: {
-    window: number;
-    dates: string[];
-    ic: (number | null)[];
-    rank_ic: (number | null)[];
-    ir: (number | null)[];
-  };
-  excess?: { dates: string[]; curves: Record<string, (number | null)[]>; benchmark: string };
-  top_n?: TopNRow[];
-  style_corr?: { styles: StyleRow[]; threshold: number; max_abs: number | null; passed: boolean | null };
-  event_study?: {
-    rel_periods: number[];
-    curves: Record<string, (number | null)[]>;
-    spread: (number | null)[];
-    look_ahead_ratio: number | null;
-    before: number; after: number; demeaned: boolean;
-  };
+
+/** 预处理方法枚举（GET /factors/preprocess/methods） */
+type PreprocessMethod = {
+  name: string; stage: string; label: string; params?: Record<string, unknown>;
+};
+type PreprocessMethods = {
+  stages: string[];
+  methods: PreprocessMethod[];
+  default_recipe: PreprocessStep[];
 };
 type CorrResult = {
   factors: string[];
@@ -98,8 +89,13 @@ const FORMULAS = ['pct_change_5', 'pct_change_10', 'pct_change_20', 'rolling_std
   'MA20', 'RSV10', 'ROC5', 'KMID', 'WVMA20', 'CNTP10', 'CORR20'];
 type BuiltinItem = { name: string; family: string; window: number | null; formula: string };
 
-/** 分层净值用色：靛青系为主，多空单独朱砂 */
-const Q_COLORS = ['#94989F', '#31589E', '#4E6E8E', '#3E8E7E', '#B08A3E', '#A85B4B', '#6B4F9E', '#C3352B', '#1E7C55', '#2F5D4E'];
+/** 预处理阶段 → 中文标签（方法名一律来自后端注册表，不在这里硬编码） */
+const STAGE_LABEL: Record<string, string> = {
+  winsorize: '去极值', standardize: '标准化', neutralize: '中性化', orthogonalize: '正交化',
+};
+
+/** 注册表逻辑协变量名 → 后端评价数据帧里的实际列名（cov_ 前缀） */
+const COV_ALIASES = new Set(['market_cap', 'industry_sw1', 'turnover_1m', 'momentum_1m']);
 
 function corrColor(v: number): string {
   const a = Math.min(Math.abs(v), 1);
@@ -137,6 +133,36 @@ export default function FactorsPage() {
   const [corrUniverse, setCorrUniverse] = useState('all');
   const [corrThreshold, setCorrThreshold] = useState(0.8);
   const [zThreshold, setZThreshold] = useState('');
+  // 预处理配方：默认配方 = 不传 steps（后端内置口径）；自定义 = 按阶段各选一个方法
+  const { data: preprocess } = useSWR<PreprocessMethods>('/factors/preprocess/methods', get);
+  const [recipeMode, setRecipeMode] = useState<'default' | 'custom'>('default');
+  const [recipeChoice, setRecipeChoice] = useState<Record<string, string>>({});
+  // 稳健性检验为可选：默认关闭（要按扰动窗口重算因子多遍，明显更慢）
+  const [withRobustness, setWithRobustness] = useState(false);
+
+  /** 自定义配方 → steps 数组（按 stages 顺序；未选方法的阶段跳过） */
+  const customSteps: PreprocessStep[] = useMemo(() => {
+    const stages = preprocess?.stages ?? [];
+    const methods = preprocess?.methods ?? [];
+    const out: PreprocessStep[] = [];
+    for (const stage of stages) {
+      const name = recipeChoice[stage];
+      if (!name) continue;
+      const m = methods.find((x) => x.stage === stage && x.name === name);
+      if (!m) continue;
+      const step: PreprocessStep = { op: stage, method: name, ...(m.params ?? {}) };
+      // 注册表里的协变量用逻辑名（market_cap/industry_sw1），后端评价时已统一
+      // 落成 cov_* 列（build_covariates）；不改名会以「列不存在」422 收场
+      if (Array.isArray(step.factors)) {
+        step.factors = (step.factors as string[]).map((f) => (COV_ALIASES.has(f) ? `cov_${f}` : f));
+      }
+      out.push(step);
+    }
+    return out;
+  }, [preprocess, recipeChoice]);
+
+  /** 本次评价要发送的 steps：默认配方用 undefined（JSON 里省略） */
+  const stepsPayload = recipeMode === 'custom' ? customSteps : undefined;
 
   // —— 评价图表（依赖 evalSeries） ——
   const icOption = useMemo(() => {
@@ -164,82 +190,17 @@ export default function FactorsPage() {
     };
   }, [evalSeries]);
 
-  const quantileOption = useMemo(() => {
-    if (!evalSeries?.quantile.dates.length) return null;
-    const { dates, curves } = evalSeries.quantile;
-    const keys = Object.keys(curves).filter((k) => k !== 'long_short')
-      .sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)));
-    return {
-      tooltip: { ...tooltip, valueFormatter: (v: number) => v?.toFixed(3) },
-      legend: legend({ top: 0, data: [...keys, '多空'] }),
-      grid: { left: 48, right: 20, top: 30, bottom: 24 },
-      dataZoom: [{ type: 'inside' as const }],
-      ...axes({ data: dates }, { scale: true, name: '净值' }),
-      series: [
-        ...keys.map((k, i) => ({
-          name: `第${k.slice(1)}组`, type: 'line' as const, data: curves[k],
-          showSymbol: false, lineStyle: { width: 1, color: Q_COLORS[i % Q_COLORS.length] },
-          itemStyle: { color: Q_COLORS[i % Q_COLORS.length] },
-        })),
-        {
-          name: '多空', type: 'line' as const, data: curves.long_short, showSymbol: false,
-          lineStyle: { width: 2.5, color: C.up }, itemStyle: { color: C.up }, z: 5,
-        },
-      ],
-    };
-  }, [evalSeries]);
+  const quantileOption = useMemo(
+    () => (evalSeries ? quantileNavOption(evalSeries) : null), [evalSeries]);
 
-  const groupOption = useMemo(() => {
-    if (!evalSeries?.quantile.groups.length) return null;
-    const gs = evalSeries.quantile.groups;
-    return {
-      tooltip: { ...tooltip, valueFormatter: (v: number) => `${(v * 100).toFixed(2)}%` },
-      grid: { left: 56, right: 16, top: 24, bottom: 24 },
-      ...axes({ data: gs.map((g) => `Q${g.q}`) },
-        { axisLabel: { color: C.inkDim, fontSize: 10, formatter: (v: number) => `${(v * 100).toFixed(0)}%` } }),
-      series: [{
-        name: '年化收益', type: 'bar' as const,
-        data: gs.map((g) => ({
-          value: g.annual_return,
-          itemStyle: { color: (g.annual_return ?? 0) >= 0 ? C.up : C.down },
-        })),
-        barMaxWidth: 36,
-      }],
-    };
-  }, [evalSeries]);
+  const groupOption = useMemo(
+    () => (evalSeries ? groupReturnOption(evalSeries) : null), [evalSeries]);
 
-  const decayOption = useMemo(() => {
-    if (!evalSeries?.decay.horizons.length) return null;
-    const { horizons, ic, rank_ic } = evalSeries.decay;
-    return {
-      tooltip,
-      legend: legend({ top: 0 }),
-      grid: { left: 48, right: 20, top: 30, bottom: 24 },
-      ...axes({ data: horizons.map((h) => `${h}天`) }, { name: 'IC均值' }),
-      series: [
-        { name: 'IC', type: 'line' as const, data: ic, showSymbol: true, lineStyle: { width: 1.8, color: C.up }, itemStyle: { color: C.up } },
-        { name: 'RankIC', type: 'line' as const, data: rank_ic, showSymbol: true, lineStyle: { width: 1.5, color: C.indigo }, itemStyle: { color: C.indigo } },
-      ],
-    };
-  }, [evalSeries]);
+  const decayOption = useMemo(
+    () => (evalSeries ? decayOptionShared(evalSeries) : null), [evalSeries]);
 
-  const icYearOption = useMemo(() => {
-    if (!evalSeries?.ic_by_year.length) return null;
-    const ys = evalSeries.ic_by_year;
-    return {
-      tooltip,
-      grid: { left: 48, right: 16, top: 24, bottom: 24 },
-      ...axes({ data: ys.map((y) => String(y.year)) }, { name: 'IC均值' }),
-      series: [{
-        name: '分年度IC', type: 'bar' as const,
-        data: ys.map((y) => ({
-          value: y.ic_mean,
-          itemStyle: { color: (y.ic_mean ?? 0) >= 0 ? C.up : C.down },
-        })),
-        barMaxWidth: 32,
-      }],
-    };
-  }, [evalSeries]);
+  const icYearOption = useMemo(
+    () => (evalSeries ? icByYearOption(evalSeries) : null), [evalSeries]);
 
   const rollingOption = useMemo(() => {
     if (!evalSeries?.rolling?.dates.length) return null;
@@ -257,55 +218,11 @@ export default function FactorsPage() {
     };
   }, [evalSeries]);
 
-  const excessOption = useMemo(() => {
-    const ex = evalSeries?.excess;
-    if (!ex?.dates.length) return null;
-    const mk = (k: string, name: string, color: string, width: number) => ({
-      name, type: 'line' as const, data: ex.curves[k] ?? [], showSymbol: false,
-      lineStyle: { width, color }, itemStyle: { color },
-    });
-    return {
-      tooltip: { ...tooltip, valueFormatter: (v: number) => v?.toFixed(3) },
-      legend: legend({ top: 0 }),
-      grid: { left: 48, right: 20, top: 30, bottom: 24 },
-      dataZoom: [{ type: 'inside' as const }],
-      ...axes({ data: ex.dates }, { scale: true, name: '超额净值' }),
-      series: [
-        mk(`ex_q${evalSeries!.n_groups}`, '最高组超额', C.up, 2.5),
-        mk('ex_q1', '最低组超额', C.down, 1.5),
-        mk('ex_long_short', '多空相对强弱', C.indigo, 1.5),
-      ],
-    };
-  }, [evalSeries]);
+  const excessOption = useMemo(
+    () => (evalSeries ? excessNavOption(evalSeries) : null), [evalSeries]);
 
-  const eventOption = useMemo(() => {
-    const es = evalSeries?.event_study;
-    if (!es?.rel_periods.length) return null;
-    const keys = Object.keys(es.curves).sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)));
-    const zeroIdx = es.rel_periods.indexOf(0);
-    return {
-      tooltip: { ...tooltip, valueFormatter: (v: number) => v?.toFixed(3) },
-      legend: legend({ top: 0, data: [...keys.map((k) => `第${k.slice(1)}组`), '最高-最低'] }),
-      grid: { left: 52, right: 20, top: 30, bottom: 24 },
-      ...axes({ data: es.rel_periods.map((p) => `${p > 0 ? '+' : ''}${p}`) }, { scale: true, name: '累计收益' }),
-      series: [
-        ...keys.map((k, i) => ({
-          name: `第${k.slice(1)}组`, type: 'line' as const, data: es.curves[k],
-          showSymbol: false, lineStyle: { width: 1, color: Q_COLORS[i % Q_COLORS.length] },
-          itemStyle: { color: Q_COLORS[i % Q_COLORS.length] },
-          markLine: i === 0 && zeroIdx >= 0 ? {
-            silent: true, symbol: 'none',
-            lineStyle: { color: C.inkDim, type: 'dashed' as const },
-            data: [{ xAxis: zeroIdx }],
-          } : undefined,
-        })),
-        {
-          name: '最高-最低', type: 'line' as const, data: es.spread, showSymbol: false,
-          lineStyle: { width: 2.5, color: C.up }, itemStyle: { color: C.up }, z: 5,
-        },
-      ],
-    };
-  }, [evalSeries]);
+  const eventOption = useMemo(
+    () => (evalSeries ? eventStudyOption(evalSeries) : null), [evalSeries]);
 
   // 评价任务流回填：终态 result → 指标/图表渲染；error / done-无果 → 消息条
   useEffect(() => {
@@ -364,6 +281,9 @@ export default function FactorsPage() {
           return n;
         })(),
         event_window: [10, 15],
+        // 预处理配方：默认配方省略（undefined → JSON 里没有该键）
+        ...(stepsPayload && stepsPayload.length ? { steps: stepsPayload } : {}),
+        with_robustness: withRobustness,
       };
       // 评价任务化：202 {job_id}，进度条与结果经 /ws/jobs/{id} 流式回流
       const r = await post<{ job_id: string; status: string }>('/factors/evaluate', params);
@@ -503,13 +423,55 @@ export default function FactorsPage() {
               截面异常收益过滤 |z| 上限（留空不过滤；20 为研报默认口径）
             </span>
           </div>
-          <button
-            onClick={evaluate}
-            disabled={busy === 'eval' || !formula}
-            className="btn btn-accent"
-          >
-            {busy === 'eval' ? '评价中…' : '运行评价'}
-          </button>
+          {/* 预处理配方：方法名单一来自后端注册表，避免前端硬编码漂移 */}
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="flex items-center gap-1 text-xs text-ink-dim">
+              预处理配方
+              <select
+                value={recipeMode}
+                onChange={(e) => setRecipeMode(e.target.value === 'custom' ? 'custom' : 'default')}
+                className="input w-32 py-1 text-xs"
+              >
+                <option value="default">内置默认</option>
+                <option value="custom">自定义</option>
+              </select>
+            </label>
+            {recipeMode === 'custom' && (preprocess?.stages ?? []).map((stage) => (
+              <label key={stage} className="flex items-center gap-1 text-xs text-ink-dim">
+                {STAGE_LABEL[stage] ?? stage}
+                <select
+                  value={recipeChoice[stage] ?? ''}
+                  onChange={(e) => setRecipeChoice((p) => ({ ...p, [stage]: e.target.value }))}
+                  className="input w-36 py-1 text-xs"
+                >
+                  <option value="">不启用</option>
+                  {(preprocess?.methods ?? [])
+                    .filter((m) => m.stage === stage)
+                    .map((m) => <option key={m.name} value={m.name}>{m.label}</option>)}
+                </select>
+              </label>
+            ))}
+            {recipeMode === 'custom' && !preprocess && (
+              <span className="text-xs text-ink-faint">预处理方法清单加载失败，暂只能用内置默认配方</span>
+            )}
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              onClick={evaluate}
+              disabled={busy === 'eval' || !formula}
+              className="btn btn-accent"
+            >
+              {busy === 'eval' ? '评价中…' : '运行评价'}
+            </button>
+            <label className="flex items-center gap-1 text-xs text-ink-dim">
+              <input
+                type="checkbox"
+                checked={withRobustness}
+                onChange={(e) => setWithRobustness(e.target.checked)}
+              />
+              稳健性检验（窗口扰动 / 分段稳定 / 起点敏感 / 月度剔除，较慢）
+            </label>
+          </div>
           {evalJob && evalStream.progress && evalStream.progress.total > 0 && (
             <div className="w-64">
               <ProgressBar
@@ -580,6 +542,27 @@ export default function FactorsPage() {
         </Panel>
       )}
 
+      {/* 评级 / 稳健性：L2 结论与 L3 可选项（二者并列，避免长条堆叠） */}
+      {tab === 'eval' && evalRes && (
+        <div className="grid gap-5 lg:grid-cols-2">
+          <RatingPanel rating={evalRes.rating} />
+          <RobustnessPanel robustness={evalRes.robustness} />
+        </div>
+      )}
+
+      {tab === 'eval' && evalRes && (
+        <Panel title="预处理配方" meta="本次评价实际生效的 steps（看数字是用哪套配方跑出来的）">
+          <RecipeSteps steps={evalRes.steps} />
+        </Panel>
+      )}
+
+      {tab === 'eval' && (
+        <ErrorBanner
+          errors={{ ...evalRes?.errors, ...evalSeries?.errors }}
+          title="评价过程有计算失败"
+        />
+      )}
+
       {tab === 'eval' && evalRes && (
         <Panel
           title="超额与持仓收缩"
@@ -616,45 +599,7 @@ export default function FactorsPage() {
                   : '未开启过滤'} />
             </div>
           </div>
-          {(evalRes.top_n?.length ?? 0) > 0 && (
-            <div className="mt-5">
-              <div className="mb-2 text-xs text-ink-faint">
-                Top-N 持仓收缩测试：头部集中通常收益不升、波动加大 —— 头部靠数量而非强度时会露馅
-              </div>
-              <table className="table-dense">
-                <thead>
-                  <tr>
-                    <th className="text-left">持仓数</th>
-                    <th className="text-left">年化收益</th>
-                    <th className="text-left">年化超额</th>
-                    <th className="text-left">超额夏普</th>
-                    <th className="text-left">最大回撤</th>
-                    <th className="text-left">年化换手</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {evalRes.top_n.map((r) => (
-                    <tr key={r.n}>
-                      <td className="font-medium">Top {r.n}</td>
-                      <td className={`font-mono ${(r.annual_return ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
-                        {r.annual_return != null ? `${(r.annual_return * 100).toFixed(2)}%` : '—'}
-                      </td>
-                      <td className={`font-mono ${(r.annual_excess ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
-                        {r.annual_excess != null ? `${(r.annual_excess * 100).toFixed(2)}%` : '—'}
-                      </td>
-                      <td className="font-mono">{r.excess_sharpe ?? '—'}</td>
-                      <td className="font-mono text-down">
-                        {r.max_drawdown != null ? `${(r.max_drawdown * 100).toFixed(2)}%` : '—'}
-                      </td>
-                      <td className="font-mono">
-                        {r.annual_turnover != null ? `${(r.annual_turnover * 100).toFixed(0)}%` : '—'}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+          <TopNTable rows={evalRes.top_n} />
         </Panel>
       )}
 
@@ -700,73 +645,14 @@ export default function FactorsPage() {
               : <Empty>样本不足</Empty>}
           </Panel>
           <div className="space-y-5">
-            <Panel title="IC 归因阶梯"
-            meta={(evalSeries.neutral_views as { return_neutral_ic?: number } | undefined)?.return_neutral_ic != null
-              ? `收益中性化 IC 对照 = ${(evalSeries.neutral_views as { return_neutral_ic: number }).return_neutral_ic.toFixed(4)}（口径：因子~协变量取残差）`
-              : '原始 → +市值 → +行业 → +换手率（逐段叠加看 IC 掉多少）'}>
-            {(evalSeries.neutral_ladder?.length ?? 0) > 0 ? (
-              <div className="space-y-1.5 px-1 py-2 text-xs">
-                {evalSeries.neutral_ladder!.map((l) => {
-                  const cov = (l as { coverage?: number }).coverage ?? 1;
-                  const dim = cov < 0.8;
-                  const first = evalSeries.neutral_ladder![0].ic_mean ?? 0;
-                  const v = l.ic_mean ?? 0;
-                  const drop = first !== 0 ? ((first - v) / Math.abs(first) * 100).toFixed(0) : '0';
-                  const w = first !== 0 ? Math.min(Math.abs(v / first) * 100, 100) : 0;
-                  return (
-                    <div key={l.label}
-                      className={`flex items-center gap-2 rounded-sm px-1 ${dim ? 'bg-ink-faint/10 opacity-60' : ''}`}
-                      title={dim ? `协变量覆盖率 ${(cov * 100).toFixed(0)}% < 80%` : ''}>
-                      <span className="w-24 text-ink-dim">{l.label}</span>
-                      <div className="h-3 flex-1 rounded-sm bg-ink-faint/10">
-                        <div className="h-3 rounded-sm" style={{ width: `${w}%`, background: 'var(--c-indigo, #31589E)' }} />
-                      </div>
-                      <span className="w-16 text-right font-mono">{v.toFixed(4)}</span>
-                      <span className="w-10 text-right text-ink-faint">↓{drop}%</span>
-                    </div>
-                  );
-                })}
-              </div>
-            ) : <Empty>协变量数据不足</Empty>}
-          </Panel>
-          <Panel
-            title="中性化后风格相关性"
-            meta={(evalSeries.style_corr?.styles?.length ?? 0) > 0
-              ? `市值+行业中性化残差 vs 风格 · 阈值 ${evalSeries.style_corr?.threshold ?? 0.14}`
-              : '市值+行业中性化残差 vs 风格'}
-          >
-            {(evalSeries.style_corr?.styles?.length ?? 0) > 0 ? (
-              <div className="space-y-1.5 px-1 py-2 text-xs">
-                {evalSeries.style_corr!.styles.map((s) => {
-                  const v = s.corr_abs_max;
-                  const ok = s.passed;
-                  return (
-                    <div key={s.style} className="flex items-center gap-2 rounded-sm px-1">
-                      <span className="w-32 truncate text-ink-dim" title={s.style}>
-                        {s.style.replace(/^cov_/, '')}{s.kind.startsWith('cat') ? ' (eta)' : ''}
-                      </span>
-                      <div className="h-3 flex-1 rounded-sm bg-ink-faint/10">
-                        {v != null && (
-                          <div className="h-3 rounded-sm"
-                            style={{ width: `${Math.min(v * 100, 100)}%`, background: ok ? 'var(--c-up, #1E7C55)' : 'var(--c-down, #C3352B)' }} />
-                        )}
-                      </div>
-                      <span className="w-14 text-right font-mono">{v != null ? v.toFixed(3) : '—'}</span>
-                      <span className="w-8 text-right">{ok == null ? '—' : ok ? '✓' : '⚠'}</span>
-                    </div>
-                  );
-                })}
-                {evalSeries.style_corr?.passed != null && (
-                  <div className={`px-1 pt-1 ${evalSeries.style_corr.passed ? 'text-up' : 'text-gold'}`}>
-                    {evalSeries.style_corr.passed
-                      ? '✓ 所有风格 max|ρ| 均在阈值内 —— 中性化后未偷风格暴露'
-                      : '⚠ 存在超阈值风格相关 —— alpha 可能是某个风格的马甲，继续加中性化或重设计'}
-                  </div>
-                )}
-              </div>
-            ) : <Empty>协变量数据不足</Empty>}
-          </Panel>
-          <Panel title="IC 衰减" meta={`半衰期 ${evalRes?.half_life ?? '—'} 天 → 建议 ${evalRes?.suggested_rebalance ?? '—'}`}>
+            <NeutralLadderPanel
+              rows={evalSeries.neutral_ladder}
+              returnNeutralIc={evalSeries.neutral_views?.return_neutral_ic}
+            />
+            <NeutralViewsSection views={evalSeries.neutral_views} />
+            <GroupIcSection groupIc={evalSeries.group_ic} />
+            <StyleCorrPanel styleCorr={evalSeries.style_corr} />
+            <Panel title="IC 衰减" meta={`半衰期 ${evalRes?.half_life ?? '—'} 天 → 建议 ${evalRes?.suggested_rebalance ?? '—'}`}>
               {decayOption
                 ? <Chart option={decayOption} height={180} />
                 : <Empty>样本不足</Empty>}

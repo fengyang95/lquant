@@ -25,26 +25,34 @@ export default function QlibWorkflowPanel() {
   const [market, setMarket] = useState('');
   const [runs, setRuns] = useState<QlibRun[]>([]);
   const [msg, setMsg] = useState('');
+  // 加载失败必须显式可见：静默 catch 会让「取不到配置」看起来像「没有配置」
+  const [loadError, setLoadError] = useState('');
 
   const refresh = useCallback(() => {
+    setLoadError('');
     listQlibConfigs()
       .then((cs) => {
         setConfigs(cs.map((c) => c.name));
         setSelected((s) => s || cs[0]?.name || '');
       })
-      .catch((e) => setMsg(String(e)));
-    listQlibRuns().then(setRuns).catch(() => undefined);
+      .catch((e) => setLoadError(`配置列表加载失败：${e instanceof Error ? e.message : e}`));
+    listQlibRuns()
+      .then(setRuns)
+      .catch((e) => setLoadError(`历史运行列表加载失败：${e instanceof Error ? e.message : e}`));
   }, []);
   useEffect(refresh, [refresh]);
 
   useEffect(() => {
     if (!selected) return;
     let alive = true;
+    setLoadError('');
     getQlibConfig(selected)
       .then((c) => {
         if (alive) setContent(c.content);
       })
-      .catch(() => undefined);
+      .catch((e) => {
+        if (alive) setLoadError(`配置内容加载失败：${e instanceof Error ? e.message : e}`);
+      });
     return () => {
       alive = false;
     };
@@ -107,6 +115,12 @@ export default function QlibWorkflowPanel() {
           value={content} onChange={(e) => setContent(e.target.value)}
           spellCheck={false} />
         {msg && <p className="text-xs text-ink-faint">{msg}</p>}
+        {loadError && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            ⚠ {loadError}
+            <button onClick={refresh} className="ml-2 text-indigo hover:underline">重试</button>
+          </div>
+        )}
         <table className="w-full text-sm">
           <thead>
             <tr className="text-left text-xs text-ink-faint">

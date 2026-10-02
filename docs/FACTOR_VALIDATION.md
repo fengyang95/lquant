@@ -43,16 +43,25 @@ MA20 / RSV10：qlib_alpha 内置实现 vs DSL 翻译版逐点对照（test_f5_cr
 
 同输入两次计算逐位一致（test_f6_reproducible_double_compute）。**状态**：✅ 本轮
 
-## N1-N6 中性化专项（M2.5 落地，先占位编号）
+## N1-N6 中性化专项（M2.5）
 
-- N1 去极值/标准化口径与手算一致
-- N2 自中性化归零：neutralize(x, [x]) == 0（一句话验证整条回归链路）
-- N3 行业中性化 = 组内去均值（与手算一致）
-- N4 残差与设计矩阵正交（OLS 一阶条件）
-- N5 log 市值口径（市值必须 log 后进回归）
-- N6 协变量全缺失必须上报 coverage=0 并告警，不得静默去均值
+每条一项断言，全部落在 `tests/unit/test_covariates.py`，并由
+`scripts/validate_factor.py` 的 N 层按**显式 node id** 逐条执行（改名即报错，
+不会静默跑空）：
 
-**状态**：⏳ M2.5 中性化里程碑
+- N1 去极值口径与手算一致：MAD = 中位数 ± n×1.4826×MAD
+  （`test_n1_winsorize_mad_handcalc`）
+- N2 自中性化归零：neutralize(x, [x]) == 0，一句话验证整条回归链路
+  （`test_n2_self_neutralize_zero`）
+- N3 行业均值剔除 = 组内去均值（手算对照）+ PIT as-of 关联
+  （`test_n3_industry_mean_equals_within_group_demean` / `test_industry_pit_asof`）
+- N4 残差与设计矩阵正交（OLS 一阶条件，`test_n4_residual_orthogonal`）
+- N5 log 市值口径：`cov_market_cap == log1p(float_mv)`
+  （`test_market_cap_is_log`）
+- N6 协变量全缺失必须**报错**，不得静默去均值
+  （`test_n6_all_covariates_missing_raises`）
+
+**状态**：✅ 已落地并纳入 `validate_factor.py`（此前脚本只跑到 F6）
 
 ## 评估阶梯 L0-L3（因子筛选侧，与 F/N 互补）
 
@@ -80,7 +89,7 @@ Strong ⇐ |ICIR|≥0.5 且 |单调性|≥0.8 且 |L/S Sharpe|≥1.0 且过门�
 
 ## 运行方式
 
-    uv run python scripts/validate_factor.py   # F1-F4 逐层 PASS/FAIL，失败退出 1
+    uv run python scripts/validate_factor.py   # F1-F6 + N1-N6 逐层 PASS/FAIL，失败退出 1
     PYTHONPATH=src python -m pytest tests/unit/test_dsl.py \
         tests/unit/test_factor_accuracy.py tests/unit/test_factor_rating.py \
         tests/unit/test_factor_robustness.py -q     # L0-L3 逐层

@@ -20,6 +20,15 @@ export type FactorRow = {
 
 const SOURCE_TABS = ['全部', 'qlib', 'yaml', 'manual', 'mined'] as const;
 
+/** 排序口径：ic = 保持后端顺序（IC 中性化 DESC），name / category = 前端重排 */
+type SortBy = 'ic' | 'name' | 'category';
+
+const SORT_LABEL: Record<SortBy, string> = {
+  ic: '按 IC(中性化)',
+  name: '按名称',
+  category: '按类别',
+};
+
 /** 可编辑来源：种子批量灌入的因子改了会被下次 seed 覆盖（后端同口径拦截） */
 const EDITABLE = new Set(['manual', 'mined']);
 
@@ -35,6 +44,7 @@ export default function FactorLibrary({
   onPickFormula?: (name: string) => void;
 }) {
   const [sourceTab, setSourceTab] = useState<string>('全部');
+  const [sortBy, setSortBy] = useState<SortBy>('ic');
   const [query, setQuery] = useState('');
   const [busy, setBusy] = useState<'' | 'seed' | 'edit' | 'del'>('');
   const [msg, setMsg] = useState('');
@@ -44,6 +54,13 @@ export default function FactorLibrary({
 
   const { data: builtin } = useSWR<{ name: string; family: string; formula: string }[]>(
     '/factors/builtin', get);
+
+  // 来源清单优先走后端（加新来源不用改前端）；请求失败/为空时回退到内置清单
+  const { data: sources } = useSWR<{ name: string; label?: string }[]>('/factors/sources', get);
+  const sourceTabs = useMemo<string[]>(() => {
+    const fromApi = (sources ?? []).map((s) => s.name).filter(Boolean);
+    return fromApi.length ? ['全部', ...fromApi] : [...SOURCE_TABS];
+  }, [sources]);
 
   async function saveEdit() {
     if (!editing) return;
@@ -118,6 +135,81 @@ export default function FactorLibrary({
       .map(([cat, rows]) => [cat, rows.sort((a, b) => a.name.localeCompare(b.name))] as const);
   }, [shown]);
 
+  // ic 口径不重排：后端已按 ic_neutral DESC 返回，客户端再排会把这个顺序抹掉
+  const flatRows = useMemo(
+    () => (sortBy === 'name'
+      ? [...shown].sort((a, b) => a.name.localeCompare(b.name, 'zh'))
+      : shown),
+    [shown, sortBy],
+  );
+
+  function renderRows(rows: FactorRow[]) {
+    return rows.map((f) => {
+      const icn = f.ic_neutral;
+      const editable = EDITABLE.has(f.source ?? 'manual');
+      return (
+        <tr key={f.name} className="hover:bg-white">
+          <td className="font-medium">
+            <a href={`/factors/${f.name}`} className="hover:underline">{f.name}</a>
+            {onPickFormula && (
+              <button
+                title="填入快速评价"
+                onClick={() => onPickFormula(f.name)}
+                className="ml-2 text-xs text-ink-faint hover:text-indigo"
+              >
+                ▶ 评价
+              </button>
+            )}
+          </td>
+          <td className="font-mono text-xs text-ink-dim">{f.expression || '—'}</td>
+          <td className="text-ink-faint">{f.source ?? 'manual'}</td>
+          <td className="font-mono">{icn == null ? '—' : Number(icn).toFixed(4)}</td>
+          <td className="text-ink-faint">{f.created_at?.slice(0, 19)}</td>
+          <td className="whitespace-nowrap">
+            {editable ? (
+              <>
+                <button
+                  title="编辑表达式 / 描述 / 类别"
+                  onClick={() => setEditing({
+                    name: f.name,
+                    expression: f.expression ?? '',
+                    description: f.description ?? '',
+                    category: f.category === '自定义' ? '' : (f.category ?? ''),
+                  })}
+                  className="text-xs text-indigo hover:underline"
+                  disabled={busy !== ''}
+                >
+                  编辑
+                </button>
+                <button
+                  title="删除因子"
+                  onClick={() => remove(f.name)}
+                  className="ml-2 text-xs text-down hover:underline"
+                  disabled={busy !== ''}
+                >
+                  删除
+                </button>
+              </>
+            ) : (
+              <span className="text-xs text-ink-faint" title="种子灌入因子不可编辑">—</span>
+            )}
+          </td>
+        </tr>
+      );
+    });
+  }
+
+  const HEAD = (
+    <tr>
+      <th className="text-left">名称</th>
+      <th className="text-left">表达式</th>
+      <th className="text-left">来源</th>
+      <th className="text-left">IC(中性化)</th>
+      <th className="text-left">注册时间</th>
+      <th className="text-left">操作</th>
+    </tr>
+  );
+
   return (
     <Panel
       title="因子库"
@@ -133,9 +225,9 @@ export default function FactorLibrary({
         </>
       }
     >
-      {/* 一级：来源 Tab */}
+      {/* 一级：来源 Tab（来自 /factors/sources，失败回退内置清单） */}
       <div className="mb-3 flex flex-wrap items-center gap-1">
-        {SOURCE_TABS.map((src) => (
+        {sourceTabs.map((src) => (
           <button
             key={src}
             onClick={() => setSourceTab(src)}
@@ -152,12 +244,26 @@ export default function FactorLibrary({
         />
       </div>
 
+      {/* 排序：默认不重排，保持后端 IC(中性化) DESC 顺序 */}
+      <div className="mb-3 flex flex-wrap items-center gap-1">
+        <span className="text-xs text-ink-faint">排序</span>
+        {(['ic', 'name', 'category'] as const).map((k) => (
+          <button
+            key={k}
+            onClick={() => setSortBy(k)}
+            className={`tag ${sortBy === k ? 'tag-on' : ''}`}
+          >
+            {SORT_LABEL[k]}
+          </button>
+        ))}
+      </div>
+
       <Msg text={msg} />
 
-      {/* 二级：类别分组 */}
+      {/* 二级：默认（ic）平铺保服务端顺序；类别口径按 category 分组 */}
       {shown.length === 0 ? (
         <Empty>该来源暂无因子 —— 用下方表单注册，或一键入库内置因子</Empty>
-      ) : (
+      ) : sortBy === 'category' ? (
         <div className="space-y-4">
           {grouped.map(([cat, rows]) => (
             <div key={cat}>
@@ -166,74 +272,21 @@ export default function FactorLibrary({
                 <span className="text-xs text-ink-faint">{rows.length} 个</span>
               </div>
               <table className="table-dense">
-                <thead>
-                  <tr>
-                    <th className="text-left">名称</th>
-                    <th className="text-left">表达式</th>
-                    <th className="text-left">来源</th>
-                    <th className="text-left">IC(中性化)</th>
-                    <th className="text-left">注册时间</th>
-                    <th className="text-left">操作</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map((f) => {
-                    const icn = f.ic_neutral;
-                    const editable = EDITABLE.has(f.source ?? 'manual');
-                    return (
-                      <tr key={f.name} className="hover:bg-white">
-                        <td className="font-medium">
-                          <a href={`/factors/${f.name}`} className="hover:underline">{f.name}</a>
-                          {onPickFormula && (
-                            <button
-                              title="填入快速评价"
-                              onClick={() => onPickFormula(f.name)}
-                              className="ml-2 text-xs text-ink-faint hover:text-indigo"
-                            >
-                              ▶ 评价
-                            </button>
-                          )}
-                        </td>
-                        <td className="font-mono text-xs text-ink-dim">{f.expression || '—'}</td>
-                        <td className="text-ink-faint">{f.source ?? 'manual'}</td>
-                        <td className="font-mono">{icn == null ? '—' : Number(icn).toFixed(4)}</td>
-                        <td className="text-ink-faint">{f.created_at?.slice(0, 19)}</td>
-                        <td className="whitespace-nowrap">
-                          {editable ? (
-                            <>
-                              <button
-                                title="编辑表达式 / 描述 / 类别"
-                                onClick={() => setEditing({
-                                  name: f.name,
-                                  expression: f.expression ?? '',
-                                  description: f.description ?? '',
-                                  category: f.category === '自定义' ? '' : (f.category ?? ''),
-                                })}
-                                className="text-xs text-indigo hover:underline"
-                                disabled={busy !== ''}
-                              >
-                                编辑
-                              </button>
-                              <button
-                                title="删除因子"
-                                onClick={() => remove(f.name)}
-                                className="ml-2 text-xs text-down hover:underline"
-                                disabled={busy !== ''}
-                              >
-                                删除
-                              </button>
-                            </>
-                          ) : (
-                            <span className="text-xs text-ink-faint" title="种子灌入因子不可编辑">—</span>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
+                <thead>{HEAD}</thead>
+                <tbody>{renderRows(rows)}</tbody>
               </table>
             </div>
           ))}
+        </div>
+      ) : (
+        <div>
+          <div className="mb-1 text-xs text-ink-faint">
+            {sortBy === 'ic' ? '按 IC(中性化) 倒序 · 服务端顺序' : '按名称排序'}
+          </div>
+          <table className="table-dense">
+            <thead>{HEAD}</thead>
+            <tbody>{renderRows(flatRows)}</tbody>
+          </table>
         </div>
       )}
 

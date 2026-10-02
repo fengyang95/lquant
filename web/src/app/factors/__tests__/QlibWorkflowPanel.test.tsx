@@ -56,4 +56,12 @@ describe('QlibWorkflowPanel', () => {
     await waitFor(() =>
       expect(qlib.putQlibConfig).toHaveBeenCalledWith('wf_a', 'qlib_init: {}\n'));
   });
+
+  it('配置/运行加载失败时显示可见错误，而不是空白页', async () => {
+    vi.mocked(qlib.listQlibConfigs).mockRejectedValue(new Error('boom'));
+    vi.mocked(qlib.listQlibRuns).mockRejectedValue(new Error('boom2'));
+    render(<QlibWorkflowPanel />);
+    await waitFor(() => expect(screen.getByText(/加载失败/)).toBeTruthy());
+    expect(screen.getByRole('button', { name: '重试' })).toBeTruthy();
+  });
 });

@@ -246,9 +246,14 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
     yearly = ic_by_year(df, factor, ret_col, date_col=date_col)
     rw = rolling_ic(df, factor, ret_col, 60, date_col=date_col)
 
+    # 归因维度只认「分类维度」：显式指定 → 原始行业列 → 行业协变量列。
+    # 绝不回退到 symbol —— 按个股算出来的「行业暴露」是无意义输出，却被读成
+    # 「行业很干净」（历史缺陷：242/242 份 API 生成的报告都是 归因分解 · symbol）。
+    # 一个都拿不到时整节不出现，而不是拿个股顶替。
     attr = None
-    cc = cat_col or ("industry_sw1" if "industry_sw1" in df.columns else "symbol")
-    if cc in df.columns:
+    cc = cat_col or next(
+        (c for c in ("industry_sw1", "cov_industry_sw1") if c in df.columns), None)
+    if cc is not None:
         try:
             attr = attribution_summary(df, factor, ret_col, date_col=date_col, cat_col=cc)
         except Exception:

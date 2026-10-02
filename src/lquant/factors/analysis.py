@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+import math
+
 import polars as pl
 
 from lquant.factors.engine import FactorEngine
@@ -19,6 +21,7 @@ __all__ = ["compute_factor_col", "build_matrix", "correlation",
            "synthesize", "REDUNDANT_THRESHOLD"]
 
 REDUNDANT_THRESHOLD = 0.8
+MIN_XS_OBS = 5          # 截面样本数下限：低于它的交易日不参与横截面统计
 
 
 def _is_quick(formula: str) -> bool:
@@ -130,12 +133,39 @@ def correlation(df: pl.DataFrame, formulas: list[str], *,
     }
 
 
+def _mean_rank_ic(df: pl.DataFrame, factor: str, ret_col: str, *,
+                  date_col: str = "trade_date", min_obs: int = MIN_XS_OBS) -> float:
+    """日均 RankIC：逐日截面 Spearman（对秩做 Pearson）后取均值。
+
+    与 ``correlation()`` 同口径。**不是**全样本池化相关 —— 池化会按截面大小
+    加权、抹掉日间变异，和「日均 RankIC」可以差 20%（实测 0.446 vs 0.372）。
+    无有效截面时返回 0.0（调用方据此退化为等权）。
+    """
+    d = df.drop_nulls([factor, ret_col])
+    if not len(d):
+        return 0.0
+    per_day = (
+        d.with_columns([pl.col(factor).rank().over(date_col),
+                        pl.col(ret_col).rank().over(date_col)])
+        .group_by(date_col)
+        .agg([pl.len().alias("n"), pl.corr(factor, ret_col).alias("ic")])
+        .filter(pl.col("n") >= min_obs)
+    )
+    if not len(per_day):
+        return 0.0
+    v = per_day["ic"].mean()
+    if v is None:
+        return 0.0
+    v = float(v)
+    return v if math.isfinite(v) else 0.0
+
+
 def synthesize(df: pl.DataFrame, formulas: list[str], *,
                weights: list[float] | None = None,
                method: str = "equal", ic_horizon: int = 5) -> pl.DataFrame:
     """合成因子：按日 zscore 后加权。method: equal / ic_weighted。
 
-    ic_weighted 用各因子与 fwd_ret_{ic_horizon} 的日均 RankIC 为权重
+    ic_weighted 用各因子与 fwd_ret_{ic_horizon} 的**日均 RankIC** 为权重
     （负 IC 因子取反向权重前先翻转符号 —— 负 IC 也是信息）。
     返回带 `<syn>` 合成列的 DataFrame。
     """
@@ -147,18 +177,14 @@ def synthesize(df: pl.DataFrame, formulas: list[str], *,
 
         d = forward_return(wide, "close", periods=[ic_horizon])
         ret_col = f"fwd_ret_{ic_horizon}"
-        ics = {}
-        for c in names:
-            r = (d.drop_nulls([c, ret_col])
-                 .with_columns(pl.col(c).rank().over("trade_date"),
-                               pl.col(ret_col).rank().over("trade_date"))
-                 .select(pl.corr(pl.col(c), pl.col(ret_col)).alias("ic")))
-            ics[c] = float(r["ic"][0]) if len(r) else 0.0
+        ics = {c: _mean_rank_ic(d, c, ret_col) for c in names}
         # 方向统一：负 IC 翻转因子符号
         signs = {c: (1.0 if v >= 0 else -1.0) for c, v in ics.items()}
         w = {c: abs(ics[c]) for c in names}
-        total = sum(w.values()) or 1.0
-        weights = [signs[c] * w[c] / total for c in names]
+        total = sum(w.values())
+        # 全部因子都测不出 IC 时退化为等权，而不是输出一列全 0（静默失效）
+        weights = ([signs[c] * w[c] / total for c in names] if total > 0
+                   else [1.0 / len(names)] * len(names))
     elif weights is None:
         weights = [1.0 / len(names)] * len(names)
     if len(weights) != len(names):

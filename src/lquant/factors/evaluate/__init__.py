@@ -61,8 +61,15 @@ __all__ = [
 
 def evaluate(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
              n_groups: int = 10, horizons: list[int] | None = None,
-             with_report: bool = True, **kw) -> dict:
-    """一次性跑完 IC / 分层 / 衰减 / 归因，并可选生成 HTML 报告。"""
+             with_report: bool = True, with_robustness: bool = False,
+             **kw) -> dict:
+    """一次性跑完 IC / 分层 / 衰减 / 归因 / 评级，并可选生成 HTML 报告。
+
+    ``with_robustness=True`` 时额外跑 L3 稳健性（窗口扰动 / 分段稳定 /
+    起点敏感 / 月度剔除 / OOS 衰减）。它要按扰动窗口重算因子若干遍，是
+    本函数里最贵的一步，所以默认关闭、由调用方显式开启。
+    ``expr`` 传给稳健性做参数扰动；缺省时该项记 skipped。
+    """
     out = {
         "factor": factor,
         "ic": ic_summary(df, factor, ret_col, **_pick(kw, "date_col", "min_obs")),
@@ -74,10 +81,20 @@ def evaluate(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
                                            **_pick(kw, "date_col", "cat_col", "num_cols")),
     }
     out["ic"].pop("series", None)      # 序列太大，不放进汇总 dict，需要时单独调 ic_series
+    # 评级：把 IC/ICIR/单调性/多空夏普/多重检验校正收敛成「强/中/弱 + 差在哪」
+    out["rating"] = factor_rating(out["ic"], out["quantile"],
+                                  n_trials=kw.get("n_trials"))
+    if with_robustness:
+        out["robustness"] = robustness_summary(
+            df, factor, ret_col,
+            expr=kw.get("expr"), covs=kw.get("covs"),
+            icir_is=kw.get("icir_is"), icir_oos=kw.get("icir_oos"),
+            **_pick(kw, "deltas", "n_splits", "n_starts", "top_n", "n_groups", "date_col"))
     if with_report:
         out["report"] = factor_report(df, factor, ret_col, n_groups=n_groups,
                                       horizons=horizons, **_pick(kw, "price_col", "date_col",
                                                                  "symbol_col", "cat_col",
+                                                                 "group_col", "bps_list",
                                                                  "universe", "filter_zscore",
                                                                  "outlier_stats", "event_window"))
     return out

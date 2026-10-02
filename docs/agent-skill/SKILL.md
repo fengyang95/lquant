@@ -19,14 +19,15 @@
 
     lq data fields               # 字段白名单 + 覆盖率（先看数据里有什么）
     lq factor check "<expr>"     # L0 静态校验（毫秒，永远第一步）
-    lq factor eval "<expr>"      # L1 平台算 IC + 中性化对照 + 校正门槛 + 剩余配额
-    lq factor series "<expr>"    # 逐日 IC 序列（平台算）
+    lq factor eval "<expr>"      # L1 平台算 IC/ICIR + 分层 + 换手 + 中性化对照 + 校正门槛 + 配额
+    lq factor series "<expr>"    # 逐日 IC/RankIC/累计 IC 序列 + dates（平台算）
     lq factor corr "<e1>" "<e2>" # 库内查重/自查（提交前必做）
     lq factor audit "<expr>"     # L2 全量评估：IC/ICIR、分层、衰减、归因、评级、OOS
     lq factor robust "<expr>"    # L3 稳健性：参数扰动 / 分段稳定 / 起点敏感 / 月度剔除
     lq factor report "<expr>"    # 出一份 HTML 评估报告（--out，默认 data/reports/）
+    lq factor run --name <因子名> # 按注册名跑 L2 深度校验（等价于对该表达式跑 audit）
     lq factor submit spec.yaml   # ★ 唯一入库通道，服务端重验（A/B 级入库）
-    lq agent list / show / test  # 接入验收：lq agent test <name> 必须通过
+    lq agent list / show / test / run / freeze  # 注册、接入验收、平台驱动跑批、冻结
 
 ## 评估阶梯（L0→L3，逐层加深、逐层变贵）
 

@@ -106,3 +106,34 @@ def test_market_cap_is_log():
     raw = out["float_mv"].to_numpy()
     got = out["cov_market_cap"].to_numpy()
     assert np.allclose(got, np.log1p(raw))
+
+
+def test_n1_winsorize_mad_handcalc():
+    """N1: MAD 去极值口径与手算一致（中位数 ± n×1.4826×MAD）。
+
+    极值必须被夹到上界，其余点原样保留 —— 口径写错（比如漏乘 1.4826、
+    或用均值代替中位数）会立刻在这里暴露。
+    """
+    vals = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 100.0])
+    d = pl.DataFrame({"trade_date": [dt.date(2025, 1, 1)] * len(vals), "f": vals})
+    out = pipeline_run(d, "f", [{"op": "winsorize", "method": "mad", "n": 5}])
+    med = 4.0
+    mad = float(np.median(np.abs(vals - med))) * 1.4826
+    expected = np.clip(vals, med - 5 * mad, med + 5 * mad)
+    assert np.allclose(out["f"].to_numpy(), expected)
+    assert out["f"].to_numpy()[-1] < 100.0          # 极值确实被夹住
+
+
+def test_n3_industry_mean_equals_within_group_demean():
+    """N3: 行业均值剔除 == 组内去均值（手算对照，按 [日期, 行业] 分组）。"""
+    d = _panel(n_days=4, n_sym=8)
+    d, _ = build_covariates(d, ["industry_sw1"], industry_df=_industry())
+    d = d.with_columns(pl.col("close").pct_change(1).over("symbol").alias("f"))
+    d = d.drop_nulls(["f", "cov_industry_sw1"])
+    assert len(d) > 0
+    out = pipeline_run(d, "f", [{"op": "neutralize", "method": "industry_mean",
+                                 "group": "cov_industry_sw1"}])
+    exp = d.with_columns(
+        (pl.col("f") - pl.col("f").mean().over(["trade_date", "cov_industry_sw1"]))
+        .alias("exp"))
+    assert np.allclose(out["f"].to_numpy(), exp["exp"].to_numpy(), atol=1e-12)

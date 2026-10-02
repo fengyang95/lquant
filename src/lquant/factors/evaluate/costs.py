@@ -10,7 +10,7 @@ import polars as pl
 from lquant.backtest.metrics import perf_from_returns
 from lquant.factors.evaluate.quantile import add_quantile, long_short_nav
 
-__all__ = ["factor_turnover", "cost_adjusted_nav", "cost_matrix"]
+__all__ = ["factor_turnover", "cost_matrix"]
 
 
 def factor_turnover(df: pl.DataFrame, factor: str, n_groups: int = 10, *,
@@ -77,28 +77,6 @@ def factor_turnover(df: pl.DataFrame, factor: str, n_groups: int = 10, *,
     )
     return out.rename({date_col: "date"}).select(
         ["date", "turnover_long", "turnover_short", "turnover_avg"]).sort("date")
-
-
-def cost_adjusted_nav(ls_nav: pl.DataFrame, turnover_df: pl.DataFrame,
-                      bps_list: list[float], *,
-                      date_col: str = "trade_date") -> dict[float, pl.DataFrame]:
-    """多空净值扣成本：净收益 = ret_long_short - turnover_avg × (bps/1e4) × 2。
-
-    返回 {bps: 净值 DataFrame}，每帧含 date, ret_net, nav_net。
-    """
-    j = ls_nav.join(turnover_df.rename({"date": date_col}), on=date_col, how="inner")
-    out: dict[float, pl.DataFrame] = {}
-    for bps in bps_list:
-        cost = pl.col("turnover_avg") * (bps / 1e4) * 2.0
-        net = j.with_columns(
-            (pl.col("ret_long_short") - cost).alias("ret_net")
-        ).select([
-            pl.col(date_col).alias("date"),
-            "ret_net",
-            (1.0 + pl.col("ret_net")).cum_prod().alias("nav_net"),
-        ])
-        out[float(bps)] = net
-    return out
 
 
 def cost_matrix(df: pl.DataFrame, factor: str, ret_col: str, *,

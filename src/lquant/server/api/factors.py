@@ -92,6 +92,26 @@ class EvaluateIn(BaseModel):
                             description="评价区间终点 YYYY-MM-DD；None = 数据末端")
     universe: str = Field(default="all",
                           description="股票池：all = 全市场，或指数代码/别名（hs300/zz500/zz800/zz1000）")
+    steps: list[dict] | None = Field(
+        default=None, max_length=8,
+        description="预处理配方（winsorize/standardize/neutralize/orthogonalize 有序列表）；"
+                    "None = 内置默认配方（mad 去极值 → zscore → 市值行业中性化）")
+    with_robustness: bool = Field(
+        default=False,
+        description="是否跑 L3 稳健性（窗口扰动/分段稳定/起点敏感/月度剔除）—— 需重算因子多遍，默认关")
+
+    @field_validator("steps")
+    @classmethod
+    def _validate_steps(cls, v: list[dict] | None) -> list[dict] | None:
+        """配方 fail-fast：未知 stage/method 直接 422，而不是跑出一个空配方。
+
+        静默忽略坏步骤 = 「改了参数没反应」，是这套流水线最贵的坑。
+        """
+        if v is None:
+            return None
+        from lquant.factors.preprocess.pipeline import validate_steps
+
+        return validate_steps(v)
 
     @field_validator("universe")
     @classmethod
@@ -157,8 +177,10 @@ def list_factors(
                 f"{where} ORDER BY {order} {suffix}",
                 [source] if source else [],
             ).fetchall()
-        except Exception:  # noqa: BLE001
-            return []
+        except Exception as e:  # noqa: BLE001
+            # 不能返回 []：库读不出来和「一个因子都没注册」在 UI 上长得一样，
+            # 用户会以为因子全丢了
+            raise HTTPException(503, f"因子列表读取失败: {e}") from e
     builtin_family = {}
     try:
         from lquant.factors.qlib_alpha import list_builtin
@@ -235,8 +257,8 @@ def update_factor(name: str, f: FactorUpdateIn) -> dict:
                 "SELECT name, expression, description, enabled, created_at, "
                 "source, source_ref, factor_id, category "
                 "FROM factor_def WHERE name = ?", [name]).fetchone()
-        except Exception:  # noqa: BLE001
-            r = None
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(503, f"因子读取失败: {e}") from e
     if not r:
         raise HTTPException(404, f"因子不存在: {name}")
     cur = {"name": r[0], "expression": r[1] or "", "description": r[2] or "",
@@ -273,8 +295,8 @@ def delete_factor(name: str) -> dict:
         try:
             exists = con.execute(
                 "SELECT 1 FROM factor_def WHERE name = ?", [name]).fetchone()
-        except Exception:  # noqa: BLE001
-            exists = None
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(503, f"因子读取失败: {e}") from e
     if not exists:
         raise HTTPException(404, f"因子不存在: {name}")
     with writer() as con:
@@ -335,8 +357,11 @@ def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
     raise HTTPException(422, f"暂不支持的因子公式: {formula}（内置因子见 GET /api/factors/builtin）")
 
 
-def _neutral_views_for(d: pl.DataFrame, ret_col: str) -> dict:
-    """收益中性化对照 + 行业内分组标注（5.1 视图）。"""
+def _neutral_views_for(d: pl.DataFrame, ret_col: str, n_groups: int = 5) -> dict:
+    """收益中性化对照 + 行业内分组分层（§5.1 三视图）。
+
+    n_groups 必须透传用户选择 —— 此前恒用默认 5，与页面上的分层组数不一致。
+    """
     from lquant.factors.evaluate.neutral_views import neutral_views as _nv
 
     try:
@@ -344,9 +369,12 @@ def _neutral_views_for(d: pl.DataFrame, ret_col: str) -> dict:
         if not cov_cols:
             return {"view": "raw（未中性化 —— 协变量数据不可用）"}
         return _nv(d, "_factor", ret_col, covariates=cov_cols,
-                   group_col="cov_industry_sw1" if "cov_industry_sw1" in d.columns else None)
-    except Exception:  # noqa: BLE001
-        return {}
+                   group_col="cov_industry_sw1" if "cov_industry_sw1" in d.columns else None,
+                   n_groups=n_groups)
+    except Exception as e:  # noqa: BLE001
+        # 不能静默成 {}：页面会把「算炸了」显示成「协变量数据不足」，
+        # 两种情况的处置完全不同（一个是修数据，一个是修代码）
+        return {"view": "error", "error": f"{type(e).__name__}: {e}"}
 
 
 def _persist_ic(name: str, ladder: list[dict]) -> None:
@@ -374,14 +402,20 @@ def _persist_ic(name: str, ladder: list[dict]) -> None:
 
 def _neutral_ladder(d: pl.DataFrame, col: str, ret_col: str,
                     dd: pl.DataFrame | None = None,
-                    cov_report: dict | None = None) -> list[dict]:
+                    cov_report: dict | None = None,
+                    errors: dict | None = None) -> list[dict]:
     """逐段叠加协变量看 IC 怎么掉：原始 → +市值 → +行业 → +换手率。
 
     dd/cov_report 可由调用方传入（协变量只构建一次，ladder 与 views 复用）。
+    errors 传入时记录失败原因 —— 「阶梯缺一段」和「这一段算不出来」必须能区分。
     """
     from lquant.factors.evaluate.ic import ic_series
     from lquant.factors.preprocess.pipeline import drop_nonfinite
     from lquant.factors.preprocess.pipeline import run as pipeline_run
+
+    def _fail(key: str, e: Exception) -> None:
+        if errors is not None:
+            errors[key] = f"{type(e).__name__}: {e}"
 
     levels = [
         ("raw", []),
@@ -396,7 +430,8 @@ def _neutral_ladder(d: pl.DataFrame, col: str, ret_col: str,
         cov_names = sorted({c for _, covs in levels for c in covs})
         try:
             dd, report = build_covariates(d, cov_names)
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            _fail("neutral_ladder:covariates", e)
             return []
         cov_report = {r["covariate"]: r["coverage"] for r in report}
     cov_report = cov_report or {}
@@ -406,11 +441,13 @@ def _neutral_ladder(d: pl.DataFrame, col: str, ret_col: str,
         if covs:
             cols = [f"cov_{c}" for c in covs if f"cov_{c}" in dd.columns]
             if covs and not cols:
+                _fail(f"neutral_ladder:{label}", RuntimeError("协变量列全缺失"))
                 continue
             steps.append({"op": "neutralize", "method": "ols", "factors": cols})
         try:
             r = pipeline_run(dd, col, steps)
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            _fail(f"neutral_ladder:{label}", e)
             continue
         r = drop_nonfinite(r, col)
         s = ic_series(r, col, ret_col)
@@ -465,14 +502,65 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
         # 面板大时这是评估链路里最贵的一步）
         d, outlier_stats = zscore_filter_with_stats(d, threshold=req.filter_zscore)
 
+    # ---- 协变量（市值/行业/换手率/动量）：必须在 evaluate() 之前构建 ----
+    # 报告的「归因分解」需要分类维度，而 read_daily 只有个股维度。此前协变量在
+    # evaluate() 之后才建 → 报告拿不到行业列 → 静默回退成按 symbol 归因
+    # （实测 242/242 份 API 生成的报告都是「归因分解 · symbol」）。顺序即口径。
+    _step(20, "构建协变量")
+    errors: dict[str, str] = {}
+    cov_names_all = ["market_cap", "industry_sw1", "turnover_1m", "momentum_1m"]
+    try:
+        with reader() as con:
+            ind = con.execute("SELECT symbol, std, code, std_date FROM industry_classify").pl()
+    except Exception as e:  # noqa: BLE001
+        ind = None
+        errors["industry_classify"] = f"{type(e).__name__}: {e}"
+    try:
+        from lquant.factors.covariates import build_covariates
+
+        d, cov_report = build_covariates(d, cov_names_all, industry_df=ind)
+        cov_map = {r["covariate"]: r["coverage"] for r in cov_report}
+    except Exception as e:  # noqa: BLE001
+        d, cov_map = d, {}
+        errors["covariates"] = f"{type(e).__name__}: {e}"
+
+    # 归因阶梯的基线始终是「原始因子」：用户配方只作用于主评价，不改变
+    # 「中性化到底吃掉了多少 IC」这个问题的答案。
+    d_pre_recipe = d
+    # 用户配方（可选）：协变量就绪后才应用，neutralize 步骤才拿得到 cov_* 列。
+    # 不给配方 = 维持原口径（原始因子直接评价），不改默认行为。
+    applied_steps = None
+    if req.steps:
+        from lquant.factors.preprocess.pipeline import run as pipeline_run
+
+        try:
+            d = pipeline_run(d, "_factor", req.steps)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(422, f"预处理配方执行失败: {e}") from e
+        applied_steps = req.steps
+        d = drop_nonfinite(d, "_factor")
+
+    # 分类维度必须是「有覆盖率的」行业列：coverage=0 的协变量列虽然存在，
+    # 但全 null —— 拿它做归因等于又换了一种空输出。原始 industry_sw1 列不受此限。
+    cat_col = next(
+        (c for c in ("cov_industry_sw1", "industry_sw1")
+         if c in d.columns and (c == "industry_sw1" or cov_map.get("industry_sw1", 0) > 0)),
+        None)
+    cov_cols_present = [c for c in d.columns if c.startswith("cov_")]
+
     # ---- metrics（原 run_evaluate 计算体） ----
-    _step(20, "评价计算")
+    _step(35, "评价计算")
     res = evaluate(d, "_factor", ret_col=ret_col, n_groups=req.n_groups,
                    horizons=req.horizons, outlier_stats=outlier_stats,
+                   cat_col=cat_col, group_col=cat_col,
+                   bps_list=[0.0, 5.0, 10.0, 15.0, 30.0],
+                   universe=req.universe, expr=req.formula, covs=cov_cols_present,
+                   with_robustness=req.with_robustness,
                    event_window=(req.event_window[0], req.event_window[1]))
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     report_path = _save_report_atomic(res["report"], REPORT_DIR / f"{req.factor}.html")
     ic = res["ic"]["ic"]
+    ric = res["ic"]["rank_ic"]
     ls = res["quantile"]["long_short"]
     metrics = {
         "factor": req.factor,
@@ -481,14 +569,24 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
         # _jf 兜底：薄截面/常数因子下这些值可能是 NaN，裸 NaN 会产出非法 JSON
         "ic": {"mean": _jf(ic["mean"]), "ir": _jf(ic["ir"], 3),
                "t_stat": _jf(ic["t_stat"], 2), "positive_rate": _jf(ic["positive_rate"]),
-               "ic_gt_002_rate": _jf(ic["ic_gt_002_rate"])},
-        "rank_ic_mean": _jf(res["ic"]["rank_ic"]["mean"]),
+               "ic_gt_002_rate": _jf(ic["ic_gt_002_rate"]),
+               # 与 CLI audit 对齐：NW t 值与 IC 自相关此前只在 CLI 有
+               "t_stat_nw": _jf(ic.get("t_stat_nw"), 2),
+               "ic_autocorr": _jf(ic.get("ic_autocorr"), 3)},
+        "rank_ic_mean": _jf(ric["mean"]),
         "long_short": {"annual_return": _jf(ls["annual_return"]),
                        "sharpe": _jf(ls["sharpe"], 2),
                        "max_drawdown": _jf(ls["max_drawdown"])},
         "monotonicity": _jf(res["quantile"]["monotonicity"], 3),
         "half_life": res["decay"]["half_life"],
         "suggested_rebalance": res["decay"]["suggested_rebalance"],
+        # 评级：L2 判据的最终结论（此前只有 CLI audit 拿得到）
+        "rating": res["rating"],
+        # L3 稳健性：默认关（要重算因子多遍），请求 with_robustness=true 才返回
+        "robustness": res.get("robustness"),
+        # 本次实际使用的预处理配方（None = 原始因子直接评价）
+        "steps": applied_steps,
+        "covariates": cov_map,
         "excess": {},                    # 计算体在下方超额块完成后回填
         "annual_turnover": None,
         "top_n": [],
@@ -528,24 +626,45 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
                 "ir": _jf(r["ir"], 3), "positive_rate": _jf(r["positive_rate"], 4)}
                for r in icy.to_dicts()] if len(icy) else []
 
-    # ---- IC 归因阶梯（方案 5.3）+ 三种中性化视图标注（方案 5.1） ----
+    # ---- IC 归因阶梯（方案 5.3）+ 三种中性化视图（方案 5.1） ----
     _step(55, "归因与中性化")
-    cov_names_all = ["market_cap", "industry_sw1", "turnover_1m", "momentum_1m"]
-    try:
-        with reader() as con:
-            ind = con.execute("SELECT symbol, std, code, std_date FROM industry_classify").pl()
-    except Exception:  # noqa: BLE001
-        ind = None
-    try:
-        from lquant.factors.covariates import build_covariates
-
-        d, cov_report = build_covariates(d, cov_names_all, industry_df=ind)
-        cov_map = {r["covariate"]: r["coverage"] for r in cov_report}
-    except Exception:  # noqa: BLE001
-        d, cov_map = d, {}
-    ladder = _neutral_ladder(d, "_factor", ret_col, dd=d, cov_report=cov_map)
+    ladder = _neutral_ladder(d_pre_recipe, "_factor", ret_col,
+                             dd=d_pre_recipe, cov_report=cov_map, errors=errors)
+    if not ladder:
+        errors.setdefault("neutral_ladder", "归因阶梯为空（协变量不可用或 IC 序列不足）")
     _persist_ic(req.factor, ladder)
-    views = _neutral_views_for(d, ret_col)
+    views = _neutral_views_for(d, ret_col, req.n_groups)
+    if views.get("view") == "error":
+        errors["neutral_views"] = views["error"]
+
+    # ---- 分组 IC：行业组 + 市值组（识破「信号只来自小市值/某一行业」） ----
+    # 此前 ic_by_group / size_group 在生产代码里不可达（report 的 group_col 被丢弃）。
+    group_ic: dict = {"by": cat_col, "industry": [], "size": [], "size_col": None,
+                      "error": None}
+    try:
+        from lquant.factors.evaluate.group_ic import ic_by_group, size_group
+
+        if cat_col:
+            gi = ic_by_group(d, "_factor", ret_col, cat_col)
+            group_ic["industry"] = [
+                {"group": str(r["group"]), "ic_mean": _jf(r["ic_mean"]),
+                 "rank_ic_mean": _jf(r["rank_ic_mean"]), "ir": _jf(r["ir"], 3),
+                 "n_days": int(r["n_days"])} for r in gi.to_dicts()
+            ] if len(gi) else []
+        mcap_col = next((c for c in ("cov_market_cap", "float_mv", "amount")
+                         if c in d.columns), None)
+        if mcap_col:
+            ds = size_group(d, mcap_col=mcap_col, n_groups=3)
+            gs = ic_by_group(ds, "_factor", ret_col, "size_q")
+            group_ic["size_col"] = mcap_col
+            group_ic["size"] = [
+                {"group": f"size_q{int(r['group'])}", "ic_mean": _jf(r["ic_mean"]),
+                 "rank_ic_mean": _jf(r["rank_ic_mean"]), "ir": _jf(r["ir"], 3),
+                 "n_days": int(r["n_days"])} for r in gs.to_dicts()
+            ] if len(gs) else []
+    except Exception as e:  # noqa: BLE001
+        group_ic["error"] = f"{type(e).__name__}: {e}"
+        errors["group_ic"] = group_ic["error"]
 
     # ---- 超额收益体系 / Top-N 收缩测试 / 中性化后风格相关性（研报标准三件套） ----
     _step(70, "超额与Top-N")
@@ -581,8 +700,9 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
                        "max_drawdown": _jf(r["max_drawdown"]),
                        "annual_turnover": _jf(r["annual_turnover"], 2)}
                       for r in tn.to_dicts()] if len(tn) else []
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
         top_n_rows = []
+        errors["top_n"] = f"{type(e).__name__}: {e}"
 
     try:
         from lquant.factors.evaluate.style_corr import style_correlation
@@ -601,8 +721,9 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
             rn, "_factor", style_cols,
             group_col="cov_industry_sw1" if "cov_industry_sw1" in rn.columns else None,
             threshold=req.style_threshold)
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
         style_corr = {}
+        errors["style_corr"] = f"{type(e).__name__}: {e}"
 
     try:
         from lquant.factors.evaluate.costs import factor_turnover
@@ -610,8 +731,9 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
         to_df = factor_turnover(d, "_factor", req.n_groups)
         mean_to = to_df["turnover_avg"].drop_nulls().mean() if len(to_df) else None
         annual_turnover = _jf(float(mean_to) * 252, 2) if mean_to is not None else None
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
         annual_turnover = None
+        errors["turnover"] = f"{type(e).__name__}: {e}"
 
     # 回填 metrics（超额/TopN/风格相关在 metrics 构造后才可算，这里统一写入）
     metrics["excess"] = excess_metrics
@@ -646,8 +768,9 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
             "look_ahead_ratio": _jf(es["look_ahead_ratio"], 3),
             "before": es["before"], "after": es["after"], "demeaned": es["demeaned"],
         }
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
         event_study = {}
+        errors["event_study"] = f"{type(e).__name__}: {e}"
 
     metrics["outlier"] = (
         {"threshold": outlier_stats["threshold"],
@@ -664,12 +787,16 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
                      "monotonicity": _jf(qsum.get("monotonicity"), 3)},
         "decay": decay, "ic_by_year": ic_year, "neutral_ladder": ladder,
         "neutral_views": views,
+        "group_ic": group_ic,
         "rolling": rolling,
         "excess": {"dates": ex_dates, "curves": ex_curves, "benchmark": "股票池等权"},
         "top_n": top_n_rows,
         "style_corr": style_corr,
         "event_study": event_study,
+        # 故障可见：UI 必须能区分「没数据」与「算炸了」
+        "errors": errors,
     }
+    metrics["errors"] = errors
     _step(95, "汇总")
     return metrics, series
 
@@ -783,6 +910,26 @@ def list_factor_sources() -> list[dict]:
     return list_sources()
 
 
+@router.get("/preprocess/methods")
+def list_preprocess_methods(
+    stage: str | None = Query(default=None,
+                             description="按阶段过滤：winsorize/standardize/neutralize/orthogonalize"),
+) -> dict:
+    """预处理方法枚举 + 默认配方（M2.5「配方接入 API/UI」）。
+
+    前端据此渲染配方选择器，不必硬编码方法名 —— 加新方法不用改前端。
+    """
+    from lquant.factors.preprocess.registry import STAGES, default_pipeline, list_methods
+
+    if stage is not None and stage not in STAGES:
+        raise HTTPException(422, f"未知预处理阶段 {stage!r}，可选: {list(STAGES)}")
+    return {
+        "stages": list(STAGES),
+        "methods": list_methods(stage),
+        "default_recipe": default_pipeline(),
+    }
+
+
 @router.get("/builtin")
 def builtin_factors(
     family: str | None = Query(default=None, description="按族过滤：kbar/price/roc/ma/..."),
@@ -883,8 +1030,8 @@ def list_mining_runs(limit: int = Query(default=50, ge=1, le=500)) -> list[dict]
                 "n_redundant, n_size_proxy, n_survivors, created_at "
                 "FROM factor_mining_run ORDER BY created_at DESC LIMIT ?",
                 [limit]).fetchall()
-        except Exception:  # noqa: BLE001
-            return []
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(503, f"挖掘台账读取失败: {e}") from e
     return [{"run_id": r[0], "agent": r[1], "generator": r[2],
              "n_evaluated": r[3], "n_static_fail": r[4], "n_low_ic": r[5],
              "n_redundant": r[6], "n_size_proxy": r[7], "n_survivors": r[8],
@@ -902,14 +1049,15 @@ def get_mining_run(run_id: str) -> dict:
                 "SELECT run_id, agent, generator, n_evaluated, n_static_fail, n_low_ic, "
                 "n_redundant, n_size_proxy, n_survivors, corrections, created_at "
                 "FROM factor_mining_run WHERE run_id = ?", [run_id]).fetchone()
-        except Exception:  # noqa: BLE001
-            r = None
+        except Exception as e:  # noqa: BLE001
+            # 读失败 ≠ 不存在：把 DB 故障伪装成 404 会让用户以为记录丢了
+            raise HTTPException(503, f"挖掘会话读取失败: {e}") from e
     if not r:
         raise HTTPException(404, f"挖掘会话不存在: {run_id}")
     try:
         corrections = json.loads(r[9] or "{}")
-    except Exception:  # noqa: BLE001
-        corrections = {}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"corrections 字段不是合法 JSON: {e}") from e
     return {"run_id": r[0], "agent": r[1], "generator": r[2],
             "n_evaluated": r[3], "n_static_fail": r[4], "n_low_ic": r[5],
             "n_redundant": r[6], "n_size_proxy": r[7], "n_survivors": r[8],
@@ -964,8 +1112,11 @@ def _mine_placeholder(run_id: str, agent: str, generator: str) -> None:
             con.execute(
                 "INSERT OR REPLACE INTO factor_mining_run VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 [run_id, agent, generator, 0, 0, 0, 0, 0, 0, "{}", dt.datetime.now()])
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        # 不阻断入队，但必须留痕：静默失败会让「台账里没有这次挖掘」无从解释
+        import loguru
+
+        loguru.logger.warning(f"挖掘占位行写入失败（任务仍入队）: {e}")
 
 
 def _run_mine_job(agent_name: str, generator: str, n: int, run_id: str) -> dict:
@@ -998,6 +1149,7 @@ def _run_mine_job(agent_name: str, generator: str, n: int, run_id: str) -> dict:
     from lquant.factors.agents import record_eval
 
     record_eval(agent_name, res.n_evaluated)
+    ledger_warning = None
     try:
         with writer() as con:
             con.execute(
@@ -1005,13 +1157,17 @@ def _run_mine_job(agent_name: str, generator: str, n: int, run_id: str) -> dict:
                 [run_id, agent_name, generator, res.n_evaluated, res.n_static_fail,
                  res.n_low_ic, res.n_redundant, res.n_size_proxy, res.n_survivors,
                  json.dumps(res.corrections, ensure_ascii=False)[:10000], dt.datetime.now()])
-    except Exception:  # noqa: BLE001
-        pass  # 记账失败不阻断结果
+    except Exception as e:  # noqa: BLE001
+        # 记账失败不阻断结果，但要在响应里显式带出来（CLI 侧同样打 warn）
+        import loguru
+
+        loguru.logger.warning(f"挖掘记账落库失败（结果仍有效）: {e}")
+        ledger_warning = str(e)
     return {"run_id": run_id, "agent": agent_name, "generator": generator,
             "n_evaluated": res.n_evaluated, "n_static_fail": res.n_static_fail,
             "n_low_ic": res.n_low_ic, "n_redundant": res.n_redundant,
             "n_size_proxy": res.n_size_proxy, "n_survivors": res.n_survivors,
-            "survivors": survivors[:10]}
+            "survivors": survivors[:10], "ledger_warning": ledger_warning}
 
 
 @router.post("/mine/run")
@@ -1067,8 +1223,8 @@ def get_factor(name: str) -> dict:
             r = con.execute(
                 "SELECT name, expression, description, created_at, source, category "
                 "FROM factor_def WHERE name = ?", [name]).fetchone()
-        except Exception:  # noqa: BLE001
-            r = None
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(503, f"因子读取失败: {e}") from e
     if not r:
         raise HTTPException(404, f"因子不存在: {name}")
     reports = []
