@@ -168,6 +168,12 @@ class Engine:
         df = df.with_columns([pl.lit(v).alias(c) for c, v in lits.items() if c not in df.columns])
         if "is_suspended" not in df.columns:
             df = df.with_columns(pl.lit(False).alias("is_suspended"))
+        # 逐日 ST 标记：日线湖的 is_st 列（baostock isST）**逐日**给出真实戴帽状态。
+        # 缺失/为 null 时保留 null（= 未知），由 rules 退回 security 表的静态默认值。
+        if "is_st" not in df.columns:
+            df = df.with_columns(pl.lit(None, dtype=pl.Boolean).alias("is_st"))
+        else:
+            df = df.with_columns(pl.col("is_st").cast(pl.Boolean, strict=False).alias("is_st"))
         vol = pl.col("volume")
         df = df.with_columns(
             pl.when(pl.col("pre_close").fill_null(0.0) == 0.0).then(pl.col("close"))
@@ -187,7 +193,8 @@ class Engine:
 
         out: dict[date, dict[str, Bar]] = {}
         cols = ["open", "high", "low", "close", "pre_close",
-                "volume", "amount", "adj_factor", "halted", "suspended", "no_volume"]
+                "volume", "amount", "adj_factor", "halted", "suspended", "no_volume",
+                "is_st"]
         for sub in df.sort([date_col, symbol_col]).partition_by(date_col, as_dict=False):
             d = sub[date_col][0]
             syms = sub[symbol_col].to_list()
@@ -205,6 +212,7 @@ class Engine:
                     halted=bool(cvals["halted"][k]),
                     suspended=bool(cvals["suspended"][k]),
                     no_volume=bool(cvals["no_volume"][k]),
+                    is_st=None if cvals["is_st"][k] is None else bool(cvals["is_st"][k]),
                     fields={c: fvals[c][k] for c in fields},
                 )
             out[d] = bars

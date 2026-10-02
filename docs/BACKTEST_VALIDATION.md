@@ -103,21 +103,45 @@ final_cash + Σ持仓数量 × 收盘价 ≡ final_nav
 但摩擦成本 = 无摩擦净值 − 有摩擦净值 必须为正且随费率单调。
 
 > 说明：自研引擎保持唯一执行真源（见 docs/BACKTEST_ENGINES.md），
-> 第三方引擎只做对照，不进生产路径。adapter 已预留，接入时补此层测试。
+> 第三方引擎只做对照，不进生产路径。
 
-**当前真实状态（2026-10-02 复核，勿把「预留」读成「已完成」）**：
+**当前真实状态（2026-10-02 第二次复核）**：
 
-- `backtest/adapter.py` 是**空注册表**：`ADAPTERS` 零注册、零调用方，
-  覆盖率 0%。L5 的「日收益相关 > 0.9999 / 净值差 < 1bp」**尚未有任何测试**。
-- 但**存在一次真实的 backtrader 对账**（`scripts/backtest_validation/validate_accuracy.py`），
-  结果记在 `docs/BACKTEST_VALIDATION_BENCHMARKS.md`：5 个策略里 **2 个 FAIL**
-  （`baseline_multifactor` 最大日差 28.38%、`momentum_rotation` 20.44%），
-  3 个 PASS（最大日差 ≤ 0.06%）。
-- 那 2 个 FAIL 在正文里被解释为「路径依赖，不影响判定」，但表格判定未改、
-  也未重跑。**按本文件的标准它们仍是未通过项**，属于本层开放缺口。
-  值得优先排查的一条线索：`momentum_rotation` 用了 159915.SZ（创业板 ETF），
-  而该 ETF 的涨跌幅此前被错设为 10%（真实 20%）—— 护栏过严会系统性改变轮动路径。
-  该项已在 2026-10-02 修复，建议在数据湖就绪时**重跑对账**并据实更新判定。
+- `backtest/adapter.py` 不再是空注册表：内置 **`frictionless_buy_hold`** ——
+  一个零依赖、纯向量化的对照实现，**不复用 Engine/Broker/Account 任何代码**，
+  因此它与原生引擎是两份独立实现。
+- L5 的核心断言已落地（`test_backtest_defect_fixes.py`）：
+  - `::test_l5_frictionless_nav_matches_independent_reference` ——
+    无摩擦设定（零费率/零滑点/无涨跌停/lot_size=1）下，两引擎**逐日净值与
+    日收益序列一致**（净值差 ≤ 1bp）；
+  - `::test_l5_friction_cost_is_positive_and_monotonic_in_rate` ——
+    有摩擦必然劣于无摩擦，且滑点越大净值越低；
+  - `::test_l5_adapter_output_matches_engine_contract` ——
+    `AdapterOutput` 与 `Engine.run()` 同形，可直接进 `/compare`。
+- 第三方引擎（vectorbt/RQAlpha）仍**未接入**（原计划放开 pip 依赖后补），
+  走同一协议即可；上表的内置对照引擎先把 L5 这一层「有测试」补上。
+- **backtrader 对账的 2 个 FAIL 仍未能重跑**：见下节「重跑受限」。
+- `result`：L5 从「零测试」变为「无摩擦一致性 + 摩擦单调性有测试」。
+
+### backtrader 对账重跑受限（2026-10-02 实测）
+
+`scripts/backtest_validation/validate_accuracy.py` 的 5 个任务里，只有 2 个
+能在**当前数据湖**上重跑：
+
+| 任务 | 依赖标的 | 湖里覆盖 | 能否重跑 |
+|---|---|---|---|
+| sma_cross | 600519.SH | 2024-01-02~2026-09-30 | ✅ |
+| turtle_donchian | 600519.SH | 同上 | ✅ |
+| baseline_multifactor | 510300.SH（参考标的） | **仅 2026-01-05 起** | ❌ 缺 2024 数据 |
+| momentum_rotation | 510300.SH, 159915.SZ | **仅 2026-01-05 起** | ❌ 缺 2024–2026H1 |
+| grid_trading | 510300.SH | **仅 2026-01-05 起** | ❌ 缺 2024–2025 |
+
+可重跑的 2 个任务在本次修复后结果**与原记录逐位一致**（sma_cross 最大日差
+0.0210%、turtle_donchian 0.0137%，成交笔数 34/17、14/7 不变）——
+这本身是「本轮修复没有扰动已验证口径」的回归证据。
+
+**结论**：那 2 个 ❌ FAIL 既没有变好也没有变坏，它们**当前无法验证**。
+要收口需先把 510300.SH / 159915.SZ 的 2024 起日线回填进湖，再重跑全文。
 
 ## L6 实盘/模拟盘对账（Paper Reconciliation）
 
@@ -127,18 +151,27 @@ final_cash + Σ持仓数量 × 收盘价 ≡ final_nav
 - 模拟盘成交价 vs 当日开盘价：偏离中位数 ≈ 滑点设定值
 - 回测成交明细 vs 实际委托：方向一致率 100%，数量偏差 < 1 手
 
-**落地**：跑通模拟盘后补 `test_paper_vs_backtest_reconciliation`
-（挂 `src/lquant/paper/engine.py`，当前为预留项）。
+**落地**：`test_backtest_defect_fixes.py::test_paper_vs_backtest_reconciliation`
+—— 同一份行情 + 同一笔成交喂给回测与模拟盘，断言**持仓、费用、逐日净值序列
+完全一致**（价格有涨有跌，避免退化成常量比较）。
 
 **当前真实状态（2026-10-02 复核）**：
 
-- 该测试**不存在**。`paper/reconcile.py` 做的是**模拟盘内部**的
-  「盘中快照 vs 收盘官方日线」重算，**不是**回测 vs 模拟盘对账，两者不可混淆。
-- 注意 `paper/engine.py` 的 `PaperBroker` 是**第三套独立撮合实现**（只共享
-  ruleset YAML，撮合/费用/限价逻辑各自实现）。所以 L6 不只是「还没跑」，
-  而是要先对账两套独立撮合器的语义，否则对账结果无法归因。
-- 前置条件：先把 `_apply_corporate_actions` / 退市核销 / 涨跌停 tick 取整
-  在 PaperBroker 侧也对齐（本轮只对齐了 Engine 与 JQ 两条路径）。
+- 该测试**已落地**，另有两条前置锁定用例：
+  `::test_paper_t_plus_n_by_trading_days_and_lot_size`、
+  `::test_paper_applies_corporate_action_share_adjustment`。
+- 为此修掉了 `PaperBroker` 侧的 4 处口径分叉（此前它对不上账）：
+  1. **公司行为完全缺失** → 新增 `apply_corporate_action`（份额调整法，与 Engine 同口径）；
+  2. **T+N 一律当 T+1** → 改为按交易日递减的冻结台账（`frozen`），并**持久化**
+     （`paper_position.frozen_json` + 启动迁移），否则 load_broker 一次就丢；
+  3. **不查整手** → 买入强制整手、仅一次性清仓允许零股（与 `Broker` 同口径）；
+  4. **涨跌停自己算** → `paper/quotes.limit_prices` 改走
+     `InstrumentRules.limit_up/limit_down`（tick 取整 / ST 分板 / ETF 跟踪指数 / 豁免）。
+- 另外修掉 `PaperEngine.push` **不盯市**的缺陷：`nav()` 用 `last_price` 估值，
+  离线回放从不刷新它 → 净值曲线一直停在建仓当天（`service.tick` 一直在做，
+  只有 replay 路径漏了）。
+- `paper/reconcile.py` 做的是**模拟盘内部**「盘中快照 vs 收盘官方日线」重算，
+  **不是**回测 vs 模拟盘对账，两者不可混淆。
 
 ## 一键体检
 

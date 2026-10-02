@@ -174,24 +174,29 @@ class InstrumentRules:
     def tax_rate(self, d: date, side=None) -> float:
         return self.tax.rate_at(d, side)
 
-    def limit_ratio(self) -> float | None:
-        """当日涨跌幅比例；None = 不设涨跌停约束。"""
+    def limit_ratio(self, is_st: bool | None = None) -> float | None:
+        """当日涨跌幅比例；None = 不设涨跌停约束。
+
+        is_st 传 None 时用本规则的静态值（security 表）；传 True/False 时按当日的
+        真实戴帽状态覆盖 —— ST 会随戴帽/摘帽变化，逐日判定才正确。
+        """
         if self.no_price_limit:
             return None
+        eff_st = self.is_st if is_st is None else bool(is_st)
         return self.price_limit.for_symbol(
-            self.symbol, self.symbol.board, is_st=self.is_st,
+            self.symbol, self.symbol.board, is_st=eff_st,
             track_index_limit=self.track_index_limit)
 
-    def limit_up(self, pre_close: float) -> float | None:
+    def limit_up(self, pre_close: float, is_st: bool | None = None) -> float | None:
         """涨停价（已按 tick 取整）；None = 无涨跌停约束。"""
-        r = self.limit_ratio()
+        r = self.limit_ratio(is_st)
         if r is None:
             return None
         return round_tick(pre_close * (1.0 + r), self.price_tick)
 
-    def limit_down(self, pre_close: float) -> float | None:
+    def limit_down(self, pre_close: float, is_st: bool | None = None) -> float | None:
         """跌停价（已按 tick 取整）；None = 无涨跌停约束。"""
-        r = self.limit_ratio()
+        r = self.limit_ratio(is_st)
         if r is None:
             return None
         return round_tick(pre_close * (1.0 - r), self.price_tick)

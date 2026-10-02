@@ -53,14 +53,22 @@ def _ruleset():
 
 
 def limit_prices(symbol: str, name: str, pre_close: float) -> tuple[float, float] | None:
-    """官方涨跌停价：pre_close × (1±pct)，pct 来自与回测同一份 RuleSet。"""
+    """官方涨跌停价：与回测 `InstrumentRules.limit_up/limit_down` 同源。
+
+    必须走 limit_up/limit_down，而不是自己 `pre_close*(1±pct)` 再 `round(,2)`：
+    后者漏掉 tick 取整（股票 0.01 / 基金 0.001）、ETF 跟踪指数涨跌幅、
+    ST 分板（创业板/科创板 ST 仍 20%）以及 no_price_limit 豁免 —— 模拟盘的
+    「涨停堵单」判定会和回测不一致，对账时无法归因。
+    """
     if not pre_close or pre_close <= 0:
         return None
     sym = parse_symbol(symbol)
     is_st = "ST" in (name or "").upper()
     rules = _ruleset().for_symbol(symbol, sym.sec_type, sym.board, is_st=is_st)
-    pct = rules.price_limit.for_symbol(sym, sym.board, is_st)
-    return round(pre_close * (1 + pct), 2), round(pre_close * (1 - pct), 2)
+    up, down = rules.limit_up(pre_close), rules.limit_down(pre_close)
+    if up is None or down is None:
+        return None                      # no_price_limit：不设涨跌停约束
+    return up, down
 
 
 def _secid(symbol: str) -> str:

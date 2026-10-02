@@ -578,8 +578,22 @@ def f(context):
 # ------------------------------------------------- G20a 字符串 date / G20b 限价显示
 
 
-def test_get_fundamentals_string_date_does_not_crash():
-    """G20a：聚宽用户习惯传 '2025-08-01' 字符串，此前 TypeError。"""
+def test_get_fundamentals_string_date_does_not_crash(monkeypatch):
+    """G20a：字符串 date 必须先归一成 date 再钳制（此前 min(str, date) 抛 TypeError）。
+
+    打桩 jq_shim.get_fundamentals，使用例不依赖真实数据湖 —— G20a 的缺陷在
+    归一/钳制这一步，与湖里有没有数据无关。
+    """
+    from lquant.research.dialect import jq_shim
+
+    seen: list = []
+
+    def _fake_get_fundamentals(query, date=None):
+        seen.append(date)
+        return pl.DataFrame({"code": [], "pe_ratio": []})
+
+    monkeypatch.setattr(jq_shim, "get_fundamentals", _fake_get_fundamentals)
+
     rows = _rows(_dates(3))
     code = '''
 from datetime import date
@@ -593,6 +607,13 @@ def f(context):
     res = JQRunner(code, initial_cash=1_000_000).run(pl.DataFrame(rows))
     assert res.error is None, res.error
     assert any("DATES_OK" in x for x in res.logs)
+    # 关键：任何字符串都不得原样传下去（此前就是这一步抛 TypeError）
+    assert seen and all(not isinstance(x, str) for x in seen), f"未归一成 date: {seen}"
+    # 每个交易日 3 次调用：'2025-08-01' / date(2025,8,1) / None
+    for i, trio in enumerate(seen[k:k + 3] for k in range(0, len(seen), 3)):
+        assert trio[0] == date(2025, 8, 1), f"字符串 date 未正确归一: {trio}"
+        assert trio[1] == date(2025, 8, 1), f"date 对象应保持一致: {trio}"
+        assert trio[2] == _dates(3)[i], f"None 应取当日: {trio}"
 
 
 def test_get_current_data_st_limit_matches_matching_rule():
@@ -731,3 +752,340 @@ def trade(context):
     mkt = JQRunner(code_mkt, initial_cash=1_000_000).run(pl.DataFrame(rows))
     assert mkt.error is None, mkt.error
     assert len(mkt.trades) == 1, "MarketOrder 应等同默认市价单"
+
+
+# --------------------------------------------------- G20d 逐日 is_st（不再全期恒定）
+
+
+def _st_rows(days, st_flags, pre=10.0, open_px=None):
+    """逐日构造 is_st 标记的行（None = 未知）。"""
+    rows = []
+    for d, st in zip(days, st_flags, strict=True):
+        r = dict(trade_date=d, symbol="600000.SH",
+                 open=open_px if open_px is not None else pre,
+                 high=pre, low=pre, close=pre, pre_close=pre,
+                 volume=1e9, amount=pre * 1e9, adj_factor=1.0)
+        if st is not None:
+            r["is_st"] = st
+        rows.append(r)
+    return rows
+
+
+def test_per_day_is_st_drives_limit_price_not_static_flag():
+    """G20d：ST 涨跌幅必须按**当日**戴帽状态，不能整段回测用同一个值。
+
+    数据现实：日线湖 is_st 逐日有值（377k 行 ST），而 security 表 is_st 全为
+    False —— 只用静态值等于完全不做 ST 处理。
+    """
+    rs = load_ruleset()
+    sym = parse_symbol("600000.SH")
+    r = rs.for_symbol("600000.SH", sym.sec_type, sym.board)   # 静态 is_st=False
+    # 前收 10.0：主板 ST 5% → 10.5；非 ST 10% → 11.0
+    assert r.limit_up(10.0, is_st=True) == 10.5
+    assert r.limit_up(10.0, is_st=False) == 11.0
+    assert r.limit_up(10.0) == 11.0            # None → 退回静态值
+
+    # 撮合侧：ST 日开盘 10.5（= ST 涨停价）必须拒单；同一价格在非 ST 日可成交
+    days = _dates(3)
+    st_rows = _st_rows(days, [True, True, True], pre=10.0, open_px=10.5)
+    eng_st = Engine(_Target({days[0]: [("600000.SH", 0.5)]}),
+                    config=EngineConfig(initial_cash=1_000_000, slippage="none"),
+                    with_db_meta=False)
+    res_st = eng_st.run(pl.DataFrame(st_rows))
+    assert res_st.trades == [], "ST 日开盘 = ST 涨停价，买单应被拒"
+    assert any("涨停" in x[2] for x in res_st.rejected)
+
+    non_st_rows = _st_rows(days, [False, False, False], pre=10.0, open_px=10.5)
+    eng_non = Engine(_Target({days[0]: [("600000.SH", 0.5)]}),
+                     config=EngineConfig(initial_cash=1_000_000, slippage="none"),
+                     with_db_meta=False)
+    res_non = eng_non.run(pl.DataFrame(non_st_rows))
+    assert len(res_non.trades) == 1, "非 ST 日 10.5 未触板，应成交"
+
+
+def test_is_st_flip_mid_backtest_changes_limit():
+    """戴帽发生在回测中途时，涨跌幅必须随之切换（这正是全期恒定的错处）。
+
+    构造：第 1 天（成交日）非 ST → 开盘 10.5 未触板，可成交；
+    第 2 天戴帽 ST → 同样开盘 10.5 就是 ST 涨停价，加仓单必须被拒。
+    若 is_st 全期恒定，两天的判定会相同 —— 必有一条断言失败。
+    """
+    days = _dates(3)
+    rows = _st_rows(days, [False, False, True], pre=10.0, open_px=10.5)
+    plan = {days[0]: [("600000.SH", 0.5)], days[1]: [("600000.SH", 1.0)]}
+    eng = Engine(_Target(plan),
+                 config=EngineConfig(initial_cash=1_000_000, slippage="none"),
+                 with_db_meta=False)
+    res = eng.run(pl.DataFrame(rows))
+
+    # 第 1 天（非 ST）成交
+    assert len(res.trades) == 1, res.trades
+    assert res.trades[0].trade_date == days[1]
+    # 第 2 天（ST）加仓被涨停拒绝 —— 证明涨跌幅随戴帽切换
+    assert any(x[0] == str(days[2]) and "涨停" in x[2] for x in res.rejected), res.rejected
+
+
+def test_get_current_data_is_st_is_per_day():
+    """G20d：策略看到的 is_st 也必须是当日的（ST 剔除不能靠静态表）。"""
+    days = _dates(3)
+    rows = _st_rows(days, [False, True, True], pre=10.0, open_px=10.0)
+    code = '''
+def initialize(context):
+    run_daily(f, time="open")
+def f(context):
+    d = get_current_data()["600000.SH"]
+    log.info("ST=%s LIMIT=%s" % (d.is_st, d.high_limit))
+'''
+    res = JQRunner(code, initial_cash=1_000_000).run(pl.DataFrame(rows))
+    assert res.error is None, res.error
+    seen = [x for x in res.logs if "ST=" in x]
+    assert any("ST=False" in x and "LIMIT=11.0" in x for x in seen), seen
+    assert any("ST=True" in x and "LIMIT=10.5" in x for x in seen), seen
+
+
+# ---------------------------------------------- L6 回测 vs 模拟盘对账（Paper）
+
+
+class _BuyOncePaper:
+    """模拟盘侧策略：只在第一笔行情上一个买单，其余时间不动。"""
+
+    def __init__(self, symbol: str, qty: float) -> None:
+        self.symbol, self.qty, self.done = symbol, qty, False
+
+    def signals(self, broker, quote):
+        if self.done or quote["symbol"] != self.symbol:
+            return []
+        self.done = True
+        return [{"symbol": self.symbol, "side": "buy", "qty": self.qty,
+                 "price": quote["price"]}]
+
+
+def test_paper_vs_backtest_reconciliation():
+    """L6：同一份行情 + 同一笔成交，回测与模拟盘的净值/费用必须一致。
+
+    这是「引擎算得对」之外的最后一层：证明回测与模拟盘用的是同一套撮合语义。
+    做法：先跑回测拿到成交股数，再把同一笔委托喂给模拟盘 —— 两者持仓一致，
+    此后净值序列的差只可能来自费用/估值口径。价格有涨有跌，避免退化成常量。
+    """
+    from lquant.paper.engine import PaperConfig, PaperEngine
+
+    days = _dates(6)
+    closes = [10.0, 11.0, 12.0, 11.0, 10.0, 10.5]
+    rows = []
+    pre = closes[0]
+    for d, c in zip(days, closes, strict=True):
+        rows.append(dict(trade_date=d, symbol="600000.SH", open=c, high=c, low=c,
+                         close=c, pre_close=pre, volume=1e9, amount=c * 1e9,
+                         adj_factor=1.0))
+        pre = c
+    df = pl.DataFrame(rows)
+
+    # 回测：day0 目标 50% 仓位，same_close 成交（与模拟盘「当日收盘价撮合」对齐）。
+    # rebalance=daily + 只在 day0 出信号 → 之后不动 = 买入持有
+    bt = Engine(_Target({days[0]: [("600000.SH", 0.5)]}),
+                config=EngineConfig(initial_cash=1_000_000, rebalance="daily",
+                                    price_mode="same_close", slippage="none",
+                                    cash_buffer=0.0, min_order_value=0.0),
+                with_db_meta=False)
+    res = bt.run(df)
+    assert len(res.trades) == 1, res.trades
+    fill = res.trades[0]
+
+    # 模拟盘：喂同一笔成交，零滑点（回测也是零滑点）
+    paper = PaperEngine(_BuyOncePaper("600000.SH", fill.qty),
+                        config=PaperConfig(initial_cash=1_000_000, slippage_pct=0.0))
+    paper.replay(df)
+    paper_broker = paper.broker
+
+    # 1) 持仓一致
+    pos = paper_broker.positions["600000.SH"]
+    assert pos.qty == fill.qty, f"模拟盘持仓 {pos.qty} != 回测 {fill.qty}"
+    # 2) 费用口径一致（佣金含最低额 + 过户费，买入无印花税）
+    paper_fee = sum(1_000_000 - paper_broker.cash - fill.qty * fill.price
+                    for _ in [0])
+    assert paper_fee == pytest.approx(fill.fee, abs=1e-6), (
+        f"模拟盘费用 {paper_fee:.6f} != 回测 {fill.fee:.6f}")
+    # 3) 净值序列一致（价格有涨跌，估值口径必须相同）
+    bt_nav = {d: v for d, v in res.nav}
+    for row in paper.nav_series:
+        d = row["trade_date"]
+        assert row["nav"] == pytest.approx(bt_nav[d], rel=1e-9, abs=1e-6), (
+            f"{d} 模拟盘 {row['nav']} != 回测 {bt_nav[d]}")
+
+
+def test_paper_t_plus_n_by_trading_days_and_lot_size():
+    """L6 前置：模拟盘的 T+N 也按交易日、且强制整手（与回测同口径）。"""
+    from lquant.paper.engine import PaperBroker, PaperConfig
+
+    b = PaperBroker(PaperConfig(initial_cash=1_000_000, slippage_pct=0.0))
+    # 1) 整手约束：挂 150 股买单 → 截到 100 股
+    o = b.submit("600000.SH", "buy", 150, 10.0)
+    assert o.qty == 100, f"买单应截到整手，实际 {o.qty}"
+    b.on_quote("600000.SH", 10.0)
+    pos = b.positions["600000.SH"]
+    assert pos.qty == 100 and pos.available == 0, "T+1 当日不可卖"
+
+    # 2) T+N 按交易日释放：T+1 → 1 个日终后解冻
+    b.on_day_close(date(2026, 1, 5))
+    assert pos.available == 100, "T+1 过一个交易日应解冻"
+
+    # 3) T+0 品种（黄金 ETF）：名称经行情传入 → 规则表推断 fund_type=commodity
+    from lquant.backtest.rules.loader import load_ruleset
+    b2 = PaperBroker(PaperConfig(initial_cash=1_000_000, slippage_pct=0.0))
+    b2._ruleset = load_ruleset()
+    b2.submit("518880.SH", "buy", 100, 3.0, name="黄金ETF")
+    b2.on_quote("518880.SH", 3.0)
+    assert b2.positions["518880.SH"].available == 100, "T+0 品种当日可卖"
+
+    # 4) T+1 的普通股票需要 1 个交易日、且不因 n=1 而被当成「当日可卖」
+    b3 = PaperBroker(PaperConfig(initial_cash=1_000_000, slippage_pct=0.0))
+    b3.submit("600000.SH", "buy", 100, 10.0)
+    b3.on_quote("600000.SH", 10.0)
+    assert b3.positions["600000.SH"].available == 0
+    b3.on_day_close(date(2026, 1, 5))
+    assert b3.positions["600000.SH"].available == 100
+
+
+def test_paper_applies_corporate_action_share_adjustment():
+    """L6 前置：模拟盘必须处理公司行为，否则跨除权日与回测净值分叉。"""
+    from lquant.paper.engine import PaperBroker, PaperConfig
+
+    b = PaperBroker(PaperConfig(initial_cash=1_000_000, slippage_pct=0.0))
+    b.submit("600000.SH", "buy", 1000, 10.0)
+    b.on_quote("600000.SH", 10.0)
+    pos = b.positions["600000.SH"]
+    # avg_cost 含买入费用（佣金+过户费），故略高于成交价
+    assert pos.qty == 1000 and pos.avg_cost >= 10.0
+    cost_before = pos.avg_cost
+
+    # 2:1 拆股：份额翻倍、成本减半，市值不变
+    before = pos.qty * pos.last_price
+    b.apply_corporate_action("600000.SH", 2.0)
+    pos.last_price = 5.0                      # 除权后价格
+    assert pos.qty == 2000
+    assert pos.avg_cost == pytest.approx(cost_before / 2.0, rel=1e-9)
+    assert pos.qty * pos.last_price == pytest.approx(before, rel=1e-9)
+
+
+# ------------------------------------------- L5 交叉引擎对照（无摩擦一致性）
+
+
+def _frictionless_ruleset():
+    """无摩擦规则集：零费率、零滑点（在 EngineConfig 里）、无涨跌停、lot_size=1。"""
+    from lquant.backtest.rules.model import RuleSet
+
+    base = {
+        "commission": {"rate": 0.0, "min": 0.0, "per_order": True},
+        "tax": {"rate": 0.0},
+        "transfer_fee": {"rate": 0.0},
+        "lot_size": 1,
+        "t_plus": 0,
+        "price_tick": 0.01,
+        # main 100% = 涨跌停不构成约束（等价无涨跌停）
+        "price_limit": {"mode": "by_board", "main": 1.0},
+    }
+    return RuleSet(market="CN", currency="CNY", default=dict(base),
+                   etf=dict(base), exceptions={})
+
+
+def test_adapter_registry_is_not_empty():
+    """L5 前置：adapter 注册表此前是空的（零注册、零调用方）→ 无对照层可跑。"""
+    from lquant.backtest.adapter import get_adapter, list_adapters
+
+    names = list_adapters()
+    assert names, "adapter 注册表不得为空"
+    assert "frictionless_buy_hold" in names
+    assert get_adapter("frictionless_buy_hold").name == "frictionless_buy_hold"
+
+
+def test_l5_frictionless_nav_matches_independent_reference():
+    """L5：无摩擦设定下，原生引擎与独立向量化对照实现的净值必须逐日一致。
+
+    这是 L5 的核心断言（净值差 < 1bp）。对照实现**不复用** Engine/Broker 任何
+    代码，所以能抓出份额换算/估值时点/费用漏算这类系统性偏差。
+    """
+    from lquant.backtest.adapter import get_adapter
+
+    days = _dates(8)
+    # 用带涨跌的价格，避免退化成常量比较
+    closes = [10.0, 10.5, 11.2, 10.8, 9.9, 10.4, 11.0, 10.6]
+    rows = []
+    pre = closes[0]
+    for d, c in zip(days, closes, strict=True):
+        rows.append(dict(trade_date=d, symbol="600000.SH", open=c, high=c * 1.01,
+                         low=c * 0.99, close=c, pre_close=pre,
+                         volume=1e9, amount=c * 1e9, adj_factor=1.0))
+        pre = c
+    df = pl.DataFrame(rows)
+
+    cash = 1_000_000.0
+    eng = Engine(_Target({days[0]: [("600000.SH", 1.0)]}),
+                 ruleset=_frictionless_ruleset(),
+                 config=EngineConfig(initial_cash=cash, rebalance="daily",
+                                     price_mode="same_close", slippage="none",
+                                     cash_buffer=0.0, min_order_value=0.0),
+                 with_db_meta=False)
+    res = eng.run(df)
+
+    ref = get_adapter("frictionless_buy_hold").run(df, symbol="600000.SH",
+                                                   weight=1.0, initial_cash=cash)
+    assert len(ref.nav) == len(res.nav)
+    for (d1, v1), (d2, v2) in zip(res.nav, ref.nav, strict=True):
+        assert d1 == d2
+        # 净值差 < 1bp（相对）
+        assert abs(v1 - v2) <= max(1e-6, abs(v2) * 1e-4), (
+            f"{d1} 引擎 {v1:.6f} vs 对照 {v2:.6f}")
+    # 日收益序列也应对齐
+    r_eng = [res.nav[i][1] / res.nav[i - 1][1] - 1 for i in range(1, len(res.nav))]
+    r_ref = [ref.nav[i][1] / ref.nav[i - 1][1] - 1 for i in range(1, len(ref.nav))]
+    for a, b in zip(r_eng, r_ref, strict=True):
+        assert abs(a - b) < 1e-9, (a, b)
+
+
+def test_l5_friction_cost_is_positive_and_monotonic_in_rate():
+    """L5：有摩擦时必须比无摩擦差，且摩擦越大净值越低（成本不会凭空消失）。"""
+    from lquant.backtest.adapter import get_adapter
+
+    days = _dates(8)
+    closes = [10.0, 10.5, 11.2, 10.8, 9.9, 10.4, 11.0, 10.6]
+    rows = []
+    pre = closes[0]
+    for d, c in zip(days, closes, strict=True):
+        rows.append(dict(trade_date=d, symbol="600000.SH", open=c, high=c * 1.01,
+                         low=c * 0.99, close=c, pre_close=pre,
+                         volume=1e9, amount=c * 1e9, adj_factor=1.0))
+        pre = c
+    df = pl.DataFrame(rows)
+    cash = 1_000_000.0
+
+    frictionless = get_adapter("frictionless_buy_hold").run(
+        df, symbol="600000.SH", weight=1.0, initial_cash=cash).nav[-1][1]
+
+    finals = []
+    for rate in (0.001, 0.005, 0.02):
+        eng = Engine(_Target({days[0]: [("600000.SH", 1.0)]}),
+                     ruleset=_frictionless_ruleset(),
+                     config=EngineConfig(initial_cash=cash, rebalance="daily",
+                                         price_mode="same_close", slippage="pct",
+                                         slippage_params={"rate": rate},
+                                         cash_buffer=0.0, min_order_value=0.0),
+                     with_db_meta=False)
+        finals.append(eng.run(df).nav[-1][1])
+
+    assert all(f < frictionless for f in finals), (finals, frictionless)
+    assert finals == sorted(finals, reverse=True), f"滑点越大净值应越低: {finals}"
+
+
+def test_l5_adapter_output_matches_engine_contract():
+    """L5：AdapterOutput 与 Engine.run() 同形（metrics 键名一致，可直接 /compare）。"""
+    from lquant.backtest.adapter import AdapterOutput, get_adapter
+
+    days = _dates(5)
+    df = pl.DataFrame(_rows(days, px=10.0))
+    out = get_adapter("frictionless_buy_hold").run(
+        df, symbol="600000.SH", weight=0.5, initial_cash=1_000_000.0)
+    assert isinstance(out, AdapterOutput)
+    for key in ("total_return", "annual_return", "sharpe", "max_drawdown"):
+        assert key in out.metrics, f"metrics 缺少 {key}"
+    assert list(out.trades.columns) >= ["trade_date", "symbol", "side", "qty",
+                                        "price", "fee"]

@@ -69,3 +69,71 @@ def test_sweep_rejects_bad_param(client):
     r = client.post("/api/backtests/sweep", json={"param": "top_n_hack",
                                                   "values": [1]})
     assert r.status_code == 422
+
+def test_sweep_post_reports_engine(client):
+    """端点回传实际选择：小网格 event、大网格 vector、显式 vector 服从请求。"""
+    from lquant.backtest.sweep import VECTOR_AUTO_MIN_POINTS
+
+    def _post(**kw):
+        base = {"formula": "pct_change_5", "param": "top_n", "rebalance": "monthly"}
+        return client.post("/api/backtests/sweep", json={**base, **kw}).json()
+
+    big = list(range(1, VECTOR_AUTO_MIN_POINTS + 1))
+    assert _post(values=[1, 2])["engine"] == "event"
+    assert _post(values=big)["engine"] == "vector"
+    assert _post(values=[1, 2], engine="vector")["engine"] == "vector"
+    assert _post(values=big, engine="event")["engine"] == "event"
+
+
+def _tiny_panel():
+    """`_run_sweep_job` 的最小行情：够 _compute_factor 派生因子列即可。"""
+    from datetime import date, timedelta
+
+    import polars as pl
+
+    rows = []
+    d0 = date(2026, 1, 5)
+    for s in ("600000", "000001", "300750"):
+        for i in range(8):
+            rows.append({"trade_date": d0 + timedelta(days=i), "symbol": s,
+                         "close": 10.0 + i, "open": 10.0 + i, "high": 11.0 + i,
+                         "low": 9.0 + i, "pre_close": 9.5 + i})
+    return pl.DataFrame(rows).with_columns(pl.col("trade_date").cast(pl.Date))
+
+
+def _fake_grid():
+    import polars as pl
+
+    return pl.DataFrame({
+        "value": [1, 2], "total_return": [0.1, 0.2], "annual_return": [0.2, 0.4],
+        "sharpe": [1.0, 2.0], "max_drawdown": [-0.1, -0.05],
+        "n_trades": [3, 4], "turnover": [0.1, 0.2],
+    })
+
+
+def test_sweep_job_selects_vectorized_engine(monkeypatch):
+    """`_run_sweep_job` 按 engine 真正走到向量化/事件两条实现路径。"""
+    from lquant.backtest import sweep as sweep_mod
+    from lquant.server.api import backtests as bt
+
+    seen: list[str] = []
+    monkeypatch.setattr(sweep_mod, "run_sweep_vectorized",
+                        lambda *a, **k: seen.append("vector") or _fake_grid())
+    monkeypatch.setattr(sweep_mod, "run_sweep",
+                        lambda *a, **k: seen.append("event") or _fake_grid())
+    df = _tiny_panel()
+    monkeypatch.setattr(bt, "read_daily", lambda **kw: df.lazy())
+
+    def _run(engine, values):
+        cfg = {"formula": "pct_change_5", "rebalance": "monthly",
+               "initial_cash": 1_000_000.0, "start": "2026-01-01",
+               "top_n": 5, "engine": engine}
+        return bt._run_sweep_job("pct_change_5", "top_n", values, cfg)
+
+    assert _run("vector", [1, 2])[0]["engine"] == "vector"
+    assert seen[-1] == "vector"
+    assert _run("auto", [1, 2])[0]["engine"] == "event"
+    assert seen[-1] == "event"
+    big = list(range(1, sweep_mod.VECTOR_AUTO_MIN_POINTS + 1))
+    assert _run("auto", big)[0]["engine"] == "vector"
+    assert seen[-1] == "vector"

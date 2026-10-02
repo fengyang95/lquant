@@ -281,17 +281,31 @@ def test_index_and_sectors_empty_result(client, monkeypatch):
     assert client.get("/api/market/sectors").json() == []
 
 
-def test_limit_threshold_boards(client):
-    """三档涨跌停阈值（北交所/创业板科创板/主板）—— map_elements 在 rayon
-    线程执行，行覆盖需直接调用。"""
+def test_limit_ratio_map_by_board_and_st(client):
+    """涨跌停阈值来自**规则表**（与回测/模拟盘同源），不再硬编码代码段。
+
+    覆盖：北交所 30% / 创业板·科创板 20% / 主板 10%，
+    以及此前完全漏掉的 **主板 ST 5%** 与 **科创 ETF 20%**。
+    """
     from lquant.server.api import market as market_mod
 
-    assert market_mod._limit_threshold("830001.BJ") == 0.295
-    assert market_mod._limit_threshold("430047.BJ") == 0.295
-    assert market_mod._limit_threshold("920001.BJ") == 0.295
-    assert market_mod._limit_threshold("300750.SZ") == 0.195
-    assert market_mod._limit_threshold("688111.SH") == 0.195
-    assert market_mod._limit_threshold("600519.SH") == 0.095
+    syms = ["830001.BJ", "430047.BJ", "920001.BJ", "300750.SZ", "688111.SH",
+            "600519.SH", "588000.SH", "159915.SZ"]
+    base, st = market_mod._limit_ratio_map(syms)
+
+    assert base["830001.BJ"] == pytest.approx(0.30)
+    assert base["430047.BJ"] == pytest.approx(0.30)
+    assert base["920001.BJ"] == pytest.approx(0.30)
+    assert base["300750.SZ"] == pytest.approx(0.20)
+    assert base["688111.SH"] == pytest.approx(0.20)
+    assert base["600519.SH"] == pytest.approx(0.10)
+    # 科创 ETF 是 20%（旧硬编码按「其余 10%」处理 → 涨跌停家数偏高）
+    assert base["588000.SH"] == pytest.approx(0.20)
+    assert base["159915.SZ"] == pytest.approx(0.20)
+    # 主板 ST 收窄到 5%（旧实现完全没有 ST 概念 → ST 涨停被漏计）
+    assert st["600519.SH"] == pytest.approx(0.05)
+    # 创业板/科创板 ST 仍是 20%
+    assert st["300750.SZ"] == pytest.approx(0.20)
 
 
 def test_collect_demo_round(client):

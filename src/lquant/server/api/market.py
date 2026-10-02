@@ -199,18 +199,28 @@ def collect_status() -> dict:
 
 # ---------------- 市场宽度 / 批量聚合（看板丰富化） ----------------
 
-def _limit_threshold(sym: str) -> float:
-    """涨跌停判定阈值（近似）：创业板/科创板 20%，北交所 30%，其余主板 10%。
+def _ratio_expr(col: str, mapping: dict[str, float]):
+    """把 {symbol: 比例} 映射成列表达式（未登记标的 → null，不猜）。"""
+    return pl.col(col).replace_strict(mapping, default=None)
 
-    北交所代码规则：43 开头（老三板转来）、83/87 开头（新三板精选层/北交所）、
-    92 开头（北交所新代码段）。
+
+def _limit_ratio_map(symbols: list[str]) -> tuple[dict[str, float], dict[str, float]]:
+    """按规则表算 per-symbol 涨跌幅比例 → (非 ST 比例表, ST 比例表)。
+
+    此前这里硬编码「300/301/688/689 → 20%，43/83/87/92 → 30%，其余 10%」，
+    是**第四份**重复实现，且漏了：
+    - 主板 ST 的 5%：ST 股涨停会被漏计 → 涨跌停家数系统性偏低；
+    - ETF 按跟踪指数：588 科创 ETF 实际 20%，却被当成主板 10% → 计数偏高。
+    改为复用 `build_rules`（与回测/模拟盘同一份规则表）。
     """
-    bare = sym.split(".", 1)[0]
-    if bare.startswith(("43", "83", "87", "92")):
-        return 0.295
-    if bare.startswith(("300", "301", "688", "689")):
-        return 0.195
-    return 0.095
+    from lquant.backtest.engine import build_rules
+
+    base: dict[str, float] = {}
+    st: dict[str, float] = {}
+    for sym, r in build_rules(symbols).items():
+        base[sym] = r.limit_ratio(is_st=False) or float("nan")
+        st[sym] = r.limit_ratio(is_st=True) or float("nan")
+    return base, st
 
 
 @router.get("/breadth")
@@ -223,16 +233,26 @@ def breadth(days: int = Query(default=60, le=250)) -> dict:
     from lquant.data.store.parquet import read_daily
 
     try:
-        df = (read_daily()
-              .select(["trade_date", "symbol", "close", "pre_close", "amount"])
-              .collect())
+        lf = read_daily()
+        # is_st 是可选列：老湖/合成湖可能没有，缺则补 null（= 未知 → 按非 ST 阈值），
+        # 不能因为少一列就让整个市场宽度接口退化成 503/None
+        cols = lf.collect_schema().names()
+        want = ["trade_date", "symbol", "close", "pre_close", "amount"]
+        df = lf.select([*want, "is_st"] if "is_st" in cols else want).collect()
+        if "is_st" not in df.columns:
+            df = df.with_columns(pl.lit(None, dtype=pl.Boolean).alias("is_st"))
     except Exception:  # noqa: BLE001 - 湖缺失/损坏时与 _daily_aggregate 同款兜底
         return {"latest": None, "history": []}
     if not len(df):
         return {"latest": None, "history": []}
+    # 涨跌停阈值来自规则表（含 ST 分板 / ETF 跟踪指数），并按当日 is_st 切换
+    base_map, st_map = _limit_ratio_map(df["symbol"].unique().to_list())
     df = df.filter(pl.col("pre_close") > 0).with_columns(
         (pl.col("close") / pl.col("pre_close") - 1).alias("chg"),
-        pl.col("symbol").map_elements(_limit_threshold, return_dtype=pl.Float64).alias("_lim"),
+        pl.when(pl.col("is_st").fill_null(False))
+          .then(_ratio_expr("symbol", st_map))
+          .otherwise(_ratio_expr("symbol", base_map))
+          .alias("_lim"),
     )
     daily = df.group_by("trade_date").agg(
         n=pl.len(),

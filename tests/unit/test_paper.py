@@ -2,6 +2,7 @@
 from datetime import date
 
 import polars as pl
+import pytest
 
 from lquant.paper import PaperConfig, PaperEngine, compare_nav
 
@@ -49,8 +50,19 @@ def test_buy_fees_and_t1_unfreeze():
     # 买入后当日 available=0（T+1），日终解冻后 == qty
     pf = eng.broker.positions_frame()
     assert (pf["available"] == pf["qty"]).all()
-    # 现金 + 持仓 ≈ 净值，手续费使其略低于本金
-    assert eng.broker.nav() < 1_000_000
+    # 手续费真实扣掉：现金 = 本金 − 成交金额 − 费用
+    cost = sum(o.filled_qty * o.filled_price
+               for o in eng.broker.orders if o.status == "filled")
+    assert cost > 0
+    assert eng.broker.cash < 1_000_000 - cost, "必须扣了手续费"
+
+    # 净值 = 现金 + 持仓盯市市值。不能再断言 nav < 本金：持仓必须按**最新行情**
+    # 盯市（last_price 随行情刷新），行情上行时净值和必然高于本金 ——
+    # 旧断言只在「持仓永远按成交价估值」的错口径下成立。
+    market = sum(p.qty * p.last_price for p in eng.broker.positions.values())
+    assert eng.broker.nav() == pytest.approx(eng.broker.cash + market, rel=1e-12)
+    assert any(p.last_price != p.avg_cost for p in eng.broker.positions.values()), \
+        "持仓应被盯市：last_price 随行情刷新，而不是停在成交价"
 
 
 def test_reject_on_insufficient_cash():

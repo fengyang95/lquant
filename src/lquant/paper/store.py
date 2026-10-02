@@ -68,6 +68,13 @@ CREATE TABLE IF NOT EXISTS paper_position(
   available INTEGER NOT NULL DEFAULT 0,
   avg_cost REAL NOT NULL DEFAULT 0,
   last_price REAL NOT NULL DEFAULT 0,
+  -- T+N 冻结台账 [[剩余交易日, 数量], ...]：必须持久化，否则每次
+  -- load_broker 都会丢掉冻结信息 → T+N 约束形同虚设（或永久冻结）。
+  frozen_json TEXT NOT NULL DEFAULT '[]',
+  -- 最近一次行情带进来的逐日 ST 标记（NULL = 未知）
+  is_st INTEGER,
+  -- 证券名称：用于推断 fund_type → ETF 的 T+0/T+1
+  name TEXT NOT NULL DEFAULT '',
   PRIMARY KEY(account, symbol)
 );
 CREATE TABLE IF NOT EXISTS paper_nav(
@@ -83,6 +90,22 @@ CREATE TABLE IF NOT EXISTS paper_nav(
 """
 
 
+def _migrate(con) -> None:
+    """老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列。
+
+    新增 frozen_json/is_st 后不迁移，老账户一读就会 `no such column`。
+    """
+    cols = {r[1] for r in con.execute("PRAGMA table_info(paper_position)").fetchall()}
+    if "frozen_json" not in cols:
+        con.execute("ALTER TABLE paper_position ADD COLUMN frozen_json "
+                    "TEXT NOT NULL DEFAULT '[]'")
+    if "is_st" not in cols:
+        con.execute("ALTER TABLE paper_position ADD COLUMN is_st INTEGER")
+    if "name" not in cols:
+        con.execute("ALTER TABLE paper_position ADD COLUMN name "
+                    "TEXT NOT NULL DEFAULT ''")
+
+
 @contextmanager
 def _conn():
     con = sqlite3.connect(db_path(), timeout=30)
@@ -90,6 +113,7 @@ def _conn():
     con.execute("PRAGMA busy_timeout=30000")
     try:
         con.executescript(_SCHEMA)
+        _migrate(con)
         yield con
         con.commit()
     finally:
@@ -178,15 +202,22 @@ def load_broker(name: str, cfg: PaperConfig | None = None) -> PaperBroker:
     broker._seq = acct["seq"]
     with _conn() as con:
         pos_rows = con.execute(
-            "SELECT symbol, qty, available, avg_cost, last_price "
-            "FROM paper_position WHERE account = ? AND qty > 0", [name]).fetchall()
+            "SELECT symbol, qty, available, avg_cost, last_price, "
+            "frozen_json, is_st, name FROM paper_position "
+            "WHERE account = ? AND qty > 0", [name]).fetchall()
         order_rows = con.execute(
             "SELECT order_id, ts, symbol, side, qty, price, status, reason, "
             "filled_qty, filled_price FROM paper_order WHERE account = ? "
             "ORDER BY ts, order_id", [name]).fetchall()
     for r in pos_rows:
+        try:
+            frozen = [[int(n), int(q)] for n, q in json.loads(r[5] or "[]")]
+        except (TypeError, ValueError):
+            frozen = []
         broker.positions[r[0]] = PaperPosition(
-            symbol=r[0], qty=r[1], available=r[2], avg_cost=r[3], last_price=r[4])
+            symbol=r[0], qty=r[1], available=r[2], avg_cost=r[3], last_price=r[4],
+            frozen=frozen, is_st=None if r[6] is None else bool(r[6]),
+            name=r[7] or "")
     for r in order_rows:
         broker.orders.append(PaperOrder(
             order_id=r[0], ts=from_iso(r[1]), symbol=r[2], side=r[3], qty=r[4],
@@ -204,11 +235,15 @@ def save_broker(name: str, broker: PaperBroker) -> None:
         for p in broker.positions.values():
             con.execute(
                 "INSERT INTO paper_position(account, symbol, qty, available, "
-                "avg_cost, last_price) VALUES (?,?,?,?,?,?) "
+                "avg_cost, last_price, frozen_json, is_st, name) "
+                "VALUES (?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(account, symbol) DO UPDATE SET qty=excluded.qty, "
                 "available=excluded.available, avg_cost=excluded.avg_cost, "
-                "last_price=excluded.last_price",
-                [name, p.symbol, p.qty, p.available, p.avg_cost, p.last_price])
+                "last_price=excluded.last_price, frozen_json=excluded.frozen_json, "
+                "is_st=excluded.is_st, name=excluded.name",
+                [name, p.symbol, p.qty, p.available, p.avg_cost, p.last_price,
+                 json.dumps([[int(n), int(q)] for n, q in p.frozen]),
+                 None if p.is_st is None else int(bool(p.is_st)), p.name or ""])
         for o in broker.orders:
             con.execute(
                 "INSERT INTO paper_order(account, order_id, ts, symbol, side, "

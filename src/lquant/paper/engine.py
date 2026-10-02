@@ -14,7 +14,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 
 import polars as pl
@@ -37,6 +37,15 @@ class PaperPosition:
     avg_cost: float = 0.0
     available: int = 0                   # T+N：当日可卖数量
     last_price: float = 0.0
+    # T+N 冻结台账：[(剩余交易日数, 数量), ...]。按**交易日**递减（on_day_close
+    # 每次调用 = 过一个交易日），而不是「n>=1 一律次日解冻」—— 后者会把
+    # T+2/T+5 之类的中长锁定一律当成 T+1。
+    frozen: list = field(default_factory=list)
+    # 最近一次外部传入的逐日 ST 标记（None = 未知，由名称/规则表兜底）
+    is_st: bool | None = None
+    # 证券名称（来自行情快照）：用于推断 fund_type → T+0（黄金/QDII/债券/货币 ETF）。
+    # 不存下来的话，规则表拿不到名称，这些 ETF 会被当成 T+1。
+    name: str = ""
 
     @property
     def market_value(self) -> float:
@@ -73,14 +82,44 @@ class PaperBroker:
         self._ruleset = load_ruleset()
 
     def submit(self, symbol: str, side: str, qty: int, price: float,
-               ts: datetime | None = None) -> PaperOrder:
-        """提交委托。数量/资金/可卖合法性在这里检查。"""
+               ts: datetime | None = None, *, is_st: bool | None = None,
+               name: str | None = None) -> PaperOrder:
+        """提交委托。数量/整手/资金/可卖合法性在这里检查。
+
+        name / is_st 来自行情快照：名称用于推断 fund_type（决定 T+0/T+1），
+        is_st 决定当日涨跌幅。二者都要落到持仓上，否则每次重算规则都会丢。
+        """
         self._seq += 1
         o = PaperOrder(order_id=f"P{self._seq:06d}", ts=ts or now_cn(),
                        symbol=symbol, side=side, qty=qty, price=price)
+        if is_st is not None or name:
+            pos0 = self.positions.setdefault(symbol, PaperPosition(symbol=symbol))
+            if is_st is not None:
+                pos0.is_st = bool(is_st)
+            if name:
+                pos0.name = str(name)
+        rules = self._rules(symbol)
         if qty <= 0:
             o.status, o.reason = "rejected", "数量非法"
-        elif side == "buy":
+        else:
+            # A 股整手约束：与回测 Broker 同口径。买入必须整手；卖出只有
+            # **一次性清仓**才允许零股（零股必须一次卖完）。此前模拟盘完全不查
+            # 整手，能挂 1 股买单 —— 回测/模拟盘数量口径直接不可比。
+            lot = rules.lot_size
+            if lot > 1 and side == "buy":
+                qty = (qty // lot) * lot
+                o.qty = qty
+            elif lot > 1 and side == "sell":
+                held = self.positions.get(symbol)
+                if held is None or qty < held.qty - 1e-9:
+                    qty = (qty // lot) * lot
+                    o.qty = qty
+            if qty <= 0:
+                o.status, o.reason = "rejected", "数量不足一手"
+        if o.status == "rejected":
+            self.orders.append(o)
+            return o
+        if side == "buy":
             need = self._buy_need(symbol, qty, price)
             # 已挂未成交买单也占资金（与卖侧 pending_sell 同理）：
             # 两笔 90 万挂单在 100 万现金下各自合法、合计成交即穿仓
@@ -108,6 +147,33 @@ class PaperBroker:
                     f"可卖不足 avail={avail} 已挂卖单={pending_sell} (T+N)")
         self.orders.append(o)
         return o
+
+    def _rules(self, symbol: str):
+        """当日撮合规则：ST 以持仓/最近行情带进来的逐日标记为准，名称用于
+        推断 fund_type（黄金/QDII/债券/货币 ETF → T+0）。"""
+        sym = parse_symbol(symbol)
+        pos = self.positions.get(symbol)
+        return self._ruleset.for_symbol(
+            symbol, sym.sec_type, sym.board,
+            is_st=bool(pos.is_st) if pos and pos.is_st else False,
+            name=pos.name if pos else None)
+
+    def apply_corporate_action(self, symbol: str, ratio: float) -> None:
+        """除权调整：按复权因子比放大份额（与回测 Engine 同一套份额调整法）。
+
+        模拟盘此前**完全没有**公司行为处理 —— 持仓跨除权日时份额不调整，
+        股价除权后净值凭空少一截，与回测对账必然对不上。
+        """
+        if ratio <= 0 or abs(ratio - 1.0) <= 1e-12:
+            return
+        pos = self.positions.get(symbol)
+        if pos is None or pos.qty <= 0:
+            return
+        pos.qty = int(round(pos.qty * ratio))
+        pos.available = int(round(pos.available * ratio))
+        pos.avg_cost = pos.avg_cost / ratio if ratio else pos.avg_cost
+        # 冻结台账同步按比例放大（送股后剩余冻结份额也要按新股数计）
+        pos.frozen = [[n, int(round(q * ratio))] for n, q in pos.frozen]
 
     def _buy_need(self, symbol: str, qty: int, price: float) -> float:
         """买入所需资金 = 金额 + 真实费率估算（含佣金最低额）+ 滑点余量。
@@ -159,29 +225,32 @@ class PaperBroker:
         o.filled_price = round(price, 4)
         o.filled_qty = o.qty
 
-        rules = self._ruleset.for_symbol(o.symbol, parse_symbol(o.symbol).sec_type,
-                                         parse_symbol(o.symbol).board)
+        rules = self._rules(o.symbol)
         trade_date = ts.date() if ts else now_cn().date()
         if o.side == "buy":
             amount = o.qty * price
+            # 印花税按方向取（2008-09-19 前双边都收）—— 与回测 Broker 同口径
             fee = max(amount * rules.commission.rate, rules.commission.min) + \
-                  amount * rules.transfer_fee_rate
+                  amount * rules.transfer_fee_rate + \
+                  amount * rules.tax_rate(trade_date, "buy")
             self.cash -= amount + fee
             pos = self.positions.setdefault(o.symbol, PaperPosition(symbol=o.symbol))
             total = pos.qty + o.qty
             pos.avg_cost = (pos.avg_cost * pos.qty + amount + fee) / total
             pos.qty = total
-            # T+N：仅 T+0（n<=0，如 QDII/黄金/债券 ETF）买入当日即可卖；
-            # n>=1 冻结，日终 on_day_close 解冻 → 次日起可卖（A 股 T+1）
+            # T+N：n<=0（QDII/黄金/债券 ETF）当日可卖；n>=1 按**交易日**冻结 n 天，
+            # 由 on_day_close 逐日递减（不是「一律次日解冻」）
             n = rules.sellable_after_days
             if n <= 0:
                 pos.available += o.qty
+            else:
+                pos.frozen.append([n, o.qty])
             pos.last_price = price
         else:
             amount = o.qty * price
             fee = max(amount * rules.commission.rate, rules.commission.min) + \
                   amount * rules.transfer_fee_rate + \
-                  amount * rules.tax_rate(trade_date)
+                  amount * rules.tax_rate(trade_date, "sell")
             self.cash += amount - fee
             pos = self.positions[o.symbol]
             pos.qty -= o.qty
@@ -192,21 +261,26 @@ class PaperBroker:
         o.status = "filled"
 
     def on_day_close(self, d: date) -> None:
-        """日终：解冻跨日买入的持仓（T+1 及以上）。
+        """日终：按交易日释放 T+N 冻结份额。
 
-        解冻数量扣除仍有 pending 卖单占用的份额：submit 时挂卖单已从
-        available 里预占，日终解冻若直接 available=qty 会把这笔预占清掉。
+        冻结台账是 `[[剩余交易日, 数量]]`，每个交易日递减 1，归零才转入 available。
+        （旧实现是「sellable_after_days>=1 就 available=qty-pending_sell」——
+        等于把 T+2/T+5 一律当成 T+1，且会把已有可卖份额重算掉。）
+
+        挂卖单占用无需在这里扣：submit 的可卖校验是
+        `avail < qty + pending_sell` 的加性判断，挂单从不减少 available。
         """
-        for sym, pos in self.positions.items():
-            rules = self._ruleset.for_symbol(sym, parse_symbol(sym).sec_type,
-                                             parse_symbol(sym).board)
-            if rules.sellable_after_days >= 1:
-                pending_sell = sum(
-                    o.qty for o in self.orders
-                    if o.symbol == sym and o.side == "sell"
-                    and o.status == "pending"
-                )
-                pos.available = max(pos.qty - pending_sell, 0)
+        for pos in self.positions.values():
+            released = 0
+            rest: list = []
+            for n, q in pos.frozen:
+                if n - 1 <= 0:
+                    released += q
+                else:
+                    rest.append([n - 1, q])
+            pos.frozen = rest
+            if released:
+                pos.available += released
             if pos.last_price == 0:
                 pos.last_price = pos.avg_cost
 
@@ -240,13 +314,27 @@ class PaperEngine:
         self.alerts: list[dict] = []
 
     def push(self, quote: dict) -> None:
-        """单条行情推进：先让策略看行情产生委托，再用该行情撮合。"""
+        """单条行情推进：策略出委托 → 撮合 → 盯市。
+
+        quote 里的 name/is_st 必须透传给 submit —— 名称决定 ETF 的 T+0/T+1，
+        is_st 决定当日涨跌幅；丢了就退化成「一律 T+1 + 非 ST」。
+
+        盯市（last_price 刷新）不能省：`nav()` 用 last_price 估值，不刷新的话
+        持仓只有成交那天有价，**净值曲线会一直停在建仓当天的水平**。
+        service.tick 一直在做这件事，但离线回放（replay）此前漏了 ——
+        于是「回测 vs 模拟盘对账」在 replay 路径上根本对不起来。
+        """
         orders = self.strategy.signals(self.broker, quote)
         for od in orders:
             self.broker.submit(od["symbol"], od["side"], od["qty"],
-                               od.get("price", quote["price"]))
+                               od.get("price", quote["price"]),
+                               name=quote.get("name") or od.get("name"),
+                               is_st=quote.get("is_st"))
         self.broker.on_quote(quote["symbol"], quote["price"],
                              quote.get("limit_up"), quote.get("limit_down"))
+        pos = self.broker.positions.get(quote["symbol"])
+        if pos is not None and pos.qty > 0 and quote.get("price"):
+            pos.last_price = float(quote["price"])
 
     def replay(self, daily: pl.DataFrame) -> dict:
         """离线回放：逐日推进，验证模拟盘全链路。"""
@@ -257,7 +345,9 @@ class PaperEngine:
             for row in day_rows.iter_rows(named=True):
                 self.push({"symbol": row["symbol"], "price": row["close"],
                            "limit_up": row.get("limit_up"),
-                           "limit_down": row.get("limit_down")})
+                           "limit_down": row.get("limit_down"),
+                           "name": row.get("name"),
+                           "is_st": row.get("is_st")})
             self.broker.on_day_close(d)
             nav = self.broker.nav()
             if not math.isfinite(nav):
