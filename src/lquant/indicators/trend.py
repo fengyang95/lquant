@@ -13,7 +13,7 @@ from lquant.indicators.registry import register_indicator
 __all__ = ["add_ma", "add_ema", "add_macd", "add_boll", "add_bbi"]
 
 
-@register_indicator("ma", label="均线族", category="trend", min_window=60,
+@register_indicator("ma", label="均线族", category="trend", pane="price", min_window=60,
                     outputs=("ma5", "ma10", "ma20", "ma60"))
 def add_ma(df: pl.DataFrame, periods: tuple[int, ...] = (5, 10, 20, 60),
            col: str = "close") -> pl.DataFrame:
@@ -23,7 +23,7 @@ def add_ma(df: pl.DataFrame, periods: tuple[int, ...] = (5, 10, 20, 60),
     return df
 
 
-@register_indicator("ema", label="指数均线", category="trend", min_window=26,
+@register_indicator("ema", label="指数均线", category="trend", pane="price", min_window=26,
                     outputs=("ema12", "ema26"))
 def add_ema(df: pl.DataFrame, periods: tuple[int, ...] = (12, 26),
             col: str = "close") -> pl.DataFrame:
@@ -33,7 +33,7 @@ def add_ema(df: pl.DataFrame, periods: tuple[int, ...] = (12, 26),
     return df
 
 
-@register_indicator("macd", label="MACD", category="trend", min_window=60,
+@register_indicator("macd", label="MACD", category="trend", pane="sub", min_window=60,
                     outputs=("ema12", "ema26", "macd_dif", "macd_dea", "macd_hist"))
 def add_macd(df: pl.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9,
              col: str = "close", cn_hist: bool = True) -> pl.DataFrame:
@@ -47,7 +47,7 @@ def add_macd(df: pl.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9,
     return df
 
 
-@register_indicator("boll", label="布林带", category="channel", min_window=40,
+@register_indicator("boll", label="布林带", category="channel", pane="price", min_window=40,
                     outputs=("boll_mid", "boll_upper", "boll_lower"))
 def add_boll(df: pl.DataFrame, n: int = 20, k: float = 2.0,
              col: str = "close") -> pl.DataFrame:
@@ -61,7 +61,7 @@ def add_boll(df: pl.DataFrame, n: int = 20, k: float = 2.0,
     return df
 
 
-@register_indicator("bbi", label="BBI 多空指标", category="trend", min_window=24,
+@register_indicator("bbi", label="BBI 多空指标", category="trend", pane="price", min_window=24,
                     outputs=("bbi",))
 def add_bbi(df: pl.DataFrame, periods: tuple[int, ...] = (3, 6, 12, 24),
             col: str = "close") -> pl.DataFrame:

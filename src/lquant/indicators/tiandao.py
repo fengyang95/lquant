@@ -54,7 +54,7 @@ def xma_truncated(col: str | pl.Expr, n: int) -> pl.Expr:
 
 
 @register_indicator("tiandao", label="天道通道（金牛/金钻）", category="channel",
-                    min_window=60, inputs=("high", "low", "close"),
+                    pane="price", min_window=60, inputs=("high", "low", "close"),
                     outputs=("td_jinniu", "td_jinzuan", "td_gold_buy", "td_gold_sell"))
 def add_tiandao(df: pl.DataFrame, n: int = TIANDAO_DEFAULT_N) -> pl.DataFrame:
     """叠加金牛 / 金钻通道与两个信号列。"""

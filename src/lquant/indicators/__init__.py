@@ -25,6 +25,7 @@ from lquant.indicators.momentum import add_kdj, add_rsi
 from lquant.indicators.registry import (
     CATEGORIES,
     INDICATORS,
+    PANES,
     compute,
     compute_many,
     min_window,
@@ -44,6 +45,7 @@ from lquant.indicators.volume import add_turnover_ma, add_volume_ratio, add_volu
 __all__ = [
     "CATEGORIES",
     "INDICATORS",
+    "PANES",
     "TIANDAO_DEFAULT_N",
     "LookaheadViolation",
     "WARMUP",

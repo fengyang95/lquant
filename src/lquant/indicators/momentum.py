@@ -8,7 +8,7 @@ from lquant.indicators.registry import register_indicator
 __all__ = ["add_rsi", "add_kdj"]
 
 
-@register_indicator("rsi", label="RSI", category="oscillator", min_window=40,
+@register_indicator("rsi", label="RSI", category="oscillator", pane="sub", min_window=40,
                     outputs=("rsi14",))
 def add_rsi(df: pl.DataFrame, n: int = 14, col: str = "close") -> pl.DataFrame:
     """Wilder RSI：涨跌幅的指数平滑（alpha=1/n）。首行无涨跌，置 null（不是 NaN）。"""
@@ -29,7 +29,7 @@ def add_rsi(df: pl.DataFrame, n: int = 14, col: str = "close") -> pl.DataFrame:
     return df
 
 
-@register_indicator("kdj", label="KDJ", category="oscillator", min_window=30,
+@register_indicator("kdj", label="KDJ", category="oscillator", pane="sub", min_window=30,
                     inputs=("high", "low", "close"),
                     outputs=("kdj_k", "kdj_d", "kdj_j"))
 def add_kdj(df: pl.DataFrame, n: int = 9, m1: int = 3, m2: int = 3) -> pl.DataFrame:

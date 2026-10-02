@@ -35,12 +35,18 @@ INDICATORS: Registry[IndicatorFn] = Registry("indicators")
 # 类别取值：趋势 / 摆动 / 量能 / 形态 / 通道
 CATEGORIES = ("trend", "oscillator", "volume", "pattern", "channel")
 
+# 挂载面板：**这是给前端用的量纲信息，不能靠类别猜**。
+# MACD 属 trend，但它的量纲与价格差两个数量级，画到价格轴上会把 K 线压成一条直线；
+# 而 KDJ 属 oscillator 同理。所以「画在哪」必须显式声明，而不是由 category 推断。
+PANES = ("price", "sub", "volume")
+
 
 def register_indicator(
     name: str,
     *,
     label: str = "",
     category: str = "trend",
+    pane: str = "sub",
     min_window: int = 0,
     inputs: Iterable[str] = ("close",),
     outputs: Iterable[str] | None = None,
@@ -51,17 +57,23 @@ def register_indicator(
         name: 唯一键，前端与 API 用。
         label: 中文展示名。
         category: ``trend`` / ``oscillator`` / ``volume`` / ``pattern`` / ``channel``。
+        pane: 前端挂载面板 —— ``price``（与价格同轴，可叠加 K 线）、
+            ``sub``（独立子图）、``volume``（量能轴）。
+            **默认 ``sub``**：不显式声明就不会被误画到价格轴上。
         min_window: 预热根数。**取数时必须多取这么多根再截尾**，否则头部指标为 null。
         inputs: 依赖的输入列。
         outputs: 新增的列名；缺省为 ``(name,)``。未来函数检测按此逐列比对。
     """
     if category not in CATEGORIES:
         raise ValueError(f"未知指标类别 {category!r}，可选: {CATEGORIES}")
+    if pane not in PANES:
+        raise ValueError(f"未知挂载面板 {pane!r}，可选: {PANES}")
     if min_window < 0:
         raise ValueError("min_window 不能为负")
     meta: dict[str, Any] = {
         "label": label or name,
         "category": category,
+        "pane": pane,
         "min_window": int(min_window),
         "inputs": list(inputs),
         "outputs": list(outputs) if outputs is not None else [name],

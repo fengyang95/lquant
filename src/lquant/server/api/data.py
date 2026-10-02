@@ -36,6 +36,9 @@ from lquant.server.jobs import enqueue
 
 router = APIRouter(prefix="/data", tags=["data"])
 
+#: /data/indicators 的默认指标集 —— 与迁移前的输出保持一致（前端旧契约不破）
+DEFAULT_INDICATORS = "ma,macd,rsi,boll"
+
 # 全湖质量检查互斥锁：防并发双跑竞写 data_quality_issue
 _lake_check_lock = threading.Lock()
 
@@ -313,25 +316,45 @@ def daily(
     return out
 
 
+@router.get("/indicators/registry")
+def indicators_registry() -> dict:
+    """枚举已注册的技术指标（前端据此生成指标选择器，无需硬编码）。"""
+    from lquant.indicators import INDICATORS
+
+    return {"indicators": INDICATORS.describe(),
+            "default": list(DEFAULT_INDICATORS.split(","))}
+
+
 @router.get("/indicators")
 def indicators(
     symbol: str = Query(min_length=6, max_length=16),
     limit: int = Query(default=120, le=500),
+    names: str = Query(default=DEFAULT_INDICATORS,
+                       description="逗号分隔的指标注册名，见 /data/indicators/registry"),
 ) -> list[dict]:
-    """个股日线 + 技术指标（MA/MACD/RSI/BOLL，方案 M3）。
+    """个股日线 + 指定技术指标。
 
-    指标有 warmup 期，所以先取 250 根再截尾 —— 返回的每行指标都是全量历史算出来的。
+    指标有 warmup 期，所以**先在全量历史上算再截尾** —— 返回的每行指标都由完整
+    历史算出，而不是只喂 limit 根。未注册的名字返回 422 而不是静默忽略，
+    否则前端会拿到一列不存在的字段而不知道哪里错了。
     """
-    from lquant.factors.indicators import add_all
+    from lquant.indicators import INDICATORS, compute_many
+
+    requested = [n.strip() for n in names.split(",") if n.strip()]
+    if not requested:
+        raise HTTPException(422, "names 不能为空")
+    unknown = [n for n in requested if n not in INDICATORS]
+    if unknown:
+        raise HTTPException(422, f"未注册的指标: {unknown}；可选: {INDICATORS.keys()}")
 
     sym = resolve_symbol(symbol)
     df = read_daily([sym]).collect()
     if not len(df):
         return []
     cols = [c for c in ["trade_date", "open", "high", "low", "close",
-                        "volume"] if c in df.columns]
+                        "volume", "turnover_rate"] if c in df.columns]
     df = df.select(cols).sort("trade_date")
-    df = add_all(df)
+    df = compute_many(df, requested)
     out = df.tail(limit).to_dicts()
     for r in out:
         r["trade_date"] = str(r["trade_date"])

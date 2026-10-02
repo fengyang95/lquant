@@ -10,6 +10,7 @@ import pytest
 from lquant.indicators import (
     CATEGORIES,
     INDICATORS,
+    PANES,
     add_bbi,
     add_kdj,
     add_tiandao,
@@ -52,9 +53,23 @@ def test_builtin_indicators_registered():
 
 def test_describe_is_frontend_ready():
     desc = INDICATORS.describe()
-    assert desc and all({"name", "label", "category", "min_window", "outputs"} <= set(d)
-                        for d in desc)
+    assert desc and all({"name", "label", "category", "pane", "min_window", "outputs"}
+                        <= set(d) for d in desc)
     assert all(d["category"] in CATEGORIES for d in desc)
+    assert all(d["pane"] in PANES for d in desc)
+
+
+def test_price_pane_is_explicit_not_inferred_from_category():
+    """回归：MACD 属 trend，但量纲与价格差两个数量级，绝不能叠到价格轴。
+
+    所以「画在哪」由注册表显式声明，而不是前端按 category 猜。
+    """
+    by_name = {d["name"]: d for d in INDICATORS.describe()}
+    price = {n for n, d in by_name.items() if d["pane"] == "price"}
+    assert price == {"ma", "ema", "boll", "bbi", "tiandao"}
+    assert by_name["macd"]["pane"] == "sub"      # 同属 trend，但不进价格轴
+    assert by_name["kdj"]["pane"] == "sub"
+    assert by_name["volume_ratio"]["pane"] == "volume"
 
 
 def test_compute_returns_original_columns_and_order():
@@ -82,11 +97,21 @@ def test_unknown_name_raises_with_choices():
         compute("does_not_exist", make_ohlcv(10))
 
 
-def test_register_rejects_bad_category_and_negative_window():
+def test_register_rejects_bad_category_pane_and_negative_window():
     with pytest.raises(ValueError, match="未知指标类别"):
         register_indicator("x1", category="nope")
+    with pytest.raises(ValueError, match="未知挂载面板"):
+        register_indicator("x2", pane="nope")
     with pytest.raises(ValueError, match="min_window"):
-        register_indicator("x2", min_window=-1)
+        register_indicator("x3", min_window=-1)
+
+
+def test_pane_defaults_to_sub_so_it_never_lands_on_price_axis():
+    @register_indicator("pane_default_demo")
+    def _f(df: pl.DataFrame) -> pl.DataFrame:      # pragma: no cover
+        return df
+
+    assert INDICATORS.meta("pane_default_demo")["pane"] == "sub"
 
 
 def test_duplicate_registration_rejected():

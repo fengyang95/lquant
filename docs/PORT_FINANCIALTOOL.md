@@ -248,15 +248,75 @@ FinancialTool 声明「盈利与现金流」模块权重 30，但子项合计只
 
 ---
 
-## 4. 验证
+## 4. API 与前端接线
+
+三个模块都以 lquant 既有范式暴露：**注册表驱动 → 端点枚举 → 前端自动生成 UI**，
+前端不硬编码任何指标/策略清单。
+
+### 4.1 新增/扩展的端点
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/data/indicators/registry` | 指标注册表（含 `pane` 挂载面板元数据） |
+| GET | `/api/data/indicators?symbol=&limit=&names=` | 按名字计算指标；未注册名返回 **422**（不静默忽略） |
+| GET | `/api/backtests/exit-strategies` | 退出策略枚举 |
+| POST | `/api/backtests/run` | 新增 `exit_strategy` / `exit_params`，内部用 `ExitOverlay` 包裹 TopN 策略 |
+| GET | `/api/fundamental/metrics` | 指标目录 + 模块权重 |
+| GET | `/api/fundamental/score?symbol=&asof=` | 单票评分（含逐指标明细与行业分位） |
+| POST | `/api/fundamental/scores` | 全市场/指定池排名（`min_coverage` 过滤低覆盖） |
+| GET | `/api/fundamental/percentiles?asof=` | 各行业 × 各指标 P25/P50/P75 |
+| POST | `/api/fundamental/reconcile` | 三表勾稽校验 |
+
+设计要点：
+
+- **`/data/indicators` 向后兼容**：默认 `names=ma,macd,rsi,boll`，与迁移前输出一致；
+  旧前端不改也能跑。
+- **未注册的指标/策略一律 422**，且提示可选清单 —— 静默忽略会让用户拿到一列
+  不存在的字段却不知道哪里错了。
+- **财务表为空返回 `available:false` + `hint`**，不是 500：空表是常态不是错误。
+
+### 4.2 指标新增 `pane` 元数据（一个被测试固定的设计决定）
+
+前端最初按 `category`（trend/channel）决定哪些指标能叠到价格 K 线上 ——
+**这是错的**：MACD 属 `trend`，但量纲与价格差两个数量级，叠上去会把 K 线压成直线。
+
+改为在注册表里**显式声明** `pane ∈ {price, sub, volume}`，默认 `sub`
+（不声明就永远不会误画到价格轴上）。前端只认 `pane === 'price'`。
+
+`tests/unit/test_indicators_registry.py::test_price_pane_is_explicit_not_inferred_from_category`
+固定了这一点。
+
+### 4.3 前端展示位置
+
+| 页面 | 变化 |
+|---|---|
+| `/security/[symbol]`（个股详情） | 顶部新增**基本面评分卡**（评级/归一化分/覆盖率/模块分解/逐指标行业位置条）；「技术指标」面板改为**注册表驱动的勾选框**，选中项同时决定指标条与 K 线叠加线 |
+| `/backtests`（快速回测） | 新增**退出策略下拉**，未选时不发 `exit_strategy` 字段（旧请求契约不破） |
+| `/fundamental`（新增页） | 全市场基本面排名表（归一化分 + 覆盖率 + 模块分列）+ 评分口径说明 |
+| 侧边栏 | 研究分组新增「基本面」 |
+
+两个刻意的展示原则：
+
+1. **总分必须与覆盖率同时出现**。只匹配到 3 个指标拿 90 分，和 17 个指标全匹配
+   拿 90 分，可信度完全不同；覆盖率低于 80% 时卡片会额外给出提示。
+2. **分位区间退化时不给位置条**。同行业取值全部相同时（P25 == P75），
+   位置条会给出误导性的"居中"假象，此时显式显示「区间退化」。
+
+---
+
+## 5. 验证
 
 | 项 | 命令 | 结果 |
 |---|---|---|
-| Lint | `ruff check src tests` | 全仓 All checks passed |
-| 单测（全量） | `pytest tests -m "not slow"` | **2666 passed, 1 skipped, 0 failed**（exit 0） |
-| 新增用例 | 6 个文件 | **101 个用例全过** |
-| 新增模块覆盖率 | `--cov=lquant.indicators,fundamental,backtest.exit` | **97.53%**（门禁 95%） |
+| 后端 Lint | `ruff check src tests` | 全仓 All checks passed |
+| 后端单测（全量） | `pytest tests -m "not slow"` | **2687 passed, 1 skipped, 0 failed**（exit 0） |
+| 后端新增用例 | 9 个文件 | **136 个用例全过** |
+| 新增模块覆盖率 | `--cov` 覆盖 3 个新包 + 新 API 路由 | **97.91%**（门禁 95%；`api/fundamental.py` 100%） |
 | 未来函数 | 反向对照用例 | 居中 XMA 被抓出 **52 处**；截断版 **0 处** |
+| 前端 typecheck | `tsc --noEmit` | 通过 |
+| 前端单测（全量） | `vitest run` | **339 passed（69 文件）** |
+| 前端新增用例 | 6 个文件 | **37 个用例** |
+| 前端生产构建 | `next build` | 通过，`/fundamental` 进入路由表 |
 
 > 注意：全量测试**必须串行跑**。并行跑多个 pytest 会因 DuckDB/临时库争用产生
 > 大量伪失败（实测出现过 `test_paper_live` / `test_api_data_tasks` 的 ERROR）。
@@ -265,21 +325,27 @@ FinancialTool 声明「盈利与现金流」模块权重 30，但子项合计只
 新增测试文件：
 
 - `tests/unit/test_indicators_future.py` —— 检测器 + **反向对照**
-- `tests/unit/test_indicators_registry.py` —— 注册表、数值正确性、转发层
+- `tests/unit/test_indicators_registry.py` —— 注册表、数值正确性、转发层、`pane` 语义
 - `tests/unit/test_exit_strategies.py` —— 三个实现 + 信号模型
 - `tests/unit/test_exit_overlay.py` —— 与真实 `Engine` 的契约 + 端到端对比
 - `tests/unit/test_fundamental_percentile.py` —— PIT + 分位 + 聚合 + 滚动
 - `tests/unit/test_fundamental_reconcile.py` —— 勾稽口径 + 缺失值安全
+- `tests/unit/test_api_port_endpoints.py` —— 新增端点的 API 契约（19 用例）
+- `tests/unit/test_api_fundamental_unit.py` —— 表缺失降级 / JSON 安全 / 样本不足分支
+- `web/.../IndicatorPicker.test.tsx`、`FundamentalCard.test.tsx`、
+  `fundamental/__tests__/page.test.tsx`、`security/__tests__/page.test.tsx`
 
 ---
 
-## 5. 明确没做的事（留给后续）
+## 6. 明确没做的事（留给后续）
 
-1. **API / 前端接线**：三个模块目前是纯库 + 测试，尚未挂到 `/api/*`。
-   注册表已提供 `describe()`，接线时前端可直接枚举。
+1. **退出策略未接入 JQ 代码回测路径**：`/api/backtests/run-code`（聚宽方言）目前
+   不接收 `exit_strategy`。走那条路的用户可以改在策略源码里调 `ExitStrategy`。
 2. **缠论 / 波浪**：FinancialTool 没有实现，无物可移；本层也没有实现。
 3. **筹码分布**：FinancialTool 的版本是**换手率近似**（非真 tick）。
    当前数据湖无 tick 数据，若要移植必须先解决数据源并**显式标注近似口径**。
 4. **其余约 150 个指标**：同质实现（4 份 Bollinger）与玄学命名混在一起，
    应按需逐个评估后接入，不做批量搬运。
 5. **RL 模块**：本次未做（P0-5）。接入方案见对比报告第 5 节。
+6. **指标子图**：`pane=sub/volume` 的指标（MACD/RSI/KDJ/量比）目前只在指标条里
+   显示末值，尚未在 KChart 下方渲染独立子图 —— 需要先扩 `KChart` 的分 panel 能力。

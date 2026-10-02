@@ -8,7 +8,7 @@ from lquant.indicators.registry import register_indicator
 __all__ = ["add_volume_ratio", "add_volume_surge", "add_turnover_ma"]
 
 
-@register_indicator("volume_ratio", label="量比", category="volume", min_window=20,
+@register_indicator("volume_ratio", label="量比", category="volume", pane="volume", min_window=20,
                     inputs=("volume",), outputs=("volume_ratio",))
 def add_volume_ratio(df: pl.DataFrame, n: int = 20, col: str = "volume") -> pl.DataFrame:
     """量比 = 当日量 / 过去 ``n`` 日均量。
@@ -21,7 +21,7 @@ def add_volume_ratio(df: pl.DataFrame, n: int = 20, col: str = "volume") -> pl.D
     return df.with_columns(out.alias("volume_ratio"))
 
 
-@register_indicator("volume_surge", label="量能突增", category="volume", min_window=25,
+@register_indicator("volume_surge", label="量能突增", category="volume", pane="volume", min_window=25,
                     inputs=("volume",), outputs=("volume_surge",))
 def add_volume_surge(df: pl.DataFrame, n: int = 5, ratio: float = 1.5,
                      col: str = "volume") -> pl.DataFrame:
@@ -31,7 +31,7 @@ def add_volume_surge(df: pl.DataFrame, n: int = 5, ratio: float = 1.5,
     return df.with_columns(flag.fill_null(False).alias("volume_surge"))
 
 
-@register_indicator("turnover_ma", label="换手率均线", category="volume", min_window=5,
+@register_indicator("turnover_ma", label="换手率均线", category="volume", pane="volume", min_window=5,
                     inputs=("turnover_rate",), outputs=("turnover_ma5",))
 def add_turnover_ma(df: pl.DataFrame, n: int = 5,
                     col: str = "turnover_rate") -> pl.DataFrame:

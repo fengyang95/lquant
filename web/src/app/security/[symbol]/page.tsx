@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
 import useSWR from 'swr';
@@ -8,8 +8,16 @@ import KChart, { type Overlay } from '@/components/KChart';
 import PageHeader from '@/components/PageHeader';
 import { Panel, Stat } from '@/components/Panel';
 import { Empty, ErrorNote, Loading } from '@/components/States';
+import IndicatorPicker, {
+  IndicatorPickerFallback,
+  PRICE_PANE,
+  isLineOutput,
+  useIndicatorRegistry,
+  type IndicatorMeta,
+} from '@/components/IndicatorPicker';
+import FundamentalCard from '@/components/FundamentalCard';
 import { Pct, fmtNum, fmtYi } from '@/components/QuoteTable';
-import { C } from '@/lib/chart';
+import { SERIES_COLORS } from '@/lib/chart';
 import { fetcher } from '@/lib/api';
 
 type Quote = {
@@ -27,7 +35,7 @@ type Quote = {
   market_cap?: number | null;
 };
 
-/** /data/indicators 返回行：OHLC + 全套技术指标 */
+/** /data/indicators 返回行：OHLC + 被选中的指标列（列集合由 names 参数决定） */
 type IndRow = {
   trade_date: string;
   open: number;
@@ -35,17 +43,7 @@ type IndRow = {
   low: number;
   close: number;
   volume?: number | null;
-  ma5?: number | null;
-  ma10?: number | null;
-  ma20?: number | null;
-  ma60?: number | null;
-  macd_dif?: number | null;
-  macd_dea?: number | null;
-  macd_hist?: number | null;
-  rsi14?: number | null;
-  boll_upper?: number | null;
-  boll_mid?: number | null;
-  boll_lower?: number | null;
+  [key: string]: unknown;
 };
 
 type FlowRow = {
@@ -55,23 +53,46 @@ type FlowRow = {
   large_net: number | null;
 };
 
-const MA_COLORS: Record<string, string> = {
-  ma5: C.gold,
-  ma10: '#6B4F9E',
-  ma20: C.indigo,
-  ma60: C.ink,
-};
+/** 默认指标集：与迁移前页面一致 */
+const DEFAULT_SELECTED = ['ma', 'macd', 'rsi', 'boll'];
+
+const MAX_OVERLAY_LINES = 8;
+
+/** 从选中的指标里挑出可叠加到价格轴上的数值列，并保持稳定顺序 */
+function pickOverlayColumns(metas: IndicatorMeta[], selected: string[],
+                            rows: IndRow[] | undefined): string[] {
+  const cols: string[] = [];
+  for (const name of selected) {
+    const meta = metas.find((m) => m.name === name);
+    // 只看显式声明为 price 面板的指标：MACD 虽属 trend，量纲却与价格差两个数量级
+    if (!meta || meta.pane !== PRICE_PANE) continue;
+    for (const out of meta.outputs) {
+      if (isLineOutput(rows, out)) cols.push(out);
+    }
+  }
+  return cols.slice(0, MAX_OVERLAY_LINES);
+}
+
+function fmtCell(v: unknown): string {
+  if (typeof v === 'boolean') return v ? '是' : '否';
+  if (typeof v === 'number') return v.toFixed(3);
+  return '—';
+}
 
 export default function SecurityPage() {
   const { symbol = '' } = useParams<{ symbol: string }>();
   const router = useRouter();
+  const [selected, setSelected] = useState<string[]>(DEFAULT_SELECTED);
+
+  const { data: registry, error: regErr } = useIndicatorRegistry();
+  const names = selected.join(',');
 
   // 实时行情 5s 轮询；不可用时用日线末根兜底
   const { data: quote } = useSWR<Quote>(
     `/data/quote?symbol=${symbol}`, fetcher, { refreshInterval: 5_000 },
   );
   const { data: rows, isLoading, error } = useSWR<IndRow[]>(
-    `/data/indicators?symbol=${symbol}&limit=250`, fetcher,
+    `/data/indicators?symbol=${symbol}&limit=250&names=${names}`, fetcher,
   );
   const { data: flows } = useSWR<FlowRow[]>(`/market/money-flow?symbol=${symbol}`, fetcher);
 
@@ -81,11 +102,19 @@ export default function SecurityPage() {
     trade_date: r.trade_date, open: r.open, high: r.high,
     low: r.low, close: r.close, volume: r.volume,
   })), [rows]);
-  const overlays: Overlay[] = useMemo(() => ['ma5', 'ma20', 'ma60'].map((k) => ({
-    name: k,
-    color: MA_COLORS[k],
-    data: (rows ?? []).map((r) => (r as IndRow & Record<string, number | null>)[k] ?? null),
-  })), [rows]);
+
+  const metas = registry?.indicators ?? [];
+  const overlayCols = useMemo(
+    () => pickOverlayColumns(metas, selected, rows), [metas, selected, rows],
+  );
+  const overlays: Overlay[] = useMemo(
+    () => overlayCols.map((k, i) => ({
+      name: k,
+      color: SERIES_COLORS[i % SERIES_COLORS.length],
+      data: (rows ?? []).map((r) => (typeof r[k] === 'number' ? (r[k] as number) : null)),
+    })),
+    [overlayCols, rows],
+  );
 
   if (isLoading) return <Loading />;
   if (error) return <ErrorNote>加载失败：{String(error)}</ErrorNote>;
@@ -98,7 +127,7 @@ export default function SecurityPage() {
     : price && prev?.close ? price / prev.close - 1 : null;
   const name = quote?.name;
 
-  const lastV = (k: keyof IndRow) => (last ? (last[k] as number | null) ?? null : null);
+  const lastV = (k: string) => (last ? (last[k] as number | null) ?? null : null);
 
   return (
     <div className="space-y-5">
@@ -140,46 +169,64 @@ export default function SecurityPage() {
         </div>
       </Panel>
 
-      {/* 技术指标（M3）：分栏指标条 */}
-      <Panel title="技术指标" meta="日线末根">
-        <div className="grid grid-cols-2 gap-y-4 divide-line md:grid-cols-4 sm:divide-x">
-          <div className="sm:pr-4">
-            <Stat label="MACD (12,26,9)"
-              value={<span className="text-base">DIF {lastV('macd_dif')?.toFixed(3) ?? '—'} · HIST {lastV('macd_hist')?.toFixed(3) ?? '—'}</span>}
-              tone={(lastV('macd_hist') ?? 0) >= 0 ? 'text-up' : 'text-down'} />
-          </div>
-          <div className="sm:px-4">
-            <Stat label="RSI(14)"
-              value={<span className="text-base">{lastV('rsi14')?.toFixed(1) ?? '—'}
-                <span className="ml-1 font-sans text-xs font-normal text-ink-faint">
-                  {(lastV('rsi14') ?? 50) >= 70 ? '超买' : (lastV('rsi14') ?? 50) <= 30 ? '超卖' : ''}
-                </span></span>}
-              tone={(lastV('rsi14') ?? 50) >= 70 ? 'text-up' : (lastV('rsi14') ?? 50) <= 30 ? 'text-down' : undefined} />
-          </div>
-          <div className="sm:px-4">
-            <Stat label="BOLL(20,2)"
-              value={<span className="text-base">{lastV('boll_lower')?.toFixed(2) ?? '—'} / {lastV('boll_mid')?.toFixed(2) ?? '—'} / {lastV('boll_upper')?.toFixed(2) ?? '—'}</span>} />
-          </div>
-          <div className="sm:px-4">
-            <Stat label="均线" value={
-              <span className="text-base">
-                {['ma5', 'ma20', 'ma60'].map((k) => (
-                  <span key={k} style={{ color: MA_COLORS[k] }} className="mr-2">
-                    {lastV(k as keyof IndRow) == null ? '—' : (lastV(k as keyof IndRow) as number).toFixed(2)}
-                  </span>
-                ))}
-              </span>
-            } />
-          </div>
-        </div>
+      {/* 基本面：行业相对分位评分（PIT） */}
+      <Panel title="基本面评分" meta="行业相对分位 · PIT">
+        <FundamentalCard symbol={symbol} />
       </Panel>
 
-      {/* K 线 + 均线叠加 */}
+      {/* 技术指标：注册表驱动的选择器 + 分栏指标条 */}
+      <Panel
+        title="技术指标"
+        meta="日线末根"
+        actions={
+          <span className="text-xs text-ink-faint">已选 {selected.length} 个</span>
+        }
+      >
+        {regErr
+          ? <IndicatorPickerFallback error={regErr} />
+          : <IndicatorPicker meta={metas} value={selected} onChange={setSelected} />}
+
+        <div className="mt-4 grid grid-cols-1 gap-y-4 divide-line md:grid-cols-3 sm:divide-x">
+          {selected.map((n) => {
+            const meta = metas.find((m) => m.name === n);
+            if (!meta) return null;
+            return (
+              <div key={n} className="sm:px-4">
+                <Stat
+                  label={`${meta.label}${meta.min_window ? ` · 预热 ${meta.min_window}` : ''}`}
+                  value={
+                    <span className="text-base">
+                      {meta.outputs.map((o) => (
+                        <span key={o} className="mr-2 whitespace-nowrap">
+                          <span className="text-xs text-ink-faint">{o}</span>{' '}
+                          {fmtCell(last?.[o])}
+                        </span>
+                      ))}
+                    </span>
+                  }
+                />
+              </div>
+            );
+          })}
+        </div>
+
+        {selected.includes('rsi') && (
+          <p className="mt-2 text-xs text-ink-faint">
+            RSI(14) 当前 {lastV('rsi14')?.toFixed(1) ?? '—'}
+            {(lastV('rsi14') ?? 50) >= 70 ? ' · 超买' : (lastV('rsi14') ?? 50) <= 30 ? ' · 超卖' : ''}
+          </p>
+        )}
+      </Panel>
+
+      {/* K 线 + 动态叠加 */}
       <Panel
         title="日 K"
         meta="近 250 交易日"
         actions={
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            {overlays.length === 0 && (
+              <span className="text-xs text-ink-faint">当前选中指标无可叠加的价格轴序列</span>
+            )}
             {overlays.map((o) => (
               <span key={o.name} className="flex items-center gap-1 text-xs text-ink-dim">
                 <span className="inline-block h-0.5 w-4" style={{ background: o.color }} />
@@ -226,6 +273,7 @@ export default function SecurityPage() {
 
       <div className="text-xs text-ink-faint">
         相关：涨停池/龙虎榜见 <Link href="/sectors" className="text-indigo hover:underline">板块页</Link> ·
+        全市场基本面排名见 <Link href="/fundamental" className="text-indigo hover:underline">基本面页</Link> ·
         把它加入自选去 <Link href="/watchlist" className="text-indigo hover:underline">自选页</Link>
       </div>
     </div>
