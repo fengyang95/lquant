@@ -24,6 +24,8 @@ class JQFundamentalsState:
         self.universe = list(universe)
 
     def make_get_fundamentals(self):
+        from datetime import date as _date
+
         from lquant.research.dialect import jq_shim
 
         def get_fundamentals(query, date=None):
@@ -31,8 +33,12 @@ class JQFundamentalsState:
             if day is None:
                 raise RuntimeError("get_fundamentals: 沙箱未绑定当前交易日")
             if date is not None:
-                # G6:显式 date 钳制到当前交易日,策略传未来日期也绝不能看到未来披露
-                day = min(date, day)
+                # G6:显式 date 钳制到当前交易日,策略传未来日期也绝不能看到未来披露。
+                # G20a:必须先归一成 date —— 历史上直接 min(str, date) 会抛
+                # TypeError: '<' not supported between 'datetime.date' and 'str'，
+                # 而聚宽用户习惯传 '2025-08-01' 这种字符串。
+                req = date if isinstance(date, _date) else _date.fromisoformat(str(date)[:10])
+                day = min(req, day)
             jq_shim.bind(jq_shim.JQContext(engine=None, trade_date=day,
                                            universe=list(self.universe)))
             return jq_shim.get_fundamentals(query, date=day)

@@ -11,22 +11,35 @@ default:
     per_order: true
   tax:
     side: sell
-    # 印花税有生效区间，历史回测必须按区间取
+    # 印花税按日期区间**和买卖方向**取：2008-09-19 起改单边征收（仅卖方），
+    # 此前双边都收 —— 早期回测若一律按单边，成本被系统性低估一半。
     schedule:
-      - { from: "2008-09-19", to: "2023-08-27", rate: 0.001 }
-      - { from: "2023-08-28", to: "9999-12-31", rate: 0.0005 }
+      - { from: "2000-01-01", to: "2001-11-15", rate: 0.004, side: both }
+      - { from: "2001-11-16", to: "2005-01-23", rate: 0.002, side: both }
+      - { from: "2005-01-24", to: "2007-05-29", rate: 0.001, side: both }
+      - { from: "2007-05-30", to: "2008-04-23", rate: 0.003, side: both }
+      - { from: "2008-04-24", to: "2008-09-18", rate: 0.001, side: both }
+      - { from: "2008-09-19", to: "2023-08-27", rate: 0.001, side: sell }
+      - { from: "2023-08-28", to: "9999-12-31", rate: 0.0005, side: sell }
   transfer_fee:
     rate: 0.00001     # 沪深过户费（双向）
+  price_tick: 0.01    # 最小变动价位（股票 0.01 元）
   price_limit:
     mode: by_board
     main: 0.10
     gem: 0.20         # 创业板 301/302/300
-    star: 0.20        # 科创板 688
+    star: 0.20        # 科创板 688/689
     bse: 0.30         # 北交所
-    st: 0.05
+    st: 0.05          # 主板 ST
+    st_by_board:      # ST 的涨跌幅不是一律 5%：创业板/科创板 ST 仍 20%
+      gem: 0.20
+      star: 0.20
+      bse: 0.30
   t_plus: 1
   lot_size: 100
-  slippage: { mode: pct, value: 0.0002 }
+  # 引擎默认滑点。这是**活配置**：Engine 未显式传 slippage_params 时读这里。
+  # 键名必须与 slippage.py 里对应模型的构造参数一致（pct → rate）。
+  slippage: { mode: pct, rate: 0.0005 }
 
 etf:
   # ETF 免的是印花税和过户费，**不是佣金**。
@@ -38,12 +51,28 @@ etf:
   tax:
     side: sell
     schedule:
-      - { from: "2000-01-01", to: "9999-12-31", rate: 0.0 }   # ETF 免征印花税
+      - { from: "2000-01-01", to: "9999-12-31", rate: 0.0, side: sell }   # ETF 免征印花税
   transfer_fee:
     rate: 0.0           # ETF 无过户费
+  price_tick: 0.001     # 基金最小变动价位 0.001 元
   price_limit:
     mode: by_track_index      # 取决于跟踪指数，不猜代码段
-    main: 0.10                # 未传入跟踪指数限制时的兜底
+    main: 0.10                # 跟踪指数未知时的兜底
+    # 数据层 security 表没有「跟踪指数」字段，因此按代码段/代码显式登记。
+    # 段位可判定的先硬编码：沪市 588/589 段 = 科创板 ETF → 20%。
+    by_code_prefix:
+      "588": 0.20
+      "589": 0.20
+    # 深市 159 段是混合的（159915 创业板 20% / 159919 沪深300 10%），
+    # 只能逐个登记；新增创业板/双创 ETF 时补在这里。
+    by_code:
+      "159915": 0.20    # 易方达创业板 ETF
+      "159948": 0.20    # 华安创业板 50 ETF
+      "159949": 0.20    # 华安创业板 50 ETF
+      "159952": 0.20    # 广发创业板 ETF
+      "159957": 0.20    # 华夏创业板 ETF
+      "159971": 0.20    # 富国创业板 ETF
+      "159977": 0.20    # 天弘创业板 ETF
   t_plus:
     # 注意：per-instrument 覆盖优先（sellable_after_days），这里只是默认值
     mode: by_fund_type
@@ -54,6 +83,17 @@ etf:
     default: 1
   lot_size: 100
 
+# fund_type 推断（T+0 判定）：security 表无该字段，按名称关键字兜底。
+# 命中顺序 = 本表的书写顺序，跨境优先于商品/债券。
+fund_type_keywords:
+  qdii: [QDII, 恒生, 恒指, 港股, 纳斯达克, 标普, 道琼斯, 日经, 德国, 法国, 美国,
+         海外, 中概, 亚太, 东南亚, 沙特, 越南, 印度, 全球, 国际, H股]
+  commodity: [黄金, 白银, 豆粕, 原油, 能源化工, 有色金属, 商品, 农业]
+  bond: [国债, 债券, 城投债, 信用债, 政金债, 可转债, 公司债, 短融]
+  money: [货币, 现金, 添益, 快线, 保证金]
+
 exceptions:
-  # 新股上市首日 / 退市整理期 / ST 变更日：不套用涨跌停约束
+  # 不套用涨跌停约束的场景：IPO 首日 / 复牌首日 / ST 变更日。
+  # 引擎按 per-instrument 的 no_price_limit 标记执行，标记由数据层/meta 提供
+  # （security 表暂无这三个日期维度，需要时经 build_rules(meta=...) 注入）。
   no_price_limit_on: [ipo_first_day, resume_first_day, st_change_day]

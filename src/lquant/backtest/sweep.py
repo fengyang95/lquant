@@ -56,10 +56,13 @@ def run_sweep(data: pl.DataFrame, param: str, values: list,
     默认是 factor_topn（支持 factor= 与 top_n=）。
     cancel_check：每档开始前轮询，返回 True 时抛 JobCanceled 协作式收尾。
     """
+    from lquant.backtest.security_meta import load_security_meta
     from lquant.backtest.strategy.factor_topn import FactorTopNStrategy
 
     cls = strategy_cls or FactorTopNStrategy
     base = dict(strategy_kwargs or {})
+    # security 元数据只读一次，复用给每档 —— 否则 N 档就是 N 次全表查询
+    meta = load_security_meta()
 
     rows = []
     for v in values:
@@ -70,7 +73,7 @@ def run_sweep(data: pl.DataFrame, param: str, values: list,
         res = Engine(strat, config=EngineConfig(
             initial_cash=spec.initial_cash, rebalance=spec.rebalance,
             max_position_weight=spec.max_position_weight,
-        )).run(data, extra_fields=[spec.factor])
+        ), meta=meta, with_db_meta=False).run(data, extra_fields=[spec.factor])
         rows.append(_metrics_res(res.metrics, v))
 
     # 固定列序（_metrics_res 的键序即 _OUT_COLS）；values 非空时 rows 至少一行

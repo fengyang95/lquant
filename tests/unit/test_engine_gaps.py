@@ -111,9 +111,10 @@ def test_schedule_rebalance_missing_bar_price_skips_symbol() -> None:
 
 
 def test_sell_qty_no_position_returns_zero() -> None:
+    """无持仓 → (0, False)。第二项 = 是否允许卖零股（清仓单专用）。"""
     e = Engine(_Fixed([]))
-    e._rules = eng.build_rules(["600000.SH"])
-    assert e._sell_qty("600000.SH", 10.0, date(2026, 1, 5)) == 0.0
+    e._rules = eng.build_rules(["600000.SH"], with_db_meta=False)
+    assert e._sell_qty("600000.SH", 10.0, date(2026, 1, 5)) == (0.0, False)
 
 
 def _same_close(*, halted=False, suspended=False, missing=False,

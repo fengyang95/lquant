@@ -19,10 +19,25 @@ class Position:
     def available_qty(self) -> float:
         return self.qty
 
-    def available_at(self, d: date, _rules: InstrumentRules) -> float:
-        """T+N：QDII / 黄金 / 债券 / 货币 ETF 是 0，当日可卖。"""
+    def available_at(self, d: date, _rules: InstrumentRules,
+                     date_index: dict[date, int] | None = None) -> float:
+        """T+N：QDII / 黄金 / 债券 / 货币 ETF 是 0，当日可卖。
+
+        N 是**交易日**，不是自然日 —— 自然日口径下 T+2 买入遇周末会提前可卖
+        （周四买、周六就「到期」），T+5 之类的中长锁定更是系统性偏松。
+        传入 date_index（交易日 → 序号）时按交易日算；不传则退回自然日口径
+        （向后兼容，仅用于没有日历的单元测试）。
+        """
         n = _rules.sellable_after_days
-        return sum(q for bd, q, _ in self.lots if bd + timedelta(days=n) <= d)
+        if n <= 0:
+            return self.qty
+        if date_index is None:
+            return sum(q for bd, q, _ in self.lots if bd + timedelta(days=n) <= d)
+        di = date_index.get(d)
+        if di is None:
+            return sum(q for bd, q, _ in self.lots if bd + timedelta(days=n) <= d)
+        return sum(q for bd, q, _ in self.lots
+                   if di - date_index.get(bd, di) >= n)
 
     def apply_corporate_action(self, ratio: float) -> None:
         """除权调整：按复权因子比放大份额（分红默认再投资的份额调整法）。

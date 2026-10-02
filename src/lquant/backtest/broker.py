@@ -7,6 +7,10 @@
   same_close   T 日收盘信号用 T 日收盘成交 —— 危险，仅研究用，显式警告
 
 前三种都要求"推迟到下一根 bar 成交"；same_close 当日成交。
+
+涨跌停价一律经 InstrumentRules.limit_up/limit_down 取**按 tick 取整**的挂牌价：
+前收 3.63 的 10% 涨停价是 3.99（不是 3.993），拿 3.993 当阈值会把
+「开盘即涨停」放行 —— 等于把根本买不进去的收益算进回测。
 """
 from __future__ import annotations
 
@@ -20,15 +24,25 @@ from lquant.backtest.rules.model import InstrumentRules
 
 MATCH_MODES = ("next_open", "next_vwap", "next_close", "same_close")
 
+# 资金不足时的处理口径：
+#   reject   —— 整单作废（真实券商开盘集合竞价语义 / backtrader 对账口径）
+#   truncate —— 按可用资金截量成交（聚宽 order_value 语义）
+INSUFFICIENT_CASH_MODES = ("reject", "truncate")
+
 
 class Broker:
     def __init__(self, rules: dict[str, InstrumentRules], slippage=None,
-                 price_mode: str = "next_open") -> None:
+                 price_mode: str = "next_open",
+                 insufficient_cash: str = "reject") -> None:
         if price_mode not in MATCH_MODES:
             raise ValueError(f"未知撮合模式 {price_mode!r}，可选: {MATCH_MODES}")
+        if insufficient_cash not in INSUFFICIENT_CASH_MODES:
+            raise ValueError(f"未知资金不足口径 {insufficient_cash!r}，"
+                             f"可选: {INSUFFICIENT_CASH_MODES}")
         self.rules = rules
         self.slippage = slippage
         self.price_mode = price_mode
+        self.insufficient_cash = insufficient_cash
         if price_mode == "same_close":
             logger.warning("撮合模式 same_close：用 T 日收盘价成交属未来函数，"
                            "仅研究对照用，勿用于实盘口径")
@@ -48,15 +62,16 @@ class Broker:
         self._cum_amount: dict[str, float] = {}
         self._paid_comm: dict[str, float] = {}
 
+    def _base_price(self, bar: Bar) -> float:
+        """不含滑点的成交基准价（撮合模式决定）。"""
+        if self.price_mode in ("next_close", "same_close"):
+            return bar.close                 # T+1 收盘 / T 日收盘（危险，已警告）
+        if self.price_mode == "next_vwap":
+            return (bar.amount / bar.volume) if bar.volume > 0 else bar.close
+        return bar.open                      # next_open（默认）
+
     def _price(self, bar: Bar, side: Side, qty: float = 0.0) -> float:
-        if self.price_mode == "next_close":
-            p = bar.close                 # T+1 收盘
-        elif self.price_mode == "same_close":
-            p = bar.close                 # T 日收盘（危险，已警告）
-        elif self.price_mode == "next_vwap":
-            p = (bar.amount / bar.volume) if bar.volume > 0 else bar.close  # T+1 VWAP
-        else:                             # next_open（默认）
-            p = bar.open                  # T+1 开盘
+        p = self._base_price(bar)
         if self.slippage is not None:
             if self._slip_takes_volume:
                 p = self.slippage.apply(p, side, qty=qty, volume=bar.volume)
@@ -72,8 +87,10 @@ class Broker:
             order.reason = "无撮合规则"
             return None
 
-        # 涨跌停不可成交（走 PriceLimit 规则：ST 5%，板块值 gem/star/bse 生效）
-        limit = r.price_limit.for_symbol(r.symbol, r.symbol.board, is_st=r.is_st)
+        # 涨跌停不可成交（PriceLimit 规则：ST 主板 5%，创业板/科创板 ST 20%，
+        # 板块值 gem/star 20%、bse 30%，ETF 按跟踪指数）。取整到挂牌价。
+        up = r.limit_up(bar.pre_close)
+        down = r.limit_down(bar.pre_close)
         if bar.halted:
             order.status = OrderStatus.REJECTED
             order.reason = "停牌"
@@ -82,11 +99,11 @@ class Broker:
         # 的成交价不是开盘价，误用 open 判断会在"平开收板"时放行（由下方
         # 实际成交价的最终校验兜底）。
         if self.price_mode == "next_open":
-            if order.side == Side.BUY and bar.open >= bar.pre_close * (1 + limit) - 1e-9:
+            if up is not None and order.side == Side.BUY and bar.open >= up - 1e-9:
                 order.status = OrderStatus.REJECTED
                 order.reason = "涨停不可买"
                 return None
-            if order.side == Side.SELL and bar.open <= bar.pre_close * (1 - limit) + 1e-9:
+            if down is not None and order.side == Side.SELL and bar.open <= down + 1e-9:
                 order.status = OrderStatus.REJECTED
                 order.reason = "跌停不可卖"
                 return None
@@ -106,30 +123,64 @@ class Broker:
         # 在 next_close 里就会以涨停价成交，现实中买不进去。上一处 open 检查
         # 只拦「开盘即封板」，这里补齐其余撮合模式的成交价边界。
         # 市场约束（涨跌停）优先于资金约束判定。
-        if order.side == Side.BUY and price >= bar.pre_close * (1 + limit) - 1e-9:
+        if up is not None and order.side == Side.BUY and price >= up - 1e-9:
             order.status = OrderStatus.REJECTED
             order.reason = "涨停不可买"
             return None
-        if order.side == Side.SELL and price <= bar.pre_close * (1 - limit) + 1e-9:
+        if down is not None and order.side == Side.SELL and price <= down + 1e-9:
             order.status = OrderStatus.REJECTED
             order.reason = "跌停不可卖"
             return None
 
-        # 资金充足性：买单成交额+费用不得超过可用现金，不足整单作废。
-        # 换仓按 T 收盘价预估资金，T+1 跳空可能让实际所需超出可用资金 ——
-        # 与 backtrader / 真实券商（开盘集合竞价资金不足废单）语义一致；
-        # 绝不能让现金悄悄变负（隐性杠杆）。
+        # 限价单语义（Order.limit_price）：此前该字段从未被读取 —— 策略设了
+        # 限价仍按市价成交，属静默错误。判定用**不含滑点**的基准价（是否可成交由
+        # 市场决定），成交价则封顶/保底到限价（限价单绝不会成交在比限价更差的价位）。
+        # 委托当日有效（A 股默认），不成交即作废，不挂到下一日。
+        if order.limit_price is not None:
+            lp = float(order.limit_price)
+            base = self._base_price(bar)
+            if order.side == Side.BUY:
+                if base > lp + 1e-9:
+                    order.status = OrderStatus.REJECTED
+                    order.reason = f"限价未触及（基准价 {base:.4f} > 限价 {lp:.4f}）"
+                    return None
+                price = min(price, lp)
+            else:
+                if base < lp - 1e-9:
+                    order.status = OrderStatus.REJECTED
+                    order.reason = f"限价未触及（基准价 {base:.4f} < 限价 {lp:.4f}）"
+                    return None
+                price = max(price, lp)
+
+        # 资金充足性：买单成交额+费用不得超过可用现金。
+        # reject（默认）：整单作废 —— 与 backtrader / 真实券商（开盘集合竞价
+        #   资金不足废单）语义一致；绝不能让现金悄悄变负（隐性杠杆）。
+        # truncate：按可用资金截量成交 —— 与聚宽 order_value 语义一致，
+        #   由 JQRunner 显式选择，两条路径的口径差异因此是**显式配置**而非偶然。
         if order.side == Side.BUY and cash is not None:
             a = qty * price
             c = max(r.commission.min, a * r.commission.rate)
             if a + c + a * r.transfer_fee_rate > cash:
-                order.status = OrderStatus.REJECTED
-                order.reason = "资金不足"
-                return None
+                if self.insufficient_cash == "reject":
+                    order.status = OrderStatus.REJECTED
+                    order.reason = "资金不足"
+                    return None
+                qty = self._affordable_qty(r, qty, price, cash)
+                if qty <= 0:
+                    order.status = OrderStatus.REJECTED
+                    order.reason = "数量不足一手或资金不足"
+                    return None
+                # 截量后滑点/费用按新数量重算
+                price = self._price(bar, order.side, qty=qty)
+                if up is not None and price >= up - 1e-9:
+                    order.status = OrderStatus.REJECTED
+                    order.reason = "涨停不可买"
+                    return None
 
         amount = qty * price
         transfer = amount * r.transfer_fee_rate
-        tax = amount * r.tax_rate(d) if order.side == Side.SELL else 0.0
+        # 印花税按日期区间 + 方向取：2008-09-19 前双边征收，之后仅卖方
+        tax = amount * r.tax_rate(d, order.side)
 
         # 最低佣金按订单累计：整个订单的佣金 = max(min, 累计成交额 * rate)。
         # 分多次成交时，后续成交只补足差额（可能为零），绝不重复收 5 元。
@@ -148,9 +199,29 @@ class Broker:
         order.status = OrderStatus.FILLED if order.filled_qty >= order.qty - 1e-9 else OrderStatus.PARTIAL
         return Fill(order.order_id, order.symbol, order.side, qty, price, fee, d)
 
+    def _affordable_qty(self, r: InstrumentRules, qty: float,
+                        price: float, cash: float) -> float:
+        """资金不足时能买的最大数量（按含费口径反解，再按整手向下取整）。"""
+        if price <= 0:
+            return 0.0
+        # 反解：q*price*(1 + comm_rate + transfer) + min_comm <= cash
+        unit = price * (1.0 + r.commission.rate + r.transfer_fee_rate)
+        budget = cash - r.commission.min
+        q = min(qty, max(budget, 0.0) / unit)
+        if q >= qty - 1e-9:              # 反解已够，不需要截量
+            return qty
+        return (q // r.lot_size) * r.lot_size if r.lot_size > 1 else q
+
     def _max_qty(self, order: Order, r: InstrumentRules,
                  max_qty: float | None = None) -> float:
         q = order.qty - order.filled_qty
-        if max_qty is not None:
-            q = min(q, max_qty)          # 成交量 / 资金约束
+        capped = False
+        if max_qty is not None and q > max_qty:
+            q = max_qty                   # 成交量约束
+            capped = True
+        if order.allow_odd_lot and not capped:
+            # 清仓零股：允许一次性卖出非整手余量（A 股规则）
+            return q
+        if r.lot_size <= 1:
+            return q
         return (q // r.lot_size) * r.lot_size

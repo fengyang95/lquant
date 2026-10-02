@@ -31,6 +31,9 @@ class Order:
     filled_amount: float = 0.0
     fee: float = 0.0
     reason: str = ""
+    # 清仓单允许卖出零股：A 股规则是「不足一手的零股必须一次性全部卖出」，
+    # 若一律向下取整到整手，10 送 9 之后剩下的 11.11 股会永远卖不掉。
+    allow_odd_lot: bool = False
 
 
 @dataclass
@@ -58,4 +61,7 @@ class Bar:
     adj_factor: float = 1.0
     halted: bool = False
     suspended: bool = False   # 停牌日：有承接报价但不可交易 → 拒单 reason="suspended"
+    # 当日零成交（volume==0）但并未停牌：同样不可成交，但**不能**记成「停牌」——
+    # 归因错误会让「为什么这单没成交」永远查不清。
+    no_volume: bool = False
     fields: dict = field(default_factory=dict)

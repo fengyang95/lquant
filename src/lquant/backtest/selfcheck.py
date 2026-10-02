@@ -226,4 +226,90 @@ def run_selfcheck() -> list[dict]:
 
     add("绩效指标（几何年化/净值回撤/夏普 独立重算）", _metrics)
 
+    # 涨跌停价按最小变动价位取整（前收 3.63 的 10% 涨停价是 3.99，不是 3.993）
+    def _limit_tick() -> tuple[bool, str]:
+        from lquant.backtest.rules.model import round_tick
+        assert round_tick(3.63 * 1.1, 0.01) == 3.99, "round_tick 自检失败"
+        base = dict(_zero_fee_ruleset().default)
+        base["price_limit"] = {"mode": "by_board", "main": 0.10}
+        base["lot_size"] = 100
+        rs = RuleSet(market="CN", currency="CNY", default=base, etf=dict(base),
+                     exceptions={})
+        # 开盘价 = 挂牌涨停价 3.99（前收 3.63）→ 必须拒单
+        df = pl.DataFrame({
+            "trade_date": [date(2026, 1, 5), date(2026, 1, 6), date(2026, 1, 7)],
+            "symbol": ["600000.SH"] * 3,
+            "open": [3.99, 3.99, 3.99], "high": [3.99] * 3,
+            "low": [3.99] * 3, "close": [3.99] * 3,
+            "pre_close": [3.63] * 3,
+            "volume": [1e9] * 3, "amount": [3.99e9] * 3,
+        })
+        eng = Engine(_BuyA(), ruleset=rs, config=_cfg(initial_cash=1_000_000))
+        res = eng.run(df)
+        rejected = [r for r in res.rejected if "涨停" in r[2]]
+        return (not res.trades) and bool(rejected), \
+            f"前收 3.63 / 开盘 3.99 视为涨停 → 拒单 {len(rejected)} 笔，成交 {len(res.trades)} 笔"
+
+    add("涨跌停价按 tick 取整（3.63→3.99 拒单）", _limit_tick)
+
+    # 除权日新建仓不欠配：挂单与持仓同比例调整
+    def _ex_div_entry() -> tuple[bool, str]:
+        days = [date(2026, 1, 5), date(2026, 1, 6), date(2026, 1, 7)]
+        rows = []
+        for i, d in enumerate(days):
+            px, adj = (10.0, 1.0) if i == 0 else (10.0 / 1.3, 1.3)
+            rows.append({"trade_date": d, "symbol": "600000.SH", "open": px,
+                         "high": px, "low": px, "close": px, "pre_close": px,
+                         "volume": 1e9, "amount": px * 1e9, "adj_factor": adj})
+        base = dict(_zero_fee_ruleset().default)
+        base["lot_size"] = 100
+        rs = RuleSet(market="CN", currency="CNY", default=base, etf=dict(base),
+                     exceptions={})
+        eng = Engine(_BuyA(), ruleset=rs,
+                     config=_cfg(initial_cash=1_000_000, min_order_value=1000))
+        res = eng.run(pl.DataFrame(rows))
+        invested = sum(t.qty * t.price for t in res.trades)
+        return invested > 0.97e6, \
+            f"除权日建仓投入 {invested:,.0f} / 1,000,000（应接近满仓，不得只到 1/1.3）"
+
+    add("除权日新建仓不欠配（挂单同比例调整）", _ex_div_entry)
+
+    # T+N 按交易日而非自然日
+    def _t_plus_trading_days() -> tuple[bool, str]:
+        from lquant.backtest.account import Position
+        from lquant.backtest.rules.loader import load_ruleset
+        from lquant.core.types import parse_symbol
+        rs2 = load_ruleset()
+        sym = parse_symbol("600000.SH")
+        r = rs2.for_symbol("600000.SH", sym.sec_type, sym.board,
+                           sellable_after_days=2)
+        fri, mon, tue = date(2026, 1, 9), date(2026, 1, 12), date(2026, 1, 13)
+        idx = {d: i for i, d in enumerate([date(2026, 1, 8), fri, mon, tue])}
+        pos = Position("600000.SH", qty=1000, avg_cost=10.0, lots=[(fri, 1000, 10.0)])
+        ok = pos.available_at(mon, r, idx) == 0 and pos.available_at(tue, r, idx) == 1000
+        return ok, (f"周五买入 T+2：周一可卖 {pos.available_at(mon, r, idx):.0f}、"
+                    f"周二可卖 {pos.available_at(tue, r, idx):.0f}（交易日口径）")
+
+    add("T+N 按交易日计算（周五买入 T+2 周一不可卖）", _t_plus_trading_days)
+
+    # 印花税历史区间 + 买卖方向（2008-09-19 起才单边）
+    def _tax_history() -> tuple[bool, str]:
+        from lquant.backtest.rules.loader import load_ruleset
+        from lquant.core.types import parse_symbol
+        rs2 = load_ruleset()
+        sym = parse_symbol("600000.SH")
+        r = rs2.for_symbol("600000.SH", sym.sec_type, sym.board)
+        both = date(2005, 1, 3)
+        sell_only = date(2020, 1, 2)
+        ok = (r.tax_rate(both, "buy") > 0 and r.tax_rate(both, "sell") > 0
+              and r.tax_rate(sell_only, "buy") == 0
+              and abs(r.tax_rate(sell_only, "sell") - 0.001) < 1e-12
+              and abs(r.tax_rate(date(2023, 8, 28), "sell") - 0.0005) < 1e-12)
+        return ok, ("2005 双边 "
+                    f"{r.tax_rate(both, 'sell'):.4f}; 2020 买 {r.tax_rate(sell_only, 'buy'):.4f} / "
+                    f"卖 {r.tax_rate(sell_only, 'sell'):.4f}; 2023-08-28 起 "
+                    f"{r.tax_rate(date(2023, 8, 28), 'sell'):.4f}")
+
+    add("印花税历史区间 + 买卖方向（2008-09-19 起单边）", _tax_history)
+
     return checks
