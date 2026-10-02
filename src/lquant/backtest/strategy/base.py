@@ -13,6 +13,10 @@ class Context:
     trade_date: object
     rules: dict
     params: dict
+    #: 交易日 → 序号。``Position.available_at`` 用它把 T+N 按**交易日**而非自然日
+    #: 计算（自然日口径下周四买的 T+2 到周六就算「到期」，系统性偏松）。
+    #: 引擎自动填充；手工构造 Context 的单元测试可以不传。
+    date_index: dict | None = None
 
 
 class Strategy:

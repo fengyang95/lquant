@@ -20,6 +20,7 @@ const GROUPS: { label: string; items: { href: string; label: string }[] }[] = [
       { href: '/factors', label: '因子' },
       { href: '/factors/mine', label: '因子挖掘' },
       { href: '/factors/reports', label: '因子报告' },
+      { href: '/fundamental', label: '基本面' },
       { href: '/backtests', label: '回测' },
       { href: '/paper', label: '模拟盘' },
     ],

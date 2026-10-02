@@ -7,6 +7,7 @@ import Page from '../page';
 // ---- api mock ----
 vi.mock('@/lib/api', () => ({
   get: vi.fn(),
+  fetcher: vi.fn(),
   post: vi.fn(),
   postData: vi.fn(),
   putData: vi.fn(),

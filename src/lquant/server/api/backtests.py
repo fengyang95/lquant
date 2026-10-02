@@ -201,6 +201,14 @@ def _benchmark_nav_aligned(run_dates: set, run_nav: dict) -> tuple[list[dict], s
     return benchmark, label, {date.fromisoformat(x["date"]): x["nav"] for x in benchmark}
 
 
+@router.get("/exit-strategies")
+def list_exit_strategies() -> dict:
+    """枚举可插拔退出策略（前端选择器的数据源）。"""
+    from lquant.backtest.exit import EXIT_STRATEGIES
+
+    return {"strategies": EXIT_STRATEGIES.describe()}
+
+
 class BacktestIn(BaseModel):
     factor: str = "pct_change_20"        # 仅作展示标签；实际因子列由 formula 派生（formula.replace("_","")）
     formula: str = "pct_change_20"       # 与 factors API 同一套公式：pct_change_{n} / rolling_std_{n}
@@ -208,6 +216,9 @@ class BacktestIn(BaseModel):
     rebalance: str = Field(default="monthly", pattern="^(daily|weekly|monthly|none)$")
     initial_cash: float = Field(default=1_000_000, gt=0)
     start: str = Field(default="2026-01-01", pattern=r"^\d{4}-\d{2}-\d{2}$")
+    #: 退出策略注册名（见 GET /backtests/exit-strategies）；None = 不加退出规则
+    exit_strategy: str | None = None
+    exit_params: dict = Field(default_factory=dict)
 
 
 def _parse_formula_n(formula: str) -> int:
@@ -305,22 +316,41 @@ def get_sweep(sweep_id: str) -> dict:
 
 @router.post("/run")
 def run_backtest(req: BacktestIn) -> dict:
-    """同步跑一个 TopN 回测，落库并返回 run_id。"""
+    """同步跑一个 TopN 回测，落库并返回 run_id。
+
+    可选叠加退出策略（``exit_strategy``）：叠加层包住 TopN 策略，不改引擎。
+    参数非法（未注册的名字 / 策略自身校验失败）一律 422，不静默退化成「无退出规则」——
+    否则用户以为加了止损，实际没加。
+    """
     df = read_daily(start=req.start).collect()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
     col = req.formula.replace("_", "")
     d = _compute_factor(df, req.formula).drop_nulls([col])
 
+    strategy = FactorTopNStrategy(factor=col, top_n=req.top_n)
+    if req.exit_strategy:
+        from lquant.backtest.exit import ExitOverlay, get_exit_strategy
+
+        try:
+            exit_strategy = get_exit_strategy(req.exit_strategy, **req.exit_params)
+        except KeyError as e:
+            raise HTTPException(422, f"未注册的退出策略: {req.exit_strategy}") from e
+        except (TypeError, ValueError) as e:
+            raise HTTPException(422, f"退出策略参数非法: {e}") from e
+        strategy = ExitOverlay(strategy, exit_strategy)
+
     run_id = uuid.uuid4().hex[:12]
     res = Engine(
-        FactorTopNStrategy(factor=col, top_n=req.top_n),
+        strategy,
         config=EngineConfig(initial_cash=req.initial_cash, rebalance=req.rebalance),
     ).run(d, extra_fields=[col])
 
     _persist_result(run_id, "factor_topn",
                     {"factor": col, "top_n": req.top_n, "rebalance": req.rebalance,
-                     "formula": req.formula, "start": req.start}, res)
+                     "formula": req.formula, "start": req.start,
+                     "exit_strategy": req.exit_strategy,
+                     "exit_params": req.exit_params}, res)
 
     m = res.metrics
     return {"run_id": run_id, "metrics": _metrics_response(m),

@@ -1,30 +1,41 @@
 // 因子轮动快速回测表单 —— 逻辑原样迁自旧回测页「运行回测」Panel；自持 state + post('/backtests/run')，
 // 唯一改动：成功后全局 mutate('/backtests') 刷新历史列表。
+// 新增：退出策略选择器（数据源 /backtests/exit-strategies，未注册时不发该字段）。
 'use client';
 
 import { useState } from 'react';
-import { mutate } from 'swr';
+import useSWR, { mutate } from 'swr';
 import { Panel } from '@/components/Panel';
 import { ErrorNote, Msg } from '@/components/States';
-import { post } from '@/lib/api';
+import { fetcher, post } from '@/lib/api';
 
 const FORMULAS = ['pct_change_5', 'pct_change_10', 'pct_change_20', 'rolling_std_20'];
 const REBALANCES = ['daily', 'weekly', 'monthly'];
+
+type ExitStrategyMeta = { name: string; label: string };
 
 export default function QuickRunPanel() {
   const [formula, setFormula] = useState('pct_change_20');
   const [topN, setTopN] = useState(5);
   const [rebalance, setRebalance] = useState('monthly');
+  const [exitStrategy, setExitStrategy] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const [ok, setOk] = useState('');
+
+  const { data: exitMeta } = useSWR<{ strategies: ExitStrategyMeta[] }>(
+    '/backtests/exit-strategies', fetcher,
+  );
 
   async function run() {
     setBusy(true);
     setErr('');
     setOk('');
     try {
-      const r = await post<{ run_id: string }>('/backtests/run', { top_n: topN, rebalance, formula });
+      // 未选退出策略时不带该字段：保持与旧契约完全一致的请求体
+      const body: Record<string, unknown> = { top_n: topN, rebalance, formula };
+      if (exitStrategy) body.exit_strategy = exitStrategy;
+      const r = await post<{ run_id: string }>('/backtests/run', body);
       await mutate('/backtests');
       setOk(`回测完成：${r.run_id}（见「历史与对比」）`);
     } catch (e) {
@@ -61,10 +72,28 @@ export default function QuickRunPanel() {
             {REBALANCES.map((r) => <option key={r}>{r}</option>)}
           </select>
         </label>
+        <label className="text-sm">
+          <div className="mb-1 text-xs text-ink-faint">退出策略</div>
+          <select value={exitStrategy}
+                  onChange={(e) => setExitStrategy(e.target.value)}
+                  className="input"
+                  aria-label="退出策略">
+            <option value="">不启用（纯因子轮动）</option>
+            {(exitMeta?.strategies ?? []).map((s) => (
+              <option key={s.name} value={s.name}>{s.label || s.name}</option>
+            ))}
+          </select>
+        </label>
         <button onClick={run} disabled={busy} className="btn btn-accent">
           {busy ? '回测中…' : '运行回测'}
         </button>
       </div>
+      {exitStrategy && (
+        <p className="mt-2 text-xs text-ink-faint">
+          已叠加「{exitMeta?.strategies.find((s) => s.name === exitStrategy)?.label ?? exitStrategy}
+          」退出规则：引擎不改动，由退出叠加层在每根 bar 后修正目标权重。
+        </p>
+      )}
     </Panel>
   );
 }
