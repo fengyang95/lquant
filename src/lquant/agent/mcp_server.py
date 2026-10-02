@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from collections.abc import Callable
 from typing import Any
@@ -40,6 +41,19 @@ logging.basicConfig(stream=sys.stderr, level=logging.INFO,
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "lquant-mcp"
+
+#: 工具白名单环境变量（逗号分隔），由工作区脚手架按会话注入（见 workspace.py）。
+#: **变量缺失 = 全开；变量存在（哪怕为空串）= 严格按名单裁剪。** 两种情况必须
+#: 分开读：空串是「一个工具都不给」这个合法配置，不能被当成「没配」。
+_ENABLED_TOOLS_ENV = "LQ_MCP_ENABLED_TOOLS"
+
+
+def enabled_tools() -> frozenset[str] | None:
+    """本进程允许的工具名；``None`` 表示不限制。每次读环境变量（进程内不会变，读起来也便宜）。"""
+    if _ENABLED_TOOLS_ENV not in os.environ:
+        return None
+    raw = os.environ[_ENABLED_TOOLS_ENV]
+    return frozenset(x.strip() for x in raw.split(",") if x.strip())
 
 
 def _tool_get_quotes(symbols: list[str]) -> list[dict]:
@@ -300,6 +314,11 @@ def _json_text(data: Any) -> str:
 
 
 def _call_tool(name: str, args: dict) -> dict:
+    allow = enabled_tools()
+    if allow is not None and name not in allow:
+        # tools/list 已经藏了它，但白名单是**访问控制**不是展示开关：
+        # 直接点名调用同样要挡（客户端可以无视 list 自己造 tools/call）。
+        return {"error": {"code": -32602, "message": f"工具未启用: {name}"}}
     handler = TOOL_HANDLERS.get(name)
     if handler is None:
         return {"error": {"code": -32602, "message": f"未知工具: {name}"}}
@@ -331,7 +350,10 @@ def handle_request(req: dict) -> dict:
             },
         }
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS_SPEC}}
+        allow = enabled_tools()
+        tools = TOOLS_SPEC if allow is None else [
+            t for t in TOOLS_SPEC if t["name"] in allow]
+        return {"jsonrpc": "2.0", "id": rid, "result": {"tools": tools}}
     if method == "tools/call":
         resp = _call_tool(params.get("name", ""), params.get("arguments") or {})
         return {"jsonrpc": "2.0", "id": rid, **resp}

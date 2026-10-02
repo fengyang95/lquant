@@ -133,3 +133,59 @@ def test_missing_skills_source_skipped(root: Path) -> None:
     ws = ensure_workspace("ws", root)
     assert not (ws / ".claude" / "skills").exists()
     assert (ws / ".claude" / "mcp.json").is_file()
+
+
+# ---- 按会话启用集裁剪能力 ---------------------------------------------------
+
+
+def _add_skill(root: Path, name: str) -> None:
+    d = root / "config" / "skills" / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(f"# {name}", encoding="utf-8")
+
+
+def test_enabled_skills_filters_copy(root: Path) -> None:
+    """只拷启用的 skill：未启用的目录不进工作区，agent 就看不到它。"""
+    _add_skill(root, "factor-mining")
+    ws = ensure_workspace("ws", root, enabled_skills={"factor-mining"})
+    skills = ws / ".claude" / "skills"
+    assert (skills / "factor-mining" / "SKILL.md").is_file()
+    assert not (skills / "demo-skill").exists()
+
+
+def test_enabled_skills_none_copies_all(root: Path) -> None:
+    """None = 不限制（老调用方与 A2A 会话走这条，行为与改造前一致）。"""
+    _add_skill(root, "factor-mining")
+    ws = ensure_workspace("ws", root, enabled_skills=None)
+    skills = ws / ".claude" / "skills"
+    assert (skills / "demo-skill").is_dir()
+    assert (skills / "factor-mining").is_dir()
+
+
+def test_enabled_skills_empty_copies_none_but_keeps_dir(root: Path) -> None:
+    """空集 = 一个都不启用；目录保留（CLAUDE.md 指向它，空目录比没有更少歧义）。"""
+    ws = ensure_workspace("ws", root, enabled_skills=set())
+    skills = ws / ".claude" / "skills"
+    assert skills.is_dir()
+    assert list(skills.iterdir()) == []
+
+
+def test_enabled_skills_cannot_escape_source_dir(root: Path) -> None:
+    """启用集来自请求体/数据库，不能靠 `../` 把任意目录拷进工作区。"""
+    outside = root / "secret"
+    outside.mkdir()
+    (outside / "SKILL.md").write_text("机密", encoding="utf-8")
+    ws = ensure_workspace("ws", root, enabled_skills={"../secret", "demo-skill"})
+    skills = ws / ".claude" / "skills"
+    assert sorted(p.name for p in skills.iterdir()) == ["demo-skill"]
+
+
+def test_mcp_server_spec_carries_enabled_tools(root: Path) -> None:
+    from lquant.agent.workspace import mcp_server_spec
+
+    spec = mcp_server_spec(root, enabled_tools={"get_quotes", "get_daily"})
+    assert spec["env"]["LQ_MCP_ENABLED_TOOLS"] == "get_daily,get_quotes"
+    # 空集要写成**存在但为空**：缺失 = 全开，空串 = 一个都不开，两者语义不同
+    assert mcp_server_spec(root, enabled_tools=set())["env"]["LQ_MCP_ENABLED_TOOLS"] == ""
+    # 不传 = 不注入该变量（老调用方行为不变）
+    assert "LQ_MCP_ENABLED_TOOLS" not in mcp_server_spec(root)["env"]

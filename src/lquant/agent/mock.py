@@ -23,8 +23,11 @@ def _extract_symbol(text: str, context: dict) -> str | None:
 
 
 class MockAgentService(AgentService):
-    async def create_session(self, context: dict | None) -> Session:
-        return await self.store.create(context)
+    provider = "mock"
+
+    async def create_session(self, context: dict | None,
+                             agent_config: dict | None = None) -> Session:
+        return await self.store.create(context, agent_config)
 
     async def list_sessions(self) -> list[Session]:
         return await self.store.list()

@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import useSWR from 'swr';
+import SkillEditor from '@/components/settings/SkillEditor';
 import { getData, putData } from '@/lib/api';
 
 type Setting = {
@@ -123,6 +124,8 @@ export default function SettingsPage() {
           </table>
         )}
       </div>
+
+      <SkillEditor />
 
       <div className="rounded-xl border bg-white p-4">
         <div className="mb-2 text-sm font-medium">数据源优先级（config/providers.yaml，自上而下）</div>

@@ -39,6 +39,51 @@ def test_agent_config_timeout_must_be_int(bad: object) -> None:
         AgentConfig(timeout_seconds=bad)  # type: ignore[arg-type]
 
 
+# ---- 新会话的全局默认能力（skill / MCP 工具） --------------------------------
+
+
+def test_capability_defaults_are_unrestricted() -> None:
+    """不配 = 不裁剪，行为与改造前一致（老会话与 A2A 会话都落到这条）。"""
+    cfg = AgentConfig()
+    assert cfg.default_skills is None
+    assert cfg.default_mcp_tools is None
+
+
+@pytest.mark.parametrize("field", ["default_skills", "default_mcp_tools"])
+def test_capability_defaults_accept_yaml_list(field: str) -> None:
+    cfg = AgentConfig(**{field: ["get_quotes", "get_daily"]})
+    assert getattr(cfg, field) == ["get_quotes", "get_daily"]
+
+
+@pytest.mark.parametrize("field", ["default_skills", "default_mcp_tools"])
+def test_capability_defaults_accept_comma_string(field: str) -> None:
+    """环境变量插值只会产出字符串，所以要能吃逗号串。"""
+    cfg = AgentConfig(**{field: "a-stock-data, factor-mining"})
+    assert getattr(cfg, field) == ["a-stock-data", "factor-mining"]
+
+
+@pytest.mark.parametrize("field", ["default_skills", "default_mcp_tools"])
+@pytest.mark.parametrize("raw", ["all", "", "  ", None])
+def test_capability_defaults_all_or_blank_means_unrestricted(field: str, raw: object) -> None:
+    assert getattr(AgentConfig(**{field: raw}), field) is None
+
+
+@pytest.mark.parametrize("field", ["default_skills", "default_mcp_tools"])
+def test_capability_defaults_empty_list_means_none_enabled(field: str) -> None:
+    """空列表 = 一个都不启用，与「不配 = 全开」是两回事，不能合并。"""
+    assert getattr(AgentConfig(**{field: []}), field) == []
+
+
+@pytest.mark.parametrize("field", ["default_skills", "default_mcp_tools"])
+def test_capability_defaults_none_sentinel_means_none_enabled(field: str) -> None:
+    """显式 `none` 表达「一个都不启用」。
+
+    环境变量只能产出字符串，而空串在这里是「全开」；没有 `none` 这个哨兵，
+    「想配成不启用」就没有安全的写法了。
+    """
+    assert getattr(AgentConfig(**{field: "none"}), field) == []
+
+
 def test_get_settings_reads_agent_section(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     """读 app.yaml 的 agent 段（缓存清空即可，不要 evict 模块）。
 

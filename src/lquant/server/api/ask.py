@@ -7,8 +7,9 @@ import logging
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
+from lquant.agent.capabilities import normalize_agent_config
 from lquant.agent.schemas import AgentEvent
-from lquant.agent.service import get_agent_service
+from lquant.agent.service import get_agent_service, get_service_for_session
 from lquant.server.api.ask_bus import AskEventBus
 from lquant.server.envelope import make_router
 
@@ -28,9 +29,17 @@ def get_event_bus() -> AskEventBus:
 
 @router.post("/sessions")
 async def create_session(body: dict | None = None):
-    svc = await get_agent_service()
-    context = (body or {}).get("context")
-    return (await svc.create_session(context)).model_dump()
+    """建会话。可选带 ``provider`` / ``skills`` / ``mcp_tools`` 锁定本次能力集。
+
+    三者都不传 = 走全局默认（与改造前行为一致，A2A 也走这条）。
+    """
+    b = body or {}
+    try:
+        cfg = normalize_agent_config(b)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    svc = await get_agent_service(cfg.get("provider"))
+    return (await svc.create_session(b.get("context"), cfg or None)).model_dump()
 
 
 @router.get("/sessions")
@@ -41,14 +50,14 @@ async def list_sessions():
 
 @router.delete("/sessions/{sid}")
 async def delete_session(sid: str):
-    svc = await get_agent_service()
+    svc = await get_service_for_session(sid)
     await svc.delete_session(sid)  # 内部先 cancel 后台任务
     return {"ok": True}
 
 
 @router.post("/sessions/{sid}/cancel")
 async def cancel_session(sid: str):
-    svc = await get_agent_service()
+    svc = await get_service_for_session(sid)
     if await svc.store.get(sid) is None:
         raise HTTPException(404, "会话不存在")
     await svc.cancel(sid)
@@ -57,7 +66,7 @@ async def cancel_session(sid: str):
 
 @router.get("/sessions/{sid}/messages")
 async def get_messages(sid: str):
-    svc = await get_agent_service()
+    svc = await get_service_for_session(sid)
     if await svc.store.get(sid) is None:
         raise HTTPException(404, "会话不存在")
     return [m.model_dump() for m in await svc.get_messages(sid)]
@@ -65,7 +74,9 @@ async def get_messages(sid: str):
 
 @router.post("/sessions/{sid}/messages")
 async def send_message(sid: str, body: dict):
-    svc = await get_agent_service()
+    # 按会话锁定的 provider 路由：运行时引用（任务/子进程）是**按 service 实例**
+    # 存的，拿全局默认的实例去取消一个 codex 会话，打的是空表。
+    svc = await get_service_for_session(sid)
     content = str((body or {}).get("content", ""))
     if not content.strip():
         raise HTTPException(400, "消息不能为空")

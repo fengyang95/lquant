@@ -66,11 +66,32 @@ class _Run:
 
 class A2AExecutor:
     def __init__(self, service: AgentService, *, sink: Sink | None = None) -> None:
+        #: 全局默认 provider 的实例 —— 只用来拿 store（会话事实源只有一个）。
+        #: **不要**拿它去驱动具体会话：会话可能锁定到别的 provider（见 _service_for）。
         self.service = service
         self.sink = sink
         self._store = service.store
         self._tasks = A2ATaskStore(self._store)
         self._runs: dict[str, _Run] = {}
+
+    async def _service_for(self, session_id: str) -> AgentService:
+        """按会话**锁定的** provider 取实现（会话未指定 → 注入的那个）。
+
+        A2A 的 contextId 就是 ``ask_sessions.id``，而 /ask 建的会话可以锁定
+        provider。拿全局默认实例去驱动它有两个后果：CLI 侧会话 id 被写串
+        （claude 的 session_id 落进 codex 会话，下一轮就去 resume 别人的线程），
+        以及**单飞被绕过** —— 槽位（``_tasks``/``_procs``）是按 service 实例存的，
+        两个实例各看各的，同一会话能同时跑两条。
+
+        provider 与注入实例一致时**必须复用它**：另建一个同 provider 实例
+        等于把单飞又劈成两半。解析也限定在 ``self._store`` 上（注入的那个库），
+        否则会拿到绑在全局库上的实例，往不存在的会话里写消息。
+        """
+        cfg = await self._store.get_agent_config(session_id)
+        name = cfg.get("provider")
+        if name is None or name == self.service.provider:
+            return self.service
+        return await get_agent_service(name, store=self._store)
 
     def set_sink(self, sink: Sink | None) -> None:
         """接旁路出口（幂等；由 server 层注入，agent 层不反向依赖 server）。"""
@@ -90,14 +111,15 @@ class A2AExecutor:
         """
         prompt = prompt_from_message(message)
         session_id = await self._resolve_context(context_id or message.context_id or "")
-        if self.service.is_busy(session_id):
+        svc = await self._service_for(session_id)
+        if svc.is_busy(session_id):
             raise SessionBusyError("该 contextId 已有正在执行的回答，请等待完成或先取消")
         task_id = uuid.uuid4().hex
         await self._tasks.create(task_id, session_id, message_id=message.message_id)
         run = _Run(task_id=task_id, context_id=session_id)
         self._runs[task_id] = run
         # 先落 user 消息：/ask 页面与 tasks/get 的 history 立刻可见（事实源一致）
-        run.user_message = await self.service.persist_user_message(session_id, prompt)
+        run.user_message = await svc.persist_user_message(session_id, prompt)
         await run.queue.put(stream_task(await self.build_task(task_id)))
         run.task = asyncio.create_task(self._pump(run, prompt, run.user_message))
         return run
@@ -134,7 +156,8 @@ class A2AExecutor:
             run.canceled = True
             if run.builder is not None:
                 run.builder.mark_canceled()
-            await self.service.cancel(rec.context_id)
+            svc = await self._service_for(rec.context_id)
+            await svc.cancel(rec.context_id)
             if run.task is not None:
                 with contextlib.suppress(Exception, asyncio.CancelledError):
                     await asyncio.wait_for(run.task, _CANCEL_WAIT_SECONDS)
@@ -175,7 +198,8 @@ class A2AExecutor:
                 for frame in builder.on_event(ev):
                     await run.queue.put(frame)
 
-            await self.service.send_message(
+            svc = await self._service_for(run.context_id)
+            await svc.send_message(
                 run.context_id, prompt, on_event, user_msg=user_msg)
         except asyncio.CancelledError:
             # 用户取消：service 已发「已中断」事件（若事件没来得及发，这里补一帧）

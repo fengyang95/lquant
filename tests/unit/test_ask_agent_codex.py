@@ -89,14 +89,23 @@ async def _run(svc, sid, content):
     return events
 
 
+def _ws(svc, sid: str = "s1") -> Path:
+    """会话工作区（工作区按会话生成，见 CliAgentService._workspace_for）。"""
+    return svc._workspace_for(sid, {})
+
+
+def _cmd(svc, content: str, cli_sid: str | None = None) -> list[str]:
+    return svc._build_cmd(content, cli_sid, _ws(svc))
+
+
 # ---- 命令行形状 ----------------------------------------------------------
 
 def test_build_cmd_shape_without_resume(tmp_path, fake_script):
     svc = _svc(tmp_path, fake_script)
-    cmd = svc._build_cmd("查茅台", None)
+    cmd = _cmd(svc, "查茅台")
     assert cmd[1:3] == ["exec", "--json"]
     assert "--skip-git-repo-check" in cmd
-    assert cmd[cmd.index("-C") + 1] == str(svc._workspace)
+    assert cmd[cmd.index("-C") + 1] == str(_ws(svc))
     # MCP 通过 -c 注入，且**不写**用户的 ~/.codex/config.toml
     joined = " ".join(cmd)
     assert "mcp_servers.lquant.command=" in joined
@@ -109,15 +118,15 @@ def test_build_cmd_shape_without_resume(tmp_path, fake_script):
 
 def test_build_cmd_resume_places_session_id_before_prompt(tmp_path, fake_script):
     svc = _svc(tmp_path, fake_script)
-    cmd = svc._build_cmd("第二问", "01a0f6fb-69dd-7753-b7b3-7f874a9370cf")
+    cmd = _cmd(svc, "第二问", "01a0f6fb-69dd-7753-b7b3-7f874a9370cf")
     i = cmd.index("resume")
     assert cmd[i + 1] == "01a0f6fb-69dd-7753-b7b3-7f874a9370cf"
     assert cmd[i + 2] == "第二问"
 
 
 def test_build_cmd_skip_permissions_toggle(tmp_path, fake_script):
-    on = _svc(tmp_path, fake_script, skip_permissions=True)._build_cmd("x", None)
-    off = _svc(tmp_path, fake_script, skip_permissions=False)._build_cmd("x", None)
+    on = _cmd(_svc(tmp_path, fake_script, skip_permissions=True), "x")
+    off = _cmd(_svc(tmp_path, fake_script, skip_permissions=False), "x")
     # 审批不 bypass 时 MCP 工具会被直接拒（实测），故默认必须带上 bypass 旗标
     assert "--dangerously-bypass-approvals-and-sandbox" in on
     assert "--dangerously-bypass-approvals-and-sandbox" not in off
@@ -172,9 +181,10 @@ async def test_second_round_resumes_session(tmp_path, fake_script):
 async def test_workspace_has_agents_md_for_codex(tmp_path, fake_script):
     """codex 读 AGENTS.md（不是 CLAUDE.md），两个都写。"""
     svc = _svc(tmp_path, fake_script)
-    assert (svc._workspace / "AGENTS.md").is_file()
-    assert (svc._workspace / "CLAUDE.md").is_file()
-    text = (svc._workspace / "AGENTS.md").read_text(encoding="utf-8")
+    ws = _ws(svc)
+    assert (ws / "AGENTS.md").is_file()
+    assert (ws / "CLAUDE.md").is_file()
+    text = (ws / "AGENTS.md").read_text(encoding="utf-8")
     assert "数据访问优先级" in text
 
 
@@ -183,9 +193,10 @@ async def test_workspace_mcp_spec_matches_json_and_cli(tmp_path, fake_script):
     import json
 
     svc = _svc(tmp_path, fake_script)
-    spec = json.loads((svc._workspace / ".claude" / "mcp.json").read_text(
+    ws = _ws(svc)
+    spec = json.loads((ws / ".claude" / "mcp.json").read_text(
         encoding="utf-8"))["mcpServers"]["lquant"]
-    joined = " ".join(svc._build_cmd("x", None))
+    joined = " ".join(svc._build_cmd("x", None, ws))
     assert spec["command"] in joined
     assert spec["args"] == ["-m", "lquant.agent.mcp_server"]
     assert 'mcp_servers.lquant.args=["-m","lquant.agent.mcp_server"]' in joined

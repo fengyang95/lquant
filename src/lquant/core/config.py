@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::([^}]*))?\}")
 
@@ -76,6 +76,40 @@ class AgentConfig(BaseModel):
     # 模型不在这里配：两个 CLI 都复用自身的模型配置
     # （claude 的 settings / ANTHROPIC_*；codex 的 ~/.codex/config.toml），
     # 子进程按原样继承环境，见 docs/AGENT_MODEL.md。
+
+    # 新建会话的**全局默认能力集**，只用于「问 AI」页新建会话弹层的**预填**
+    # （见 server/api/agent.py 的 /capabilities 与前端 resolveDefaults）。
+    #
+    # ⚠️ 它**不是**运行时兜底：会话没有 agent_config（老会话 / A2A 建的 /
+    # 前端降级直接建）时，能力集是 `{}` = **不裁剪（全开）**，不会回退到这里。
+    # 所以把 default_mcp_tools 设成 none 只影响新建会话的默认勾选，管不住
+    # 已经存在或由 A2A 建的会话 —— 要收紧那类会话得另想办法。
+    #
+    # None = 不裁剪（全开）；[] = 一个都不启用。两者语义不同，不要合并。
+    default_skills: list[str] | None = None
+    default_mcp_tools: list[str] | None = None
+
+    @field_validator("default_skills", "default_mcp_tools", mode="before")
+    @classmethod
+    def _parse_capability_list(cls, v: Any) -> Any:
+        """接受 YAML 列表，或环境变量插值出的逗号串。
+
+        字符串形态：``all`` / 空白 = 不裁剪（``None``）；``none`` = 一个都不启用
+        （``[]``）；其余按逗号切分。
+
+        为什么要有显式的 ``none``：这两个开关的名字与工作区里那个
+        ``LQ_MCP_ENABLED_TOOLS`` 很像，但后者的空串表示**一个都不开**。
+        没有 ``none`` 的话，「想配成不启用」只能写成空串，而空串在这里是
+        「全开」—— 同一形状两种含义，是最容易静默给多权限的坑。
+        """
+        if isinstance(v, str):
+            v = v.strip()
+            if not v or v == "all":
+                return None
+            if v == "none":
+                return []
+            return [x.strip() for x in v.split(",") if x.strip()]
+        return v
 
 
 class Settings(BaseModel):

@@ -4,7 +4,30 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { AgentEventMsg, AskMessage, AskSession } from '@/lib/ask-api';
 import { connectAskEvents, getMessages, reduceMessages, sendMessage } from '@/lib/ask-api';
+import { PROVIDER_LABELS } from '@/lib/agent-api';
 import Message from './Message';
+
+/** 会话能力条：建会话时锁定，这里只读展示（没有入口可改）。 */
+function SessionCapabilities({ session }: { session: AskSession }) {
+  const cfg = session.agent_config ?? {};
+  const provider = cfg.provider ?? '';
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 border-b border-line px-4 py-1.5 text-xs">
+      <span className="tag tag-on">{PROVIDER_LABELS[provider] ?? (provider || '默认后端')}</span>
+      <CountChip label="skill" names={cfg.skills} />
+      <CountChip label="MCP 工具" names={cfg.mcp_tools} />
+    </div>
+  );
+}
+
+/** `null` / 缺省 = 全开（没裁剪），与「空列表 = 一个都不给」要分得清。 */
+function CountChip({ label, names }: { label: string; names?: string[] | null }) {
+  return (
+    <span className="tag">
+      {label} {names == null ? '全部' : names.length === 0 ? '未启用' : `×${names.length}`}
+    </span>
+  );
+}
 
 /** 右栏对话窗口：历史加载、事件流订阅、乐观发送、错误重试 */
 export default function ChatWindow({ session }: { session: AskSession }) {
@@ -117,6 +140,7 @@ export default function ChatWindow({ session }: { session: AskSession }) {
 
   return (
     <div className="flex h-full flex-col">
+      <SessionCapabilities session={session} />
       {/* 消息流 */}
       <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
         {msgs.length === 0 && !pending && !error ? (

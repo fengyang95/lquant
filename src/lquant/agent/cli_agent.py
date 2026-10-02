@@ -52,6 +52,20 @@ from lquant.agent.workspace import ensure_workspace
 _LOG = logging.getLogger(__name__)
 
 
+def _name_set(value: object) -> set[str] | None:
+    """会话配置里的能力名单 → 启用集。
+
+    ``None`` = 不裁剪（全开）；列表/元组/集合 = 按名单裁剪（空集合 = 一个都不启用）。
+    形态不合法时按**不裁剪**处理：宁可多给能力，也不要因为一条脏数据让 agent
+    变成什么都不会的裸模型（能力缺失是静默的，用户只会看到「它怎么不会用工具」）。
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return {str(x) for x in value}
+    return None
+
+
 class CliAgentService(AgentService):
     """无头 CLI provider 的公共基类；子类只需实现命令构造与输出解析。
 
@@ -60,16 +74,21 @@ class CliAgentService(AgentService):
     会话 id 落库在 ``ask_sessions.cli_session_id``。
     """
 
-    #: 写进日志与报错文本的 provider 名
+    #: 写进日志与报错文本的 provider 名（子类同时把它当 provider 用）
     label = "cli"
     #: stderr 日志前缀
     stderr_tag = "cli"
+    #: provider 名 —— 会话级路由与实例缓存按它认人（子类与 label 同值）
+    provider = "cli"
 
     def __init__(self, store: SessionStore) -> None:
         super().__init__(store)
         #: 会话 → 子进程（单槽：同会话同时只允许一个，见 _claim）
         self._procs: dict[str, SpawnedChild] = {}
-        self._workspace: Path = Path()
+        #: 工作区**父目录**：每个会话的工作区是 ``<base>/<sid>``（见 _workspace_for）。
+        #: 注意这里存的是父目录而不是某个具体工作区 —— 同一个 service 实例会
+        #: 并发服务多个会话，具体工作区必须按轮传入，不能是实例状态。
+        self._workspace_base: Path = Path()
         self._root: Path = Path()
         self._timeout: float = 300.0
 
@@ -78,12 +97,26 @@ class CliAgentService(AgentService):
         """公共运行时初始化（子类解析完 provider 专属配置后调用）。"""
         self._root = Path(root)
         self._timeout = float(timeout_seconds)
-        self._workspace = ensure_workspace(workspace_dir, self._root)
+        self._workspace_base = self._root / workspace_dir
+
+    def _workspace_for(self, sid: str, cfg: dict) -> Path:
+        """按会话**锁定的**能力配置准备并返回该会话的工作区。
+
+        每轮都重新生成（幂等）：只重写 CLAUDE.md/AGENTS.md 与 ``.claude/``，
+        所以改了 skill 文件下一轮就生效；agent 在工作区里写下的产物不受影响。
+
+        ``cfg`` 里的 ``skills`` / ``mcp_tools``：``None`` = 不裁剪（全开），
+        列表（含空列表）= 按名单裁剪。
+        """
+        return ensure_workspace(
+            str(self._workspace_base / sid), self._root,
+            enabled_skills=_name_set(cfg.get("skills")),
+            enabled_tools=_name_set(cfg.get("mcp_tools")))
 
     # ---- 子类钩子 ---------------------------------------------------------
 
-    def _build_cmd(self, content: str, cli_sid: str | None) -> list[str]:
-        """构造本次调用的命令行。"""
+    def _build_cmd(self, content: str, cli_sid: str | None, workspace: Path) -> list[str]:
+        """构造本次调用的命令行。``workspace`` 是本次运行的会话工作区。"""
         raise NotImplementedError
 
     def _parse_line(self, raw: bytes) -> list[dict]:
@@ -92,8 +125,9 @@ class CliAgentService(AgentService):
 
     # ---- 会话 -------------------------------------------------------------
 
-    async def create_session(self, context: dict | None) -> Session:
-        return await self.store.create(context)
+    async def create_session(self, context: dict | None,
+                             agent_config: dict | None = None) -> Session:
+        return await self.store.create(context, agent_config)
 
     async def list_sessions(self) -> list[Session]:
         return await self.store.list()
@@ -142,11 +176,13 @@ class CliAgentService(AgentService):
                 proc.terminate()
 
     async def _run(self, sid: str, content: str, on_event: Emit) -> None:
+        cfg = await self.store.get_agent_config(sid)
+        workspace = self._workspace_for(sid, cfg)
         cli_sid = await self.store.get_cli_session_id(sid)
-        cmd = self._build_cmd(content, cli_sid)
+        cmd = self._build_cmd(content, cli_sid, workspace)
         proc: SpawnedChild | None = None
         try:
-            proc = spawn_child(cmd, cwd=str(self._workspace))
+            proc = spawn_child(cmd, cwd=str(workspace))
             await proc.attach()
         except OSError as e:
             # 子进程可能已经起来了（posix_spawn 成功、attach 才失败）：
