@@ -57,6 +57,61 @@ def test_normalize_rejects_non_list_names():
         cap.normalize_agent_config({"skills": "alpha"})
 
 
+# ---- normalize_capability_update（会话内改能力） ---------------------------
+
+
+def test_capability_update_keeps_only_present_keys():
+    assert cap.normalize_capability_update({"skills": ["alpha"]}) == {"skills": ["alpha"]}
+    assert cap.normalize_capability_update({"mcp_tools": ["get_quotes"]}) == {
+        "mcp_tools": ["get_quotes"]}
+    assert cap.normalize_capability_update(
+        {"skills": ["alpha"], "mcp_tools": ["get_quotes"]}
+    ) == {"skills": ["alpha"], "mcp_tools": ["get_quotes"]}
+
+
+def test_capability_update_distinguishes_none_from_empty_list():
+    """``None`` = 全开，``[]`` = 全不启用；合并两者会让「全不选」变成「全给」。"""
+    assert cap.normalize_capability_update({"skills": None}) == {"skills": None}
+    assert cap.normalize_capability_update({"skills": []}) == {"skills": []}
+
+
+def test_capability_update_rejects_provider():
+    with pytest.raises(cap.CapabilityError, match="provider"):
+        cap.normalize_capability_update({"provider": "codex"})
+    # 即使和合法字段一起传，也整体拒绝（不能只忽略 provider 悄悄改 skills）
+    with pytest.raises(cap.CapabilityError, match="provider"):
+        cap.normalize_capability_update({"provider": None, "skills": ["alpha"]})
+
+
+def test_capability_update_rejects_unknown_field():
+    with pytest.raises(cap.CapabilityError, match="不支持的能力项"):
+        cap.normalize_capability_update({"whatever": 1})
+    with pytest.raises(cap.CapabilityError, match="不支持的能力项"):
+        cap.normalize_capability_update({"skills": ["alpha"], "whatever": 1})
+    # context 是建会话字段，不是能力项，同样不能出现在这个 PATCH 里
+    with pytest.raises(cap.CapabilityError, match="不支持的能力项"):
+        cap.normalize_capability_update({"context": {"symbol": "600519"}})
+
+
+def test_capability_update_rejects_empty():
+    with pytest.raises(cap.CapabilityError, match="没有可修改的能力项"):
+        cap.normalize_capability_update({})
+
+
+def test_capability_update_reuses_agent_config_validation():
+    """值校验复用 ``normalize_agent_config``，不写第二份 —— 口径一致。"""
+    with pytest.raises(cap.CapabilityError, match="非法 skill 名"):
+        cap.normalize_capability_update({"skills": ["Bad_Name"]})
+    with pytest.raises(cap.CapabilityError, match="必须是字符串列表"):
+        cap.normalize_capability_update({"skills": "alpha"})
+    with pytest.raises(cap.CapabilityError, match="未知 MCP 工具"):
+        cap.normalize_capability_update({"mcp_tools": ["get_nope"]})
+
+
+def test_mutable_fields_constant_excludes_provider():
+    assert cap.MUTABLE_CAPABILITY_FIELDS == ("skills", "mcp_tools")
+
+
 # ---- skill 名与路径安全 ---------------------------------------------------
 
 

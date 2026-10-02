@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { fmtNum, fmtPct, fmtYi, pctColorClass, taskStatusText } from './format';
+import { fmtDuration, fmtNum, fmtPct, fmtYi, pctColorClass, taskStatusText } from './format';
 
 describe('fmtPct', () => {
   it('正数带加号、负数自带负号', () => {
@@ -59,5 +59,22 @@ describe('fmtNum', () => {
     expect(fmtNum(1309.305, 2)).toBe('1309.31');
     expect(fmtNum(0, 2)).toBe('0.00');
     expect(fmtNum(null)).toBe('—');
+  });
+});
+
+describe('fmtDuration —— 过程轨的耗时文案', () => {
+  it('亚秒 / 秒（保留一位小数）/ 分秒三档', () => {
+    expect(fmtDuration(0)).toBe('0ms');
+    expect(fmtDuration(820)).toBe('820ms');
+    expect(fmtDuration(8300)).toBe('8.3s');
+    expect(fmtDuration(59_999)).toBe('60.0s');
+    expect(fmtDuration(65_000)).toBe('1m05s');
+    expect(fmtDuration(3_600_000)).toBe('60m00s');
+  });
+
+  it('负数 / 非有限值 → 占位符（时钟回拨或字段缺失时不显示乱码）', () => {
+    expect(fmtDuration(-1)).toBe('—');
+    expect(fmtDuration(Number.NaN)).toBe('—');
+    expect(fmtDuration(Number.POSITIVE_INFINITY)).toBe('—');
   });
 });

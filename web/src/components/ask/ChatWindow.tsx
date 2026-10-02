@@ -3,12 +3,29 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { AgentEventMsg, AskMessage, AskSession } from '@/lib/ask-api';
-import { connectAskEvents, getMessages, reduceMessages, sendMessage } from '@/lib/ask-api';
+import {
+  cancelSession,
+  connectAskEvents,
+  getMessages,
+  reduceMessages,
+  sendMessage,
+} from '@/lib/ask-api';
 import { PROVIDER_LABELS } from '@/lib/agent-api';
+import type { RunTrace } from '@/lib/ask-stream';
+import { applyTraceEvent, newRunTrace } from '@/lib/ask-stream';
+import { fmtDuration } from '@/lib/format';
 import Message from './Message';
+import RunTraceView from './RunTraceView';
+import SessionConfigDialog from './SessionConfigDialog';
 
-/** 会话能力条：建会话时锁定，这里只读展示（没有入口可改）。 */
-function SessionCapabilities({ session }: { session: AskSession }) {
+/** 会进过程轨的事件类型。assistant_delta 只进正文，不进过程。 */
+const TRACE_EVENTS = new Set([
+  'thinking', 'tool_call', 'tool_result', 'system', 'done', 'error',
+]);
+
+/** 会话头：能力集只读展示 + 「调整能力」入口。
+ *  provider 不在这里改（换了会续到别的 CLI 会话），skill / MCP 可以。 */
+function SessionHeader({ session, onEdit }: { session: AskSession; onEdit: () => void }) {
   const cfg = session.agent_config ?? {};
   const provider = cfg.provider ?? '';
   return (
@@ -16,6 +33,9 @@ function SessionCapabilities({ session }: { session: AskSession }) {
       <span className="tag tag-on">{PROVIDER_LABELS[provider] ?? (provider || '默认后端')}</span>
       <CountChip label="skill" names={cfg.skills} />
       <CountChip label="MCP 工具" names={cfg.mcp_tools} />
+      <button type="button" onClick={onEdit} className="ml-auto text-ink-dim hover:text-up">
+        调整能力
+      </button>
     </div>
   );
 }
@@ -29,121 +49,211 @@ function CountChip({ label, names }: { label: string; names?: string[] | null })
   );
 }
 
-/** 右栏对话窗口：历史加载、事件流订阅、乐观发送、错误重试 */
-export default function ChatWindow({ session }: { session: AskSession }) {
+/** 右栏对话窗口：历史加载、事件流订阅、流式渲染、中断、会话内改能力。 */
+export default function ChatWindow({
+  session,
+  onSessionChange,
+}: {
+  session: AskSession;
+  onSessionChange?: (updated: AskSession) => void;
+}) {
   const [msgs, setMsgs] = useState<AskMessage[]>([]);
   const [draft, setDraft] = useState('');
-  const [pending, setPending] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [trace, setTrace] = useState<RunTrace | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const [atBottom, setAtBottom] = useState(true);
+  const [configOpen, setConfigOpen] = useState(false);
   const lastSentRef = useRef('');
   const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  //: 组件是否还挂着（中断兜底定时器用；卸载后不再 setState）
+  const aliveRef = useRef(true);
+  //: 运行代数：每轮回答 +1，收到 done/error 也 +1。中断兜底定时器据此判断
+  //: 「我那次取消对应的还是不是当前这一轮」，避免误伤刚发起的新一轮。
+  const runSeqRef = useRef(0);
   const sid = session.id;
+
+  const loadHistory = useCallback(
+    (alive: () => boolean) => {
+      getMessages(sid)
+        .then((list) => {
+          if (alive()) setMsgs(list);
+        })
+        .catch(() => {
+          if (alive()) setError('历史消息加载失败');
+        });
+    },
+    [sid],
+  );
 
   // 选中会话：加载历史 → 订阅事件流；切换会话取消旧订阅
   useEffect(() => {
-    let alive = true;
-    let cancel: (() => void) | null = null;
+    let live = true;
+    const alive = () => live;
+    aliveRef.current = true;
     setMsgs([]);
     setError(null);
-    setPending(false);
-    getMessages(sid)
-      .then((list) => {
-        if (alive) setMsgs(list);
-      })
-      .catch(() => {
-        if (alive) setError('历史消息加载失败');
-      });
-    cancel = connectAskEvents(sid, (ev: AgentEventMsg) => {
-      if (ev.type === 'done') {
-        // done 只走 onEvent（ask-api 已知缺陷）：拉落库消息对账替换，不依赖 onDone
-        setPending(false);
-        getMessages(sid)
-          .then((list) => {
-            if (alive) setMsgs(list);
-          })
-          .catch(() => {});
-      } else if (ev.type === 'error') {
-        setError(ev.message ?? '生成失败，请重试');
-        setPending(false);
-      } else {
+    setRunning(false);
+    setCancelling(false);
+    setTrace(null);
+    setAtBottom(true);
+    loadHistory(alive);
+    const cancel = connectAskEvents(
+      sid,
+      (ev: AgentEventMsg) => {
+        if (ev.type === 'done' || ev.type === 'error') {
+          setRunning(false);
+          setCancelling(false);
+          runSeqRef.current += 1; // 本轮结束：中断兜底定时器作废
+          // done/error 的落库内容以拉库为准（中断标记「（已中断）」也在库里）
+          loadHistory(alive);
+        } else {
+          setRunning(true);
+          setNow(Date.now());
+        }
+        if (ev.type === 'error') setError(ev.message ?? '生成失败，请重试');
+        if (TRACE_EVENTS.has(ev.type)) {
+          const t = Date.now();
+          setTrace((prev) => applyTraceEvent(prev ?? newRunTrace(t), ev, t));
+        }
         setMsgs((prev) => reduceMessages(prev, ev));
-        if (ev.type !== 'tool_result') setPending(true);
-      }
-    });
+      },
+      undefined,
+      // 重连成功：总线不回放，断线期间的事件只能靠重新拉库补上
+      () => loadHistory(alive),
+    );
     return () => {
-      alive = false;
-      cancel?.();
+      live = false;
+      aliveRef.current = false;
+      cancel();
     };
-  }, [sid]);
+  }, [sid, loadHistory]);
 
-  // 新消息自动滚底
+  // 运行中：心跳驱动耗时显示（过程轨与输入区的「已运行 8.3s」）
   useEffect(() => {
-    if (typeof bottomRef.current?.scrollIntoView === 'function') {
-      bottomRef.current.scrollIntoView();
-    }
-  }, [msgs]);
+    if (!running) return;
+    setNow(Date.now());
+    const t = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(t);
+  }, [running]);
 
-  // pending 看门狗：重连后服务端可能不再补发 done，2 分钟无任何新事件则复位，
-  // 避免输入框永久卡在「正在生成…」无法再发消息
+  // 新事件自动滚底 —— 只在用户本来就在底部时。用户翻上去看历史时把视口抢回
+  // 底部，是「不流畅」最典型的一种表现。
   useEffect(() => {
-    if (!pending) return;
-    const t = setTimeout(() => setPending(false), 120_000);
+    if (!atBottom) return;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [msgs, trace, atBottom]);
+
+  // pending 看门狗：服务端异常时可能不再补发 done，2 分钟无任何新事件则复位，
+  // 避免输入框永久卡在「正在生成…」。复位不掩盖错误，只解除锁死。
+  useEffect(() => {
+    if (!running) return;
+    const t = setTimeout(() => setRunning(false), 120_000);
     return () => clearTimeout(t);
-  }, [pending, msgs]);
+  }, [running, msgs, trace]);
+
+  const scrollToBottom = useCallback(() => {
+    setAtBottom(true);
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, []);
+
+  const beginRun = useCallback(() => {
+    const t = Date.now();
+    runSeqRef.current += 1; // 新的运行代数：上一轮的中断兜底定时器随之作废
+    setRunning(true);
+    setCancelling(false);
+    setError(null);
+    setTrace(newRunTrace(t));
+    setNow(t);
+    setAtBottom(true);
+  }, []);
+
+  const pushLocalUser = useCallback(
+    (content: string) => {
+      const local: AskMessage = {
+        id: `local-${Date.now()}`,
+        session_id: sid,
+        role: 'user',
+        content,
+        tool_calls: [],
+        created_at: new Date().toISOString(),
+      };
+      setMsgs((prev) => [...prev, local]);
+    },
+    [sid],
+  );
 
   const send = useCallback(async () => {
     const content = draft.trim();
-    if (!content || pending) return;
+    if (!content || running) return;
     setDraft('');
-    setPending(true);
-    setError(null);
     lastSentRef.current = content;
-    const local: AskMessage = {
-      id: `local-${Date.now()}`,
-      session_id: sid,
-      role: 'user',
-      content,
-      tool_calls: [],
-      created_at: new Date().toISOString(),
-    };
-    setMsgs((prev) => [...prev, local]);
+    pushLocalUser(content);
+    beginRun();
     try {
       await sendMessage(sid, content);
     } catch (e) {
-      setPending(false);
+      setRunning(false);
       setError(e instanceof Error ? e.message : String(e));
     }
-  }, [draft, pending, sid]);
+  }, [beginRun, draft, pushLocalUser, running, sid]);
 
   const retry = useCallback(async () => {
-    // 重发原文本
     const text = lastSentRef.current;
-    if (!text || pending) return;
-    setPending(true);
-    setError(null);
-    const local: AskMessage = {
-      id: `local-${Date.now()}`,
-      session_id: sid,
-      role: 'user',
-      content: text,
-      tool_calls: [],
-      created_at: new Date().toISOString(),
-    };
-    setMsgs((prev) => [...prev, local]);
+    if (!text || running) return;
+    pushLocalUser(text);
+    beginRun();
     try {
       await sendMessage(sid, text);
     } catch (e) {
-      setPending(false);
+      setRunning(false);
       setError(e instanceof Error ? e.message : String(e));
     }
-  }, [pending, sid]);
+  }, [beginRun, pushLocalUser, running, sid]);
+
+  const stop = useCallback(async () => {
+    setCancelling(true);
+    const seq = runSeqRef.current;
+    try {
+      await cancelSession(sid);
+    } catch (e) {
+      setCancelling(false);
+      setError(e instanceof Error ? e.message : String(e));
+      return;
+    }
+    // 收尾仍然以事件流里的 error 事件为准。但事件可能根本收不到（WS 断线时
+    // 总线不回放），所以给一个兜底：3 秒后若这一轮还没结束就复位状态并拉库，
+    // 免得界面永远卡在「正在中断…」。代数没变说明没有新一轮，复位是安全的。
+    setTimeout(() => {
+      if (!aliveRef.current || runSeqRef.current !== seq) return;
+      setRunning(false);
+      setCancelling(false);
+      loadHistory(() => aliveRef.current);
+    }, 3000);
+  }, [loadHistory, sid]);
+
+  const elapsed = trace ? (trace.finishedAt ?? now) - trace.startedAt : 0;
 
   return (
     <div className="flex h-full flex-col">
-      <SessionCapabilities session={session} />
+      <SessionHeader session={session} onEdit={() => setConfigOpen(true)} />
+      {trace ? <RunTraceView trace={trace} running={running} now={now} /> : null}
+
       {/* 消息流 */}
-      <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
-        {msgs.length === 0 && !pending && !error ? (
+      <div
+        ref={scrollRef}
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          setAtBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 40);
+        }}
+        className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4"
+      >
+        {msgs.length === 0 && !running && !error ? (
           <div className="border border-dashed border-line-strong bg-panel px-6 py-12 text-center text-sm text-ink-faint">
             还没有消息，输入问题开始对话
           </div>
@@ -151,7 +261,6 @@ export default function ChatWindow({ session }: { session: AskSession }) {
         {msgs.map((m) => (
           <Message key={m.id} message={m} />
         ))}
-        {pending ? <div className="px-1 text-xs text-ink-faint">正在生成…</div> : null}
         {error ? (
           <div className="border-l-2 border-up bg-panel px-4 py-3 text-sm text-up">
             {error}
@@ -162,22 +271,65 @@ export default function ChatWindow({ session }: { session: AskSession }) {
         ) : null}
         <div ref={bottomRef} />
       </div>
+
+      {!atBottom ? (
+        <div className="border-t border-line bg-panel px-3 py-1 text-right">
+          <button type="button" className="btn btn-sm" onClick={scrollToBottom}>
+            ↓ 回到最新
+          </button>
+        </div>
+      ) : null}
+
       {/* 输入区：Enter 发送、Shift+Enter 换行 */}
       <div className="border-t border-line p-3">
-        <textarea
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          placeholder="输入问题，Enter 发送，Shift+Enter 换行"
-          rows={2}
-          className="input w-full resize-none"
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault();
-              void send();
-            }
+        {running ? (
+          <div className="mb-2 flex items-center justify-between text-xs text-ink-faint">
+            <span>正在生成…{trace ? ` 已运行 ${fmtDuration(elapsed)}` : ''}</span>
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => void stop()}
+              disabled={cancelling}
+            >
+              {cancelling ? '正在中断…' : '■ 停止'}
+            </button>
+          </div>
+        ) : null}
+        <div className="flex items-end gap-2">
+          <textarea
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder="输入问题，Enter 发送，Shift+Enter 换行"
+            rows={2}
+            className="input w-full resize-none"
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                void send();
+              }
+            }}
+          />
+          <button
+            type="button"
+            className="btn btn-primary shrink-0"
+            onClick={() => void send()}
+            disabled={running || !draft.trim()}
+          >
+            发送
+          </button>
+        </div>
+      </div>
+
+      {configOpen ? (
+        <SessionConfigDialog
+          session={session}
+          onCancel={() => setConfigOpen(false)}
+          onSaved={(updated) => {
+            setConfigOpen(false);
+            onSessionChange?.(updated);
           }}
         />
-      </div>
+      ) : null}
     </div>
   );
 }

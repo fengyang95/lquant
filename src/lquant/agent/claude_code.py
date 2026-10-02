@@ -6,9 +6,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
-from lquant.agent.claude_json import parse_stream_line
+from lquant.agent.claude_json import StreamParser, parse_stream_line
 from lquant.agent.cli_agent import CliAgentService
 from lquant.agent.sessions import SessionStore
 from lquant.agent.spawn import SpawnedChild
@@ -44,6 +45,7 @@ class ClaudeCodeAgentService(CliAgentService):
         root: Path | str | None = None,
         timeout_seconds: int | None = None,
         skip_permissions: bool | None = None,
+        partial_messages: bool | None = None,
     ) -> None:
         from lquant.core.config import get_settings  # noqa: PLC0415
 
@@ -55,6 +57,11 @@ class ClaudeCodeAgentService(CliAgentService):
         # 做成开关（默认保持原行为），不要散在命令行里硬编码。
         self._skip_permissions = (
             s.agent.skip_permissions if skip_permissions is None else skip_permissions)
+        # token 级流式（打字机效果）。老版本 claude CLI **不认**
+        # --include-partial-messages 会直接报错退出，所以做成开关：环境里是旧
+        # CLI 就设 partial_messages: false 退回整块正文。
+        self._partial_messages = (
+            s.agent.partial_messages if partial_messages is None else partial_messages)
         self._init_runtime(
             workspace_dir=workspace_dir or s.agent.workspace_dir,
             root=s.root if root is None else root,
@@ -69,6 +76,11 @@ class ClaudeCodeAgentService(CliAgentService):
             "-p", content,
             "--output-format", "stream-json",
             "--verbose",
+        ]
+        if self._partial_messages:
+            # 与 stream-json 配套：产出 stream_event 增量行（正文逐 token）
+            cmd.append("--include-partial-messages")
+        cmd += [
             "--append-system-prompt", _SYSTEM_PROMPT,
             "--mcp-config", str(workspace / ".claude" / "mcp.json"),
         ]
@@ -81,3 +93,12 @@ class ClaudeCodeAgentService(CliAgentService):
 
     def _parse_line(self, raw: bytes) -> list[dict]:
         return parse_stream_line(raw.decode(errors="replace"))
+
+    def _make_line_parser(self) -> Callable[[bytes], list[dict]]:
+        """本轮复用**同一个** :class:`StreamParser`：去重需要跨行记住 message.id。
+
+        别退化成每行一个实例 —— 那样拿不到「本消息已发过增量」的状态，
+        ``assistant`` 整块会和增量一起落库，正文翻倍。
+        """
+        parser = StreamParser()
+        return lambda raw: parser.feed(raw.decode(errors="replace"))

@@ -1,10 +1,16 @@
 """会话级能力配置：provider / skill / MCP 工具的校验、清单与 skill 文件读写。
 
-「能力」有三层，都能在**建会话时**选定、建后锁定（见 ``SessionStore.create``）：
+「能力」有三层，建会话时都能选定：
 
-- ``provider``：谁来答（claude_code / codex / mock）
-- ``skills``：工作区 ``.claude/skills/`` 里放哪几个（``None`` = 全放）
-- ``mcp_tools``：MCP server 暴露哪几个工具（``None`` = 全放）
+- ``provider``：谁来答（claude_code / codex / mock），**建后锁定**
+- ``skills``：工作区 ``.claude/skills/`` 里放哪几个（``None`` = 全放），建后可改
+- ``mcp_tools``：MCP server 暴露哪几个工具（``None`` = 全放），建后可改
+
+为什么只有 provider 锁死：CLI 侧会话 id（claude 的 ``session_id`` / codex 的
+``thread_id``）在库里共用一列，中途换 provider 会「续接」到另一个 CLI 的会话，
+上下文直接串了。skills / mcp_tools 不参与会话寻址，且每轮回答都按当前配置
+**重建工作区**（见 ``CliAgentService._workspace_for``），所以允许会话内修改、
+下一轮生效（:func:`normalize_capability_update` + ``SessionStore.set_agent_config``）。
 
 校验刻意分两档：
 
@@ -67,6 +73,11 @@ def _known_mcp_tools() -> set[str]:
     return set(TOOL_HANDLERS)
 
 
+#: 建会话后仍可修改的能力项（provider 不在其中：换 provider 会续到别人的
+#: CLI 会话，见 ``SessionStore.set_agent_config`` 与 ``server.api.ask`` 的说明）。
+MUTABLE_CAPABILITY_FIELDS: tuple[str, ...] = ("skills", "mcp_tools")
+
+
 def normalize_agent_config(body: dict) -> dict:
     """把建会话请求体里的能力字段规整成落库用的 dict。
 
@@ -94,6 +105,32 @@ def normalize_agent_config(body: dict) -> dict:
                 raise CapabilityError(f"未知 MCP 工具: {', '.join(unknown)}")
         cfg["mcp_tools"] = names
     return cfg
+
+
+def normalize_capability_update(body: dict) -> dict:
+    """把「会话内改能力」的请求体规整成落库用的 dict（只允许 skills / mcp_tools）。
+
+    与 :func:`normalize_agent_config` 的区别只在**准入字段**：建会话时按空体
+    （``{}``）表示「全走全局默认」，这里空体是错误 —— 一次什么都没改的 PATCH
+    说明前端状态坏了，静默 200 会让人以为改生效了。值的校验则**完全复用**
+    ``normalize_agent_config``（skill 名形状、MCP 工具必须在注册表里），
+    不写第二份，避免两处口径分叉。
+
+    返回值只含出现在 ``body`` 里的键；``None``（= 全开）与 ``[]``（= 全不启用）
+    原样保留、不合并 —— 语义与建会话一致。
+    """
+    if "provider" in body:
+        # provider 锁定：CLI 侧会话 id（claude 的 session_id / codex 的
+        # thread_id）共用一列，中途换 provider 续接的是另一个 CLI 的会话。
+        raise CapabilityError("provider 建会话时锁定，不可修改")
+    unknown = [k for k in body if k not in MUTABLE_CAPABILITY_FIELDS]
+    if unknown:
+        raise CapabilityError(
+            f"不支持的能力项: {', '.join(str(k) for k in unknown)}"
+            "（只支持 skills / mcp_tools）")
+    if not any(k in body for k in MUTABLE_CAPABILITY_FIELDS):
+        raise CapabilityError("没有可修改的能力项（只支持 skills / mcp_tools）")
+    return normalize_agent_config(body)
 
 
 # ---- 可用能力清单（/api/agent/capabilities） --------------------------------

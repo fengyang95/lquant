@@ -82,7 +82,7 @@ experimental_bearer_token = "..."
 | 续聊 | `--resume <session_id>` | `codex exec … resume <thread_id> <prompt>` |
 | 审批/沙箱 | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` |
 | MCP 注入 | 工作区 `.claude/mcp.json`（`--mcp-config`） | `-c mcp_servers.<name>.*` |
-| 正文粒度 | 逐块 `assistant` 消息 | **整段** `item.completed/agent_message`（无 token 级增量） |
+| 正文粒度 | token 级增量（`--include-partial-messages`，见下） | **整段** `item.completed/agent_message`（无 token 级增量） |
 | 会话落盘 | CLI 自己管理 | 写到 `$CODEX_HOME/sessions/`（`resume` 依赖它） |
 
 因此工作区里 **`CLAUDE.md` 与 `AGENTS.md` 内容一致、各写一份**
@@ -121,19 +121,29 @@ agent 模块是**惰性 import** 的：服务启动时只加载 `sessions.py` �
 ## 按会话选择能力（provider / skill / MCP 工具）
 
 上面的 `agent.provider` 是**全局默认**。「问 AI」页新建会话时可以在弹层里
-逐会话选定三件事，**建会话时锁定、建后不可改**：
+逐会话选定三件事：
 
-| 维度 | 取值 | 落点 |
-|---|---|---|
-| `provider` | claude_code / codex / mock | 决定哪个 service 实例作答 |
-| `skills` | `config/skills/*` 的子集 | 只把这些目录同步进会话工作区 |
-| `mcp_tools` | `mcp_server` 工具名子集 | 经 `LQ_MCP_ENABLED_TOOLS` 注入 MCP server |
+| 维度 | 取值 | 落点 | 建会话后 |
+|---|---|---|---|
+| `provider` | claude_code / codex / mock | 决定哪个 service 实例作答 | **锁定** |
+| `skills` | `config/skills/*` 的子集 | 只把这些目录同步进会话工作区 | 可改 |
+| `mcp_tools` | `mcp_server` 工具名子集 | 经 `LQ_MCP_ENABLED_TOOLS` 注入 MCP server | 可改 |
 
-为什么建后不可改：provider 决定 CLI 侧会话 id 的口径（claude 的 `session_id`
+**provider 为什么锁死**：它决定 CLI 侧会话 id 的口径（claude 的 `session_id`
 与 codex 的 `thread_id` 共用 `ask_sessions.claude_session_id` 一列），中途换
-后端去 resume 的就是别人的会话。想换就新建会话。
+后端去 resume 的就是别人的会话，上下文直接串。想换就新建会话。
+
+**skills / mcp_tools 为什么可改**：它们不参与会话寻址，而工作区每轮都按当前
+配置重建，所以改完**下一轮生效**，不用重开会话、也不用等当前这轮跑完。
+入口在会话头的「调整能力」（`PATCH /api/ask/sessions/{id}/config`，
+只收 `skills` / `mcp_tools`；传 `provider` 或别的键一律 400）。
+新增 skill 不用先去设置页：新建会话弹层与「调整能力」弹层里都有
+「＋ 新建 skill」（名字 + 一句话描述 → 生成带 frontmatter 的骨架并自动勾选），
+要写正文再去设置页的 `#skills` 编辑器。
 
 语义上 `null` / 缺省 = **不裁剪（全开）**，`[]` = **一个都不启用**，两者不同：
+弹层里「全选」保存回去的仍是 `null`（不是快照），所以以后新增的 skill 会自动
+带上；只有真正取消勾选某项时才会写成显式名单。
 
 - 老会话与 A2A 建的会话没有 `agent_config`，走全局默认（全开），行为不变。
 - 会话配置存在 `ask_sessions.agent_config_json`；多个 provider 的 service 实例
@@ -148,6 +158,28 @@ skill 的增删改在「设置」页（直接编辑 `config/skills/<name>/SKILL.
 frontmatter 必填 `name` 与 `description`，缺了后端直接 400 —— 缺这两项的
 skill 在 Agent Card 与能力清单里都是不可见的。
 
+## 过程展示（流式与工具调用）
+
+「问 AI」页把事件流分两层渲染，事实源不同，**不要混**：
+
+- **正文**走 `assistant_delta`，落库成 `ask_messages`，是唯一会改变回答内容的
+  事件；`done` / `error` 之后页面重新拉一次落库消息对账（中断标记
+  「（已中断）」就在库里）。
+- **过程**（`thinking` / `tool_call` / `tool_result` / `system`）只活在当前这一轮，
+  由前端的 `RunTrace` 单独渲染成步骤轨（工具行带状态/耗时/结果摘要，结果全文
+  只留头部 4000 字，避免大结果常驻内存与 DOM）。
+  落库侧**只有正文**：CLI 路径（`cli_agent._consume`）不写 `tool_calls`，
+  只有 `mock` provider 会写。所以刷新页面或切走再回来，过程轨是空的 ——
+  这是事实，不做假重建（要补历史过程，得先真的把过程落库）。
+
+claude 侧要打字机效果必须显式打开 `agent.partial_messages`（默认 true），
+它给命令加 `--include-partial-messages`：CLI 于是先发 `stream_event`
+（`content_block_delta`）再发完整的 `assistant` 行。**两路都要按 `message.id`
+去重**（`agent/claude_json.py` 的 `StreamParser`），否则正文会翻倍 ——
+拿不到 id 时宁可退回整块，也不发两遍。老版本 claude CLI 不认这个旗标
+（会报 unknown option），那种环境把它设成 false。codex 没有 token 级增量，
+这项对它无效（正文仍是一整帧）。
+
 ## 相关开关
 
 ```yaml
@@ -159,10 +191,14 @@ agent:
   workspace_dir: ${LQ_AGENT_WORKSPACE:data/agent_workspace}  # 每会话子目录 <sid>/
   timeout_seconds: ${LQ_AGENT_TIMEOUT:300}     # 单次回答超时（超时 kill 子进程）
   skip_permissions: ${LQ_AGENT_SKIP_PERMISSIONS:true}
+  partial_messages: ${LQ_AGENT_PARTIAL_MESSAGES:true}  # claude 的 token 级流式
   # 新建会话的默认能力集（逗号分隔或 YAML 列表）；all / 留空 = 全开
-  default_skills: ${LQ_AGENT_DEFAULT_SKILLS:all}
+  default_skills: ${LQ_AGENT_DEFAULT_SKILLS:a-stock-data}
   default_mcp_tools: ${LQ_AGENT_DEFAULT_MCP_TOOLS:all}
 ```
+
+`default_skills` 默认只给 `a-stock-data`：skill 一多，全塞给 agent 反而稀释
+注意力，按会话勾选更划算；想要全开就设 `LQ_AGENT_DEFAULT_SKILLS=all`。
 
 `skip_permissions` 等于给 CLI 全自主权限（无头模式必须，否则会挂在/被拒掉），
 边界与风险见 `docs/SECURITY.md`。

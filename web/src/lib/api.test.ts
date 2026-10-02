@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ApiError, get, getData, post } from './api';
+import { ApiError, get, getData, patchData, post } from './api';
 
 function mockFetch(status: number, body: unknown) {
   return vi.fn().mockResolvedValue(new Response(JSON.stringify(body), {
@@ -73,5 +73,21 @@ describe('api 请求封装', () => {
     expect(init.method).toBe('POST');
     expect(init.headers['Content-Type']).toBe('application/json');
     expect(JSON.parse(init.body)).toEqual({ symbol: '600519' });
+  });
+
+  it('patchData：PATCH + 封套解包，400 时透出封套 message', async () => {
+    const f = mockFetch(200, { code: 0, data: { id: 's1' }, message: 'ok' });
+    vi.stubGlobal('fetch', f);
+    await expect(patchData('/ask/sessions/s1/config', { skills: ['a'] }))
+      .resolves.toEqual({ id: 's1' });
+    const [url, init] = f.mock.calls[0];
+    expect(url).toBe('/api/ask/sessions/s1/config');
+    expect(init.method).toBe('PATCH');
+
+    // 封套接口的 HTTPException 会把后端文案放在 message 里，别退化成「400 /xxx」
+    vi.stubGlobal('fetch', mockFetch(400, { code: 1, message: 'provider 建会话时锁定，不可修改' }));
+    const err = (await patchData('/ask/sessions/s1/config', { provider: 'codex' })
+      .catch((e) => e)) as ApiError;
+    expect(err.message).toBe('provider 建会话时锁定，不可修改');
   });
 });

@@ -1,8 +1,8 @@
-"""parse_stream_line 的单元测试。"""
+"""parse_stream_line / StreamParser 的单元测试。"""
 
 import json
 
-from lquant.agent.claude_json import parse_stream_line
+from lquant.agent.claude_json import StreamParser, parse_stream_line
 
 
 def _ev(**kw) -> dict:
@@ -243,3 +243,113 @@ class TestMalformedBlocks:
         assert len(events) == 1
         assert events[0]["kind"] == "tool_result"
         assert events[0]["text"] == "done"
+
+
+# ---- 有状态增量解析（--include-partial-messages） ---------------------------
+
+
+def _msg_start(mid: str) -> str:
+    return json.dumps({
+        "type": "stream_event",
+        "event": {"type": "message_start",
+                  "message": {"id": mid, "role": "assistant", "content": []}},
+    })
+
+
+def _delta(delta_type: str, key: str, text: str) -> str:
+    return json.dumps({
+        "type": "stream_event",
+        "event": {"type": "content_block_delta", "index": 0,
+                  "delta": {"type": delta_type, key: text}},
+    })
+
+
+def _assistant(mid: str, content: list) -> str:
+    return json.dumps({
+        "type": "assistant",
+        "message": {"id": mid, "role": "assistant", "content": content},
+    })
+
+
+class TestStreamParser:
+    """实测同一段正文会以「增量 + 整块」两种形态各来一次，必须按 id 去重。"""
+
+    def test_message_start_then_text_delta(self):
+        p = StreamParser()
+        assert p.feed(_msg_start("m1")) == []
+        assert p.feed(_delta("text_delta", "text", "你好")) == [
+            _ev(kind="delta", text="你好")]
+
+    def test_assistant_same_id_skips_text_but_keeps_tool_use(self):
+        p = StreamParser()
+        p.feed(_msg_start("m1"))
+        p.feed(_delta("text_delta", "text", "你好"))
+        events = p.feed(_assistant("m1", [
+            {"type": "text", "text": "你好"},
+            {"type": "tool_use", "id": "t1", "name": "bash", "input": {"cmd": "ls"}},
+        ]))
+        # 正文被去重，工具调用照常（工具只从 assistant 整块出）
+        assert events == [_ev(kind="tool_call", name="bash", args={"cmd": "ls"},
+                              tool_use_id="t1")]
+
+    def test_delta_without_message_start_is_dropped_and_block_falls_back(self):
+        p = StreamParser()
+        # 拿不到 id → 不产增量（否则与后面的整块一起翻倍）
+        assert p.feed(_delta("text_delta", "text", "你好")) == []
+        assert p.feed(_assistant("m1", [{"type": "text", "text": "你好"}])) == [
+            _ev(kind="delta", text="你好")]
+
+    def test_thinking_delta_then_same_id_thinking_block_skipped(self):
+        p = StreamParser()
+        p.feed(_msg_start("m1"))
+        assert p.feed(_delta("thinking_delta", "thinking", "先查数据")) == [
+            _ev(kind="thinking", text="先查数据")]
+        assert p.feed(_assistant("m1", [
+            {"type": "thinking", "thinking": "先查数据"}])) == []
+
+    def test_non_text_delta_types_ignored(self):
+        p = StreamParser()
+        p.feed(_msg_start("m1"))
+        assert p.feed(_delta("input_json_delta", "partial_json", "{}")) == []
+        assert p.feed(_delta("signature_delta", "signature", "sig")) == []
+
+    def test_other_stream_events_return_empty(self):
+        p = StreamParser()
+        p.feed(_msg_start("m1"))
+        for event in ({"type": "content_block_start", "index": 0},
+                      {"type": "content_block_stop", "index": 0},
+                      {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+                      {"type": "message_stop"}):
+            line = json.dumps({"type": "stream_event", "event": event})
+            assert p.feed(line) == []
+        # 非法形状的 stream_event 也不能抛
+        assert p.feed(json.dumps({"type": "stream_event"})) == []
+        assert p.feed(json.dumps({"type": "stream_event", "event": "x"})) == []
+
+    def test_new_message_id_block_still_emitted(self):
+        p = StreamParser()
+        p.feed(_msg_start("m1"))
+        p.feed(_delta("text_delta", "text", "A"))
+        # 另一条 id（没走过增量）的整块正文照常产出
+        assert p.feed(_assistant("m2", [{"type": "text", "text": "B"}])) == [
+            _ev(kind="delta", text="B")]
+
+    def test_tracked_ids_are_bounded(self):
+        """已下发 id 只保留最近若干条，防止长会话无界增长。"""
+        p = StreamParser()
+        for i in range(70):
+            p.feed(_msg_start(f"m{i}"))
+            p.feed(_delta("text_delta", "text", "x"))
+        # 最新的仍被去重
+        assert p.feed(_assistant("m69", [{"type": "text", "text": "x"}])) == []
+        # 最老的已被挤出窗口 → 整块兜底照常产出
+        assert p.feed(_assistant("m0", [{"type": "text", "text": "x"}])) == [
+            _ev(kind="delta", text="x")]
+
+    def test_parse_stream_line_is_stateless(self):
+        """单行调用拿不到之前的 message_start，整块照常产出（行为不变）。"""
+        assert parse_stream_line(_assistant("m1", [
+            {"type": "text", "text": "你好"}])) == [_ev(kind="delta", text="你好")]
+        # 每条单行调用都是一次性的：message_start 不跨调用留存
+        assert parse_stream_line(_msg_start("m1")) == []
+        assert parse_stream_line(_delta("text_delta", "text", "你好")) == []

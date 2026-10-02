@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import textwrap
 from pathlib import Path
 
@@ -231,4 +232,103 @@ async def test_attach_failure_reaps_spawned_child(tmp_path, fake_script, monkeyp
     # 已被 waitpid 回收（returncode 有值 ≠ None）→ 不是孤儿
     assert spawned[0].returncode is not None
     assert svc._procs == {}
+
+
+# ---- 命令行形状：token 级流式开关 -------------------------------------------
+
+
+def test_build_cmd_includes_partial_messages_flag(tmp_path, fake_script):
+    svc = _svc(tmp_path, fake_script, partial_messages=True)
+    cmd = svc._build_cmd("hi", None, tmp_path / "ws")
+    assert "--include-partial-messages" in cmd
+    # 与 stream-json 配套，别丢了输出格式
+    assert cmd[cmd.index("--output-format") + 1] == "stream-json"
+
+
+def test_build_cmd_omits_partial_messages_flag_when_disabled(tmp_path, fake_script):
+    """老版本 claude CLI 不认这个旗标，开关关掉时命令里不能出现。"""
+    svc = _svc(tmp_path, fake_script, partial_messages=False)
+    cmd = svc._build_cmd("hi", None, tmp_path / "ws")
+    assert "--include-partial-messages" not in cmd
+
+
+def test_line_parser_reuses_stream_state(tmp_path, fake_script):
+    """回归：本轮解析器必须跨行复用，否则增量与 assistant 整块一起落库 → 正文翻倍。"""
+    svc = _svc(tmp_path, fake_script)
+    parse = svc._make_line_parser()
+    start = json.dumps({"type": "stream_event", "event": {
+        "type": "message_start", "message": {"id": "m1", "content": []}}})
+    delta = json.dumps({"type": "stream_event", "event": {
+        "type": "content_block_delta", "index": 0,
+        "delta": {"type": "text_delta", "text": "你好"}}})
+    block = json.dumps({"type": "assistant", "message": {
+        "id": "m1", "content": [{"type": "text", "text": "你好"}]}})
+    assert parse(start.encode()) == []
+    assert [e["kind"] for e in parse(delta.encode())] == ["delta"]
+    assert parse(block.encode()) == []  # 同 id 的整块被去重
+
+
+_PARTIAL_CLAUDE = textwrap.dedent(
+    """\
+    #!/usr/bin/env python3
+    import json
+
+    # 实机取证（claude 2.1.263，--include-partial-messages）的形状：
+    # message_start → content_block_delta ×N → assistant 整块 → result
+    sid = "partial-sid"
+    mid = "msg-partial-1"
+    chunks = ["贵州", "茅台", "上涨"]
+    print(json.dumps({"type": "system", "subtype": "init", "model": "m1",
+                      "tools": ["Bash"], "session_id": sid}), flush=True)
+    print(json.dumps({"type": "stream_event", "session_id": sid, "event": {
+        "type": "message_start", "message": {"id": mid, "role": "assistant",
+                                             "content": []}}}), flush=True)
+    for c in chunks:
+        print(json.dumps({"type": "stream_event", "session_id": sid, "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": c}}}), flush=True)
+    # 整块会把同一段正文再给一遍：解析层必须按 message id 去重
+    print(json.dumps({"type": "assistant", "message": {
+        "id": mid, "content": [{"type": "text", "text": "".join(chunks)}]}}), flush=True)
+    print(json.dumps({"type": "result", "subtype": "success", "session_id": sid,
+                      "result": "".join(chunks)}), flush=True)
+    """
+)
+
+
+@pytest.fixture()
+def partial_script(tmp_path: Path) -> str:
+    p = tmp_path / "fake_claude_partial.py"
+    p.write_text(_PARTIAL_CLAUDE, encoding="utf-8")
+    p.chmod(0o755)
+    return str(p)
+
+
+async def test_partial_messages_stream_once_end_to_end(tmp_path, partial_script):
+    """端到端：token 级增量逐条外发，且**不**被 assistant 整块翻倍。
+
+    这是「打字机效果」的验收点：既要有 N 条 assistant_delta（而不是 1 条整块），
+    拼起来的正文又必须与整块逐字一致。
+    """
+    svc = _svc(tmp_path, partial_script, partial_messages=True)
+    ses = await svc.create_session(None)
+    events = await _run(svc, ses.id, "茅台怎么样")
+
+    deltas = [e.text for e in events if e.type == "assistant_delta"]
+    assert deltas == ["贵州", "茅台", "上涨"]  # 逐片到达，不是一整块
+    assert "".join(deltas) == "贵州茅台上涨"  # 也没有翻倍
+    # 落库内容 = 增量的拼接（事实源与流式一致）
+    msgs = await svc.get_messages(ses.id)
+    assert [m.content for m in msgs if m.role == "assistant"] == ["贵州茅台上涨"]
+    assert events[-1].type == "done"
+
+
+async def test_legacy_cli_without_stream_events_falls_back_to_whole_block(
+        tmp_path, fake_script):
+    """老 CLI（没有 stream_event）：正文仍以 assistant 整块下发一次，不丢也不翻倍。"""
+    svc = _svc(tmp_path, fake_script, partial_messages=False)
+    ses = await svc.create_session(None)
+    events = await _run(svc, ses.id, "茅台怎么样")
+    deltas = [e.text for e in events if e.type == "assistant_delta"]
+    assert deltas == ["第1轮分析"]
 

@@ -112,7 +112,7 @@ export default function SkillEditor() {
   }, [newName, skills]);
 
   return (
-    <div className="rounded-xl border bg-white p-4">
+    <div id="skills" className="scroll-mt-4 rounded-xl border bg-white p-4">
       <div className="mb-2 flex items-baseline justify-between">
         <div className="text-sm font-medium">Skill（config/skills/*/SKILL.md）</div>
         <span className="text-xs text-neutral-400">保存后下一轮对话即生效，无需重启</span>
