@@ -68,4 +68,65 @@
   .table-dense td {
     @apply border-b border-line py-2 tabular-nums;
   }
+
+  /* Markdown 代码高亮：rehype-highlight 给代码打 .hljs-* 类，配色映射到研报台
+     token（不用 highlight.js 自带主题，免得默认色破坏瓷灰纸面）。 */
+  .markdown-body .hljs-comment,
+  .markdown-body .hljs-quote {
+    @apply italic text-ink-faint;
+  }
+  .markdown-body .hljs-keyword,
+  .markdown-body .hljs-selector-tag,
+  .markdown-body .hljs-literal,
+  .markdown-body .hljs-section,
+  .markdown-body .hljs-doctag,
+  .markdown-body .hljs-type,
+  .markdown-body .hljs-name {
+    @apply text-up;
+  }
+  .markdown-body .hljs-string,
+  .markdown-body .hljs-regexp,
+  .markdown-body .hljs-addition,
+  .markdown-body .hljs-attribute,
+  .markdown-body .hljs-meta .hljs-string {
+    @apply text-down;
+  }
+  .markdown-body .hljs-number,
+  .markdown-body .hljs-symbol,
+  .markdown-body .hljs-bullet,
+  .markdown-body .hljs-variable,
+  .markdown-body .hljs-template-variable,
+  .markdown-body .hljs-link {
+    @apply text-gold;
+  }
+  .markdown-body .hljs-title,
+  .markdown-body .hljs-built_in,
+  .markdown-body .hljs-title.function_,
+  .markdown-body .hljs-title.class_ {
+    @apply text-indigo;
+  }
+  .markdown-body .hljs-attr,
+  .markdown-body .hljs-property,
+  .markdown-body .hljs-params,
+  .markdown-body .hljs-selector-class,
+  .markdown-body .hljs-selector-id,
+  .markdown-body .hljs-selector-attr {
+    @apply text-ink;
+  }
+  .markdown-body .hljs-emphasis {
+    @apply italic;
+  }
+  .markdown-body .hljs-strong {
+    @apply font-semibold;
+  }
+
+  /* 行内代码（不在 pre 里）带描边底色；块级代码交给 pre 容器，不套行内样式 */
+  .markdown-body :not(pre) > code {
+    @apply rounded-[2px] border border-line bg-panel px-1 py-0.5 font-mono text-[12.5px] text-up;
+  }
+
+  /* GFM 任务列表的复选框 */
+  .markdown-body input[type='checkbox'] {
+    @apply mr-1 align-middle;
+  }
 }
