@@ -221,7 +221,7 @@ describe('connectAskEvents', () => {
     expect(last().closed).toBe(true);
   });
 
-  it('onDone 仅在收到 done 事件时触发，并停止重连意图', () => {
+  it('onDone 仅在收到 done 事件时触发，之后仍保持连接可续问', () => {
     setup();
     const cancel = connectAskEvents('s1', onEvent, onDone);
 
@@ -231,12 +231,31 @@ describe('connectAskEvents', () => {
     last().onmessage?.({ data: JSON.stringify({ type: 'done' }) });
     expect(onDone).toHaveBeenCalledTimes(1);
 
-    // done 后连接关闭不再重连
+    // 服务端 done 后不关连接，同一会话可继续提问：这里**不能**停止重连。
+    // 旧写法把 done 当终态，done 之后一旦掉线，下一次提问就再也收不到事件。
     last().onclose?.();
-    vi.advanceTimersByTime(10_000);
-    expect(FakeWebSocket.instances).toHaveLength(1);
+    vi.advanceTimersByTime(1000);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+
+    // 同一连接上再来一次 done：onDone 再触发一次（每次回答各有一次收尾）
+    last().onmessage?.({ data: JSON.stringify({ type: 'done' }) });
+    expect(onDone).toHaveBeenCalledTimes(2);
     cancel();
-    expect(onDone).toHaveBeenCalledTimes(1); // cancel 不重复触发
+  });
+
+  it('重连成功才回调 onReconnect（首次连接不回调）', () => {
+    setup();
+    const onReconnect = vi.fn();
+    const cancel = connectAskEvents('s1', onEvent, onDone, onReconnect);
+
+    last().onopen?.();
+    expect(onReconnect).not.toHaveBeenCalled(); // 首连：历史本来就刚拉过
+
+    last().onclose?.();
+    vi.advanceTimersByTime(1000);
+    last().onopen?.();
+    expect(onReconnect).toHaveBeenCalledTimes(1); // 断线期间的事件只能靠补拉
+    cancel();
   });
 
   it('cancel/清理不再调用 onDone', () => {

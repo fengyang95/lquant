@@ -72,6 +72,18 @@ export function selectableSkills(caps: AgentCapabilities): string[] {
   return caps.skills.filter((s) => s.valid).map((s) => s.name);
 }
 
+/** 勾选集 → 落库值：**全选 = `null`（不裁剪）**。
+ *
+ *  `null` 与「显式列出全部」当下等价，但语义不同：`null` 是不裁剪，
+ *  之后新增的 skill / 工具会自动带上；显式列表则冻结成当下的快照。
+ *  界面上的「全选」字面意思就是前者，所以这里回写成 `null`。
+ *  可选项为空时同样回写 `null`：全选一个空集仍是「不裁剪」，写成 `[]`
+ *  会把它降级成「一个都不启用」，以后新增的能力就不会自动带上了。 */
+export function encodeSelection(selected: string[], all: string[]): string[] | null {
+  if (all.every((n) => selected.includes(n))) return null;
+  return selected;
+}
+
 /** 新建会话弹层的初始勾选：defaults 里的 null = 全开 → 全部可选的都勾上 */
 export function resolveDefaults(caps: AgentCapabilities): {
   provider: string;
@@ -95,3 +107,29 @@ tags: []
 
 在这里写清步骤与口径：先查什么、走哪个接口、结论怎么给。
 `;
+
+/** skill 名形状，与后端 `capabilities.SKILL_NAME_RE` 同一口径。
+ *  前端先挡一道是为了给即时反馈；真正的门禁仍在后端（写接口会 400）。 */
+export const SKILL_NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
+
+/** 按名字 + 一句话描述渲染 skill 骨架（新建向导用，省去手写 frontmatter）。
+ *
+ *  两个坑：
+ *  1. description 直接进 YAML frontmatter，**先用双引号包裹再转义** `\` 与 `"`；
+ *     含换行或 `: ` 会把 frontmatter 写坏，而坏掉的 skill 在能力清单里是
+ *     valid=false，用户只会看到「新建成功但选不了」。
+ *  2. 替换串必须用**函数形式**：字符串形式的 `$&` / `` $` `` / `$'` 会被
+ *     `String.replace` 当成替换模式解释，用户描述里带一个 `$&` 就会把模板原文
+ *     插进 frontmatter（静默写出坏 skill）。 */
+export function renderSkillTemplate(name: string, description: string): string {
+  const desc = description
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"');
+  return NEW_SKILL_TEMPLATE
+    .replace(/^name: my-skill$/m, () => `name: ${name}`)
+    .replace(/^description: .*$/m, () => `description: "${desc}"`)
+    // 正文标题也跟着改：留着 my-skill 会让人以为 skill 没建对
+    .replace(/^# my-skill$/m, () => `# ${name}`);
+}

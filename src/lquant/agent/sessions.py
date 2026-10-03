@@ -120,9 +120,10 @@ class SessionStore:
                      agent_config: dict | None = None) -> Session:
         """建会话。``agent_config`` 是会话级能力配置（provider/skills/mcp_tools）。
 
-        建后不可改（不提供更新入口）：provider 决定 CLI 侧会话 id 的口径
-        （claude 的 session_id / codex 的 thread_id 共用一列），中途换 provider
-        续接的就是别人的会话，所以能力配置在创建时锁定。
+        provider 建后不可改：它决定 CLI 侧会话 id 的口径（claude 的 session_id /
+        codex 的 thread_id 共用一列），中途换 provider 续接的就是别人的会话，
+        所以 provider 在创建时锁定。skills / mcp_tools 可以会话内改，走
+        :meth:`set_agent_config`（工作区每轮重建，下一轮生效）。
         """
         con = await self._conn()
         cfg = agent_config or {}
@@ -161,14 +162,34 @@ class SessionStore:
             return {}
         return json.loads(r[0] or "{}")
 
-    async def set_agent_config(self, sid: str, cfg: dict) -> None:
-        # `cfg or {}`：写成 "null" 的话读回来是 None，喂给 Session 的 dict 字段
-        # 会直接校验失败（整条会话都读不出来了）
+    async def set_agent_config(self, sid: str, patch: dict) -> Session | None:
+        """会话内改能力配置：``patch`` 与现有配置**浅合并**（只覆盖传进来的键）。
+
+        返回值是**从库里读回**的 ``Session``（不是拼出来的），保证与落库一致；
+        会话不存在返回 ``None``，由 API 层转 404。
+
+        ``patch`` 里的 ``None`` 是有意义的值（= 该能力全开），所以合并时只按
+        「键在不在」判断，不按值真假判断 —— ``{"skills": None}`` 必须真的把
+        skills 覆盖成 None，而不是被当成「没传」。
+        """
         con = await self._conn()
+        cur = await con.execute(
+            "SELECT id,title,context_json,created_at,agent_config_json FROM ask_sessions "
+            "WHERE id=?", (sid,))
+        r = await cur.fetchone()
+        if r is None:
+            return None
+        # current 恒为 dict（落库时保证过：写成 "null" 会让整条会话读不出来）
+        merged = {**json.loads(r[4] or "{}"), **(patch or {})}
         await con.execute(
             "UPDATE ask_sessions SET agent_config_json=? WHERE id=?",
-            (json.dumps(cfg or {}, ensure_ascii=False), sid))
+            (json.dumps(merged, ensure_ascii=False), sid))
         await con.commit()
+        cur = await con.execute(
+            "SELECT id,title,context_json,created_at,agent_config_json FROM ask_sessions "
+            "WHERE id=?", (sid,))
+        r = await cur.fetchone()
+        return self._row_session(r) if r else None
 
     async def delete(self, sid: str) -> None:
         con = await self._conn()

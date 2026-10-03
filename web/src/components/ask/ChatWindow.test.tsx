@@ -1,8 +1,8 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AgentEventMsg, AskMessage, AskSession } from '@/lib/ask-api';
-import { connectAskEvents, getMessages, sendMessage } from '@/lib/ask-api';
+import { cancelSession, connectAskEvents, getMessages, sendMessage } from '@/lib/ask-api';
 import ChatWindow from './ChatWindow';
 
 vi.mock('@/lib/ask-api', async (importOriginal) => {
@@ -11,12 +11,14 @@ vi.mock('@/lib/ask-api', async (importOriginal) => {
     ...actual,
     getMessages: vi.fn(),
     sendMessage: vi.fn(),
+    cancelSession: vi.fn(),
     connectAskEvents: vi.fn(() => vi.fn()),
   };
 });
 
 const mockedGetMessages = vi.mocked(getMessages);
 const mockedSendMessage = vi.mocked(sendMessage);
+const mockedCancel = vi.mocked(cancelSession);
 const mockedConnect = vi.mocked(connectAskEvents);
 
 const session: AskSession = {
@@ -95,5 +97,79 @@ describe('ChatWindow', () => {
     ]);
     onEvent({ type: 'done' });
     await screen.findByText('贵州茅台近一年上涨 12%（落库版）');
+  });
+
+  it('过程轨：thinking 与工具调用上屏，结果配回对应工具', async () => {
+    mockedGetMessages.mockResolvedValue([]);
+    render(<ChatWindow session={session} />);
+    await screen.findByPlaceholderText('输入问题，Enter 发送，Shift+Enter 换行');
+    await waitFor(() => expect(capturedOnEvent).not.toBeNull());
+    const onEvent = capturedOnEvent as (ev: AgentEventMsg) => void;
+
+    onEvent({ type: 'thinking', text: '先确认口径' });
+    onEvent({ type: 'tool_call', name: 'get_quotes', args: { symbol: '600519' } });
+    // 时长随真实时钟走（「推理 · 0ms」可能变成 1ms），只断言步骤本身
+    expect(await screen.findByText(/^推理/)).toBeInTheDocument();
+    expect(screen.getByText('先确认口径')).toBeInTheDocument();
+    expect(screen.getByText('get_quotes')).toBeInTheDocument();
+    expect(screen.getByText('symbol=600519')).toBeInTheDocument();
+
+    onEvent({ type: 'tool_result', name: 'get_quotes', summary: '1500 元', text: '贵州茅台 1500 元' });
+    // 摘要进 summary、全文进折叠的 pre
+    expect(await screen.findByText('贵州茅台 1500 元')).toBeInTheDocument();
+    expect(screen.getAllByText(/1500 元/).length).toBeGreaterThan(0);
+  });
+
+  it('运行中给「停止」按钮，点击调 cancelSession', async () => {
+    mockedGetMessages.mockResolvedValue([]);
+    mockedCancel.mockResolvedValue(undefined);
+    render(<ChatWindow session={session} />);
+    await screen.findByPlaceholderText('输入问题，Enter 发送，Shift+Enter 换行');
+    await waitFor(() => expect(capturedOnEvent).not.toBeNull());
+    const onEvent = capturedOnEvent as (ev: AgentEventMsg) => void;
+
+    expect(screen.queryByRole('button', { name: /停止/ })).toBeNull();
+    onEvent({ type: 'thinking', text: '想一下' });
+    const stop = await screen.findByRole('button', { name: '■ 停止' });
+    fireEvent.click(stop);
+    await waitFor(() => expect(mockedCancel).toHaveBeenCalledWith('s1'));
+
+    // error 事件（中断）后回到空闲态，停止按钮消失
+    onEvent({ type: 'error', message: '已中断' });
+    await waitFor(() => expect(screen.queryByRole('button', { name: /停止/ })).toBeNull());
+    expect(await screen.findByText('已中断')).toBeInTheDocument();
+  });
+
+  it('中断后收不到收尾事件：3 秒兜底复位，不会永远卡在「正在中断…」', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      mockedGetMessages.mockResolvedValue([]);
+      mockedCancel.mockResolvedValue(undefined);
+      render(<ChatWindow session={session} />);
+      await screen.findByPlaceholderText('输入问题，Enter 发送，Shift+Enter 换行');
+      await waitFor(() => expect(capturedOnEvent).not.toBeNull());
+      const onEvent = capturedOnEvent as (ev: AgentEventMsg) => void;
+
+      onEvent({ type: 'thinking', text: '想一下' });
+      fireEvent.click(await screen.findByRole('button', { name: '■ 停止' }));
+      await waitFor(() => expect(mockedCancel).toHaveBeenCalledWith('s1'));
+      // 后端事件因 WS 断线永远到不了：兜底定时器到点后必须自己复位
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3100);
+      });
+      expect(screen.queryByRole('button', { name: /停止|正在中断/ })).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('发送按钮：草稿为空时禁用，有内容时可点', async () => {
+    mockedGetMessages.mockResolvedValue([]);
+    render(<ChatWindow session={session} />);
+    const input = await screen.findByPlaceholderText('输入问题，Enter 发送，Shift+Enter 换行');
+    const btn = screen.getByRole('button', { name: '发送' });
+    expect(btn).toBeDisabled();
+    fireEvent.change(input, { target: { value: '大盘怎么样' } });
+    expect(btn).not.toBeDisabled();
   });
 });

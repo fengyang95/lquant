@@ -1,5 +1,5 @@
 import type { AgentConfig } from './agent-api';
-import { ApiError, delData, getData, post } from './api';
+import { delData, getData, patchData, postData } from './api';
 
 /** 会话列表项 */
 export interface AskSession {
@@ -7,7 +7,9 @@ export interface AskSession {
   title: string;
   context: Record<string, unknown>;
   created_at: string;
-  /** 会话级能力配置（建会话时锁定，建后不可改）；{} = 未指定，走全局默认 */
+  /** 会话级能力配置。`provider` 建会话时锁定（换后端会续到别人的 CLI 会话），
+   *  `skills` / `mcp_tools` 可在会话内改（见 updateSessionConfig）。
+   *  `{}` = 未指定，走全局默认。 */
   agent_config?: AgentConfig;
 }
 
@@ -47,56 +49,55 @@ export interface AgentEventMsg {
   message?: string;
 }
 
-/** 后端封套 {code,data,message,trace_id} */
-interface Envelope<T> {
-  code: number;
-  data: T;
-  message?: string;
-  trace_id?: string;
-}
-
 const BASE = '/ask';
 
 export function listSessions(): Promise<AskSession[]> {
   return getData<AskSession[]>(`${BASE}/sessions`);
 }
 
-/** 建会话；`agentConfig` 传了就在建会话时锁定能力集（建后不可改）。 */
+/** 建会话；`agentConfig` 传了就在建会话时锁定能力集（provider 建后锁定）。 */
 export function createSession(
   context: Record<string, unknown> = {},
   agentConfig?: AgentConfig,
 ): Promise<AskSession> {
-  return post(`${BASE}/sessions`, { context, ...(agentConfig ?? {}) }).then((body) => {
-    // /api/ask 为封套接口：post 不解包，这里自行取 data
-    const env = body as unknown as Envelope<AskSession>;
-    if (env && typeof env === 'object' && 'code' in env) {
-      if (env.code !== 0) throw new ApiError(200, env.message || '创建会话失败');
-      return env.data;
-    }
-    return body as unknown as AskSession;
-  });
+  // /api/ask 是封套路由：走 *Data 系列解包；失败时后端的 message 才会透出来
+  return postData<AskSession>(`${BASE}/sessions`, { context, ...(agentConfig ?? {}) });
 }
 
 export function deleteSession(id: string): Promise<void> {
   return delData<void>(`${BASE}/sessions/${encodeURIComponent(id)}`);
 }
 
+/** 改会话的 skill / MCP 工具。`provider` 不在可改之列（传了后端会 400）。
+ *
+ *  改动**下一轮生效**：工作区每轮都按会话配置重建，所以不用重开会话，
+ *  也不用等当前这轮跑完。走 `patchData`（封套接口）：400 的后端文案
+ *  （「provider 建会话时锁定，不可修改」）要能原样透到弹层里。 */
+export function updateSessionConfig(id: string, cfg: AgentConfig): Promise<AskSession> {
+  return patchData<AskSession>(`${BASE}/sessions/${encodeURIComponent(id)}/config`, cfg);
+}
+
+/** 中断当前回答：服务端会 cancel 后台任务并 terminate CLI 子进程。
+ *  中断的最终结果仍以事件流里的 error 事件为准，这里只负责发指令。
+ *  走 `postData`：404（会话已删）的后端文案要能透出来，别退化成「404 /xxx」。 */
+export async function cancelSession(id: string): Promise<void> {
+  await postData<void>(`${BASE}/sessions/${encodeURIComponent(id)}/cancel`, {});
+}
+
 export function getMessages(id: string): Promise<AskMessage[]> {
   return getData<AskMessage[]>(`${BASE}/sessions/${encodeURIComponent(id)}/messages`);
 }
 
-/** POST 返回 202，封套 data 里是 {user_message, agent_task}；这里只取 user_message */
-export async function sendMessage(
+/** POST 202，封套 data 里是 {user_message, agent_task}；这里只取 user_message。
+ *
+ *  走 `postData` 而不是裸 `post`：同会话单飞时后端回 409「该会话已有正在执行的
+ *  回答」，裸 post 只读 body.detail，会把这条人话吞成「409 /api/ask/...」。 */
+export function sendMessage(
   id: string,
   content: string,
 ): Promise<{ user_message: AskMessage }> {
-  const body = await post(`${BASE}/sessions/${encodeURIComponent(id)}/messages`, { content });
-  const env = body as unknown as Envelope<{ user_message: AskMessage }>;
-  if (env && typeof env === 'object' && 'code' in env) {
-    if (env.code !== 0) throw new ApiError(200, env.message || '发送失败');
-    return env.data;
-  }
-  return body as unknown as { user_message: AskMessage };
+  return postData<{ user_message: AskMessage }>(
+    `${BASE}/sessions/${encodeURIComponent(id)}/messages`, { content });
 }
 
 /** 把 Agent 事件流归约进消息列表（纯函数，不可变更新）。
@@ -104,8 +105,8 @@ export async function sendMessage(
 export function reduceMessages(msgs: AskMessage[], ev: AgentEventMsg): AskMessage[] {
   if (ev.type === 'done' || ev.type === 'error') return msgs;
 
-  // 过程数据（thinking / system）只给外部 A2A 消费方；本页面不渲染，
-  // 且必须显式忽略 —— 否则会掉进下面的 assistant_delta 分支被当成正文累积。
+  // 过程数据（thinking / system）不进消息流：它们是**本轮运行**的过程，
+  // 由 ask-stream 的 RunTrace 单独渲染；混进正文会污染落库对账。
   if (ev.type === 'thinking' || ev.type === 'system') return msgs;
 
   if (ev.type === 'tool_result') {
@@ -163,12 +164,19 @@ function findLastAssistant(msgs: AskMessage[]): number {
 
 
 /** 连接会话事件流：ws(s)://host/ws/ask/{sid}，断线指数退避重连（1s 起上限 10s）。
- *  收到 done 事件时触发 onDone 并停止重连意图；cancel 只负责停止重连并关闭连接，不触发 onDone。
- *  返回取消函数。 */
+ *
+ *  - 服务端在 done/error 后**不关连接**（同一会话可继续提问），所以这里收到
+ *    done 只回调 onDone，不停止重连 —— 旧写法把 done 当成终态，一旦这之后
+ *    连接掉了（代理超时、后端重启），下一次提问就再也收不到任何事件，界面
+ *    只能卡在「正在生成…」直到看门狗超时。
+ *  - 事件总线**不回放**：断线期间的事件只能靠调用方重新拉落库消息对账，
+ *    所以重连成功时回调 onReconnect（首次连接不回调）。
+ *  - 返回的取消函数用于组件卸载：停止重连意图并关闭连接。 */
 export function connectAskEvents(
   sid: string,
   onEvent: (ev: AgentEventMsg) => void,
   onDone?: () => void,
+  onReconnect?: () => void,
 ): () => void {
   const host = window.location.host;
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -176,13 +184,19 @@ export function connectAskEvents(
 
   let ws: WebSocket | null = null;
   let cancelled = false;
-  let finished = false;
+  let opened = false;
   let retry = 0;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   const connect = (): void => {
-    if (cancelled || finished) return; // cancel/done 后不再新建连接
+    if (cancelled) return;
     ws = new WebSocket(url);
+    ws.onopen = () => {
+      if (cancelled) return;
+      if (opened) onReconnect?.();
+      opened = true;
+      retry = 0; // 连上了就把退避清零，别让一次抖动永久抬高重连延迟
+    };
     ws.onmessage = (e: MessageEvent) => {
       let ev: AgentEventMsg;
       try {
@@ -190,14 +204,11 @@ export function connectAskEvents(
       } catch {
         return; // 非 JSON 消息静默忽略
       }
-      if (ev.type === 'done' && !finished) {
-        finished = true;
-        onDone?.();
-      }
+      if (ev.type === 'done') onDone?.();
       onEvent(ev);
     };
     ws.onclose = () => {
-      if (cancelled || finished) return; // done 后不再重连
+      if (cancelled) return;
       const delay = Math.min(1000 * 2 ** retry, 10000);
       retry += 1;
       retryTimer = setTimeout(connect, delay);

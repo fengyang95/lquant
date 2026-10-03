@@ -47,23 +47,33 @@ describe('NewSessionDialog', () => {
     expect(screen.getByRole('radio', { name: /Codex/ })).not.toBeDisabled();
   });
 
-  it('提交带上勾选的能力集（不合格的不在其中）', () => {
+  it('提交带上勾选的能力集（不合格的不在其中；全选回写成 null=不裁剪）', () => {
     const onCreate = setup();
     fireEvent.click(screen.getByRole('radio', { name: /Claude Code/ }));
-    fireEvent.click(box(/get_daily/));
+    fireEvent.click(box(/get_daily/)); // 两个工具都勾上 → 全选
     fireEvent.click(screen.getByRole('button', { name: '创建会话' }));
     expect(onCreate).toHaveBeenCalledWith({
       provider: 'claude_code',
-      skills: ['alpha'],
-      mcp_tools: ['get_quotes', 'get_daily'],
+      // 全选 = null（不裁剪）：以后新增的 skill / 工具自动带上
+      skills: null,
+      mcp_tools: null,
     });
   });
 
-  it('全选只选可用的 skill', () => {
+  it('只勾部分能力时落显式名单（不是 null）', () => {
+    const onCreate = setup();
+    fireEvent.click(box(/alpha/)); // 取消唯一的可用 skill
+    fireEvent.click(screen.getByRole('button', { name: '创建会话' }));
+    expect(onCreate).toHaveBeenCalledWith({
+      provider: 'codex', skills: [], mcp_tools: ['get_quotes'],
+    });
+  });
+
+  it('全选只选可用的 skill（不合格的不参与，故仍是全选=null）', () => {
     const onCreate = setup();
     fireEvent.click(screen.getAllByRole('button', { name: '全选' })[0]);
     fireEvent.click(screen.getByRole('button', { name: '创建会话' }));
-    expect(onCreate.mock.calls[0][0].skills).toEqual(['alpha']);
+    expect(onCreate.mock.calls[0][0].skills).toBeNull();
   });
 
   it('清空 → 提交空列表（一个都不启用，与「不传」语义不同）', () => {
@@ -77,11 +87,11 @@ describe('NewSessionDialog', () => {
     });
   });
 
-  it('全选恢复全部', () => {
+  it('全选恢复全部（回写成不裁剪）', () => {
     const onCreate = setup();
     fireEvent.click(screen.getAllByRole('button', { name: '全选' })[1]);
     fireEvent.click(screen.getByRole('button', { name: '创建会话' }));
-    expect(onCreate.mock.calls[0][0].mcp_tools).toEqual(['get_quotes', 'get_daily']);
+    expect(onCreate.mock.calls[0][0].mcp_tools).toBeNull();
   });
 
   it('busy 时禁用提交并显示进度文案', () => {

@@ -73,6 +73,11 @@ class AgentConfig(BaseModel):
     # （MCP tool call requires approval），所以 True 时用
     # --dangerously-bypass-approvals-and-sandbox，false 时退到 -s workspace-write。
     skip_permissions: bool = True
+    # claude 侧的 token 级流式（打字机效果）：给 CLI 加 --include-partial-messages。
+    # 老版本 claude CLI 不认这个旗标（会直接报错退出），那种环境设 false 退回
+    # 「正文整块到达」。codex 侧没有 token 级增量（见 agent/codex_json.py 的
+    # 「没有 token 级增量」），所以这项对 codex provider 无效。
+    partial_messages: bool = True
     # 模型不在这里配：两个 CLI 都复用自身的模型配置
     # （claude 的 settings / ANTHROPIC_*；codex 的 ~/.codex/config.toml），
     # 子进程按原样继承环境，见 docs/AGENT_MODEL.md。

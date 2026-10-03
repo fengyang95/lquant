@@ -1,4 +1,13 @@
-"""问 AI：会话 CRUD + 发消息（agent 后台运行，事件走 WS）。"""
+"""问 AI：会话 CRUD + 发消息（agent 后台运行，事件走 WS）。
+
+能力配置的两档口径（``PATCH /sessions/{sid}/config``）：
+
+- ``provider`` **不可改**：CLI 侧会话 id（claude 的 session_id / codex 的
+  thread_id）共用一列，换 provider 后续接的是另一个 CLI 的会话，上下文会串。
+  会话级操作一律按锁定的 provider 路由（``get_service_for_session``）。
+- ``skills`` / ``mcp_tools`` **可改**：不参与会话寻址，每轮回答都按当前配置
+  重建工作区（``CliAgentService._workspace_for``），改完下一轮生效。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -7,7 +16,11 @@ import logging
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
-from lquant.agent.capabilities import normalize_agent_config
+from lquant.agent.capabilities import (
+    CapabilityError,
+    normalize_agent_config,
+    normalize_capability_update,
+)
 from lquant.agent.schemas import AgentEvent
 from lquant.agent.service import get_agent_service, get_service_for_session
 from lquant.server.api.ask_bus import AskEventBus
@@ -46,6 +59,29 @@ async def create_session(body: dict | None = None):
 async def list_sessions():
     svc = await get_agent_service()
     return [s.model_dump() for s in await svc.list_sessions()]
+
+
+@router.patch("/sessions/{sid}/config")
+async def update_session_config(sid: str, body: dict | None = None):
+    """会话内改能力配置（只允许 skills / mcp_tools；provider 锁定）。
+
+    provider 为什么不给改：CLI 侧会话 id（claude 的 session_id / codex 的
+    thread_id）共用一列，换 provider 后续接的是另一个 CLI 的会话，上下文直接串。
+    所以按会话锁定的 provider 路由（``get_service_for_session``），不用全局默认实例。
+
+    skills / mcp_tools 为什么能改：它们不参与会话寻址，每一轮回答都按当前
+    配置**重建工作区**（``CliAgentService._workspace_for``），改完下一轮生效，
+    不需要重开会话。
+    """
+    try:
+        patch = normalize_capability_update(body or {})
+    except CapabilityError as e:
+        raise HTTPException(400, str(e)) from e
+    svc = await get_service_for_session(sid)
+    session = await svc.store.set_agent_config(sid, patch)
+    if session is None:
+        raise HTTPException(404, "会话不存在")
+    return session.model_dump()
 
 
 @router.delete("/sessions/{sid}")

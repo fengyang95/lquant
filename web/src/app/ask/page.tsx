@@ -62,9 +62,11 @@ function AskWorkspace() {
   const handleNew = useCallback(async () => {
     setInitError('');
     setCreateError(null);
-    // 先拉能力清单再开弹层；拉不到就直接建（走全局默认），不挡住主路径
+    // 先拉能力清单再开弹层；拉不到就直接建（走全局默认），不挡住主路径。
+    // **每次都重新拉**：弹层里能就地新建 skill，缓存住上次的清单会让刚建的
+    // skill 直到刷新页面才出现。
     try {
-      const list = caps ?? (await getCapabilities());
+      const list = await getCapabilities();
       setCaps(list);
       setDialogOpen(true);
     } catch {
@@ -75,7 +77,7 @@ function AskWorkspace() {
         setInitError(e instanceof Error ? e.message : String(e));
       });
     }
-  }, [caps]);
+  }, []);
 
   const handleCreate = useCallback(async (cfg: AgentConfig) => {
     setCreating(true);
@@ -137,7 +139,13 @@ function AskWorkspace() {
         </aside>
         <div className="min-w-0 flex-1 border border-l-0 border-line bg-white">
           {current ? (
-            <ChatWindow session={current} key={current.id} />
+            <ChatWindow
+              session={current}
+              key={current.id}
+              onSessionChange={(updated) =>
+                setSessions((prev) => prev.map((s) => (s.id === updated.id ? updated : s)))
+              }
+            />
           ) : (
             <Empty>还没有会话 —— 点击左上角「新建会话」开始提问</Empty>
           )}

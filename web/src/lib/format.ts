@@ -36,3 +36,15 @@ export function taskStatusText(s: string): string {
   };
   return m[s] ?? s;
 }
+
+/** 毫秒 → 紧凑耗时文案：`820ms` / `12.4s` / `3m05s`。
+ *
+ *  1 分钟内保留一位小数（「跑了 8.3 秒」比「跑了 8 秒」有用得多），
+ *  超过 1 分钟才换成 分+秒 —— 长回答里秒级精度已经是噪音。 */
+export function fmtDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '—';
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const total = Math.floor(ms / 1000);
+  return `${Math.floor(total / 60)}m${String(total % 60).padStart(2, '0')}s`;
+}

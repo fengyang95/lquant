@@ -19,6 +19,11 @@ agent:
   # 无头 CLI 必须跳过交互授权（等价于全自主权限，仅限本机单人使用）。
   # codex 侧还决定 MCP 工具能不能调：审批策略不 bypass 时会被直接拒绝。
   skip_permissions: ${LQ_AGENT_SKIP_PERMISSIONS:true}
+  # claude 侧的 token 级流式（`--include-partial-messages`）：正文逐字下发，
+  # 「问 AI」页才是打字机效果而不是整段蹦出来。老版本 claude CLI 不认这个旗标
+  # （会直接报 unknown option），那种环境设成 false 退回整块输出。
+  # codex 侧没有 token 级增量（见 agent/codex_json.py），这项对它无效。
+  partial_messages: ${LQ_AGENT_PARTIAL_MESSAGES:true}
   # 模型不在平台侧配置：两个 CLI 都复用自身的模型配置
   # （claude 的 ANTHROPIC_* / settings；codex 的 ~/.codex/config.toml），
   # 见 docs/AGENT_MODEL.md
@@ -26,8 +31,12 @@ agent:
   # 新建会话的默认能力集（逗号分隔或 YAML 列表）。
   # all / 留空 = 全开；none = 一个都不启用（注意与工作区里的
   # LQ_MCP_ENABLED_TOOLS 不同 —— 那个的空串表示「一个都不开」）。
-  # 「问 AI」页新建会话时按它预填，可逐会话覆盖（建后锁定）。
-  default_skills: ${LQ_AGENT_DEFAULT_SKILLS:all}
+  # 「问 AI」页新建会话时按它预填；建会话后 skill / MCP 工具仍可改
+  # （PATCH /api/ask/sessions/{id}/config），provider 建后锁定。
+  #
+  # 默认只开 a-stock-data：skill 一多，全塞给 agent 会稀释注意力，
+  # 按会话需要勾选更划算。想要全开就设 LQ_AGENT_DEFAULT_SKILLS=all。
+  default_skills: ${LQ_AGENT_DEFAULT_SKILLS:a-stock-data}
   default_mcp_tools: ${LQ_AGENT_DEFAULT_MCP_TOOLS:all}
 
 store:

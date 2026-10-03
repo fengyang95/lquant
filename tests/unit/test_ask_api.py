@@ -180,3 +180,106 @@ async def test_message_slot_released_after_completion(client):
     await asyncio.sleep(1.5)
 
     await client.delete(f"/api/ask/sessions/{sid}")
+
+
+# ---- PATCH /sessions/{sid}/config（会话内改 skills / mcp_tools） ------------
+
+
+async def _listed(client, sid):
+    r = await client.get("/api/ask/sessions")
+    assert r.status_code == 200
+    return next(s for s in r.json()["data"] if s["id"] == sid)
+
+
+async def test_update_config_skills_persists(client):
+    r = await client.post("/api/ask/sessions", json={"provider": "mock"})
+    sid = r.json()["data"]["id"]
+
+    r = await client.patch(f"/api/ask/sessions/{sid}/config", json={"skills": ["alpha"]})
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["agent_config"]["skills"] == ["alpha"]
+    # 列表接口也读到新值（不是只改了返回体）
+    assert (await _listed(client, sid))["agent_config"]["skills"] == ["alpha"]
+
+    await client.delete(f"/api/ask/sessions/{sid}")
+
+
+async def test_update_config_null_skills_means_all(client):
+    """JSON null = 全开，必须原样落库成 None，不能变成 []（全不启用）。"""
+    r = await client.post("/api/ask/sessions",
+                          json={"provider": "mock", "skills": ["alpha"]})
+    sid = r.json()["data"]["id"]
+
+    r = await client.patch(f"/api/ask/sessions/{sid}/config", json={"skills": None})
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["agent_config"]["skills"] is None
+    assert (await _listed(client, sid))["agent_config"]["skills"] is None
+
+    await client.delete(f"/api/ask/sessions/{sid}")
+
+
+async def test_update_config_patch_merges_only_given_keys(client):
+    """浅合并：改 skills 不动已锁定的 provider 与 mcp_tools。"""
+    r = await client.post("/api/ask/sessions",
+                          json={"provider": "mock", "mcp_tools": ["get_quotes"]})
+    sid = r.json()["data"]["id"]
+
+    r = await client.patch(f"/api/ask/sessions/{sid}/config", json={"skills": ["alpha"]})
+    assert r.status_code == 200, r.text
+    cfg = r.json()["data"]["agent_config"]
+    assert cfg == {"provider": "mock", "mcp_tools": ["get_quotes"], "skills": ["alpha"]}
+
+    await client.delete(f"/api/ask/sessions/{sid}")
+
+
+async def test_update_config_rejects_provider_change(client):
+    r = await client.post("/api/ask/sessions", json={"provider": "mock"})
+    sid = r.json()["data"]["id"]
+
+    r = await client.patch(f"/api/ask/sessions/{sid}/config", json={"provider": "codex"})
+    assert r.status_code == 400, r.text
+    assert "provider" in r.json()["message"]
+    # 会话的 provider 没被改
+    assert (await _listed(client, sid))["agent_config"]["provider"] == "mock"
+
+    await client.delete(f"/api/ask/sessions/{sid}")
+
+
+async def test_update_config_rejects_unknown_tool(client):
+    r = await client.post("/api/ask/sessions", json={"provider": "mock"})
+    sid = r.json()["data"]["id"]
+
+    r = await client.patch(f"/api/ask/sessions/{sid}/config",
+                           json={"mcp_tools": ["不存在的工具"]})
+    assert r.status_code == 400, r.text
+    assert "未知 MCP 工具" in r.json()["message"]
+
+    await client.delete(f"/api/ask/sessions/{sid}")
+
+
+@pytest.mark.parametrize("body", [{"whatever": 1}, {}])
+async def test_update_config_rejects_bad_body(client, body):
+    r = await client.post("/api/ask/sessions", json={"provider": "mock"})
+    sid = r.json()["data"]["id"]
+
+    r = await client.patch(f"/api/ask/sessions/{sid}/config", json=body)
+    assert r.status_code == 400, r.text
+
+    await client.delete(f"/api/ask/sessions/{sid}")
+
+
+async def test_update_config_rejects_missing_body(client):
+    """body 缺省也应当是 400（「什么都没改」不是合法请求，静默 200 会骗人）。"""
+    r = await client.post("/api/ask/sessions", json={"provider": "mock"})
+    sid = r.json()["data"]["id"]
+
+    r = await client.patch(f"/api/ask/sessions/{sid}/config")
+    assert r.status_code == 400, r.text
+
+    await client.delete(f"/api/ask/sessions/{sid}")
+
+
+async def test_update_config_unknown_session_404(client):
+    r = await client.patch("/api/ask/sessions/nope/config", json={"skills": ["alpha"]})
+    assert r.status_code == 404, r.text
+    assert "会话不存在" in r.json()["message"]

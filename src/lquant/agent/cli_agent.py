@@ -1,10 +1,12 @@
 """CliAgentService：把「起一个无头 CLI 子进程、把它的输出流映射成事件」抽成公共骨架。
 
-claude_code 与 codex 两个 provider 的差异**全部收在三个钩子里**：
+claude_code 与 codex 两个 provider 的差异**全部收在四个钩子里**：
 
 - ``label`` / ``stderr_tag``：日志与报错里的 provider 名
 - ``_build_cmd(content, cli_sid)``：命令行形状
-- ``_parse_line(raw)``：一行输出 → 归一化事件
+- ``_parse_line(raw)``：一行输出 → 归一化事件（无状态）
+- ``_make_line_parser()``：本轮使用的行解析器；跨行有状态的 provider
+  （claude 的流式去重）覆写它，默认即 ``_parse_line`` 的薄封装
 
 其余（会话落库、会话单飞、超时、取消、子进程回收、失败收尾）只有**一份**实现。
 这类「同一套语义两个出口」的分叉是本仓的高频缺陷来源（A2A 的错误码在
@@ -40,6 +42,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from lquant.agent.errors import AgentError
@@ -122,6 +125,17 @@ class CliAgentService(AgentService):
     def _parse_line(self, raw: bytes) -> list[dict]:
         """CLI 的一行输出 → 归一化事件列表。"""
         raise NotImplementedError
+
+    def _make_line_parser(self) -> Callable[[bytes], list[dict]]:
+        """构造**本轮 ``_consume`` 专用**的行解析器（无状态默认实现）。
+
+        默认逐行转发给 ``_parse_line``。跨行有状态的 provider 覆写它 ——
+        claude 的 token 增量去重需要跨行记住 ``message.id``（见 claude_json
+        的 ``StreamParser``）。``_consume`` 每轮只调用**一次**，把有状态解析器
+        的作用域天然限制在「一轮输出」里；不要实现成每行新建一个实例，
+        那等于退回无状态。
+        """
+        return lambda raw: self._parse_line(raw)
 
     # ---- 会话 -------------------------------------------------------------
 
@@ -215,6 +229,8 @@ class CliAgentService(AgentService):
         # tool_use_id → 工具名：有些 CLI 的 result 块自身不带名字，靠它回填
         # （过程数据帧要能标出结果属于哪个工具）
         tool_names: dict[str, str] = {}
+        # 每轮只构造一次：有状态解析器（claude 的流式去重）靠它跨行记住状态
+        parse = self._make_line_parser()
         try:
             while True:
                 if time.monotonic() - started > self._timeout:
@@ -230,7 +246,7 @@ class CliAgentService(AgentService):
                     continue
                 if not raw:
                     break
-                for ev in self._parse_line(raw):
+                for ev in parse(raw):
                     kind = ev["kind"]
                     if kind == "delta":
                         await self.store.append_assistant_delta(
