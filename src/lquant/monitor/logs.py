@@ -58,17 +58,19 @@ def _parse_and_filter(path: Path, min_rank: int, needle: str) -> list[dict]:
     if cur is not None:
         records.append(cur)
     for r in records:
-        r["message"] = r.pop("first") + ("\n" + "\n".join(r.pop("extra"))
-                                          if r["extra"] else "")
+        first, extra = r.pop("first"), r.pop("extra")
+        r["message"] = first + ("\n" + "\n".join(extra) if extra else "")
     return records
 
 
 def tail_app_logs(level: str | None = None, q: str = "",
-                  limit: int = 200) -> dict:
-    """tail 应用日志：倒序返回最近 limit 条（先全量解析再倒序截断）。
+                  limit: int | None = None) -> dict:
+    """tail 应用日志：倒序返回记录（先全量解析再倒序截断）。
 
     level 语义是「该级别及以上」（WARNING 会同时含 ERROR/CRITICAL）；
     level 缺省/非法按 DEBUG 处理 = 文件里全部记录（「全部」按钮的真实语义）。
+    limit=None 返回窗口内**全部**匹配记录（面板「全部」语义，不再截 200）；
+    给定 limit 时只取最近 limit 条。实际范围受 _TAIL_BYTES 读窗约束。
     文件缺失/不可读返回空集（首次运行为常态）。
     """
     rank = _LEVEL_RANK.get((level or "DEBUG").upper(), _LEVEL_RANK["DEBUG"])
@@ -79,4 +81,6 @@ def tail_app_logs(level: str | None = None, q: str = "",
     for r in matched:
         del r["level_ok"]
     total = len(matched)
-    return {"items": matched[-limit:][::-1], "total": total}
+    if limit is not None and limit > 0:
+        matched = matched[-limit:]
+    return {"items": matched[::-1], "total": total}

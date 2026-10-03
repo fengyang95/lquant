@@ -37,10 +37,12 @@ export default function LogsPanel() {
     return () => clearTimeout(t);
   }, [kw]);
 
-  const key =
-    '/monitor/app-logs?limit=200' +
-    (level ? `&level=${level}` : '') +
-    (query ? `&q=${encodeURIComponent(query)}` : '');
+  // 不传 limit：后端返回读窗内全部匹配记录（ERROR 也一并给全，不再被 200 截断）
+  const params = new URLSearchParams();
+  if (level) params.set('level', level);
+  if (query) params.set('q', query);
+  const qs = params.toString();
+  const key = `/monitor/app-logs${qs ? `?${qs}` : ''}`;
   const { data, error, isLoading } = useSWR<{ items: LogItem[]; total: number }>(key, fetcherData, {
     refreshInterval: 30000,
   });
@@ -50,7 +52,7 @@ export default function LogsPanel() {
   return (
     <Panel
       title="运行日志"
-      meta={`最近 200 条${data ? ` / 共 ${data.total}` : ''}`}
+      meta={data ? `共 ${data.total} 条` : '加载中…'}
       actions={
         <>
           <div className="flex items-center gap-1">
@@ -101,7 +103,8 @@ export default function LogsPanel() {
                     className={open ? 'cursor-pointer bg-panel' : 'cursor-pointer'}
                     onClick={() => setExpanded(open ? null : k)}
                   >
-                    <td className="tabular-nums">{it.ts.slice(11)}</td>
+                    {/* 带日期（原 slice(11) 只有 HH:MM:SS，跨天没法定位） */}
+                    <td className="whitespace-nowrap tabular-nums">{it.ts.slice(0, 23)}</td>
                     <td
                       className={
                         it.level === 'ERROR' || it.level === 'CRITICAL'
