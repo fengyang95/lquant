@@ -5,10 +5,13 @@ import useSWR from 'swr';
 
 import {
   NEW_SKILL_TEMPLATE,
+  SKILL_NAME_RE,
   deleteSkill,
   getCapabilities,
   getSkill,
   putSkill,
+  readSkillFrontmatter,
+  repairSkillContent,
 } from '@/lib/agent-api';
 
 function msgOf(e: unknown): string {
@@ -32,6 +35,12 @@ export default function SkillEditor() {
   // 新建态：这个名字服务端还没有，不能去 GET（否则 404 会把引导文案冲掉，
   // 而且名字撞上已有 skill 时会静默把模板替换成别人的正文）
   const [isNew, setIsNew] = useState(false);
+  // 列表搜索：skill 多了以后「滚动找」比「敲两个字」慢得多
+  const [query, setQuery] = useState('');
+
+  const filtered = query.trim()
+    ? skills.filter((s) => s.name.toLowerCase().includes(query.trim().toLowerCase()))
+    : skills;
 
   // 首次拉到清单后默认选中第一个
   useEffect(() => {
@@ -138,7 +147,7 @@ export default function SkillEditor() {
             </button>
           </div>
           <ul className="max-h-72 overflow-y-auto border-t">
-            {skills.map((s) => (
+            {filtered.map((s) => (
               <li key={s.name}>
                 <button
                   onClick={() => {
@@ -160,10 +169,21 @@ export default function SkillEditor() {
                 </button>
               </li>
             ))}
-            {skills.length === 0 && (
-              <li className="px-2 py-4 text-center text-xs text-neutral-400">暂无 skill</li>
+            {filtered.length === 0 && (
+              <li className="px-2 py-4 text-center text-xs text-neutral-400">
+                {skills.length === 0 ? '暂无 skill' : `没有匹配「${query.trim()}」的 skill`}
+              </li>
             )}
           </ul>
+          {skills.length > 0 && (
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder={`搜索 ${skills.length} 个 skill`}
+              aria-label="搜索 skill"
+              className="mt-1.5 w-full rounded-md border px-2 py-1 text-xs text-neutral-900"
+            />
+          )}
         </div>
 
         <div className="min-w-0 flex-1">
@@ -176,6 +196,15 @@ export default function SkillEditor() {
                 spellCheck={false}
                 aria-label={`${selected} 的 SKILL.md`}
                 className="w-full rounded-md border px-3 py-2 font-mono text-xs text-neutral-900"
+              />
+              <RepairBanner
+                dirName={selected}
+                content={content}
+                isNew={isNew}
+                onRepair={(next) => {
+                  setContent(next);
+                  setMsg('已补全 frontmatter：确认无误后点保存');
+                }}
               />
               <div className="mt-2 flex gap-2">
                 <button
@@ -204,6 +233,67 @@ export default function SkillEditor() {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * frontmatter 不合格时的就地修复提示。
+ *
+ * 为什么值得一个专门的条：不合格的 skill 在能力清单里是 ``valid=false``
+ * （选不了、Agent Card 里也不出现），但用户看到的现象只是「这个 skill 用不上」——
+ * 没有任何地方告诉他「因为 frontmatter 缺 description」。这里把缺什么、
+ * 怎么一键补全说清楚。
+ *
+ * 只对**已存在**的 skill 提示：新建态下用户正在按模板改，此刻「还没写名字」
+ * 是正常中间状态，弹一个警告只会吓人。
+ */
+function RepairBanner({
+  dirName,
+  content,
+  isNew,
+  onRepair,
+}: {
+  dirName: string;
+  content: string;
+  isNew: boolean;
+  onRepair: (next: string) => void;
+}) {
+  if (isNew) return null;
+  const fm = readSkillFrontmatter(content);
+  const missing: string[] = [];
+  if (fm === null) missing.push('整段 frontmatter（文件要以 `---` 开头并以 `---` 结束）');
+  else {
+    if (!fm.name.trim()) missing.push('name');
+    if (!fm.description.trim()) missing.push('description');
+  }
+  const dirOk = SKILL_NAME_RE.test(dirName);
+  if (missing.length === 0 && dirOk) return null;
+
+  return (
+    <div className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+      {missing.length > 0 ? (
+        <div>
+          这个 skill 目前<strong>不可用</strong>：缺少 {missing.join('、')}。
+          agent 看不到它，能力清单里也选不上。
+        </div>
+      ) : null}
+      {!dirOk ? (
+        <div className="mt-1">
+          目录名 <code className="font-mono">{dirName}</code> 不合规（只能用小写字母、
+          数字与短横线）。这一项<strong>改正文修不好</strong> —— 需要用合规的名字
+          新建一个 skill，再把正文搬过去。
+        </div>
+      ) : null}
+      {missing.length > 0 ? (
+        <button
+          type="button"
+          onClick={() => onRepair(repairSkillContent(content, dirName))}
+          className="mt-1.5 rounded border border-amber-300 bg-white px-2 py-0.5 hover:bg-amber-100"
+        >
+          补全 frontmatter（name 用目录名）
+        </button>
+      ) : null}
     </div>
   );
 }

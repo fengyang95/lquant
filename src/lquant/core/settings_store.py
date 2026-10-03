@@ -35,6 +35,26 @@ SETTING_DEFS: dict[str, SettingDef] = {
         default="claude_code", ty="enum", choices=("claude_code", "codex", "mock"),
         label="问 AI 后端 provider（claude_code=内置 Claude Code；codex=OpenAI Codex CLI；"
               "mock=脚本化演示，不调 LLM）"),
+    # 下面五项都是「新建会话的默认值 / 运行参数」，改完**下一次运行即生效**：
+    # agent 侧一律经 lquant.agent.runtime.effective_agent_config() 取值，不缓存。
+    "agent.default_skills": SettingDef(
+        default="", ty="str",
+        label="新建会话默认 skill（all=全开；none=一个都不启用；其余逗号分隔）"),
+    "agent.default_mcp_tools": SettingDef(
+        default="", ty="str",
+        label="新建会话默认 MCP 工具（同上：all / none / 逗号分隔）"),
+    "agent.timeout_seconds": SettingDef(
+        default=300, ty="int", label="问 AI 单次回答超时（秒，超时 kill CLI 子进程）"),
+    "agent.skip_permissions": SettingDef(
+        default=True, ty="bool",
+        label="CLI 全自主权限（无头运行必需：claude --dangerously-skip-permissions / "
+              "codex 同时关闭沙箱；关掉后 codex 侧 MCP 工具不可用）"),
+    "agent.partial_messages": SettingDef(
+        default=True, ty="bool",
+        label="claude token 级流式（--include-partial-messages；老版本 CLI 不认这个旗标时关掉）"),
+    "agent.max_concurrent_runs": SettingDef(
+        default=4, ty="int",
+        label="同时在跑的 agent 上限（每个回答都是一个全自主权限的 CLI 子进程，超限的新请求直接拒绝）"),
     "coverage_drop_warn_pct": SettingDef(
         default=30, ty="int", label="覆盖度环比下降告警阈值（%，前端标橙线）"),
 }
@@ -99,34 +119,38 @@ def _config_default_providers() -> tuple[str, ...]:
         return ()
 
 
-def _config_default_agent_provider() -> tuple[str, str]:
-    """config/app.yaml **显式声明**的 agent.provider → (值, "config")。
+def _config_default_agent(key: str) -> tuple[object, str]:
+    """config/app.yaml **显式声明**的 ``agent.<field>`` → (值, "config")。
 
     没声明（或读不到）就回退代码默认值，source 标 "default" —— 之前是拿
     解析结果跟写死的 "mock" 比，默认值一改语义就错位，这里改成看原始 yaml 键。
+
+    取原始 yaml 而不是 ``get_settings().agent``：后者是**解析后**的形态
+    （``all`` 已经变成 ``None``），展示给前端时「当前值 all」比「空串」清楚得多。
     """
-    default = str(SETTING_DEFS["agent.provider"].default)
+    field = key.split(".", 1)[1]
+    default = SETTING_DEFS[key].default
     try:
         from lquant.core.config import get_settings  # noqa: PLC0415
 
         raw = get_settings().raw.get("agent") or {}
-        declared = raw.get("provider")
-        if declared:
-            return str(declared), "config"
+        declared = raw.get(field)
+        if declared is not None:
+            return declared, "config"
     except Exception:  # noqa: BLE001 - 读不到配置就回退默认
         pass
     return default, "default"
 
 
 def defaults() -> dict[str, tuple[object, str]]:
-    """key -> (value, source)。providers_order 从 config 派生（config/默认）。"""
+    """key -> (value, source)。providers_order 与 agent.* 从 config 派生。"""
     out: dict[str, tuple[object, str]] = {}
     for k, d in SETTING_DEFS.items():
         if k == "providers_order":
             cfg = _config_default_providers()
             out[k] = (cfg, "config" if cfg else "default")
-        elif k == "agent.provider":
-            out[k] = _config_default_agent_provider()
+        elif k.startswith("agent."):
+            out[k] = _config_default_agent(k)
         else:
             out[k] = (d.default, "default")
     return out
@@ -213,12 +237,66 @@ class SettingsStore:
         crosscheck_peers：只接受已注册且声明 daily/etf_daily 的源。
         校验器在 data 层（源注册表/capability 归 data 域），此处延迟导入 ——
         与 _ensure_table 延迟导入 lquant.data.store.ddl 同方向、同理由。
+        agent.*：能力名单与超时都按 agent 域的注册表校验，同样延迟导入。
         """
-        if key != "crosscheck_peers":
-            return
-        from lquant.data.ingest.crosscheck import validate_peers
+        if key == "crosscheck_peers":
+            from lquant.data.ingest.crosscheck import validate_peers
 
-        validate_peers([v for v in coerced.split(",") if v])
+            validate_peers([v for v in coerced.split(",") if v])
+            return
+        if key in ("agent.default_skills", "agent.default_mcp_tools"):
+            self._validate_agent_capability(key, coerced)
+            return
+        if key == "agent.timeout_seconds":
+            from lquant.agent.capabilities import (  # noqa: PLC0415
+                CapabilityError,
+                clean_timeout_seconds,
+            )
+
+            try:
+                clean_timeout_seconds(coerced)
+            except CapabilityError as e:
+                raise ValueError(str(e)) from e
+            return
+        if key == "agent.max_concurrent_runs":
+            # 区间与 agent.concurrency.MAX_RUNS_* 同源：写入侧与运行时兜底用
+            # 同一份边界，杜绝「设置页存不进去但接口收下了」这类分叉。
+            from lquant.agent.concurrency import MAX_RUNS_MAX, MAX_RUNS_MIN  # noqa: PLC0415
+
+            val = int(float(coerced))
+            if not MAX_RUNS_MIN <= val <= MAX_RUNS_MAX:
+                raise ValueError(
+                    f"并发上限应在 {MAX_RUNS_MIN}~{MAX_RUNS_MAX} 之间，收到 {val}")
+
+    @staticmethod
+    def _validate_agent_capability(key: str, coerced: str) -> None:
+        """``all`` / ``none`` / 逗号名单。名单里的名字必须**真的存在**（skill 目录
+        或 MCP 工具注册表）—— 默认能力集是「以后每次新建会话都照这个来」，
+        写错一个名字会让新建的会话静默少一项能力，用户只会觉得「它怎么不会用」。
+        """
+        from lquant.core.config import parse_capability_list  # noqa: PLC0415
+
+        names = parse_capability_list(coerced)
+        if names is None:  # all / 空白 = 全开
+            return
+        if not names:
+            return  # none = 一个都不启用
+        if key == "agent.default_mcp_tools":
+            from lquant.agent.capabilities import known_mcp_tools  # noqa: PLC0415
+
+            unknown = sorted(set(names) - known_mcp_tools())
+            if unknown:
+                raise ValueError(f"未知 MCP 工具: {', '.join(unknown)}")
+            return
+        from lquant.agent.capabilities import (  # noqa: PLC0415
+            CapabilityError,
+            check_default_skill_names,
+        )
+
+        try:
+            check_default_skill_names(names)
+        except CapabilityError as e:
+            raise ValueError(str(e)) from e
 
     def reset(self, key: str) -> None:
         self._ensure_table()

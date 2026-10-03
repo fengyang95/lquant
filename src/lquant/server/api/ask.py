@@ -5,8 +5,11 @@
 - ``provider`` **不可改**：CLI 侧会话 id（claude 的 session_id / codex 的
   thread_id）共用一列，换 provider 后续接的是另一个 CLI 的会话，上下文会串。
   会话级操作一律按锁定的 provider 路由（``get_service_for_session``）。
+  想换后端接着问，走 ``POST /sessions/{sid}/fork`` **另开一条**会话。
 - ``skills`` / ``mcp_tools`` **可改**：不参与会话寻址，每轮回答都按当前配置
   重建工作区（``CliAgentService._workspace_for``），改完下一轮生效。
+- ``timeout_seconds`` / ``skip_permissions`` **可改**：会话级运行参数，
+  权限与超时都是**每次运行**解析的（``CliAgentService._run``），下一轮生效。
 """
 from __future__ import annotations
 
@@ -17,12 +20,19 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
 from lquant.agent.capabilities import (
+    MUTABLE_SESSION_FIELDS,
+    PROVIDERS,
     CapabilityError,
     normalize_agent_config,
     normalize_capability_update,
 )
 from lquant.agent.schemas import AgentEvent
-from lquant.agent.service import get_agent_service, get_service_for_session
+from lquant.agent.service import (
+    get_agent_service,
+    get_service_for_session,
+    running_runs_all,
+)
+from lquant.agent.sessions import render_briefing
 from lquant.server.api.ask_bus import AskEventBus
 from lquant.server.envelope import make_router
 
@@ -123,15 +133,134 @@ async def send_message(sid: str, body: dict):
     if svc.is_busy(sid):
         raise HTTPException(409, "该会话已有正在执行的回答，请等待完成或先取消")
 
-    bus = get_event_bus()
-
-    async def on_event(e: AgentEvent) -> None:
-        await bus.publish(sid, e)
-
     # 同步落库 user 消息，再起后台任务跑 agent。
     # 旧写法是「先起任务、再轮询 get_messages 等 user 消息落库」，两个毛病：
     # 同会话并发时会取到别人那条 user 消息；轮询上限到点就 500 并把任务掐掉。
     user_msg = await svc.persist_user_message(sid, content)
+    _start_run(svc, sid, content, user_msg)
+    return JSONResponse(
+        status_code=202,
+        content={"user_message": user_msg.model_dump(), "agent_task": "started"},
+    )
+
+
+@router.post("/sessions/{sid}/regenerate")
+async def regenerate_session(sid: str, body: dict | None = None):
+    """重跑最后一条提问（保留那条 user 消息，删掉它后面的回答）。
+
+    ``body.provider`` 不支持 —— 换后端是 ``/fork``。这里只重跑，不换人。
+
+    为什么删掉旧答案而不是留着再摞一条：同一条问题下面并存两个答案，界面上
+    像是「它答了两遍」，而落库的事实源也分不清哪个才是当前答案（下一轮
+    ``--resume`` 续接时更是两边都带着）。重跑就是**替换**，语义才唯一。
+    """
+    b = body or {}
+    if b.get("provider"):
+        raise HTTPException(400, "重新生成不换后端；换后端请用「另开会话」")
+    svc = await get_service_for_session(sid)
+    if await svc.store.get(sid) is None:
+        raise HTTPException(404, "会话不存在")
+    if svc.is_busy(sid):
+        raise HTTPException(409, "该会话已有正在执行的回答，请等待完成或先取消")
+    msgs = await svc.store.messages(sid)
+    last_user = next((m for m in reversed(msgs) if m.role == "user"), None)
+    if last_user is None:
+        raise HTTPException(400, "该会话还没有提问，无法重新生成")
+    removed = await svc.store.delete_assistant_after(sid, last_user.id)
+    _start_run(svc, sid, last_user.content, last_user)
+    return JSONResponse(
+        status_code=202,
+        content={"user_message": last_user.model_dump(),
+                 "agent_task": "started", "replaced_messages": removed},
+    )
+
+
+@router.post("/sessions/{sid}/fork")
+async def fork_session(sid: str, body: dict | None = None):
+    """复制上下文到**另一个 provider** 的新会话（老会话原样不动）。
+
+    为什么要另开会话而不是改 provider：CLI 侧会话 id 共用一列，中途换 provider
+    就是拿着 claude 的 session_id 去 ``codex exec resume``，续接的是别人家的
+    会话（串台）。所以「换个后端接着问」只能是新会话。
+
+    上下文怎么带过去：CLI 的历史在**另一个 CLI 那边**，带不过去，所以把原会话
+    的消息渲染成一段简报放进新会话的 ``context.briefing``，由
+    ``CliAgentService._with_briefing`` 在**第一次调用**时拼进 prompt。新会话的
+    界面上仍然是干净的对话（简报不是一条 user 消息），用户在界面上看不到
+    一大段转述。
+    """
+    target = str((body or {}).get("provider") or "").strip()
+    if target not in PROVIDERS:
+        raise HTTPException(400, f"未知 provider: {target}（可选：{'/'.join(PROVIDERS)}）")
+    src_svc = await get_service_for_session(sid)
+    src = await src_svc.store.get(sid)
+    if src is None:
+        raise HTTPException(404, "会话不存在")
+    current = src.agent_config.get("provider") or (await get_agent_service()).provider
+    if current == target:
+        raise HTTPException(400, f"目标 provider 与会话相同（{current}），换一个才有意义")
+
+    msgs = await src_svc.store.messages(sid)
+    # 只搬「配置」，不搬 provider 之外的历史事实：skills / mcp_tools 是这一路
+    # 会话攒下来的能力集，run 参数（超时/权限）同理 —— 都是用户对新会话的预期。
+    # provider 换成目标值，注意**不要**带 cli session id（那属于另一个 CLI）。
+    keep = (*MUTABLE_SESSION_FIELDS, "provider")
+    cfg = {k: v for k, v in src.agent_config.items() if k in keep}
+    cfg["provider"] = target
+    context = dict(src.context or {})
+    context["forked_from"] = sid
+    briefing = render_briefing(msgs)
+    if briefing:
+        context["briefing"] = briefing
+    dst_svc = await get_agent_service(target)
+    created = await dst_svc.create_session(
+        context, cfg, title=f"{src.title} → {target}")
+    return {
+        **created.model_dump(),
+        "source_session_id": sid,
+        "source_provider": current,
+        "copied_messages": len([m for m in msgs if m.role in ("user", "assistant")]),
+        "briefing_chars": len(briefing),
+    }
+
+
+@router.get("/runs")
+async def list_runs():
+    """正在跑的 agent 回答（跨 provider）。
+
+    ``GET /sessions`` 只看得见会话，看不出「谁正在跑、跑了多久、pid 是多少」；
+    用户在「问 AI」页发现转圈不停时，需要这份列表才能判断该等还是该杀。
+    """
+    from lquant.agent.service import max_concurrent_runs  # noqa: PLC0415
+
+    return {"runs": running_runs_all(), "max_concurrent_runs": max_concurrent_runs()}
+
+
+@router.post("/runs/{sid}/kill")
+async def kill_run(sid: str):
+    """终止某个会话正在跑的回答（等价于该会话的 /cancel，但按 sid 全局找）。
+
+    存在意义是「运行中」列表的每一行都能直接点掉，不用先切到那条会话。
+    """
+    svc = await get_service_for_session(sid)
+    if await svc.store.get(sid) is None:
+        raise HTTPException(404, "会话不存在")
+    ran = svc.is_busy(sid)
+    await svc.cancel(sid)
+    return {"ok": True, "killed": ran}
+
+
+def _start_run(svc, sid: str, content: str, user_msg) -> None:
+    """起后台任务跑 agent，事件走事件总线。
+
+    ``send_message`` 与 ``regenerate`` 共用同一份实现：两条入口如果各起一套
+    后台任务，就会出现「一条路径发 error 事件、另一条只往库里写」这种分叉，
+    而前端只认事件。
+    """
+    bus = get_event_bus()
+
+    async def on_event(e: AgentEvent) -> None:
+        await bus.publish(sid, e)
 
     async def run() -> None:
         try:
@@ -147,8 +276,3 @@ async def send_message(sid: str, body: dict):
     task = asyncio.create_task(run())
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
-
-    return JSONResponse(
-        status_code=202,
-        content={"user_message": user_msg.model_dump(), "agent_task": "started"},
-    )

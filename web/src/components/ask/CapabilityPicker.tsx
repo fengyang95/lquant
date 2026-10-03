@@ -18,6 +18,16 @@ export function toggleName(list: string[], name: string): string[] {
   return list.includes(name) ? list.filter((x) => x !== name) : [...list, name];
 }
 
+/** 反选：在**可选集合**内取反。
+ *
+ *  只按 `all` 取反、不碰 `all` 之外已选的名字：那些只可能是后来失效的 skill
+ *  （目录被删/改名），把它们顺手清掉等于替用户做了一次他没要求的裁剪。
+ *  顺序也跟着 `all` 走，与「全选」的结果一致，两次点击的结果可以直接对比。 */
+export function invertSelection(selected: string[], all: string[]): string[] {
+  const outside = selected.filter((n) => !all.includes(n));
+  return [...all.filter((n) => !selected.includes(n)), ...outside];
+}
+
 /**
  * 能力选择器：provider（可锁定只读）+ skill + MCP 工具。
  *
@@ -113,6 +123,13 @@ export default function CapabilityPicker({
             <button
               type="button"
               className="text-ink-dim hover:text-up"
+              onClick={() => onSkillsChange((prev) => invertSelection(prev, usable))}
+            >
+              反选
+            </button>
+            <button
+              type="button"
+              className="text-ink-dim hover:text-up"
               onClick={() => onSkillsChange([])}
             >
               清空
@@ -137,6 +154,7 @@ export default function CapabilityPicker({
           }))}
           selected={skills}
           onToggle={(n) => onSkillsChange((prev) => toggleName(prev, n))}
+          searchPlaceholder="搜索 skill"
         />
       </section>
 
@@ -159,6 +177,17 @@ export default function CapabilityPicker({
             <button
               type="button"
               className="text-ink-dim hover:text-up"
+              onClick={() =>
+                onToolsChange((prev) =>
+                  invertSelection(prev, caps.mcp_tools.map((t) => t.name)),
+                )
+              }
+            >
+              反选
+            </button>
+            <button
+              type="button"
+              className="text-ink-dim hover:text-up"
               onClick={() => onToolsChange([])}
             >
               清空
@@ -169,21 +198,32 @@ export default function CapabilityPicker({
           items={caps.mcp_tools.map((t) => ({ name: t.name, hint: t.description }))}
           selected={tools}
           onToggle={(n) => onToolsChange((prev) => toggleName(prev, n))}
+          searchPlaceholder="搜索 MCP 工具"
         />
       </section>
     </div>
   );
 }
 
+/** 名字清单 + 搜索框。
+ *
+ *  搜索只过滤**显示**，不影响「全选 / 反选 / 清空」的作用面：那三个按钮按
+ *  完整清单算。反过来的话，用户搜「limit」后点全选会得到一个只含 limit 的
+ *  名单，而界面上根本看不出自己丢掉了别的项 —— 这类「操作面随视图变」的
+ *  行为是最容易静默出错的。
+ */
 function NameList({
   items,
   selected,
   onToggle,
+  searchPlaceholder,
 }: {
   items: { name: string; hint: string; disabled?: boolean }[];
   selected: string[];
   onToggle: (name: string) => void;
+  searchPlaceholder: string;
 }) {
+  const [query, setQuery] = useState('');
   if (items.length === 0) {
     return (
       <div className="border border-dashed border-line px-3 py-4 text-center text-xs text-ink-faint">
@@ -191,30 +231,49 @@ function NameList({
       </div>
     );
   }
+  const q = query.trim().toLowerCase();
+  const shown = q ? items.filter((it) => it.name.toLowerCase().includes(q)) : items;
   return (
-    <ul className="max-h-44 space-y-0.5 overflow-y-auto border border-line bg-white p-2">
-      {items.map((it) => (
-        <li key={it.name}>
-          <label
-            className={`flex items-start gap-2 py-0.5 text-sm ${
-              it.disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'
-            }`}
-          >
-            <input
-              type="checkbox"
-              className="mt-1"
-              disabled={it.disabled}
-              checked={selected.includes(it.name)}
-              onChange={() => onToggle(it.name)}
-            />
-            <span className="min-w-0">
-              <span className="font-mono text-xs text-ink">{it.name}</span>
-              <span className="ml-2 text-xs text-ink-faint">{it.hint}</span>
-            </span>
-          </label>
-        </li>
-      ))}
-    </ul>
+    <div>
+      {items.length > 6 ? (
+        <input
+          className="input mb-1 w-full text-xs"
+          placeholder={searchPlaceholder}
+          aria-label={searchPlaceholder}
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+        />
+      ) : null}
+      {shown.length === 0 ? (
+        <div className="border border-dashed border-line px-3 py-3 text-center text-xs text-ink-faint">
+          没有匹配「{query.trim()}」的项
+        </div>
+      ) : (
+        <ul className="max-h-44 space-y-0.5 overflow-y-auto border border-line bg-white p-2">
+          {shown.map((it) => (
+            <li key={it.name}>
+              <label
+                className={`flex items-start gap-2 py-0.5 text-sm ${
+                  it.disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'
+                }`}
+              >
+                <input
+                  type="checkbox"
+                  className="mt-1"
+                  disabled={it.disabled}
+                  checked={selected.includes(it.name)}
+                  onChange={() => onToggle(it.name)}
+                />
+                <span className="min-w-0">
+                  <span className="font-mono text-xs text-ink">{it.name}</span>
+                  <span className="ml-2 text-xs text-ink-faint">{it.hint}</span>
+                </span>
+              </label>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 

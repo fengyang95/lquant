@@ -2,8 +2,21 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AgentEventMsg, AskMessage, AskSession } from '@/lib/ask-api';
-import { cancelSession, connectAskEvents, getMessages, sendMessage } from '@/lib/ask-api';
+import {
+  cancelSession,
+  connectAskEvents,
+  getMessages,
+  regenerateSession,
+  sendMessage,
+} from '@/lib/ask-api';
 import ChatWindow from './ChatWindow';
+
+// 这两个 mock 用 vi.hoisted：ChatWindow 里的 ForkDialog 也 import forkSession，
+// 工厂函数被提升后必须有稳定的同一个 fn 实例，断言才不会指向另一个副本。
+const askApiMocks = vi.hoisted(() => ({
+  regenerateSession: vi.fn(),
+  forkSession: vi.fn(),
+}));
 
 vi.mock('@/lib/ask-api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/ask-api')>();
@@ -13,6 +26,22 @@ vi.mock('@/lib/ask-api', async (importOriginal) => {
     sendMessage: vi.fn(),
     cancelSession: vi.fn(),
     connectAskEvents: vi.fn(() => vi.fn()),
+    regenerateSession: askApiMocks.regenerateSession,
+    forkSession: askApiMocks.forkSession,
+  };
+});
+
+// ForkDialog 打开时会拉能力清单；这里给个假的，避免测试真的去打 fetch
+vi.mock('@/lib/agent-api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/agent-api')>();
+  return {
+    ...actual,
+    getCapabilities: vi.fn(async () => ({
+      providers: [{ id: 'codex', label: 'Codex', available: true }],
+      skills: [],
+      mcp_tools: [],
+      defaults: {},
+    })),
   };
 });
 
@@ -20,6 +49,7 @@ const mockedGetMessages = vi.mocked(getMessages);
 const mockedSendMessage = vi.mocked(sendMessage);
 const mockedCancel = vi.mocked(cancelSession);
 const mockedConnect = vi.mocked(connectAskEvents);
+const mockedRegenerate = vi.mocked(regenerateSession);
 
 const session: AskSession = {
   id: 's1',
@@ -171,5 +201,58 @@ describe('ChatWindow', () => {
     expect(btn).toBeDisabled();
     fireEvent.change(input, { target: { value: '大盘怎么样' } });
     expect(btn).not.toBeDisabled();
+  });
+
+  it('「重新生成」：没有 user 消息时禁用（没有提问可重跑）', async () => {
+    mockedGetMessages.mockResolvedValue([
+      msg({ id: 'a1', role: 'assistant', content: '之前的回答' }),
+    ]);
+    render(<ChatWindow session={session} />);
+    // 只有 assistant 历史 → 找不到「最后一条提问」，重跑无从谈起
+    await screen.findByText('之前的回答');
+    expect(screen.getByRole('button', { name: /重新生成/ })).toBeDisabled();
+  });
+
+  it('「重新生成」：有 user 消息且空闲时调 regenerateSession(sid)', async () => {
+    mockedGetMessages.mockResolvedValue([msg({ id: 'u1', role: 'user', content: '你好' })]);
+    mockedRegenerate.mockResolvedValue({
+      user_message: msg({ id: 'u1', role: 'user', content: '你好' }),
+      replaced_messages: 1,
+    });
+    render(<ChatWindow session={session} />);
+    await screen.findByText('你好');
+
+    const btn = screen.getByRole('button', { name: /重新生成/ });
+    await waitFor(() => expect(btn).not.toBeDisabled());
+    fireEvent.click(btn);
+
+    await waitFor(() => expect(mockedRegenerate).toHaveBeenCalledWith('s1'));
+  });
+
+  it('「重新生成」：运行中禁用（不能和正在跑的这一轮抢答）', async () => {
+    mockedGetMessages.mockResolvedValue([msg({ id: 'u1', role: 'user', content: '你好' })]);
+    mockedSendMessage.mockResolvedValue({ user_message: msg({ content: '再问一句' }) });
+    render(<ChatWindow session={session} />);
+    await screen.findByText('你好');
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /重新生成/ })).not.toBeDisabled(),
+    );
+
+    const input = screen.getByPlaceholderText('输入问题，Enter 发送，Shift+Enter 换行');
+    fireEvent.change(input, { target: { value: '再问一句' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mockedSendMessage).toHaveBeenCalledWith('s1', '再问一句'));
+
+    expect(screen.getByRole('button', { name: /重新生成/ })).toBeDisabled();
+  });
+
+  it('点「换后端」打开 ForkDialog（另开会话，而不是原地改 provider）', async () => {
+    mockedGetMessages.mockResolvedValue([]);
+    render(<ChatWindow session={session} />);
+    await screen.findByPlaceholderText('输入问题，Enter 发送，Shift+Enter 换行');
+
+    expect(screen.queryByRole('dialog', { name: '换后端另开会话' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '换后端' }));
+    expect(await screen.findByRole('dialog', { name: '换后端另开会话' })).toBeInTheDocument();
   });
 });

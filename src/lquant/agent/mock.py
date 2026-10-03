@@ -26,8 +26,9 @@ class MockAgentService(AgentService):
     provider = "mock"
 
     async def create_session(self, context: dict | None,
-                             agent_config: dict | None = None) -> Session:
-        return await self.store.create(context, agent_config)
+                             agent_config: dict | None = None, *,
+                             title: str | None = None) -> Session:
+        return await self.store.create(context, agent_config, title=title)
 
     async def list_sessions(self) -> list[Session]:
         return await self.store.list()

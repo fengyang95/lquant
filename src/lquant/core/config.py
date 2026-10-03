@@ -78,6 +78,12 @@ class AgentConfig(BaseModel):
     # 「正文整块到达」。codex 侧没有 token 级增量（见 agent/codex_json.py 的
     # 「没有 token 级增量」），所以这项对 codex provider 无效。
     partial_messages: bool = True
+    # 同时在跑的 agent 回答数上限（全局）。为什么要有：每个回答都是一个全自主
+    # 权限的 CLI 子进程，没有任何上限时一次「多个会话齐发」就能在本机上拉起
+    # 几十个 claude 进程把机器打死，而前端看到的只是「都在转圈」。超限的新请求
+    # 直接拒绝（429），不排队 —— 排队会让用户以为点了没反应，而且「排队中的
+    # 任务算不算已经在跑」在超时判定上又是一笔说不清的账。
+    max_concurrent_runs: int = 4
     # 模型不在这里配：两个 CLI 都复用自身的模型配置
     # （claude 的 settings / ANTHROPIC_*；codex 的 ~/.codex/config.toml），
     # 子进程按原样继承环境，见 docs/AGENT_MODEL.md。
@@ -97,24 +103,32 @@ class AgentConfig(BaseModel):
     @field_validator("default_skills", "default_mcp_tools", mode="before")
     @classmethod
     def _parse_capability_list(cls, v: Any) -> Any:
-        """接受 YAML 列表，或环境变量插值出的逗号串。
+        """接受 YAML 列表，或环境变量插值出的逗号串（见 :func:`parse_capability_list`）。"""
+        return parse_capability_list(v)
 
-        字符串形态：``all`` / 空白 = 不裁剪（``None``）；``none`` = 一个都不启用
-        （``[]``）；其余按逗号切分。
 
-        为什么要有显式的 ``none``：这两个开关的名字与工作区里那个
-        ``LQ_MCP_ENABLED_TOOLS`` 很像，但后者的空串表示**一个都不开**。
-        没有 ``none`` 的话，「想配成不启用」只能写成空串，而空串在这里是
-        「全开」—— 同一形状两种含义，是最容易静默给多权限的坑。
-        """
-        if isinstance(v, str):
-            v = v.strip()
-            if not v or v == "all":
-                return None
-            if v == "none":
-                return []
-            return [x.strip() for x in v.split(",") if x.strip()]
-        return v
+def parse_capability_list(v: Any) -> Any:
+    """能力名单的字符串形态 → 落库形态（``None`` = 全开 / ``[]`` = 一个都不启用）。
+
+    字符串：``all`` / 空白 = 不裁剪（``None``）；``none`` = 一个都不启用（``[]``）；
+    其余按逗号切分。非字符串（YAML 列表等）原样返回。
+
+    为什么要有显式的 ``none``：这两个开关的名字与工作区里那个
+    ``LQ_MCP_ENABLED_TOOLS`` 很像，但后者的空串表示**一个都不开**。
+    没有 ``none`` 的话，「想配成不启用」只能写成空串，而空串在这里是
+    「全开」—— 同一形状两种含义，是最容易静默给多权限的坑。
+
+    抽成模块级函数是为了让运行时配置层（``agent/runtime.py``）复用同一份解析：
+    设置页写进来的也是字符串，两处各写一份必然分叉。
+    """
+    if isinstance(v, str):
+        v = v.strip()
+        if not v or v == "all":
+            return None
+        if v == "none":
+            return []
+        return [x.strip() for x in v.split(",") if x.strip()]
+    return v
 
 
 class Settings(BaseModel):

@@ -8,9 +8,11 @@ import type { AskSession } from '@/lib/ask-api';
 import { createSession, deleteSession, listSessions } from '@/lib/ask-api';
 import type { AgentCapabilities, AgentConfig } from '@/lib/agent-api';
 import { getCapabilities } from '@/lib/agent-api';
+import AiSettingsPanel from '@/components/ask/AiSettingsPanel';
 import ChatWindow from '@/components/ask/ChatWindow';
 import ContextChip from '@/components/ask/ContextChip';
 import NewSessionDialog from '@/components/ask/NewSessionDialog';
+import RunningRuns from '@/components/ask/RunningRuns';
 import SessionList from '@/components/ask/SessionList';
 
 function AskWorkspace() {
@@ -24,6 +26,7 @@ function AskWorkspace() {
   // 不让一个可选的配置入口把「新建会话」这条主路径也堵死。
   const [caps, setCaps] = useState<AgentCapabilities | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
@@ -113,6 +116,13 @@ function AskWorkspace() {
     setCurrentId(id);
   }, []);
 
+  /** 换后端另开会话成功：把新会话插到列表最前并切过去。
+   *  新会话带 `briefing`，界面上仍是干净对话（简报在首次调用时拼进 prompt）。 */
+  const handleForked = useCallback((created: AskSession) => {
+    setSessions((prev) => [created, ...prev]);
+    setCurrentId(created.id);
+  }, []);
+
   if (initState === 'loading') return <Loading />;
   if (initState === 'error') return <ErrorNote>加载失败：{initError}</ErrorNote>;
 
@@ -123,7 +133,19 @@ function AskWorkspace() {
       <PageHeader
         title="问 AI"
         sub={symbol ? `上下文 ${symbol}` : 'Agent 对话分析'}
-        actions={symbol ? <ContextChip symbol={symbol} /> : null}
+        actions={
+          <>
+            {symbol ? <ContextChip symbol={symbol} /> : null}
+            <RunningRuns
+              onOpen={(sid) => {
+                setCurrentId(sid);
+              }}
+            />
+            <button type="button" className="btn btn-sm" onClick={() => setSettingsOpen(true)}>
+              ⚙ AI 设置
+            </button>
+          </>
+        }
       />
       {/* ready 态的错误反馈：新建/删除失败不能静默 */}
       {initError ? <ErrorNote>操作失败：{initError}</ErrorNote> : null}
@@ -145,6 +167,7 @@ function AskWorkspace() {
               onSessionChange={(updated) =>
                 setSessions((prev) => prev.map((s) => (s.id === updated.id ? updated : s)))
               }
+              onForked={handleForked}
             />
           ) : (
             <Empty>还没有会话 —— 点击左上角「新建会话」开始提问</Empty>
@@ -160,6 +183,7 @@ function AskWorkspace() {
           onCreate={(cfg) => void handleCreate(cfg)}
         />
       ) : null}
+      {settingsOpen ? <AiSettingsPanel onClose={() => setSettingsOpen(false)} /> : null}
     </div>
   );
 }

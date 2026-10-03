@@ -29,6 +29,11 @@ export interface AgentConfig {
   provider?: string | null;
   skills?: string[] | null;
   mcp_tools?: string[] | null;
+  /** 会话级超时（秒）。`null` / 缺省 = 跟随全局 `agent.timeout_seconds`。 */
+  timeout_seconds?: number | null;
+  /** 会话级全自主权限。`null` / 缺省 = 跟随全局 `agent.skip_permissions`。
+   *  **不是**「false」的同义词：前者是「回到默认档」，后者是「这一会话明确关掉」。 */
+  skip_permissions?: boolean | null;
 }
 
 export interface AgentCapabilities {
@@ -95,6 +100,87 @@ export function resolveDefaults(caps: AgentCapabilities): {
     skills: caps.defaults.skills ?? selectableSkills(caps),
     mcpTools: caps.defaults.mcp_tools ?? caps.mcp_tools.map((t) => t.name),
   };
+}
+
+/** frontmatter 里的两个必填项 */
+export interface SkillFrontmatter {
+  name: string;
+  description: string;
+}
+
+/** 去引号：`description: "甲"` 与 `description: 甲` 都要能认出值来。
+ *
+ *  为什么在前端也认一遍 YAML：这里**不做校验**（门禁仍在后端
+ *  `capabilities.validate_skill_content`），只用来驱动「补全 frontmatter」
+ *  这个编辑动作与「哪一项缺了」的提示。真按 YAML 全套解析一遍既没必要，
+ *  也会和后端的 `yaml.safe_load` 慢慢对不上。 */
+function unquote(raw: string): string {
+  const v = raw.trim();
+  if (v.length >= 2 && ((v.startsWith('"') && v.endsWith('"'))
+    || (v.startsWith("'") && v.endsWith("'")))) {
+    return v.slice(1, -1).replace(/\\(["\\])/g, '$1');
+  }
+  return v;
+}
+
+/** 读 SKILL.md 顶部 frontmatter 的 name / description；没有 frontmatter 返回 null。
+ *
+ *  与后端 `agent/a2a/card.parse_frontmatter` 同形状：首行必须是 `---`，
+ *  再找到下一条 `---`。两处口径不一致的话，会出现「前端说合格、保存被拒」
+ *  这种最难解释的交互。 */
+export function readSkillFrontmatter(text: string): SkillFrontmatter | null {
+  const lines = text.split(/\r?\n/);
+  if (lines.length === 0 || lines[0].trim() !== '---') return null;
+  let end = -1;
+  for (let i = 1; i < lines.length; i += 1) {
+    if (lines[i].trim() === '---') {
+      end = i;
+      break;
+    }
+  }
+  if (end < 0) return null;
+  const meta: SkillFrontmatter = { name: '', description: '' };
+  for (const line of lines.slice(1, end)) {
+    const m = /^(name|description)\s*:\s*(.*)$/.exec(line.trim());
+    if (!m) continue;
+    meta[m[1] as 'name' | 'description'] = unquote(m[2]);
+  }
+  return meta;
+}
+
+/** 补全 SKILL.md 的 frontmatter（就地修一个「装了但 agent 看不到」的 skill）。
+ *
+ *  只做最小的两件事：补 `---` 包裹、补 name / description。**不改正文** ——
+ *  用户的正文才是他写这个 skill 的目的，自动「重排」它比不修更糟。
+ *
+ *  name 取目录名而不是用户填的描述：`list_skills` 以目录名做 id、以 frontmatter
+ *  name 做展示名，两者不一致时能力清单里会出现两个名字，用户只会更困惑。
+ *
+ *  ⚠️ 目录名本身不合形状（大写、空格、下划线）时**修内容没用** —— 那种情况
+ *  得重命名目录，界面上要显式说明（见 SkillEditor 的提示）。 */
+export function repairSkillContent(text: string, dirName: string): string {
+  const fm = readSkillFrontmatter(text);
+  const fallbackDesc = `${dirName} 的说明：写清它解决什么问题、什么时候该用它`;
+  const esc = (s: string) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  if (fm === null) {
+    const body = text.replace(/^\s*\n+/, '');
+    return `---\nname: ${dirName}\ndescription: "${esc(fallbackDesc)}"\n---\n\n${body}`;
+  }
+  const name = fm.name.trim() || dirName;
+  const desc = fm.description.trim() || fallbackDesc;
+  const lines = text.split(/\r?\n/);
+  let end = -1;
+  for (let i = 1; i < lines.length; i += 1) {
+    if (lines[i].trim() === '---') {
+      end = i;
+      break;
+    }
+  }
+  const missing: string[] = [];
+  if (!fm.name.trim()) missing.push(`name: ${name}`);
+  if (!fm.description.trim()) missing.push(`description: "${esc(desc)}"`);
+  const head = [...lines.slice(0, end), ...missing, ...lines.slice(end)];
+  return head.join('\n');
 }
 
 export const NEW_SKILL_TEMPLATE = `---

@@ -100,6 +100,56 @@ export function sendMessage(
     `${BASE}/sessions/${encodeURIComponent(id)}/messages`, { content });
 }
 
+/** 重新生成：重跑最后一条提问，**替换**掉它后面的回答。
+ *
+ *  后端会先删掉旧回答再跑，所以调用方收到 202 后直接拉一次消息即可看到
+ *  「旧答案已消失」；`replaced_messages` 是删掉的条数（0 也正常：上一轮失败
+ *  没留下回答）。
+ *
+ *  走 `postData`：400（还没提问）/ 409（正在跑）的后端文案要能透出来。 */
+export function regenerateSession(
+  id: string,
+): Promise<{ user_message: AskMessage; replaced_messages: number }> {
+  return postData<{ user_message: AskMessage; replaced_messages: number }>(
+    `${BASE}/sessions/${encodeURIComponent(id)}/regenerate`, {});
+}
+
+/** 换后端另开会话：复制本会话的上下文与能力集，在**另一个 provider** 上建新会话。
+ *
+ *  为什么不是「改 provider」：CLI 侧会话 id（claude 的 session_id / codex 的
+ *  thread_id）共用一列，中途换 provider 续接的是另一个 CLI 的会话，上下文会串。
+ *  老会话原样保留，新会话通过 `context.briefing` 拿到老会话的对话简报。 */
+export function forkSession(id: string, provider: string): Promise<AskSession> {
+  return postData<AskSession>(
+    `${BASE}/sessions/${encodeURIComponent(id)}/fork`, { provider });
+}
+
+/** 一个正在跑的 agent 回答（`GET /ask/runs`） */
+export interface RunInfo {
+  session_id: string;
+  provider: string;
+  elapsed_seconds: number;
+  /** CLI 子进程 pid；mock 这类无子进程的 provider 为 null */
+  pid: number | null;
+  workspace: string;
+}
+
+export interface RunsSnapshot {
+  runs: RunInfo[];
+  max_concurrent_runs: number;
+}
+
+/** 正在跑的 agent（跨 provider）。用于「谁在跑、跑了多久、pid 多少」。 */
+export function listRuns(): Promise<RunsSnapshot> {
+  return getData<RunsSnapshot>(`${BASE}/runs`);
+}
+
+/** 终止某条会话正在跑的回答（运行中列表里直接点掉，不用先切会话）。 */
+export function killRun(id: string): Promise<{ ok: boolean; killed: boolean }> {
+  return postData<{ ok: boolean; killed: boolean }>(
+    `${BASE}/runs/${encodeURIComponent(id)}/kill`, {});
+}
+
 /** 把 Agent 事件流归约进消息列表（纯函数，不可变更新）。
  *  done/error 原样返回——落库消息的最终替换由调用方拉取完成。 */
 export function reduceMessages(msgs: AskMessage[], ev: AgentEventMsg): AskMessage[] {

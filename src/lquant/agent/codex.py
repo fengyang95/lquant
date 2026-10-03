@@ -59,15 +59,13 @@ class CodexAgentService(CliAgentService):
         super().__init__(store)
         self._codex_path = codex_path or s.agent.codex_path
         self._codex_args = codex_args or []
-        # 同 claude 的 skip_permissions：无头运行必须跳过审批，否则连 MCP
-        # 工具都调不动；但它同时关掉沙箱，是「全自主」权限。
-        self._skip_permissions = (
-            s.agent.skip_permissions if skip_permissions is None else skip_permissions)
+        # 同 claude：权限不在构造时定值（None = 跟随运行时配置，前端可改）。
+        # 无头运行必须跳过审批，否则连 MCP 工具都调不动；它同时关掉沙箱。
         self._init_runtime(
             workspace_dir=workspace_dir or s.agent.workspace_dir,
             root=s.root if root is None else root,
-            timeout_seconds=timeout_seconds if timeout_seconds is not None
-            else s.agent.timeout_seconds,
+            timeout_seconds=timeout_seconds,
+            skip_permissions=skip_permissions,
         )
 
     # ---- 命令行 -----------------------------------------------------------
@@ -91,8 +89,8 @@ class CodexAgentService(CliAgentService):
             "-c", f"mcp_servers.{_MCP_SERVER_NAME}.env={env_toml}",
         ]
 
-    def _build_cmd(self, content: str, cli_sid: str | None,
-                   workspace: Path) -> list[str]:
+    def _build_cmd(self, content: str, cli_sid: str | None, workspace: Path,
+                   cfg: dict | None = None) -> list[str]:
         cmd = [
             self._codex_path,
             "exec",
@@ -101,7 +99,7 @@ class CodexAgentService(CliAgentService):
             "--skip-git-repo-check",
             "-C", str(workspace),
         ]
-        if self._skip_permissions:
+        if self._resolve_skip_permissions(cfg):
             cmd.append("--dangerously-bypass-approvals-and-sandbox")
         else:
             cmd += ["-s", "workspace-write"]

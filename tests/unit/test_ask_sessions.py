@@ -2,7 +2,7 @@
 import aiosqlite
 import pytest
 
-from lquant.agent.sessions import SessionStore
+from lquant.agent.sessions import SessionStore, render_briefing
 
 
 @pytest.fixture()
@@ -119,3 +119,83 @@ async def test_migrate_adds_agent_config_to_legacy_db(tmp_path):
         assert (await s.get("old1")).agent_config == {"provider": "codex"}
     finally:
         await s.close()
+
+
+# ---- 另开会话：标题、删旧答案、上下文简报 ---------------------------------
+
+
+async def test_create_accepts_title(store):
+    """fork 时给新会话一个带来源的标题；空白标题回退默认，不落一个空标题。"""
+    ses = await store.create(None, {"provider": "codex"}, title="  大盘 → codex  ")
+    assert ses.title == "大盘 → codex"
+    assert (await store.get(ses.id)).title == "大盘 → codex"
+    assert (await store.create(None, title="   ")).title == "新会话"
+
+
+async def test_delete_assistant_after_keeps_earlier_turns(store):
+    """重新生成：只删目标 user 消息**之后**的 assistant，前面的历史不许动。
+
+    ``(created_at, rowid)`` 的排序口径必须与 ``messages()`` 一致 —— 两处不一致
+    会导致「界面上看到的顺序」与「删的是哪几条」对不上，而这条路径删错了
+    是**静默**的（用户只发现答案不见了）。
+    """
+    ses = await store.create(None)
+    u1 = await store.add_message(ses.id, "user", "第一问")
+    a1 = await store.add_message(ses.id, "assistant", "第一答")
+    u2 = await store.add_message(ses.id, "user", "第二问")
+    await store.add_message(ses.id, "assistant", "第二答")
+    await store.add_message(ses.id, "assistant", "第二答重跑")
+
+    assert await store.delete_assistant_after(ses.id, u2.id) == 2
+    left = [m.id for m in await store.messages(ses.id)]
+    assert left == [u1.id, a1.id, u2.id]
+    # 第二问后面那两条 assistant 都没了；再删一次是空操作（幂等）
+    assert await store.delete_assistant_after(ses.id, u2.id) == 0
+
+    assert await store.delete_assistant_after(ses.id, "missing") == 0
+
+
+async def test_delete_assistant_after_ignores_system_rows(store):
+    """system 行不是「回答」，删旧答案时不该连它一起抹掉。"""
+    ses = await store.create(None)
+    u = await store.add_message(ses.id, "user", "问")
+    await store.add_message(ses.id, "system", "运行时信息")
+    await store.add_message(ses.id, "assistant", "答")
+    assert await store.delete_assistant_after(ses.id, u.id) == 1
+    assert [m.role for m in await store.messages(ses.id)] == ["user", "system"]
+
+
+def _msgs(*pairs):
+    from lquant.agent.schemas import Message
+
+    return [Message(id=f"m{i}", session_id="s", role=r, content=c)
+            for i, (r, c) in enumerate(pairs)]
+
+
+def test_render_briefing_orders_oldest_first():
+    text = render_briefing(_msgs(("user", "第一问"), ("assistant", "第一答"),
+                                 ("user", "第二问")))
+    assert text == "用户：第一问\n\n助手：第一答\n\n用户：第二问"
+
+
+def test_render_briefing_keeps_recent_and_drops_oldest():
+    """超预算时**从最早的开始丢**：用户接着问的总是最后那几轮。"""
+    text = render_briefing(
+        _msgs(("user", "很久以前" * 20), ("user", "最近这一问")), max_chars=40)
+    assert "最近这一问" in text
+    assert "很久以前" not in text
+
+
+def test_render_briefing_truncates_when_latest_alone_exceeds_budget():
+    """最近一条本身就超预算：截尾保留，不能返回空串（那等于没带上下文）。"""
+    text = render_briefing(_msgs(("assistant", "前言" + "尾部关键结论")), max_chars=30)
+    assert text
+    assert text.endswith("尾部关键结论")
+    assert len(text) <= 30
+
+
+def test_render_briefing_skips_system_and_empty():
+    """system 是本机运行时噪声（不该转述给别的后端），空 assistant 是占位。"""
+    text = render_briefing(_msgs(("system", "MCP 白名单：xxx"),
+                                 ("user", "问"), ("assistant", "")))
+    assert text == "用户：问"

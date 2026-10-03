@@ -6,6 +6,7 @@ import {
   getCapabilities,
   getSkill,
   putSkill,
+  readSkillFrontmatter,
   type AgentCapabilities,
 } from '@/lib/agent-api';
 import { renderPage } from '@/test/page-utils';
@@ -147,5 +148,75 @@ describe('SkillEditor', () => {
     mockedGet.mockRejectedValue(new Error('skill 不存在: alpha'));
     renderPage(<SkillEditor />);
     expect(await screen.findByText('✗ skill 不存在: alpha')).toBeInTheDocument();
+  });
+
+  it('搜索：只留下匹配项；搜不到时说明搜的是什么，而不是给一个空列表', async () => {
+    renderPage(<SkillEditor />);
+    await screen.findByText('alpha');
+    const search = screen.getByLabelText('搜索 skill');
+
+    fireEvent.change(search, { target: { value: 'alp' } });
+    expect(screen.getByText('alpha')).toBeInTheDocument();
+    expect(screen.queryByText('broken')).toBeNull();
+
+    fireEvent.change(search, { target: { value: 'zzz' } });
+    expect(screen.getByText('没有匹配「zzz」的 skill')).toBeInTheDocument();
+    expect(screen.queryByText('alpha')).toBeNull();
+  });
+
+  it('frontmatter 不合格的 skill：提示不可用，一键补全后内容合法且提示消失', async () => {
+    const badBody = '# broken 正文\n\n步骤一：先查什么。';
+    mockedGet.mockImplementation(async (name) => ({
+      name,
+      content:
+        name === 'broken' ? badBody : '---\nname: alpha\ndescription: 甲\n---\n\n# alpha',
+    }));
+    renderPage(<SkillEditor />);
+    const alphaTa = (await screen.findByLabelText('alpha 的 SKILL.md')) as HTMLTextAreaElement;
+    await waitFor(() => expect(alphaTa.value).toContain('name: alpha'));
+
+    fireEvent.click(screen.getByText('broken'));
+    const ta = (await screen.findByLabelText('broken 的 SKILL.md')) as HTMLTextAreaElement;
+    expect(ta.value).toBe(badBody);
+    // 不合格的 skill 在能力清单里选不了，用户至少要被告知为什么
+    expect(screen.getByText(/这个 skill 目前/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /补全 frontmatter/ }));
+
+    const repaired = (screen.getByLabelText('broken 的 SKILL.md') as HTMLTextAreaElement).value;
+    const fm = readSkillFrontmatter(repaired);
+    expect(fm?.name).toBe('broken'); // name 取目录名，与 list_skills 的 id 对齐
+    expect(fm?.description).toBeTruthy();
+    // 正文必须原样保留：用户的正文才是他写这个 skill 的目的
+    expect(repaired).toContain(badBody);
+    // 修完提示要消失，否则用户会以为没修好
+    expect(screen.queryByText(/这个 skill 目前/)).toBeNull();
+  });
+
+  it('已合规的 skill 不显示「不可用」提示（没有缺项就不该弹警告）', async () => {
+    mockedGet.mockResolvedValue({
+      name: 'alpha',
+      content: '---\nname: alpha\ndescription: 甲\n---\n正文',
+    });
+    renderPage(<SkillEditor />);
+    const ta = (await screen.findByLabelText('alpha 的 SKILL.md')) as HTMLTextAreaElement;
+    await waitFor(() => expect(ta.value).toBe('---\nname: alpha\ndescription: 甲\n---\n正文'));
+    expect(screen.queryByText(/这个 skill 目前/)).toBeNull();
+    expect(screen.queryByRole('button', { name: /补全 frontmatter/ })).toBeNull();
+  });
+
+  it('新建态不显示「不可用」提示：内容还没写完是正常中间状态', async () => {
+    renderPage(<SkillEditor />);
+    await screen.findByDisplayValue('# alpha 正文');
+    fireEvent.change(screen.getByPlaceholderText('新 skill 名'), {
+      target: { value: 'my-new' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '新建' }));
+
+    const ta = screen.getByLabelText('my-new 的 SKILL.md');
+    // 故意把 frontmatter 删掉：新建态下也不该弹警告（isNew 一律豁免）
+    fireEvent.change(ta, { target: { value: '# 还没写 frontmatter' } });
+    expect(screen.queryByText(/这个 skill 目前/)).toBeNull();
+    expect(screen.queryByRole('button', { name: /补全 frontmatter/ })).toBeNull();
   });
 });

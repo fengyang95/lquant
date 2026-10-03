@@ -84,17 +84,17 @@ def test_capability_update_rejects_provider():
 
 
 def test_capability_update_rejects_unknown_field():
-    with pytest.raises(cap.CapabilityError, match="不支持的能力项"):
+    with pytest.raises(cap.CapabilityError, match="不支持的配置项"):
         cap.normalize_capability_update({"whatever": 1})
-    with pytest.raises(cap.CapabilityError, match="不支持的能力项"):
+    with pytest.raises(cap.CapabilityError, match="不支持的配置项"):
         cap.normalize_capability_update({"skills": ["alpha"], "whatever": 1})
     # context 是建会话字段，不是能力项，同样不能出现在这个 PATCH 里
-    with pytest.raises(cap.CapabilityError, match="不支持的能力项"):
+    with pytest.raises(cap.CapabilityError, match="不支持的配置项"):
         cap.normalize_capability_update({"context": {"symbol": "600519"}})
 
 
 def test_capability_update_rejects_empty():
-    with pytest.raises(cap.CapabilityError, match="没有可修改的能力项"):
+    with pytest.raises(cap.CapabilityError, match="没有可修改的配置项"):
         cap.normalize_capability_update({})
 
 
@@ -110,6 +110,52 @@ def test_capability_update_reuses_agent_config_validation():
 
 def test_mutable_fields_constant_excludes_provider():
     assert cap.MUTABLE_CAPABILITY_FIELDS == ("skills", "mcp_tools")
+    assert cap.MUTABLE_SESSION_FIELDS == (
+        "skills", "mcp_tools", "timeout_seconds", "skip_permissions")
+
+
+# ---- 会话级运行参数（timeout_seconds / skip_permissions） -------------------
+
+
+def test_capability_update_accepts_run_fields():
+    assert cap.normalize_capability_update({"timeout_seconds": 600}) == {
+        "timeout_seconds": 600}
+    assert cap.normalize_capability_update({"skip_permissions": False}) == {
+        "skip_permissions": False}
+    # 能力项与运行参数可以一起改
+    assert cap.normalize_capability_update(
+        {"skills": ["alpha"], "timeout_seconds": "120", "skip_permissions": True}
+    ) == {"skills": ["alpha"], "timeout_seconds": 120, "skip_permissions": True}
+
+
+def test_capability_update_run_field_none_means_follow_default():
+    """``None`` = 回到全局默认档。**不能**与能力的 None（= 全开）混为一谈。"""
+    assert cap.normalize_capability_update({"timeout_seconds": None}) == {
+        "timeout_seconds": None}
+    assert cap.normalize_capability_update({"skip_permissions": None}) == {
+        "skip_permissions": None}
+
+
+@pytest.mark.parametrize("bad", [5, 3601, 0, -1, "abc", [], {}])
+def test_capability_update_rejects_out_of_range_timeout(bad):
+    with pytest.raises(cap.CapabilityError, match="超时"):
+        cap.normalize_capability_update({"timeout_seconds": bad})
+
+
+@pytest.mark.parametrize("bad", ["true", 1, 0, "yes"])
+def test_capability_update_rejects_non_bool_skip_permissions(bad):
+    """字符串 "true" 也不收：JSON 里本来就有真正的布尔，收字符串等于两种形态
+    都能进库，读回来时「到底是 False 还是解析失败」说不清。"""
+    with pytest.raises(cap.CapabilityError, match="skip_permissions"):
+        cap.normalize_capability_update({"skip_permissions": bad})
+
+
+def test_timeout_bounds_are_the_only_source():
+    assert (cap.TIMEOUT_MIN_SECONDS, cap.TIMEOUT_MAX_SECONDS) == (10, 3600)
+    assert cap.clean_timeout_seconds(cap.TIMEOUT_MIN_SECONDS) == 10
+    assert cap.clean_timeout_seconds(cap.TIMEOUT_MAX_SECONDS) == 3600
+    with pytest.raises(cap.CapabilityError):
+        cap.clean_timeout_seconds(cap.TIMEOUT_MAX_SECONDS + 1)
 
 
 # ---- skill 名与路径安全 ---------------------------------------------------
