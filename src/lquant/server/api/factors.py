@@ -237,6 +237,56 @@ def validate_expression(v: _ValidateIn) -> dict:
     return {"ok": True, "error": None}
 
 
+@router.get("/ops")
+def list_ops() -> dict:
+    """因子 DSL 算子目录 —— 因子编辑画布据此动态生成积木（唯一真相源）。
+
+    画布不自持算子定义：元数、参数、中文语义全部从这里来，前端与引擎
+    就不会出现两套口径（Greater 取大 vs 比较、Ts_ArgMax 的 0/1 基准
+    这类分歧无从漂移）。
+
+    返回两部分：`ops` 是注册表里的函数式算子；`infix` 是语法内建的中缀
+    算子（`+ - * / < >`，由 parser 直接处理，不在 OPS 注册表里）。
+    """
+    from lquant.factors.ops.catalog import infix_catalog, op_catalog
+
+    return {"ops": op_catalog(), "infix": infix_catalog()}
+
+
+@router.get("/fields")
+def list_fields() -> list[dict]:
+    """因子可用字段清单 —— 与静态校验白名单同源（factors/fields.py）。"""
+    from lquant.factors.fields import field_catalog
+
+    return field_catalog()
+
+
+class _AstIn(BaseModel):
+    expression: str
+
+
+@router.post("/ast")
+def expression_ast(v: _AstIn) -> dict:
+    """DSL 表达式 → AST JSON，供画布把已有因子反解析成 DAG。
+
+    前端不重写词法/语法分析器（两份解析器必然漂移），只消费这里产出的树
+    做形状映射。解析或静态检查失败返回 422 + 原因原文。
+    """
+    expr = (v.expression or "").strip()
+    if not expr:
+        raise HTTPException(422, "表达式为空")
+    try:
+        from lquant.factors.dsl.analyzer import check
+        from lquant.factors.dsl.json_ast import to_dict
+        from lquant.factors.dsl.parser import parse
+
+        ast = parse(expr, "ast")
+        check(ast)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(422, f"DSL 解析失败: {e}") from e
+    return {"expression": expr, "ast": to_dict(ast.root)}
+
+
 class FactorUpdateIn(BaseModel):
     """部分更新：None 字段保持原值。expression 传空串表示清空 DSL。"""
     expression: str | None = None

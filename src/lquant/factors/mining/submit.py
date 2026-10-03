@@ -198,9 +198,14 @@ def g0_static(expr, allowed_fields=None):
 
 
 def _daily_fields():
-    """日线表可用字段白名单（与 covariates/provider 口径一致）。"""
-    return {"trade_date", "symbol", "open", "high", "low", "close", "volume",
-            "amount", "pre_close", "turnover_rate", "adj_factor", "float_mv"}
+    """日线表可用字段白名单（与 covariates/provider 口径一致）。
+
+    真相源在 `factors/fields.py` —— 因子编辑画布的字段面板与这里共用一份，
+    避免「画布能选到、引擎不认」的漂移。
+    """
+    from lquant.factors.fields import daily_fields
+
+    return daily_fields()
 
 
 def dt_now():

@@ -7,21 +7,9 @@
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { post } from '@/lib/api';
-
-const OPERATORS: { label: string; insert: string; hint: string }[] = [
-  { label: '$close', insert: '$close', hint: '收盘价' },
-  { label: '$open', insert: '$open', hint: '开盘价' },
-  { label: '$high', insert: '$high', hint: '最高价' },
-  { label: '$low', insert: '$low', hint: '最低价' },
-  { label: '$volume', insert: '$volume', hint: '成交量' },
-  { label: 'Mean', insert: 'Mean(', hint: '时序均值' },
-  { label: 'Rank', insert: 'Rank(', hint: '截面排名' },
-  { label: 'Std', insert: 'Std(', hint: '时序标准差' },
-  { label: 'Corr', insert: 'Corr(', hint: '相关系数' },
-  { label: 'Ref', insert: 'Ref(', hint: '滞后取值' },
-  { label: 'Delta', insert: 'Delta(', hint: '一阶差分' },
-  { label: 'Ratio', insert: 'Ratio(', hint: '比值' },
-];
+import { EMPTY_CATALOG, fetchCatalog } from '@/lib/factor-canvas/catalog';
+import { snippetGroups } from '@/lib/factor-canvas/snippet';
+import type { Catalog } from '@/lib/factor-canvas/types';
 
 export type EditingFactor = {
   name: string;
@@ -31,16 +19,18 @@ export type EditingFactor = {
 
 const NAME_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
-/** 算子按钮：点击把 insert 追加到表达式末尾 */
-function OpButton({ op, onInsert }: { op: typeof OPERATORS[number]; onInsert: (s: string) => void }) {
+type SnippetItem = { key: string; label: string; insert: string; hint: string };
+
+/** 算子按钮：点击把片段追加到表达式末尾 */
+function OpButton({ item, onInsert }: { item: SnippetItem; onInsert: (s: string) => void }) {
   return (
     <button
       type="button"
-      title={op.hint}
-      onClick={() => onInsert(op.insert)}
+      title={item.hint}
+      onClick={() => onInsert(item.insert)}
       className="tag font-mono"
     >
-      {op.label}
+      {item.label}
     </button>
   );
 }
@@ -59,7 +49,29 @@ export default function RegisterForm({
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState('');
   const [isEditing, setIsEditing] = useState(Boolean(editing));
+  const [catalog, setCatalog] = useState<Catalog>(EMPTY_CATALOG);
+  const [catalogFailed, setCatalogFailed] = useState(false);
   const exprRef = useRef<HTMLInputElement>(null);
+
+  // 算子清单来自服务端目录。旧版在这里硬编码了 Mean/Std/Corr/Ref/Delta/Ratio，
+  // 其中 Delta/Ratio/Ref 引擎根本不认 —— 点出来的表达式过不了校验。
+  useEffect(() => {
+    let alive = true;
+    fetchCatalog()
+      .then((next) => {
+        if (alive) setCatalog(next);
+      })
+      .catch(() => {
+        // 目录拉不到就退化成纯文本输入，不挡注册流程 —— 但要说清楚，
+        // 否则界面会永远停在"加载中…"
+        if (alive) setCatalogFailed(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const groups = useMemo(() => snippetGroups(catalog), [catalog]);
 
   // 编辑模式切换 → 回填并进入编辑；编辑清空（null）→ 退出编辑
   useEffect(() => {
@@ -183,9 +195,22 @@ export default function RegisterForm({
         <p className="text-xs text-red-600">DSL 校验失败：{dslError}</p>
       )}
       {msg && <p className="text-xs text-ink-dim">{msg}</p>}
-      <div className="flex flex-wrap items-center gap-1 pt-1">
-        <span className="text-xs text-ink-faint">点击插入：</span>
-        {OPERATORS.map((op) => <OpButton key={op.label} op={op} onInsert={insertOp} />)}
+      <div className="pt-1">
+        <div className="mb-1 text-xs text-ink-faint">点击插入（算子清单来自服务端目录）：</div>
+        {groups.length === 0 ? (
+          <span className="text-xs text-ink-faint">
+            {catalogFailed ? '算子目录加载失败，可直接手写表达式' : '算子目录加载中…'}
+          </span>
+        ) : (
+          groups.map((group) => (
+            <div key={group.label} className="mb-1 flex flex-wrap items-center gap-1">
+              <span className="w-20 shrink-0 text-[11px] text-ink-faint">{group.label}</span>
+              {group.items.map((item) => (
+                <OpButton key={item.key} item={item} onInsert={insertOp} />
+              ))}
+            </div>
+          ))
+        )}
       </div>
     </div>
   );

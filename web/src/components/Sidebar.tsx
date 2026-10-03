@@ -18,6 +18,7 @@ const GROUPS: { label: string; items: { href: string; label: string }[] }[] = [
     label: '研究',
     items: [
       { href: '/factors', label: '因子' },
+      { href: '/factors/editor', label: '因子编辑' },
       { href: '/factors/mine', label: '因子挖掘' },
       { href: '/factors/reports', label: '因子报告' },
       { href: '/fundamental', label: '基本面' },

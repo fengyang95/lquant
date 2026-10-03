@@ -72,12 +72,44 @@ describe('RegisterForm', () => {
     expect(screen.getByRole('button', { name: '注册' })).toBeDisabled();
   });
 
-  it('点击算子插入表达式末尾', () => {
+  it('算子面板由服务端目录驱动，点击插入的是完整合法片段', async () => {
+    mockGet.mockImplementation((path: string) => {
+      if (path === '/factors/ops') {
+        return Promise.resolve({
+          ops: [
+            {
+              name: 'Ts_Mean',
+              category: 'TS',
+              label: '时序均值',
+              min_window: 1,
+              series_arity: 1,
+              params: [{ name: 'n', type: 'window', required: true, default: null }],
+            },
+          ],
+          infix: [{ token: '/', label: '除法', arity: 2 }],
+        });
+      }
+      if (path === '/factors/fields') {
+        return Promise.resolve([{ name: 'close', label: '收盘价' }]);
+      }
+      return Promise.resolve([]);
+    });
+
     render(<RegisterForm />);
     const input = screen.getByPlaceholderText(/Rank\(Ts_Mean/) as HTMLInputElement;
-    fireEvent.change(input, { target: { value: 'Rank(' } });
-    fireEvent.click(screen.getByRole('button', { name: '$close' }));
-    expect(input.value).toBe('Rank($close');
+
+    // 目录异步到达后按钮才出现
+    fireEvent.click(await screen.findByRole('button', { name: '时序均值' }));
+    // 关键：插入的是带元数与窗口的完整调用，而不是旧版的半截 `Mean(`
+    expect(input.value).toBe('Ts_Mean($close,5)');
+
+    fireEvent.click(screen.getByRole('button', { name: '收盘价' }));
+    expect(input.value).toBe('Ts_Mean($close,5)$close');
+
+    // 旧版写死的引擎不认识的算子名不该再出现
+    for (const stale of ['Delta', 'Ratio', 'Ref']) {
+      expect(screen.queryByRole('button', { name: stale })).not.toBeInTheDocument();
+    }
   });
 
   it('编辑模式回填并支持取消', async () => {
