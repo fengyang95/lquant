@@ -1,5 +1,7 @@
 import type { AskMessage } from '@/lib/ask-api';
 
+import Markdown from '../Markdown';
+
 /** 单条消息：user 右对齐、assistant 左对齐；tool_calls 渲染为折叠 details */
 export default function Message({ message }: { message: AskMessage }) {
   const isUser = message.role === 'user';
@@ -24,19 +26,22 @@ export default function Message({ message }: { message: AskMessage }) {
             </div>
           </details>
         )}
+        {/* 用户消息保持纯文本：输入里的 `*`、`#` 不该被当成格式。
+            助手回答走 Markdown（表格 / 列表 / 代码块），见 components/Markdown.tsx。 */}
         {message.content ? (
-          <div
-            className={`whitespace-pre-wrap rounded-sm px-3 py-2 text-sm leading-relaxed ${
-              isUser ? 'bg-up/10 text-ink' : 'bg-panel text-ink'
-            }`}
-          >
-            {message.content}
-          </div>
+          isUser ? (
+            <div className="whitespace-pre-wrap rounded-sm bg-up/10 px-3 py-2 text-sm leading-relaxed text-ink">
+              {message.content}
+            </div>
+          ) : (
+            <div className="rounded-sm bg-panel px-3 py-2">
+              <Markdown content={message.content} />
+            </div>
+          )
         ) : (
           <div className="px-1 text-xs text-ink-faint">正在生成…</div>
         )}
       </div>
-      {/* 纯文本 + 换行渲染，Markdown 后置（YAGNI） */}
     </div>
   );
 }

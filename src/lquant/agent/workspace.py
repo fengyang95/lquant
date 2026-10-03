@@ -40,8 +40,13 @@ _CLAUDE_MD_TEMPLATE = """\
 1. **MCP 工具**（首选，免写脚本）：`lquant` MCP server 的 `get_*` 工具，覆盖实时行情、
    日线、内置因子，以及大盘概览 / 涨跌家数 / 板块 / 资金流 / 涨停池 / 龙虎榜 /
    热榜 / 指数 / ETF。
-2. **skill**：见 `.claude/skills/`（`a-stock-data` 是 MCP 未覆盖端点的清单，
-   `factor-mining` 是因子挖掘与体检的流程）。skill 里的 API base 已指向本机服务。
+2. **skill**：见 `.claude/skills/`——
+   - `lquant-market`：lquant **本地数据湖**里 MCP 未覆盖端点的清单（大盘/板块/资金流/
+     涨停/龙虎榜/热榜/指数/ETF/覆盖度/日线）；其中的 API base 已指向本机服务。
+   - `a-stock-data`：**外部第三方** skill（simonlin1212/a-stock-data，Apache-2.0），
+     内嵌 Python 直连公开源，覆盖研报 / 公告 / 财务三表 / 期货 / 期权 / 可转债 / 宏观
+     等本地湖没有的面。需要联网；本地湖已有的一律优先走 MCP / `lquant-market`。
+   - `factor-mining`：因子挖掘与体检的流程。
 3. **lquant CLI**：MCP 与 skill 都覆盖不到时，用 `lquant` 命令行。
 4. **临时 python 脚本**：最后手段，直接读数据湖。
 

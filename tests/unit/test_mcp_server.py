@@ -31,7 +31,7 @@ def test_tools_list_covers_market_and_factor_tools_with_schema():
     tools = resp["result"]["tools"]
     names = {t["name"] for t in tools}
     assert names == set(mcp_server.TOOL_HANDLERS)
-    # a-stock-data skill 覆盖的大盘/板块/资金流/涨停/龙虎榜/热榜/指数/ETF 都要有对应工具
+    # lquant-market skill 覆盖的大盘/板块/资金流/涨停/龙虎榜/热榜/指数/ETF 都要有对应工具
     assert {"get_market_overview", "get_market_breadth", "get_sectors", "get_money_flow",
             "get_limit_up", "get_dragon_tiger", "get_heat", "get_index_quotes",
             "get_etf_list"} <= names

@@ -74,7 +74,8 @@ def test_agent_card_discoverable_without_api_prefix():
         assert key in card, key
     assert card["supportedInterfaces"][0]["url"].endswith("/a2a")
     assert card["capabilities"]["streaming"] is True
-    assert {"a-stock-data", "factor-mining"} <= {s["id"] for s in card["skills"]}
+    assert {"a-stock-data", "lquant-market", "factor-mining"} <= {
+        s["id"] for s in card["skills"]}
     # 描述随配置的 provider 走（本套件强制 provider=mock），不是写死的某一家
     assert "非 LLM" in card["description"]
 
