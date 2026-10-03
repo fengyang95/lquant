@@ -1,6 +1,8 @@
 """分组 IC：一个因子可能只是“小市值暴露”，分组 IC 一眼识破。"""
 from __future__ import annotations
 
+import math
+
 import polars as pl
 
 from lquant.factors.evaluate.ic import ic_series
@@ -20,6 +22,12 @@ def ic_by_group(df: pl.DataFrame, factor: str, ret_col: str, group_col: str, *,
     out = []
     for g_raw, sub in df.group_by(group_col):
         g = g_raw[0] if isinstance(g_raw, (list, tuple)) else g_raw
+        # 未分组（null / NaN，如市值缺失 → size_q 为 null）不是「组」：
+        # 它的 IC 无意义，且 polars group_by 会把它当独立分组吐出来。
+        # 漏出去会让 API 的 f"size_q{int(...)}" 抛 TypeError（报告表格只会多一行
+        # 无意义的 n/a 分组，不崩，但同样不该有）。
+        if g is None or (isinstance(g, float) and math.isnan(g)):
+            continue
         if len(sub) < min_obs:
             continue
         # 组内每日样本数少（如 3 只一组的市值分组），同一 min_obs 透传给 ic_series
