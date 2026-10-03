@@ -55,6 +55,14 @@ py()    { .venv/bin/python "$@"; }
 lq()    { .venv/bin/lq "$@"; }
 pid_ok(){ [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
 
+# ---- 前端 next：只认本地安装的可执行文件，绝不裸用 `npx next` --------------
+# 本地没装依赖时裸 `npx next` 会从 registry 拉一个**大版本可能不符**的 next
+# （曾把 next 16 装进 pin 15.1.6 的项目），且它启动时还会自动改写
+# web/node_modules。所以「依赖是否装齐」一律以这个可执行文件为准，
+# 缺失就明确报错让调用方去跑 ./lquant.sh install。
+NEXT_BIN="node_modules/.bin/next"   # 相对 web/
+next_ready() { [ -x "web/$NEXT_BIN" ]; }
+
 http_ok() {  # curl 存在才探测；--noproxy 防系统代理劫持 localhost
   command -v curl >/dev/null 2>&1 || return 1
   curl -sf --noproxy '*' -o /dev/null -m 3 "http://localhost:${API_PORT}/api/health/ping"
@@ -133,8 +141,11 @@ install_node_deps() {
   # package.json / lock 未变且 node_modules 存在就跳过
   local inputs=(web/package.json)
   [ -f web/package-lock.json ] && inputs+=(web/package-lock.json)
-  if [ -d web/node_modules ] && ! changed_since "$RUN_DIR/npmdeps.sha" "${inputs[@]}"; then
-    dim "前端依赖未变化（package.json），跳过 npm install"
+  # 只看 `-d web/node_modules` 会被「空/残缺的 node_modules」骗过：目录在、
+  # package.json 没变 → 永久跳过 install，直到 next build 找不到 next 才暴露。
+  # 用 next_ready（.bin/next 可执行）当「依赖真的装齐了」的判据。
+  if next_ready && ! changed_since "$RUN_DIR/npmdeps.sha" "${inputs[@]}"; then
+    dim "前端依赖未变化且已就绪（package.json），跳过 npm install"
     return 0
   fi
   info "安装前端依赖（registry: ${NPM_REGISTRY}）"
@@ -251,22 +262,24 @@ stop_web() {  # 停 Web；「原本是否在跑」写入全局 WEB_WAS_RUNNING�
 
 start_web() {
   if pid_ok "$RUN_DIR/web.pid"; then warn "Web 已在运行 (pid $(cat "$RUN_DIR/web.pid"))"; return 0; fi
+  next_ready || { warn "未找到本地 next（web/$NEXT_BIN）—— 先跑 ./lquant.sh install 同步前端依赖"; return 1; }
   free_port "$WEB_PORT"
   if [ -d web/.next ] && [ -f web/.next/BUILD_ID ]; then
     info "启动 Web（生产模式 next start, port ${WEB_PORT}）"
-    spawn web "$LOG_DIR/web.log" bash -c "cd web && npx next start -p $WEB_PORT"
+    spawn web "$LOG_DIR/web.log" bash -c "cd web && $NEXT_BIN start -p $WEB_PORT"
   else
     warn "无生产构建，用 dev 模式（跑 ./lquant.sh build 可切生产模式）"
-    spawn web "$LOG_DIR/web.log" bash -c "cd web && npx next dev -p $WEB_PORT"
+    spawn web "$LOG_DIR/web.log" bash -c "cd web && $NEXT_BIN dev -p $WEB_PORT"
   fi
 }
 
 run_next_build() {  # [--keep-stopped] 构建前停 Web（独占 .next），成功后按需恢复
   local keep_stopped=0
   if [ "${1:-}" = "--keep-stopped" ]; then keep_stopped=1; fi
+  next_ready || { warn "未找到本地 next（web/$NEXT_BIN），跳过 next build"; return 1; }
   stop_web
   local rc=0
-  ( cd web && npx next build ) || rc=1
+  ( cd web && "$NEXT_BIN" build ) || rc=1
   if [ "$WEB_WAS_RUNNING" = 1 ] && [ "$keep_stopped" = 0 ]; then
     dim "构建完成，恢复 Web"
     start_web
@@ -287,6 +300,7 @@ cmd_doctor() {
     fi
   done
   [ -x .venv/bin/python ] && echo "  [✓] .venv  $(py -V 2>&1)" || echo "  [ ] .venv 未创建"
+  next_ready && echo "  [✓] 前端依赖 (web/$NEXT_BIN)" || echo "  [ ] 前端依赖缺失 (./lquant.sh install)"
   [ -f data/duckdb/lquant.duckdb ] && echo "  [✓] DuckDB 已建库" || echo "  [ ] DuckDB 未建库 (make db-init)"
   if [ -x .venv/bin/python ]; then
     py - <<'EOF' 2>/dev/null || true
@@ -384,7 +398,7 @@ cmd_update() {
 
   # 3) 前端生产构建：已有生产构建或 --full 才重建（dev 模式无需构建）；源码没变则跳过
   if [ "$full" = 1 ] || { [ -d web/.next ] && [ -f web/.next/BUILD_ID ]; }; then
-    if command -v npm >/dev/null 2>&1 && [ -d web/node_modules ]; then
+    if command -v npm >/dev/null 2>&1 && next_ready; then
       if [ "$full" = 0 ] && ! changed_since "$RUN_DIR/webbuild.sha" <(web_build_inputs); then
         dim "前端源码未变化，跳过 next build"
       else
@@ -424,7 +438,7 @@ cmd_update() {
 cmd_build() {
   info "打包生产构建"
   [ -x .venv/bin/python ] || fail "先跑 ./lquant.sh install"
-  [ -d web/node_modules ] || install_node_deps || fail "npm 不可用"
+  next_ready || install_node_deps || fail "前端依赖不可用（缺 next，且 npm 同步失败）"
 
   info "前端生产构建 (next build, standalone)"
   if ! changed_since "$RUN_DIR/webbuild.sha" <(web_build_inputs); then
