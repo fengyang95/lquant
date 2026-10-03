@@ -67,15 +67,95 @@ def _clean_names(value: object, field: str) -> list[str] | None:
     return out
 
 
-def _known_mcp_tools() -> set[str]:
+def known_mcp_tools() -> set[str]:
+    """已注册的 MCP 工具名（会话配置与运行时默认值共用同一份注册表）。"""
     from lquant.agent.mcp_server import TOOL_HANDLERS  # noqa: PLC0415
 
     return set(TOOL_HANDLERS)
 
 
-#: 建会话后仍可修改的能力项（provider 不在其中：换 provider 会续到别人的
+#: 兼容旧引用（模块内多处已按私有名调用过）
+_known_mcp_tools = known_mcp_tools
+
+
+def check_skill_names(names: list[str]) -> None:
+    """skill 名单的**形状**校验（非法 → :class:`CapabilityError`）。
+
+    只校验形状、不校验存在性：老的会话配置里可以有「目录后来被删掉」的 skill，
+    它仍应能继续跑（存在性由工作区同步与真实目录取交集兜底）。
+    """
+    bad = [n for n in names if not SKILL_NAME_RE.match(n)]
+    if bad:
+        raise CapabilityError(f"非法 skill 名: {', '.join(bad)}")
+
+
+def check_default_skill_names(names: list[str]) -> None:
+    """**默认** skill 名单：形状 + 存在性。
+
+    比 :func:`check_skill_names` 多查一次存在性，因为默认名单是「以后每次新建
+    会话都照这个来」：写错一个名字，新建的会话会静默少一项能力，用户只会觉得
+    「它怎么不会用这个 skill」，而这种缺失在界面上看不出来。会话级配置不查
+    （见上），global 默认查 —— 差别就是「改错了能不能当场发现」。
+    """
+    check_skill_names(names)
+    from lquant.core.config import get_settings  # noqa: PLC0415
+
+    known = {s["name"] for s in list_skills(get_settings().root)}
+    missing = sorted(set(names) - known)
+    if missing:
+        raise CapabilityError(
+            f"skill 不存在: {', '.join(missing)}（config/skills/ 下没有这个目录）")
+
+
+#: 建会话后仍可修改的**能力**项（provider 不在其中：换 provider 会续到别人的
 #: CLI 会话，见 ``SessionStore.set_agent_config`` 与 ``server.api.ask`` 的说明）。
 MUTABLE_CAPABILITY_FIELDS: tuple[str, ...] = ("skills", "mcp_tools")
+
+#: 建会话后仍可修改的**运行参数**：单次回答超时、CLI 全自主权限。
+#:
+#: 为什么这两项要能按会话改：它们是「这一轮敢不敢放手让它跑」的旋钮，而不同
+#: 会话的诉求天然不同 —— 一个只是问答的会话不该给全自主权限，一个跑长任务的
+#: 会话又需要更长的超时。全局值（AI 设置面板里的 ``agent.*``）是**默认档**，
+#: 这里存的是本会话的覆盖；值 ``None`` = 不覆盖、跟随全局（与 ``skills`` 的
+#: ``None`` 不是同一回事，别类推：那边的 ``None`` 是「不裁剪」这个**实义值**，
+#: 这边的 ``None`` 是「回到默认」）。
+MUTABLE_RUN_FIELDS: tuple[str, ...] = ("timeout_seconds", "skip_permissions")
+
+#: ``PATCH /sessions/{sid}/config`` 能收的全部字段。
+MUTABLE_SESSION_FIELDS: tuple[str, ...] = (
+    *MUTABLE_CAPABILITY_FIELDS, *MUTABLE_RUN_FIELDS)
+
+#: 单次回答超时的合法区间（秒）。**唯一一份**：写入侧（SettingsStore）、
+#: 运行时解析（agent.runtime）、会话级校验（这里）都引用它，避免三处各写
+#: 一个数字后悄悄分叉 —— 那种分叉的表现是「设置页存不进去但接口收下了」。
+TIMEOUT_MIN_SECONDS = 10
+TIMEOUT_MAX_SECONDS = 3600
+
+
+def clean_timeout_seconds(value: object) -> int | None:
+    """会话级 / 全局超时值的校验与归一。``None`` = 回到默认档。"""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise CapabilityError(f"超时（timeout_seconds）必须是整数秒，收到 {value!r}")
+    try:
+        val = int(float(value))
+    except (TypeError, ValueError):
+        raise CapabilityError(
+            f"超时（timeout_seconds）必须是整数秒，收到 {value!r}") from None
+    if not TIMEOUT_MIN_SECONDS <= val <= TIMEOUT_MAX_SECONDS:
+        raise CapabilityError(
+            f"超时应在 {TIMEOUT_MIN_SECONDS}~{TIMEOUT_MAX_SECONDS} 秒之间，收到 {val}")
+    return val
+
+
+def clean_skip_permissions(value: object) -> bool | None:
+    """会话级权限开关的校验与归一。``None`` = 回到默认档。"""
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise CapabilityError(f"skip_permissions 必须是 true/false，收到 {value!r}")
+    return value
 
 
 def normalize_agent_config(body: dict) -> dict:
@@ -93,14 +173,12 @@ def normalize_agent_config(body: dict) -> dict:
     if "skills" in body:
         names = _clean_names(body["skills"], "skills")
         if names is not None:
-            bad = [n for n in names if not SKILL_NAME_RE.match(n)]
-            if bad:
-                raise CapabilityError(f"非法 skill 名: {', '.join(bad)}")
+            check_skill_names(names)
         cfg["skills"] = names
     if "mcp_tools" in body:
         names = _clean_names(body["mcp_tools"], "mcp_tools")
         if names is not None:
-            unknown = sorted(set(names) - _known_mcp_tools())
+            unknown = sorted(set(names) - known_mcp_tools())
             if unknown:
                 raise CapabilityError(f"未知 MCP 工具: {', '.join(unknown)}")
         cfg["mcp_tools"] = names
@@ -108,29 +186,41 @@ def normalize_agent_config(body: dict) -> dict:
 
 
 def normalize_capability_update(body: dict) -> dict:
-    """把「会话内改能力」的请求体规整成落库用的 dict（只允许 skills / mcp_tools）。
+    """把「会话内改配置」的请求体规整成落库用的 dict。
+
+    准入字段见 :data:`MUTABLE_SESSION_FIELDS`：``skills`` / ``mcp_tools``
+    （能力）与 ``timeout_seconds`` / ``skip_permissions``（运行参数）。
 
     与 :func:`normalize_agent_config` 的区别只在**准入字段**：建会话时按空体
     （``{}``）表示「全走全局默认」，这里空体是错误 —— 一次什么都没改的 PATCH
-    说明前端状态坏了，静默 200 会让人以为改生效了。值的校验则**完全复用**
+    说明前端状态坏了，静默 200 会让人以为改生效了。能力值的校验则**完全复用**
     ``normalize_agent_config``（skill 名形状、MCP 工具必须在注册表里），
     不写第二份，避免两处口径分叉。
 
-    返回值只含出现在 ``body`` 里的键；``None``（= 全开）与 ``[]``（= 全不启用）
-    原样保留、不合并 —— 语义与建会话一致。
+    返回值只含出现在 ``body`` 里的键；``None``（能力侧 = 全开；运行参数侧
+    = 回到全局默认）与 ``[]``（= 全不启用）原样保留、不合并 —— 语义与建会话一致。
     """
     if "provider" in body:
         # provider 锁定：CLI 侧会话 id（claude 的 session_id / codex 的
         # thread_id）共用一列，中途换 provider 续接的是另一个 CLI 的会话。
-        raise CapabilityError("provider 建会话时锁定，不可修改")
-    unknown = [k for k in body if k not in MUTABLE_CAPABILITY_FIELDS]
+        # 「换个后端接着问」是**另开会话**（见 server.api.ask 的 fork 接口），
+        # 不是改这一条配置。
+        raise CapabilityError("provider 建会话时锁定，不可修改（换后端请另开会话）")
+    unknown = [k for k in body if k not in MUTABLE_SESSION_FIELDS]
     if unknown:
         raise CapabilityError(
-            f"不支持的能力项: {', '.join(str(k) for k in unknown)}"
-            "（只支持 skills / mcp_tools）")
-    if not any(k in body for k in MUTABLE_CAPABILITY_FIELDS):
-        raise CapabilityError("没有可修改的能力项（只支持 skills / mcp_tools）")
-    return normalize_agent_config(body)
+            f"不支持的配置项: {', '.join(str(k) for k in unknown)}"
+            f"（只支持 {' / '.join(MUTABLE_SESSION_FIELDS)}）")
+    if not any(k in body for k in MUTABLE_SESSION_FIELDS):
+        raise CapabilityError(
+            f"没有可修改的配置项（只支持 {' / '.join(MUTABLE_SESSION_FIELDS)}）")
+    out = normalize_agent_config(
+        {k: v for k, v in body.items() if k in MUTABLE_CAPABILITY_FIELDS})
+    if "timeout_seconds" in body:
+        out["timeout_seconds"] = clean_timeout_seconds(body["timeout_seconds"])
+    if "skip_permissions" in body:
+        out["skip_permissions"] = clean_skip_permissions(body["skip_permissions"])
+    return out
 
 
 # ---- 可用能力清单（/api/agent/capabilities） --------------------------------

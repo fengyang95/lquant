@@ -3,10 +3,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from lquant.agent.concurrency import (
+    register_run,
+    release_run,
+    running_count,
+)
 from lquant.agent.errors import AgentError
 from lquant.agent.schemas import AgentEvent, Message, Session
 from lquant.agent.sessions import SessionStore
@@ -23,10 +30,14 @@ class AgentService(ABC):
         self.store = store
         #: 会话 → 正在跑的回答任务（单槽：同一会话同时只允许一个，见 _claim）
         self._tasks: dict[str, asyncio.Task | None] = {}
+        #: 会话 → 本轮运行的可见信息（开始时间 / pid …）。
+        #: 与 ``_tasks`` 同生命周期：``_claim`` 建、``_release`` 清。
+        self._run_meta: dict[str, dict] = {}
 
     @abstractmethod
     async def create_session(self, context: dict | None,
-                             agent_config: dict | None = None) -> Session: ...
+                             agent_config: dict | None = None, *,
+                             title: str | None = None) -> Session: ...
 
     @abstractmethod
     async def list_sessions(self) -> list[Session]: ...
@@ -50,22 +61,95 @@ class AgentService(ABC):
         return t is not None and not t.done()
 
     def _claim(self, sid: str) -> None:
-        """占住会话的执行槽位；已被占用 → 409。
+        """占住会话的执行槽位；已被占用 → 409，全局并发超限 → 429。
 
-        为什么必须挡：运行时引用（任务 / 子进程）是按会话**单槽**存的，
+        为什么必须挡同会话并发：运行时引用（任务 / 子进程）是按会话**单槽**存的，
         同会话两条并发消息会互相覆盖引用 —— `/cancel` 打到错的那个进程、
         先结束的那个把另一个的引用 pop 掉变成孤儿，前端还会看到两条回答的事件交错。
         单飞（one in-flight per session）是唯一说得清的语义。
+
+        为什么要挡全局并发：每个回答都是一个全自主权限的 CLI 子进程，没有上限时
+        多开会话齐发就能把本机打死。上限判定放在这里（而不是 API 层）是刻意的：
+        A2A 出站路径不经过 ``server.api.ask``，只拦 HTTP 那个口等于给 A2A 留了
+        一条绕过上限的路。**不排队**：直接拒绝，让用户看到明确的「超限」而不是
+        一个永远不动的转圈。
         """
         if self.is_busy(sid):
             raise AgentError("该会话已有正在执行的回答，请等待完成或先取消",
                              status_code=409)
+        cap = max_concurrent_runs()
+        if running_count() >= cap:
+            raise AgentError(
+                f"同时在跑的 agent 已达上限 {cap} 个，请等待其中一些结束或先终止",
+                status_code=429)
         self._tasks[sid] = asyncio.current_task()
+        self._run_meta[sid] = {
+            #: 归属校验用（见 _release 的第 3 种情形）；**不进 API 响应**
+            "task": self._tasks[sid],
+            "provider": self.provider,
+            "started_at": time.time(),
+            "started_monotonic": time.monotonic(),
+            "pid": None,
+            "workspace": "",
+        }
+        register_run(self, sid)
 
     def _release(self, sid: str) -> None:
-        """只释放**自己的**槽位：别人接手后不能被我们 pop 掉。"""
-        if self._tasks.get(sid) is asyncio.current_task():
+        """只释放**自己的**槽位：别人接手后不能被我们 pop 掉。
+
+        三种情形都要对：
+
+        1. 正常结束 —— ``_tasks[sid]`` 还是自己，连账本一起放掉；
+        2. ``cancel()`` 先把 ``_tasks`` 里的任务 pop 掉再 cancel（所以身份判断
+           恒为假），这一轮确实结束了，槽位空着就必须放账本与运行信息 ——
+           不放的话账本会留下永久记录，并发上限被慢慢吃光，而现象只是
+           「用着用着就开始 429」；
+        3. ``cancel()`` 之后**新的一轮已经接手**了同一个 sid（pop 掉的瞬间
+           ``is_busy`` 就是假，理论上接得上）。这时候绝对不能放账本：那等于
+           把别人的额度扣掉，上限形同虚设。判据是槽位现在有没有人。
+        """
+        me = asyncio.current_task()
+        if self._tasks.get(sid) is me:
             self._tasks.pop(sid, None)
+            self._run_meta.pop(sid, None)
+            release_run(self, sid)
+            return
+        if self._tasks.get(sid) is None and self._run_meta.get(sid, {}).get("task") is me:
+            self._run_meta.pop(sid, None)
+            release_run(self, sid)
+
+    def set_run_info(self, sid: str, **fields: object) -> None:
+        """补充本轮运行的可见信息（当前只有 CLI provider 会写 pid / workspace）。
+
+        容忍会话已经不在跑（取消路径可能先把槽位释放掉）：这种情况下丢掉这条
+        补充信息正是想要的 —— 往一个已经不存在的槽位里写字，等于给进程列表
+        留一条永远不消失的幽灵记录。
+        """
+        meta = self._run_meta.get(sid)
+        if meta is not None:
+            meta.update(fields)
+
+    def running_runs(self) -> list[dict]:
+        """本实例上正在跑的回答（供 ``GET /ask/runs`` 汇总）。
+
+        ``elapsed`` 由 ``started_monotonic`` 现算而不是落库：它只是给人看的
+        「跑了多久」，不需要跨进程一致，也就不值得为它多存一列。
+        """
+        now = time.monotonic()
+        out: list[dict] = []
+        for sid, task in list(self._tasks.items()):
+            if task is None or task.done():
+                continue
+            meta = dict(self._run_meta.get(sid, {}))
+            started = meta.pop("started_monotonic", None)
+            meta.pop("task", None)  # asyncio.Task 不可序列化，绝不能进 API 响应
+            out.append({
+                "session_id": sid,
+                "provider": meta.pop("provider", self.provider),
+                "elapsed_seconds": round(now - started, 1) if started else 0.0,
+                **meta,
+            })
+        return out
 
     async def persist_user_message(self, sid: str, content: str) -> Message:
         """同步落库 user 消息并返回。
@@ -89,6 +173,34 @@ _store: SessionStore | None = None
 _store_root: Path | None = None
 
 _WARNED_PROVIDERS: set[str] = set()
+
+#: 创建过的所有 service 实例（含 A2A 执行器自带 store 的那份）。
+#: 弱集合：只用来枚举「谁可能正在跑」，不参与缓存，不延长生命周期。
+_ALL_SERVICES: weakref.WeakSet[AgentService] = weakref.WeakSet()
+
+
+def max_concurrent_runs() -> int:
+    """全局并发上限（运行时配置，前端可在 AI 设置面板改，改完立即生效）。"""
+    from lquant.agent.runtime import effective_agent_config  # noqa: PLC0415
+
+    return int(effective_agent_config()["max_concurrent_runs"])
+
+
+def running_runs_all() -> list[dict]:
+    """**所有** provider 实例上正在跑的回答。
+
+    为什么要跨实例汇总：``_cache`` 只装走全局 store 的那些实例，A2A 执行器
+    自带的实例不在里面；只看缓存会漏掉「A2A 那边正在跑」的那部分，而
+    「运行中」列表漏一条比多一条更糟（用户会照着这个列表判断能不能关服务）。
+    """
+    rows: list[dict] = []
+    for svc in list(_ALL_SERVICES):
+        try:
+            rows.extend(svc.running_runs())
+        except Exception:  # noqa: BLE001 - 枚举不该因为某个实例异常而整体失败
+            logging.getLogger(__name__).warning("枚举运行中回答失败", exc_info=True)
+    rows.sort(key=lambda r: r.get("elapsed_seconds", 0.0), reverse=True)
+    return rows
 
 
 def _get_store() -> SessionStore:
@@ -116,12 +228,15 @@ def default_agent_config() -> dict:
 
     ``skills`` / ``mcp_tools`` 为 ``None`` 表示**不裁剪**（全开），空列表表示
     一个都不启用 —— 两者语义不同，前端据此决定预填成什么样。
-    """
-    from lquant.core.config import get_settings  # noqa: PLC0415
 
-    a = get_settings().agent
-    return {"provider": a.provider, "skills": a.default_skills,
-            "mcp_tools": a.default_mcp_tools}
+    取值走 :func:`lquant.agent.runtime.effective_agent_config`：这三项都能在
+    「问 AI」页的 AI 设置面板里改，改完**下一次新建会话即生效**。
+    """
+    from lquant.agent.runtime import effective_agent_config  # noqa: PLC0415
+
+    a = effective_agent_config()
+    return {"provider": a["provider"], "skills": a["default_skills"],
+            "mcp_tools": a["default_mcp_tools"]}
 
 
 def _warn_autonomous_once(name: str, skip_permissions: bool) -> None:
@@ -141,15 +256,16 @@ async def get_agent_service(provider: str | None = None, *,
                             store: SessionStore | None = None) -> AgentService:
     """按 provider 取实现；**每个 (store, provider) 一个单例**。
 
-    ``provider=None`` → 用全局默认（``settings.agent.provider``）。
+    ``provider=None`` → 用全局默认（运行时配置的 ``agent.provider``，可在
+    「问 AI」页改，改完下一条消息就走新后端）。
     ``store=None`` → 全局 store。缓存按 store 区分是必须的：A2A 执行器拿的是
     自己注入的 store，若按 provider 名缓存，它会拿到绑在全局库上的实例，
     往不存在的会话里写消息（FOREIGN KEY 直接炸）。
     """
-    from lquant.core.config import get_settings  # noqa: PLC0415
+    from lquant.agent.runtime import effective_agent_config  # noqa: PLC0415
 
-    s = get_settings()
-    name = provider or s.agent.provider
+    cfg = effective_agent_config()
+    name = provider or cfg["provider"]
     st = store or _get_store()
     key = (st.path, name)
     cached = _cache.get(key)
@@ -161,7 +277,7 @@ async def get_agent_service(provider: str | None = None, *,
 
         svc: AgentService = MockAgentService(st)
     elif name in ("claude_code", "codex"):
-        _warn_autonomous_once(name, s.agent.skip_permissions)
+        _warn_autonomous_once(name, bool(cfg["skip_permissions"]))
         if name == "claude_code":
             from lquant.agent.claude_code import (  # noqa: PLC0415
                 ClaudeCodeAgentService,
@@ -175,6 +291,7 @@ async def get_agent_service(provider: str | None = None, *,
     else:
         raise AgentError(f"未知 agent provider: {name}")
     _cache[key] = svc
+    _ALL_SERVICES.add(svc)
     return svc
 
 

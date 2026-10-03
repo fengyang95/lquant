@@ -8,12 +8,14 @@ import {
   connectAskEvents,
   getMessages,
   reduceMessages,
+  regenerateSession,
   sendMessage,
 } from '@/lib/ask-api';
 import { PROVIDER_LABELS } from '@/lib/agent-api';
 import type { RunTrace } from '@/lib/ask-stream';
 import { applyTraceEvent, newRunTrace } from '@/lib/ask-stream';
 import { fmtDuration } from '@/lib/format';
+import ForkDialog from './ForkDialog';
 import Message from './Message';
 import RunTraceView from './RunTraceView';
 import SessionConfigDialog from './SessionConfigDialog';
@@ -23,9 +25,23 @@ const TRACE_EVENTS = new Set([
   'thinking', 'tool_call', 'tool_result', 'system', 'done', 'error',
 ]);
 
-/** 会话头：能力集只读展示 + 「调整能力」入口。
+/** 会话头：能力集只读展示 + 「调整能力 / 重新生成 / 换后端」入口。
  *  provider 不在这里改（换了会续到别的 CLI 会话），skill / MCP 可以。 */
-function SessionHeader({ session, onEdit }: { session: AskSession; onEdit: () => void }) {
+function SessionHeader({
+  session,
+  running,
+  canRegenerate,
+  onEdit,
+  onRegenerate,
+  onFork,
+}: {
+  session: AskSession;
+  running: boolean;
+  canRegenerate: boolean;
+  onEdit: () => void;
+  onRegenerate: () => void;
+  onFork: () => void;
+}) {
   const cfg = session.agent_config ?? {};
   const provider = cfg.provider ?? '';
   return (
@@ -33,9 +49,27 @@ function SessionHeader({ session, onEdit }: { session: AskSession; onEdit: () =>
       <span className="tag tag-on">{PROVIDER_LABELS[provider] ?? (provider || '默认后端')}</span>
       <CountChip label="skill" names={cfg.skills} />
       <CountChip label="MCP 工具" names={cfg.mcp_tools} />
-      <button type="button" onClick={onEdit} className="ml-auto text-ink-dim hover:text-up">
-        调整能力
-      </button>
+      {cfg.timeout_seconds ? <span className="tag">超时 {cfg.timeout_seconds}s</span> : null}
+      {cfg.skip_permissions === false ? <span className="tag">非全自主</span> : null}
+      <div className="ml-auto flex items-center gap-2">
+        {/* 会话级 override 的可见性：改过什么要一眼看得出来，否则用户会以为
+            自己改的是全局默认（那两项在「⚙ AI 设置」里，含义不同）。 */}
+        <button
+          type="button"
+          onClick={onRegenerate}
+          disabled={running || !canRegenerate}
+          title={canRegenerate ? '重跑最后一条提问，替换掉当前答案' : '还没有提问过'}
+          className="text-ink-dim hover:text-up disabled:opacity-40"
+        >
+          ↻ 重新生成
+        </button>
+        <button type="button" onClick={onFork} className="text-ink-dim hover:text-up">
+          换后端
+        </button>
+        <button type="button" onClick={onEdit} className="text-ink-dim hover:text-up">
+          调整能力
+        </button>
+      </div>
     </div>
   );
 }
@@ -53,9 +87,12 @@ function CountChip({ label, names }: { label: string; names?: string[] | null })
 export default function ChatWindow({
   session,
   onSessionChange,
+  onForked,
 }: {
   session: AskSession;
   onSessionChange?: (updated: AskSession) => void;
+  /** 换后端另开会话成功后回调（父级要把新会话加进列表并切过去） */
+  onForked?: (created: AskSession) => void;
 }) {
   const [msgs, setMsgs] = useState<AskMessage[]>([]);
   const [draft, setDraft] = useState('');
@@ -66,6 +103,7 @@ export default function ChatWindow({
   const [now, setNow] = useState(() => Date.now());
   const [atBottom, setAtBottom] = useState(true);
   const [configOpen, setConfigOpen] = useState(false);
+  const [forkOpen, setForkOpen] = useState(false);
   const lastSentRef = useRef('');
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -216,8 +254,21 @@ export default function ChatWindow({
     }
   }, [beginRun, pushLocalUser, running, sid]);
 
-  const stop = useCallback(async () => {
-    setCancelling(true);
+  /** 重新生成：后端会**先删掉旧答案**再跑，所以这里不等事件流 —— 立刻拉一次
+   *  历史把旧答案从界面上抹掉，然后靠事件流把新一轮正文补上。 */
+  const regenerate = useCallback(async () => {
+    if (running) return;
+    beginRun();
+    try {
+      await regenerateSession(sid);
+      loadHistory(() => aliveRef.current);
+    } catch (e) {
+      setRunning(false);
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, [beginRun, loadHistory, running, sid]);
+
+  const stop = useCallback(async () => {    setCancelling(true);
     const seq = runSeqRef.current;
     try {
       await cancelSession(sid);
@@ -238,10 +289,18 @@ export default function ChatWindow({
   }, [loadHistory, sid]);
 
   const elapsed = trace ? (trace.finishedAt ?? now) - trace.startedAt : 0;
+  const canRegenerate = msgs.some((m) => m.role === 'user');
 
   return (
     <div className="flex h-full flex-col">
-      <SessionHeader session={session} onEdit={() => setConfigOpen(true)} />
+      <SessionHeader
+        session={session}
+        running={running}
+        canRegenerate={canRegenerate}
+        onEdit={() => setConfigOpen(true)}
+        onRegenerate={() => void regenerate()}
+        onFork={() => setForkOpen(true)}
+      />
       {trace ? <RunTraceView trace={trace} running={running} now={now} /> : null}
 
       {/* 消息流 */}
@@ -327,6 +386,18 @@ export default function ChatWindow({
           onSaved={(updated) => {
             setConfigOpen(false);
             onSessionChange?.(updated);
+          }}
+        />
+      ) : null}
+
+      {forkOpen ? (
+        <ForkDialog
+          session={session}
+          currentProvider={session.agent_config?.provider ?? ''}
+          onCancel={() => setForkOpen(false)}
+          onForked={(created) => {
+            setForkOpen(false);
+            onForked?.(created);
           }}
         />
       ) : null}

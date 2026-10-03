@@ -6,7 +6,9 @@ import {
   getCapabilities,
   getSkill,
   putSkill,
+  readSkillFrontmatter,
   renderSkillTemplate,
+  repairSkillContent,
   resolveDefaults,
   SKILL_NAME_RE,
   type AgentCapabilities,
@@ -133,5 +135,88 @@ describe('renderSkillTemplate —— 新建 skill 的骨架', () => {
     expect(SKILL_NAME_RE.test('a-stock-data')).toBe(true);
     expect(SKILL_NAME_RE.test('Bad Name')).toBe(false);
     expect(SKILL_NAME_RE.test('-lead')).toBe(false);
+  });
+});
+
+describe('readSkillFrontmatter —— 与后端 parse_frontmatter 同口径', () => {
+  it('首行不是 --- → null：这是「没有 frontmatter」，不是「字段为空」', () => {
+    expect(readSkillFrontmatter('# 标题\nname: alpha\n')).toBeNull();
+    expect(readSkillFrontmatter('name: alpha\ndescription: 甲')).toBeNull();
+    expect(readSkillFrontmatter('')).toBeNull();
+  });
+
+  it('只有开头 --- 没有结束 --- → null（半截 frontmatter 不按合格算）', () => {
+    expect(readSkillFrontmatter('---\nname: alpha\ndescription: 甲\n正文')).toBeNull();
+  });
+
+  it('正常的两行 → {name, description}；缺 description 给空串而不是 undefined', () => {
+    expect(readSkillFrontmatter('---\nname: alpha\ndescription: 甲\n---\n正文')).toEqual({
+      name: 'alpha',
+      description: '甲',
+    });
+    // 缺的字段必须是 ''：RepairBanner 靠 !fm.description.trim() 判断要不要补
+    expect(readSkillFrontmatter('---\nname: alpha\n---\n正文')).toEqual({
+      name: 'alpha',
+      description: '',
+    });
+  });
+
+  it('双引号 / 单引号包裹的值要去引号（引号是 YAML 外壳，不是值的一部分）', () => {
+    expect(
+      readSkillFrontmatter('---\nname: "alpha"\ndescription: \'带 : 冒号的说明\'\n---\n正文'),
+    ).toEqual({ name: 'alpha', description: '带 : 冒号的说明' });
+  });
+
+  it('field: value 之外的行忽略，正文里的 --- 不会当成结束之外的东西', () => {
+    expect(
+      readSkillFrontmatter('---\nname: alpha\ntags: [a, b]\ndescription: 甲\n---\n正文'),
+    ).toEqual({ name: 'alpha', description: '甲' });
+  });
+});
+
+describe('repairSkillContent —— 只补 frontmatter，绝不重排正文', () => {
+  it('完全没有 frontmatter → 开头补出合法一段，原文一字不动地接在后面', () => {
+    const out = repairSkillContent('# 我的 skill\n\n步骤一。', 'my-skill');
+    // 补完的结果要能被同一个读取器认出来（两个函数互为对照）
+    expect(readSkillFrontmatter(out)).toEqual({
+      name: 'my-skill',
+      description: expect.stringContaining('my-skill'),
+    });
+    // 正文必须原样留着：用户的正文才是他写这个 skill 的目的
+    expect(out).toContain('# 我的 skill\n\n步骤一。');
+  });
+
+  it('有 frontmatter 但缺 name → 只插一行 name（取目录名），正文与其余行不重排', () => {
+    const src = '---\ndescription: 甲\n---\n\n# 正文\n第二行';
+    expect(repairSkillContent(src, 'my-skill')).toBe(
+      '---\ndescription: 甲\nname: my-skill\n---\n\n# 正文\n第二行',
+    );
+  });
+
+  it('有 frontmatter 但缺 description → 只补 description，已有的 name 不被目录名顶替', () => {
+    const out = repairSkillContent('---\nname: other\n---\n正文', 'my-skill');
+    expect(readSkillFrontmatter(out)?.name).toBe('other');
+    expect(readSkillFrontmatter(out)?.description).toBeTruthy();
+    // 正文还在末尾，没被吃掉也没被挪到前面
+    expect(out.endsWith('\n正文')).toBe(true);
+  });
+
+  it('两项都在 → 原样返回（幂等，不会塞出第二段 frontmatter）', () => {
+    const good = '---\nname: alpha\ndescription: 甲\n---\n\n# 正文';
+    expect(repairSkillContent(good, 'alpha')).toBe(good);
+  });
+
+  it('repairSkillContent(repairSkillContent(x)) 幂等：修完的 skill 再点一次补全不会变动', () => {
+    const cases = [
+      '# 无 frontmatter 的正文',
+      '---\ndescription: 甲\n---\n正文',
+      '---\nname: x\n---\n正文',
+      '---\nname: "\n---\n正文',
+    ];
+    for (const src of cases) {
+      const once = repairSkillContent(src, 'dir-name');
+      expect(repairSkillContent(once, 'dir-name')).toBe(once);
+      expect(readSkillFrontmatter(once)).not.toBeNull();
+    }
   });
 });

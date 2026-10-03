@@ -22,6 +22,10 @@ vi.mock('@/lib/ask-api', () => ({
   deleteSession: vi.fn(),
   getMessages: mockGetMessages,
   connectAskEvents: vi.fn(() => vi.fn()),
+  // 页头的「运行中」指示器会拉它（SWR）。缺这个导出的话 mock 会直接把整个
+  // AskPage 的渲染炸掉，失败信息还指向「找不到空态文案」，很难定位。
+  listRuns: vi.fn(async () => ({ runs: [], max_concurrent_runs: 4 })),
+  killRun: vi.fn(),
 }));
 
 describe('AskPage 新建会话失败反馈', () => {

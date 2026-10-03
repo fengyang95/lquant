@@ -73,6 +73,52 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
 
 
+#: 「另开会话」时转述历史的预算（字符）。为什么要有上限：一段跑了几十轮的
+#: 会话原文远超 CLI 的输入上限，硬塞进去的结果是**整个请求直接报错**（不是
+#: 截断），用户看到的是「换后端就崩了」。宁可只要最近的一段。
+BRIEFING_MAX_CHARS = 12000
+
+
+def render_briefing(messages: list[Message],
+                    max_chars: int = BRIEFING_MAX_CHARS) -> str:
+    """把一段对话渲染成「换后端」用的上下文简报。
+
+    **从最近往前取**，取满预算为止，最后再翻回时间顺序 —— 用户接着问的几乎
+    总是最后那几轮，而最早那几轮（往往是「你好」这类寒暄）丢掉毫无损失。
+    反过来的写法（从头截取）会把最关键的最新上下文切掉，是最容易写错的一版。
+
+    只带 user / assistant 两种角色：``system`` 行是运行时噪声（MCP 白名单之类的
+    本机信息），转述给另一个后端既没用、又等于把本机配置写进别人家的 prompt。
+    空的 assistant 消息也要跳过：它是「正在生成」的占位，转述出去就是一句
+    「Assistant: 」。
+    """
+    parts: list[str] = []
+    used = 0
+    latest: tuple[str, str] | None = None
+    for m in reversed(messages):
+        if m.role not in ("user", "assistant"):
+            continue
+        text = (m.content or "").strip()
+        if not text:
+            continue
+        who = "用户" if m.role == "user" else "助手"
+        if latest is None:
+            latest = (who, text)
+        block = f"{who}：{text}"
+        if used + len(block) > max_chars:
+            break
+        parts.append(block)
+        used += len(block)
+    if not parts and latest is not None:
+        # 最近这一条本身就超预算：**截尾保留**。截头留尾是因为「最后说的那件事」
+        # 才是接下来要接的话；整段丢掉等于换后端之后从零开始，用户会以为
+        # 「这后端看不懂上下文」。
+        who, text = latest
+        head = f"{who}：…（前文略）"
+        parts.append(head + text[-(max_chars - len(head)):])
+    return "\n\n".join(reversed(parts))
+
+
 class SessionStore:
     def __init__(self, path: str) -> None:
         self._path = path
@@ -117,18 +163,24 @@ class SessionStore:
                        tool_calls=json.loads(r[4]), created_at=r[5])
 
     async def create(self, context: dict | None,
-                     agent_config: dict | None = None) -> Session:
+                     agent_config: dict | None = None,
+                     title: str | None = None) -> Session:
         """建会话。``agent_config`` 是会话级能力配置（provider/skills/mcp_tools）。
 
         provider 建后不可改：它决定 CLI 侧会话 id 的口径（claude 的 session_id /
         codex 的 thread_id 共用一列），中途换 provider 续接的就是别人的会话，
         所以 provider 在创建时锁定。skills / mcp_tools 可以会话内改，走
         :meth:`set_agent_config`（工作区每轮重建，下一轮生效）。
+
+        ``title`` 只在「另开会话」（fork）时用得上：新会话是旧会话的延续，
+        标题带上来源比多一条「新会话」好找得多。默认仍是 ``新会话``。
         """
         con = await self._conn()
         cfg = agent_config or {}
         ses = Session(id=uuid.uuid4().hex, context=context or {}, created_at=_now(),
                       agent_config=cfg)
+        if title and title.strip():
+            ses.title = title.strip()
         await con.execute(
             "INSERT INTO ask_sessions "
             "(id, title, context_json, created_at, agent_config_json) VALUES (?,?,?,?,?)",
@@ -233,6 +285,28 @@ class SessionStore:
         con = await self._conn()
         await con.execute("DELETE FROM ask_messages WHERE session_id=?", (sid,))
         await con.commit()
+
+    async def delete_assistant_after(self, sid: str, message_id: str) -> int:
+        """删掉 ``message_id`` **之后**的所有 assistant 消息，返回删除条数。
+
+        给「重新生成」用：重跑同一个问题时，上一轮的答案必须先消失 —— 否则
+        同一条问题下面会摞着两个答案，前端看起来像是「它答了两遍」，而落库
+        的那份事实源也分不清哪个才是当前答案。
+
+        为什么按 ``(created_at, rowid)`` 的排序位置比而不是比时间戳：同一毫秒内
+        落库的两条消息时间戳完全相同（``_now`` 是毫秒精度），只比时间戳会漏删
+        或误删。排序口径与 :meth:`messages` **一致**（那边也是 created_at, rowid）——
+        两处不一致会导致「界面上看到的顺序」与「删的是哪几条」对不上。
+        """
+        con = await self._conn()
+        cur = await con.execute(
+            "DELETE FROM ask_messages WHERE session_id=? AND role='assistant' "
+            "AND (created_at, rowid) > ("
+            "  SELECT created_at, rowid FROM ask_messages WHERE id=? AND session_id=?"
+            ")",
+            (sid, message_id, sid))
+        await con.commit()
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
     # ---- CLI 侧会话 id（provider 无关；列名是历史遗留的 claude_session_id）----
     #

@@ -47,7 +47,7 @@ from pathlib import Path
 
 from lquant.agent.errors import AgentError
 from lquant.agent.schemas import AgentEvent, Message, Session
-from lquant.agent.service import AgentService, Emit
+from lquant.agent.service import AgentService, Emit, _warn_autonomous_once
 from lquant.agent.sessions import SessionStore
 from lquant.agent.spawn import SpawnedChild, spawn_child
 from lquant.agent.workspace import ensure_workspace
@@ -67,6 +67,13 @@ def _name_set(value: object) -> set[str] | None:
     if isinstance(value, (list, tuple, set, frozenset)):
         return {str(x) for x in value}
     return None
+
+
+def _global_config() -> dict:
+    """运行时全局 agent 配置（延迟导入：cli_agent 被 service 延迟加载）。"""
+    from lquant.agent.runtime import effective_agent_config  # noqa: PLC0415
+
+    return effective_agent_config()
 
 
 class CliAgentService(AgentService):
@@ -93,14 +100,59 @@ class CliAgentService(AgentService):
         #: 并发服务多个会话，具体工作区必须按轮传入，不能是实例状态。
         self._workspace_base: Path = Path()
         self._root: Path = Path()
-        self._timeout: float = 300.0
+        # 运行参数一律**在每次运行时解析**，不在构造时快照：service 实例是按
+        # (store, provider) 缓存的单例，快照下来「前端改完超时/权限」就永远不生效。
+        # None = 没显式指定 → 走运行时全局配置（可在「问 AI」页改）。
+        self._timeout_override: float | None = None
+        self._skip_permissions_override: bool | None = None
+        self._partial_messages_override: bool | None = None
 
     def _init_runtime(self, *, workspace_dir: str, root: Path,
-                      timeout_seconds: float) -> None:
-        """公共运行时初始化（子类解析完 provider 专属配置后调用）。"""
+                      timeout_seconds: float | None = None,
+                      skip_permissions: bool | None = None,
+                      partial_messages: bool | None = None) -> None:
+        """公共运行时初始化（子类解析完 provider 专属配置后调用）。
+
+        三个 ``*_override`` 都为 ``None`` 时表示「跟随运行时配置」，这是生产路径；
+        测试与 A2A 执行器会显式传值，那种情况以显式值为准。
+        """
         self._root = Path(root)
-        self._timeout = float(timeout_seconds)
         self._workspace_base = self._root / workspace_dir
+        self._timeout_override = None if timeout_seconds is None else float(timeout_seconds)
+        self._skip_permissions_override = skip_permissions
+        self._partial_messages_override = partial_messages
+
+    # ---- 运行参数解析（会话 cfg > 构造参数 > 运行时全局配置）----------------
+
+    def _timeout_for(self, cfg: dict) -> float:
+        if cfg.get("timeout_seconds") is not None:
+            return float(cfg["timeout_seconds"])
+        if self._timeout_override is not None:
+            return self._timeout_override
+        return float(_global_config()["timeout_seconds"])
+
+    def _resolve_skip_permissions(self, cfg: dict | None = None) -> bool:
+        """会话级 ``skip_permissions`` > 构造时显式值 > 运行时全局配置。
+
+        会话级能覆盖是「这一轮敢不敢放手」这个诉求的直接体现：一个只问答的
+        会话不该继承全局打开的 ``--dangerously-skip-permissions``。
+        ``cfg`` 里的 ``None`` 是「跟随默认档」，**不等于 False** —— 用
+        ``is not None`` 判断，别写成 ``if cfg.get(...)``。
+        """
+        cfg = cfg or {}
+        if cfg.get("skip_permissions") is not None:
+            return bool(cfg["skip_permissions"])
+        if self._skip_permissions_override is not None:
+            return self._skip_permissions_override
+        return bool(_global_config()["skip_permissions"])
+
+    def _resolve_partial_messages(self, cfg: dict | None = None) -> bool:
+        cfg = cfg or {}
+        if cfg.get("partial_messages") is not None:
+            return bool(cfg["partial_messages"])
+        if self._partial_messages_override is not None:
+            return self._partial_messages_override
+        return bool(_global_config()["partial_messages"])
 
     def _workspace_for(self, sid: str, cfg: dict) -> Path:
         """按会话**锁定的**能力配置准备并返回该会话的工作区。
@@ -118,8 +170,15 @@ class CliAgentService(AgentService):
 
     # ---- 子类钩子 ---------------------------------------------------------
 
-    def _build_cmd(self, content: str, cli_sid: str | None, workspace: Path) -> list[str]:
-        """构造本次调用的命令行。``workspace`` 是本次运行的会话工作区。"""
+    def _build_cmd(self, content: str, cli_sid: str | None, workspace: Path,
+                   cfg: dict | None = None) -> list[str]:
+        """构造本次调用的命令行。
+
+        ``workspace`` 是本次运行的会话工作区；``cfg`` 是会话级配置 —— 权限 /
+        token 级流式这类**按会话可覆盖**的开关必须从它解析（子类调
+        ``self._resolve_skip_permissions(cfg)``）。早期版本没有这个参数，两个
+        子类只能读全局值，于是会话级的权限旋钮写了也没人看。
+        """
         raise NotImplementedError
 
     def _parse_line(self, raw: bytes) -> list[dict]:
@@ -140,8 +199,9 @@ class CliAgentService(AgentService):
     # ---- 会话 -------------------------------------------------------------
 
     async def create_session(self, context: dict | None,
-                             agent_config: dict | None = None) -> Session:
-        return await self.store.create(context, agent_config)
+                             agent_config: dict | None = None, *,
+                             title: str | None = None) -> Session:
+        return await self.store.create(context, agent_config, title=title)
 
     async def list_sessions(self) -> list[Session]:
         return await self.store.list()
@@ -164,7 +224,7 @@ class CliAgentService(AgentService):
             raise AgentError("会话不存在", status_code=404)
         # API 路径已同步落库并传入，避免二次写入（也避免轮询等待）
         user_msg = user_msg or await self.persist_user_message(sid, content)
-        self._claim(sid)  # 同会话单飞：并发再来一条 → 409，不许互相踩运行时引用
+        self._claim(sid)  # 同会话单飞 + 全局并发上限：超限 → 429，不许互相踩运行时引用
         try:
             await self._run(sid, content, on_event)
         except asyncio.CancelledError:
@@ -191,9 +251,13 @@ class CliAgentService(AgentService):
 
     async def _run(self, sid: str, content: str, on_event: Emit) -> None:
         cfg = await self.store.get_agent_config(sid)
+        # 权限是**每次运行**解析的（会话级 > 构造参数 > 全局，前端都能改），
+        # 所以「全自主」告警也在这里判：只判一次全局值会漏掉会话级打开的情形。
+        _warn_autonomous_once(self.provider, self._resolve_skip_permissions(cfg))
         workspace = self._workspace_for(sid, cfg)
         cli_sid = await self.store.get_cli_session_id(sid)
-        cmd = self._build_cmd(content, cli_sid, workspace)
+        content = await self._with_briefing(sid, content, cli_sid)
+        cmd = self._build_cmd(content, cli_sid, workspace, cfg)
         proc: SpawnedChild | None = None
         try:
             proc = spawn_child(cmd, cwd=str(workspace))
@@ -205,14 +269,50 @@ class CliAgentService(AgentService):
                 await self._reap(proc)
             raise AgentError(f"无法启动 {self.label} CLI：{e}") from e
         self._procs[sid] = proc
-        await self._consume(sid, proc, on_event)
+        # 运行中列表要能看到 pid 与工作区：用户判断「卡住了要不要杀」时，
+        # 能拿 pid 去 ps 一眼比只看到「已跑 300 秒」有用得多。
+        self.set_run_info(sid, pid=proc.pid, workspace=str(workspace))
+        await self._consume(sid, proc, on_event, cfg=cfg)
+
+    async def _with_briefing(self, sid: str, content: str, cli_sid: str | None) -> str:
+        """首次调用时把「另开会话」带来的上下文简报拼在提问前面。
+
+        来历：换 provider 另开会话（``POST /ask/sessions/{sid}/fork``）时，新会话
+        那边没有任何 CLI 侧历史（claude 的 session_id / codex 的 thread_id 是
+        **另一个 CLI 的**，续接过去就是串台）。所以老会话的对话被渲染成一段
+        简报落在 ``session.context.briefing`` 里，在这里注入。
+
+        为什么注入点放在这里而不是建会话时当成一条 user 消息写进去：那样这条
+        简报会以「用户说过的话」出现在消息列表里，改也改不掉、删也删不干净；
+        而且用户看到的正文会变成一大段转述。放在命令行构造这一层，简报只影响
+        送给 CLI 的那一份 prompt，界面上的对话仍然是干净的。
+
+        只在 ``cli_sid`` 还是空的时候注入（= 本会话还没跟 CLI 对上话）：第二
+        轮起 CLI 自己带着上下文，再注入一次就是同一段历史重复两遍。
+        """
+        if cli_sid:
+            return content
+        ses = await self.store.get(sid)
+        ctx = ses.context if ses is not None else None
+        if not isinstance(ctx, dict):
+            return content
+        briefing = str(ctx.get("briefing") or "").strip()
+        if not briefing:
+            return content
+        return (f"{briefing}\n\n"
+                "（以上是此前另一个后端会话的对话记录，供你接续上下文；"
+                "请直接回答最后的问题。）\n\n"
+                f"---\n\n{content}")
 
     @staticmethod
     async def _reap(proc: SpawnedChild) -> None:
         """terminate + waitpid 回收（半启动的子进程必须收干净）。"""
         await proc.reap()
 
-    async def _consume(self, sid: str, proc: SpawnedChild, on_event: Emit) -> None:
+    async def _consume(self, sid: str, proc: SpawnedChild, on_event: Emit,
+                       cfg: dict | None = None) -> None:
+        cfg = cfg or {}
+        timeout = self._timeout_for(cfg)  # 会话级 > 构造参数 > 运行时全局
         stderr_lines: list[str] = []
 
         async def pump_stderr() -> None:
@@ -233,7 +333,7 @@ class CliAgentService(AgentService):
         parse = self._make_line_parser()
         try:
             while True:
-                if time.monotonic() - started > self._timeout:
+                if time.monotonic() - started > timeout:
                     with contextlib.suppress(ProcessLookupError):
                         proc.terminate()
                     tail = "\n".join(stderr_lines[-5:])[-400:]

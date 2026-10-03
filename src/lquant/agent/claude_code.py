@@ -53,38 +53,33 @@ class ClaudeCodeAgentService(CliAgentService):
         super().__init__(store)
         self._claude_path = claude_path or s.agent.claude_path
         self._claude_args = claude_args or []
-        # 无头 claude 需要跳过交互式授权，否则会挂住；但它是「全自主」权限。
-        # 做成开关（默认保持原行为），不要散在命令行里硬编码。
-        self._skip_permissions = (
-            s.agent.skip_permissions if skip_permissions is None else skip_permissions)
-        # token 级流式（打字机效果）。老版本 claude CLI **不认**
-        # --include-partial-messages 会直接报错退出，所以做成开关：环境里是旧
-        # CLI 就设 partial_messages: false 退回整块正文。
-        self._partial_messages = (
-            s.agent.partial_messages if partial_messages is None else partial_messages)
+        # 权限 / token 级流式都**不在构造时定值**（None = 跟随运行时配置）：
+        # service 实例按 (store, provider) 缓存，快照下来前端改完就不生效了。
+        # 详见 CliAgentService._resolve_skip_permissions / _resolve_partial_messages。
         self._init_runtime(
             workspace_dir=workspace_dir or s.agent.workspace_dir,
             root=s.root if root is None else root,
-            timeout_seconds=timeout_seconds if timeout_seconds is not None
-            else s.agent.timeout_seconds,
+            timeout_seconds=timeout_seconds,
+            skip_permissions=skip_permissions,
+            partial_messages=partial_messages,
         )
 
-    def _build_cmd(self, content: str, cli_sid: str | None,
-                   workspace: Path) -> list[str]:
+    def _build_cmd(self, content: str, cli_sid: str | None, workspace: Path,
+                   cfg: dict | None = None) -> list[str]:
         cmd = [
             self._claude_path,
             "-p", content,
             "--output-format", "stream-json",
             "--verbose",
         ]
-        if self._partial_messages:
+        if self._resolve_partial_messages(cfg):
             # 与 stream-json 配套：产出 stream_event 增量行（正文逐 token）
             cmd.append("--include-partial-messages")
         cmd += [
             "--append-system-prompt", _SYSTEM_PROMPT,
             "--mcp-config", str(workspace / ".claude" / "mcp.json"),
         ]
-        if self._skip_permissions:
+        if self._resolve_skip_permissions(cfg):
             cmd.append("--dangerously-skip-permissions")
         if cli_sid:
             cmd += ["--resume", cli_sid]
