@@ -67,6 +67,31 @@ def test_missing_file_returns_empty(log_env) -> None:
     assert r == {"items": [], "total": 0}
 
 
+def test_default_returns_all_unbounded(log_env) -> None:
+    """limit 缺省 = 不截断：窗口内全部匹配都返回（监控页「全部」语义）。
+
+    回归：原默认 200 会把 ERROR 也一起截掉，面板上表现为「只有 200 条」。
+    """
+    lines = [
+        f"2026-09-16 09:{m:02d}:{s:02d}.000 | INFO    |  | m:1 - msg{m}{s}\n"
+        for m in range(2) for s in range(30)
+    ]
+    _write(log_env, "".join(lines))
+    r = tail_app_logs()
+    assert r["total"] == 60
+    assert len(r["items"]) == 60
+    assert r["items"][0]["message"] == "msg129"
+
+
+def test_records_carry_only_display_fields(log_env) -> None:
+    """解析用的 first/extra/level_ok 不得泄漏进响应（否则面板渲染多余字段）。"""
+    _write(log_env, SAMPLE)
+    r = tail_app_logs()
+    assert r["items"]
+    assert all(set(it) == {"ts", "level", "run_id", "source", "message"}
+               for it in r["items"])
+
+
 def test_api_endpoint_wiring(log_env) -> None:
     """API 端点直调：参数透传 + 响应契约（items/total）。"""
     _write(log_env, SAMPLE)
@@ -76,3 +101,17 @@ def test_api_endpoint_wiring(log_env) -> None:
     assert r["total"] == 1
     assert r["items"][0]["level"] == "ERROR"
     assert all("boom" in it["message"] for it in r["items"])
+
+
+def test_api_default_limit_unbounded(log_env) -> None:
+    """端点 limit 缺省时返回全部：>200 条 ERROR 也要给全。"""
+    lines = [
+        f"2026-09-16 09:{m:02d}:{s:02d}.000 | ERROR   |  | m:1 - e{m}{s}\n"
+        for m in range(3) for s in range(30)   # 90 条 < 200，验证不被默认值截断
+    ]
+    _write(log_env, "".join(lines))
+    from lquant.server.api.monitor import app_logs
+
+    r = app_logs(level=None, q="", limit=None)
+    assert r["total"] == 90
+    assert len(r["items"]) == 90

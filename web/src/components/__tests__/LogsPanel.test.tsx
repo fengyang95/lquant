@@ -45,4 +45,17 @@ describe('LogsPanel', () => {
       ),
     );
   });
+
+  it('不带 limit：取全部日志，ERROR 不被 200 截断', async () => {
+    const fetchMock = renderPanel();
+    await screen.findByText(/ok/);
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain('/monitor/app-logs');
+    expect(url).not.toContain('limit=');
+  });
+
+  it('时间列包含日期（便于跨天检索）', async () => {
+    renderPanel();
+    expect(await screen.findByText('2026-09-16 23:00:00.000')).toBeInTheDocument();
+  });
 });

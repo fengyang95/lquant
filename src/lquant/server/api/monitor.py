@@ -54,8 +54,12 @@ def error_logs(range: str = Query("24h"),
 @router.get("/app-logs")
 def app_logs(level: str | None = Query(default=None, max_length=8),
              q: str = Query(default="", max_length=100),
-             limit: int = Query(default=200, ge=1, le=1000)) -> dict:
-    """运行日志 tail（logs/lquant.log）：级别过滤 + 关键字搜索，倒序最新在前。"""
+             limit: int | None = Query(default=None, ge=1)) -> dict:
+    """运行日志 tail（logs/lquant.log）：级别过滤 + 关键字搜索，倒序最新在前。
+
+    limit 缺省 = 不截断，返回读窗内全部匹配记录（面板「全部」语义）；
+    显式传 limit 才截断（原默认 200 会把 ERROR 也截掉，见监控页反馈）。
+    """
     from lquant.monitor.logs import tail_app_logs
 
     return tail_app_logs(level=level, q=q, limit=limit)

@@ -42,6 +42,31 @@ def _force_mock_agent_provider():
     get_settings.cache_clear()
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _isolate_app_logs(tmp_path_factory):
+    """整个测试会话把应用日志重定向到临时目录。
+
+    app 启动（server.main 的 lifespan）与 factors.ops.rust_bridge 都会调用
+    setup_logging()，默认文件 sink 是 logs/lquant.log —— 正是监控页「运行日志」
+    面板的数据源。不隔离的话，跑一次测试就把用例**刻意构造**的 ERROR
+    （如 test_selfcheck 里 monkeypatch 成必炸的 Engine）灌进生产日志，监控页
+    上表现为一排红色 ERROR，真假故障混在一起。
+
+    重定向后测试日志落在 tmp，logs/lquant.log 只反映真实运行。
+    需要指定日志目录的用例（如 test_monitor_logs）自行 monkeypatch LQ_LOG_DIR 覆盖。
+    """
+    import os
+
+    d = tmp_path_factory.mktemp("lq-logs")
+    prev = os.environ.get("LQ_LOG_DIR")
+    os.environ["LQ_LOG_DIR"] = str(d)
+    yield d
+    if prev is None:
+        os.environ.pop("LQ_LOG_DIR", None)
+    else:
+        os.environ["LQ_LOG_DIR"] = prev
+
+
 def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
     """收尾：关掉 agent service 单例持有的 aiosqlite 连接。
 
