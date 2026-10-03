@@ -37,6 +37,9 @@ bash scripts/xval/alphapurify/run_xval.sh
 
 # 自定义
 bash scripts/xval/alphapurify/run_xval.sh 2023-01-01 2024-12-31 800
+
+# 仓库级核对（clone 上游 + 跑它的自带测试 + API 契约探针）
+bash scripts/xval/alphapurify/repo_probe.sh
 ```
 
 单跑某一侧：
@@ -63,6 +66,18 @@ LQ_DATA_DIR=$PWD/data .venv/bin/python \
   各自出厂默认（MAD n=5×1.4826 vs n=3）`max|Δ| = 3.04`。
 - 顺带发现 AlphaPurify 注册表/分发不一致：`neutralize("random_forest")` 报
   `NotImplementedError`，能用的名字是不在注册表里的 `randomforest`。
+
+### 仓库级核对（`repo_probe.sh`）
+
+- **上游 main == PyPI 1.0.6**（仅 2 处非功能性差异），wheel 结论对 main 成立。
+- **自带测试 2/3 失败**：`test_Exposures.py` 是测试自身 fixture 名冲突（永远不可能过）；
+  `test_FctorAnalyzer.py` 断言了 `create_single_fac_full_sheet()` 的返回值，而该方法
+  **没有 return 语句**。
+- **版本元数据三处不一致**：pyproject 1.0.6 / setup.py 1.0.5 / setup.ini 0.1.0。
+- **examples 文档的 keyword 写法直接 `TypeError`**：链式方法签名是
+  `(self, method, *args)`，不接受关键字参数；参数必须按注册表顺序位置传入。
+
+→ 结论：**算法与口径可信（已位级验证），但 API 契约与测试/文档不能当规格用。**
 
 ## 注意
 

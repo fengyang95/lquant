@@ -56,6 +56,9 @@ p.neutralize("randomforest", [...])       # OK —— 但这个名字不在注�
 
 即 **`get_methods()` 自省结果与可调用名不一致**。只有这一个键有此问题（winsorize 12/12、standardize 15/15 都对得上）。
 
+同一病根还有第二处表现：`get_methods()` 列出的**参数名**（`neutralizer_cols`、`degree` 等）
+根本无法作为关键字传入，因为链式方法签名是 `(self, method, *args)`——详见 §1.6④。
+
 反过来看：**lquant 的注册表设计在这点上更稳**——`METHODS` 同时是分发来源和自省来源（单一真源），不可能出现「列得出、调不到」。这条是「反向借鉴」：不要学 AlphaPurify 把注册表和 if/elif 分发分开写。
 
 ---
@@ -106,6 +109,50 @@ p.neutralize("randomforest", [...])       # OK —— 但这个名字不在注�
 - 依赖：pandas、polars、duckdb、plotly、numpy、scipy、pyarrow、joblib、scikit-learn、tqdm（较重）。
 - 全链路以 **pandas 作为对外 DataFrame 契约**（`AlphaPurifier.__init__` 收 pandas/polars，`to_result()` 出 pandas；`ics_dict` 也是 pandas）。
 - 输出交互报告依赖 Plotly。
+
+### 1.6 仓库级核对（clone 上游 main + 官方 examples/tests）
+
+为区分「PyPI wheel」与「仓库真源」，`git clone --depth 1` 了上游仓库逐文件对照：
+
+**① 上游 main == PyPI 1.0.6**（全部 7 个源文件，仅 2 处非功能性差异：一行版权注释、一个空行）。
+→ 本报告基于 wheel 的所有结论对上游 main 同样成立，不存在「main 更新」的问题。
+
+**② 仓库自带测试 2/3 失败**（实测 `pytest tests`，pytest 9.1.1）：
+
+| 测试 | 结果 | 原因 |
+|---|---|---|
+| `tests/test_AlphaPurifier.py::test` | ✅ PASSED | — |
+| `tests/test_Exposures.py::test_sheets` | ❌ FAILED | **测试自身写错**：模块内 `@pytest.fixture def df()` 与测试里的 `df()` 调用**同名冲突**，pytest 注入的是 DataFrame → `TypeError: 'DataFrame' object is not callable`。**该测试永远不可能通过。** |
+| `tests/test_FctorAnalyzer.py::test_sheets` | ❌ FAILED | **API 与测试期望不符**：`create_single_fac_full_sheet(return_fig=True)` 方法体只调用四个 sheet 方法、**没有 return 语句**（源码核对），返回 `None` → `assert not res.empty` 必然失败。 |
+
+附带：文件名拼写错误 `test_FctorAnalyzer.py`（Fctor）。
+
+**③ 版本元数据三处不一致**：`pyproject.toml` = **1.0.6**，`setup.py` = **1.0.5**，`setup.ini` = **0.1.0**。
+（wheel 里 `__version__ = "1.0.6"`，以 pyproject 为准。）
+
+**④ 官方 examples 承诺的 keyword API 实际不可用**（实测）：
+
+```python
+# examples/AlphaPurifier.py 文档（L137-147）与 get_methods 都这样写：
+AP.neutralize('multiOLS', neutralizer_cols=['ret_20','beta_60'], dummy_cols=['industry'])
+# 实测：TypeError: AlphaPurifier.neutralize() got an unexpected keyword argument 'neutralizer_cols'
+
+AP.winsorize('mad', n=3)     # TypeError: unexpected keyword argument 'n'
+AP.winsorize('mad', 3)       # OK —— 必须按注册表顺序位置传参
+```
+
+三个链式方法签名都是 `(self, method, *args)`，**不接受 `**kwargs`**；而
+`get_methods("neutralize","polynomial")` 却会列出 `neutralizer_cols` / `dummy_cols` /
+`degree` / `interaction_only` / `include_bias` 等参数名。即
+**自省暴露的参数名无法用于调用**——与 §0.3 的 `random_forest` 属于同一类病根：
+**注册表/文档与分发实现不是单一真源**。
+
+**⑤ Exposures 的设计语义（这部分值得借鉴）**：
+
+- `PortfolioExposures`（分位组合 + `position="ls"`）：回答「**我的组合表现得像什么**」；
+- `PureExposures`（因子加权组合 `w_i = f_i / Σ|f_i|`）：回答「**我的信号本身载荷在什么上**」；
+- 两者合起来才是「alpha vs risk exposure」的完整分解——单看组合暴露会把
+  「信号本身的暴露」与「组合构建引入的暴露」混在一起。
 
 ---
 
@@ -233,7 +280,12 @@ bash scripts/xval/alphapurify/run_xval.sh 2023-01-01 2024-12-31 800
 ### P1 —— 有明确收益，建议排期
 
 4. **因子收益归因：截面 OLS「纯暴露 / 纯收益」分解**（成本：中）
-   借 `PureExposures.calc_stats` 的设计（`_cross_section_ols`）：把目标因子对行业/市值/风格暴露回归，分离「因子自身收益」与「暴露带来的收益」。lquant 现在有分组归因（`attribution.py`）与风格相关（`style_corr.py`），但缺这个分解视角。
+   借 `PureExposures` / `PortfolioExposures` 的**双视角**设计（`_cross_section_ols`）：
+   - `PortfolioExposures` → 「组合表现得像什么」（分位组合的暴露归因）；
+   - `PureExposures` → 「信号本身载荷在什么上」（因子加权组合 `w_i = f_i / Σ|f_i|`）。
+
+   lquant 现在有分组归因（`attribution.py`）与风格相关（`style_corr.py`），但缺这个分解视角；
+   尤其**「纯暴露」这一支**能回答「alpha 是不是只是换了皮的 beta/行业暴露」。
 
 5. **截面快照 `trace()`**（成本：中）
    给定「日期 + 方向 + 分箱」，回看当期持仓权重与收益明细。这是排查「某天净值跳变到底是哪几只票」的最快路径，lquant 的 HTML 报告目前做不到这一粒度。
@@ -257,6 +309,7 @@ bash scripts/xval/alphapurify/run_xval.sh 2023-01-01 2024-12-31 800
 | Plotly 交互报告 | lquant 已有自包含 HTML（零外部依赖），换 Plotly 是净增依赖 |
 | 以 pandas 作为内部 DataFrame 契约 | lquant 全 Polars + Rust，回退 pandas 是倒退 |
 | 把注册表与 if/elif 分发分开写 | 会重演 `random_forest` 这类「列得出、调不到」的 bug；lquant 的单一真源更好 |
+| 把上游 tests / examples 当 API 规格 | 实测自带测试 2/3 失败、examples 的 keyword 写法直接 `TypeError`（§1.6）；规格以「自己跑通的调用」为准 |
 
 ---
 
@@ -267,3 +320,7 @@ bash scripts/xval/alphapurify/run_xval.sh 2023-01-01 2024-12-31 800
 3. **值得抄的是「产品化的三件套」**：截面快照 `trace()`、因子收益的纯暴露/纯收益分解、多 horizon 并行 IC。
 4. **注册表设计上 lquant 反而更优**：单一真源避免了 AlphaPurify 的 `random_forest` 不一致。
 5. **继续隔离**：AlphaPurify 作为「交叉验证器」而非运行时依赖——本次 harness 已经把这条路径固化成可重复的一键脚本。
+6. **工程成熟度要打折，但算法可信**：上游 main == 1.0.6，自带测试 2/3 失败、版本元数据三处不一致、
+   文档承诺的 keyword API 直接 `TypeError`（§1.6）。所以正确的用法是：
+   **借算法语义与实现口径，不借 API 契约，也不把它的测试/文档当规格**——
+   这也正是本次交叉验证要用「独立参考实现」做第三方的价值所在。
