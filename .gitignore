@@ -42,8 +42,13 @@ dist/
 *.tar.gz
 web/tsconfig.tsbuildinfo
 
-# Claude
-.claude/worktrees/
+# Claude Code / OMC 本地状态。
+# 注意：.claude/commands/ 和 .claude/skills/dev-workflow/ 是**有意入库**的
+# （团队共享的 slash 命令与 skill），所以不能整目录忽略 .claude/ ——
+# 否则这些文件的后续改动会从 git status 里消失。只忽略本机内部那几项。
+/.claude/worktrees/
+/.claude/CLAUDE.md
+/.claude/skills/wiki/
 
 # Env & secrets
 .env
@@ -73,3 +78,14 @@ data/qlib-smoke/
 web/coverage/
 web/test-results/
 web/playwright-report/
+
+# 嵌套 git 仓：/lquant/ 下是一个独立仓库（有自己的 .git），`git add -A` 会把它
+# 提交成 gitlink —— 公开仓的读者拿不到内容，只看到一个指向不存在仓库的空条目。
+# 前导斜杠锚定根目录，避免把 src/lquant/（数据模块源码，必须入库）一起忽略掉。
+/lquant/
+
+# 内部工具与临时产物
+/.idea/
+/.tools/
+.tmp_*
+.secret-scan*.json

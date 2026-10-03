@@ -1,0 +1,74 @@
+# =============================================================================
+# lquant 密钥扫描配置（gitleaks v8.19+，用 git/dir 子命令）
+#
+# 设计原则（改这个文件前先读）：
+#   1. 用 [extend] useDefault = true 继承 gitleaks 内置规则集 ——
+#      内置有 200+ 条规则且持续更新，手写维护是负收益。
+#   2. 自定义规则只补本仓**特有的凭证面**（数据源 token、A2A bearer）。
+#   3. 白名单按「值」精确放行，**不按目录整片跳过**。
+#      跳过 tests/ 是最常见的偷懒做法，代价是「测试里塞了真密钥」这条
+#      最高频的泄露路径彻底失去保护。这里只放行已确认的假值，
+#      每一条都要能说清「为什么它不是密钥」。
+# =============================================================================
+
+title = "lquant secret scan"
+
+[extend]
+useDefault = true
+
+# -----------------------------------------------------------------------------
+# 自定义规则：本仓真实存在的凭证面
+# -----------------------------------------------------------------------------
+
+# Tushare Pro token：32~64 位十六进制，由 src/lquant/.env 的 TUSHARE_TOKEN 注入。
+# 内置规则不覆盖「裸十六进制串」，所以必须自己写。
+[[rules]]
+id = "lquant-tushare-token"
+description = "Tushare Pro token（本仓数据源凭证）"
+regex = '''(?i)tushare[_a-z0-9]*(?:token|key|secret)["'\s]*[:=]\s*["']?([0-9a-f]{32,64})'''
+secretGroup = 1
+keywords = ["tushare"]
+
+# 同花顺 HiThink：config/providers.yaml 里以 HITHINK_API_KEY 注入
+[[rules]]
+id = "lquant-hithink-key"
+description = "同花顺 HiThink API key"
+regex = '''(?i)hithink[_a-z0-9]*(?:api[_-]?key|token|secret)["'\s]*[:=]\s*["']?([A-Za-z0-9_\-]{16,})'''
+secretGroup = 1
+keywords = ["hithink"]
+
+# A2A Bearer token：设了它 /a2a 才能被网络访问（见 docs/SECURITY.md）
+[[rules]]
+id = "lquant-a2a-token"
+description = "A2A Bearer token（LQ_A2A_TOKEN）"
+regex = '''(?i)LQ_A2A_TOKEN["'\s]*[:=]\s*["']?([A-Za-z0-9_\-]{16,})'''
+secretGroup = 1
+keywords = ["lq_a2a_token"]
+
+# 兜底：LQ_* 环境变量里的凭证类赋值（TOKEN/KEY/SECRET/PASSWORD）。
+# 文档里的占位写法（<...>、$(openssl ...)）不含 16 位以上连续串，不会误报。
+[[rules]]
+id = "lquant-env-credential"
+description = "lquant 环境变量中的凭证赋值"
+regex = '''(?i)\bLQ_[A-Z0-9_]*(?:TOKEN|API_?KEY|SECRET|PASSWORD|PASSWD)\s*[:=]\s*["']?([A-Za-z0-9_\-+/=]{16,})'''
+secretGroup = 1
+keywords = ["lq_"]
+
+# -----------------------------------------------------------------------------
+# 全局白名单：只放行「已确认不是密钥」的值，每条都注明理由
+# -----------------------------------------------------------------------------
+[[allowlists]]
+description = "公开常量与测试夹具"
+regexTarget = "match"
+regexes = [
+  # 东方财富公开 ut 常量：akshare / efinance 内置的公共请求参数，
+  # 任何装过 akshare 的机器上都有，不是个人凭证。仅存在于历史提交中。
+  '''7eea3edcaed734bea9cbfc24409ed989''',
+  '''f057cbcbce2a86e2866ab8877db1d059''',
+  '''b2884a393a59ad64002292a3e90d46a5''',
+  # 脱敏模块的测试夹具：test_redact.py 故意用假密钥验证打码逻辑。
+  # AKIAIOSFODNN7EXAMPLE 是 AWS 官方文档里的示例键。
+  '''AKIAIOSFODNN7EXAMPLE''',
+  '''xoxb-1234567890-abcdef''',
+  '''sk-abcdefghijkl''',
+]

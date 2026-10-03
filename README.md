@@ -88,3 +88,19 @@ lq data status             # 数据覆盖度一览
 
 `src/lquant/_rust/*.py` 是纯 Polars 实现，Rust 扩展加载失败时自动降级。
 这不是洁癖——是一个人扛不住编译失败全线停摆的现实。
+
+## 密钥与公开仓库卫生
+
+公开仓库暴露的是**全部历史**，不只是当前文件，所以加个推送钩子是不够的：
+
+```bash
+make secrets-install    # 装 gitleaks（免 sudo，装一次所有 worktree 共用）
+make secrets-history    # 全历史 + 所有分支审计
+make public-ready       # 公开前体检：全历史 + 工作区 + 卫生（严格）
+```
+
+`pre-commit` / `pre-push` 钩子会自动扫密钥，与 CI 共用同一份规则
+（`.gitleaks.toml`）。钩子能用 `--no-verify` 绕过，CI 绕不过。
+真出事了**先轮换凭证、再清理历史**——改写历史不能让已流出的值失效。
+完整机制、GitHub 网页操作清单与补救手册见
+[`docs/SECRET_HYGIENE.md`](docs/SECRET_HYGIENE.md)。

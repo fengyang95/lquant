@@ -1,16 +1,45 @@
 #!/usr/bin/env bash
-# 推送前检查：跑测试（比 pre-commit 严格）+ 改动行覆盖率门禁 ≥95%
+# 推送前检查：密钥扫描（快，先跑）+ 跑测试（比 pre-commit 严格）+ 改动行覆盖率门禁 ≥95%
 #
 # 注意：全量测试里有依赖数据的用例（API / sync），所以先做环境自愈 ——
 # 缺库建库、缺数据生成演示数据兜底，避免把"没跑过 bootstrap"误判成代码问题。
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-echo "==> pre-push: 测试 + diff 覆盖率门禁"
+echo "==> pre-push: 密钥扫描 + 测试 + diff 覆盖率门禁"
+
+# git 通过 stdin 把待推送的 ref 列表交给 pre-push（<local ref> <sha> <remote ref> <sha>）。
+# 必须**最先**把它读走：后面的 pytest 会继承同一个 stdin，不读走这里就解析不到推送范围。
+# `-t 0` 为真说明是手动执行（无 stdin），此时 cat 会一直等输入，直接跳过范围扫描。
+PUSH_REFS="$(mktemp "${TMPDIR:-/tmp}/lq-push-refs.XXXXXX")"
+trap 'rm -f "$PUSH_REFS"' EXIT
+if [ -t 0 ]; then
+  : > "$PUSH_REFS"
+else
+  cat > "$PUSH_REFS"
+fi
+
+# --- 0) 密钥扫描：刻意放在测试之前 -------------------------------------------
+# 两个理由：
+#   ① 测试要跑几分钟，先扫密钥才能在"这次 push 会泄露"时立刻失败；
+#   ② 用**独立**开关。LQ_SKIP_PUSH_CHECK=1 是"跳过测试"的日常逃生门，
+#      不该顺带把安全门禁也关掉 —— 否则跳过测试的人会在不知情下裸奔推送。
+#      要跳过得显式写 LQ_SKIP_SECRET_SCAN=1，是一次有意识的操作。
+if [ "${LQ_SKIP_SECRET_SCAN:-0}" = "1" ]; then
+  echo "    LQ_SKIP_SECRET_SCAN=1，跳过密钥扫描（不推荐）"
+else
+  scripts/secret_scan.sh push "$PUSH_REFS" || {
+    echo "✗ 推送范围发现疑似密钥，已阻止 push。"
+    echo "  · 真密钥：先撤销/轮换该凭证，再清理提交（见 docs/SECRET_HYGIENE.md）"
+    echo "  · 假阳性：改 .gitleaks.toml 白名单并写明理由"
+    exit 1
+  }
+fi
 
 # 跳过开关（CI 上或临时放行）：LQ_SKIP_PUSH_CHECK=1 git push 或 git push --no-verify
+# 注意：它只跳过测试与覆盖率，**不**跳过上面的密钥扫描。
 if [ "${LQ_SKIP_PUSH_CHECK:-0}" = "1" ]; then
-  echo "    LQ_SKIP_PUSH_CHECK=1，跳过"; exit 0
+  echo "    LQ_SKIP_PUSH_CHECK=1，跳过测试与覆盖率"; exit 0
 fi
 
 # venv 解析：worktree 里通常没有自己的 .venv —— 退回主 checkout 的 .venv；

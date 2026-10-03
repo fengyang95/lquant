@@ -11,10 +11,16 @@ if [ -x .venv/bin/ruff ]; then
     echo "✗ ruff 检查失败，先修复或 ./lquant.sh install 补装依赖"; exit 1; }
 fi
 
-# 2) 禁止提交密钥（简单启发式）
-if git diff --cached -U0 | grep -InE \
-    '(api[_-]?key|secret|token|password)\s*=\s*["'"'"'][A-Za-z0-9+/]{16,}'; then
-  echo "✗ 疑似硬编码密钥，请移到 .env"; exit 1
-fi
+# 2) 密钥扫描（gitleaks，扫暂存区）
+#    旧实现是一条 grep 正则，只能匹配 `key = "..."`（等号两侧带空格）——
+#    YAML 的 `key: "..."`、`key="..."`、无空格赋值全部漏掉，等于没有门禁。
+#    换成 gitleaks 后：规则集 1 条 → 200+ 条，且与 pre-push / CI 共用同一份
+#    .gitleaks.toml，三处口径一致（否则"本地过了 CI 挂"迟早逼人加 --no-verify）。
+scripts/secret_scan.sh staged || {
+  echo "✗ 暂存区发现疑似密钥，已阻止提交。"
+  echo "  · 真密钥：移到 .env（已在 .gitignore），并确认它从未被提交过"
+  echo "  · 假阳性：改 .gitleaks.toml 白名单并写明理由，不要用 --no-verify 绕过"
+  exit 1
+}
 
 echo "==> pre-commit 通过"
