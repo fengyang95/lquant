@@ -39,7 +39,18 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$ROOT"
 
+# 配置解析：优先当前工作树；没有就退回主仓的。
+# 为什么需要回退：core.hooksPath 指向主仓，64 个 worktree 共用同一套钩子，
+# 而旧分支的 worktree 里根本没有 .gitleaks.toml。不回退的话，那些 worktree
+# 的 push 会以「缺少扫描配置」直接失败 —— 报错完全指不到真正原因。
 CONFIG="$ROOT/.gitleaks.toml"
+if [ ! -f "$CONFIG" ]; then
+  _common_root="$(cd "$(git rev-parse --path-format=absolute --git-common-dir)/.." 2>/dev/null && pwd)" || _common_root=""
+  if [ -n "$_common_root" ] && [ -f "$_common_root/.gitleaks.toml" ]; then
+    CONFIG="$_common_root/.gitleaks.toml"
+  fi
+fi
+
 MIN_VERSION="8.19.0"
 GL=""
 #: 脚本自己创建的临时报告路径（非空时退出前删除；调用方指定报告时保持为空）

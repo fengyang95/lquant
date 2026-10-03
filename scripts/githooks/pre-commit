@@ -5,6 +5,16 @@ cd "$(git rev-parse --show-toplevel)"
 
 echo "==> pre-commit: 快速检查"
 
+# 扫描脚本解析：优先当前工作树的；旧分支的 worktree 里没有这个文件，
+# 退回钩子所在的主仓 —— 否则那些 worktree 会以「疑似密钥」这种误导性
+# 信息失败（真实原因是命令根本不存在）。
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MAIN_ROOT="$(cd "$HOOK_DIR/../.." && pwd)"
+SCAN="scripts/secret_scan.sh"
+if [ ! -f "$SCAN" ]; then
+  SCAN="$MAIN_ROOT/scripts/secret_scan.sh"
+fi
+
 # 1) Python 语法/风格（有 .venv 用它，没有则跳过）
 if [ -x .venv/bin/ruff ]; then
   .venv/bin/ruff check src/ scripts/ || {
@@ -16,7 +26,7 @@ fi
 #    YAML 的 `key: "..."`、`key="..."`、无空格赋值全部漏掉，等于没有门禁。
 #    换成 gitleaks 后：规则集 1 条 → 200+ 条，且与 pre-push / CI 共用同一份
 #    .gitleaks.toml，三处口径一致（否则"本地过了 CI 挂"迟早逼人加 --no-verify）。
-scripts/secret_scan.sh staged || {
+bash "$SCAN" staged || {
   echo "✗ 暂存区发现疑似密钥，已阻止提交。"
   echo "  · 真密钥：移到 .env（已在 .gitignore），并确认它从未被提交过"
   echo "  · 假阳性：改 .gitleaks.toml 白名单并写明理由，不要用 --no-verify 绕过"

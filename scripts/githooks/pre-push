@@ -8,6 +8,16 @@ cd "$(git rev-parse --show-toplevel)"
 
 echo "==> pre-push: 密钥扫描 + 测试 + diff 覆盖率门禁"
 
+# 扫描脚本解析：优先当前工作树的；旧分支的 worktree 里没有这个文件，
+# 退回钩子所在的主仓 —— 否则那 60+ 个 worktree 的 push 会以「疑似密钥」
+# 这种误导性信息失败（真实原因是命令根本不存在）。
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MAIN_ROOT="$(cd "$HOOK_DIR/../.." && pwd)"
+SCAN="scripts/secret_scan.sh"
+if [ ! -f "$SCAN" ]; then
+  SCAN="$MAIN_ROOT/scripts/secret_scan.sh"
+fi
+
 # git 通过 stdin 把待推送的 ref 列表交给 pre-push（<local ref> <sha> <remote ref> <sha>）。
 # 必须**最先**把它读走：后面的 pytest 会继承同一个 stdin，不读走这里就解析不到推送范围。
 # `-t 0` 为真说明是手动执行（无 stdin），此时 cat 会一直等输入，直接跳过范围扫描。
@@ -28,7 +38,7 @@ fi
 if [ "${LQ_SKIP_SECRET_SCAN:-0}" = "1" ]; then
   echo "    LQ_SKIP_SECRET_SCAN=1，跳过密钥扫描（不推荐）"
 else
-  scripts/secret_scan.sh push "$PUSH_REFS" || {
+  bash "$SCAN" push "$PUSH_REFS" || {
     echo "✗ 推送范围发现疑似密钥，已阻止 push。"
     echo "  · 真密钥：先撤销/轮换该凭证，再清理提交（见 docs/SECRET_HYGIENE.md）"
     echo "  · 假阳性：改 .gitleaks.toml 白名单并写明理由"
