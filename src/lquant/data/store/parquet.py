@@ -74,9 +74,36 @@ def _atomic_write_parquet(df: pl.DataFrame, p: Path) -> None:
         raise
 
 
+_root_warned = False
+
+
+def _warn_if_nested_lake(p: Path) -> None:
+    """数据根形状自检（廉价，每次取根时跑；只警告一次，避免刷屏）。
+
+    影子湖是**静默**故障：写入落到另一棵树，两条路径各自报成功，真实的湖
+    少掉的年份没有任何人发现（2026-10-03 审计）。这里不抛异常 —— 抛会打断
+    既有同步链路 —— 但要把话说清楚并指向修复动作。
+    """
+    global _root_warned
+    if _root_warned:
+        return
+    from lquant.data.store.integrity import nested_lake_reason
+
+    reason = nested_lake_reason(p)
+    if reason:
+        _root_warned = True
+        from loguru import logger
+
+        logger.error(
+            f"数据根可疑：{reason}。请检查 LQ_DATA_DIR 是否已包含 /parquet；"
+            f"完整检查：`lq data check`（DATA_ROOT_NESTED / SHADOW_LAKE）"
+        )
+
+
 def _root() -> Path:
     p = Path(get_settings().parquet_dir)
     p.mkdir(parents=True, exist_ok=True)
+    _warn_if_nested_lake(p)
     return p
 
 

@@ -52,9 +52,22 @@ def backfill_minute(
             continue
         if len(df):
             write_minute(df)
-        cp.mark(chunk)
-        done += len(chunk)
-        if done % 50 == 0:
+            # 只标记**确实返回了数据**的标的：源站静默零行（无异常）此前被
+            # 整批标 done —— 该标的分钟线永久缺失，且重跑会因断点命中全部
+            # 跳过（审计 P0-3）。与 daily.py 的 empty_response、reference.py
+            # 的「只标记返回的标的」保持同一口径。
+            got = set(df["symbol"].to_list())
+            ok = [s for s in chunk if s in got]
+            cp.mark(ok)
+            done += len(ok)
+            missing = len(chunk) - len(ok)
+            if missing:
+                logger.warning(
+                    f"批次 {i} 源零行返回 {missing}/{len(chunk)} 只，未标记（重跑将重试）"
+                )
+        else:
+            logger.warning(f"批次 {i} 源零行返回（{len(chunk)} 只），未标记（重跑将重试）")
+        if done and done % 50 == 0:
             logger.info(f"  分钟线进度 {done}/{len(todo)}")
     return done
 

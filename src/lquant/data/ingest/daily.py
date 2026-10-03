@@ -109,7 +109,10 @@ def backfill_pool(
 
     Returns:
         {"done": int, "failed": [{"symbol","reason"}...], "rows": int,
-         "early_stopped": bool}
+         "early_stopped": bool, "canceled": bool, "unprocessed": [symbol...]}
+        `unprocessed` = 因取消/提前停止**从未尝试**的标的。调用方必须用它把
+        这些标的排除在 `cp.mark()` 之外 —— 否则「没跑」被记成「跑完了」，
+        后续 retry 会因为断点命中而报 ok，留下永久静默空洞（审计 P0-2）。
     """
     from loguru import logger
 
@@ -119,7 +122,7 @@ def backfill_pool(
     total = len(todo)
     if not todo:
         return {"done": 0, "failed": [], "rows": 0, "early_stopped": False,
-                "canceled": False}
+                "canceled": False, "unprocessed": []}
     # 空跑不覆盖 meta（end=None 时避免抹掉上次记录）
     cp.set_meta(start=str(start), end=str(end) if end else None)
 
@@ -131,12 +134,16 @@ def backfill_pool(
     consecutive_full_failures = 0
     stopped = False
     canceled = False
+    attempted: set[str] = set()
 
     for i in range(0, total, batch_size):
         if cancel_check is not None and cancel_check():
             canceled = True
             break
         chunk = todo[i : i + batch_size]
+        # 进入本批即算「尝试过」：无论成功失败，后续都由 failed/ok 记账决定
+        # 是否标 done；只有从未进入的尾部才是 unprocessed。
+        attempted.update(s for s, _ in chunk)
         batch_failed: dict[str, str] = {}
         batch_rows = 0
         for end_d, group in _by_end(chunk):
@@ -216,6 +223,8 @@ def backfill_pool(
         "rows": rows,
         "early_stopped": stopped,
         "canceled": canceled,
+        # 从未尝试的尾部：调用方绝不能把它们标 done（审计 P0-2）
+        "unprocessed": [s for s, _ in todo if s not in attempted],
     }
 
 

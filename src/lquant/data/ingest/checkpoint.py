@@ -134,11 +134,32 @@ class Checkpoint:
         return any(a <= start and b >= end for a, b in self._spans(key))
 
     def covered_window(self, key: str) -> tuple[date, date] | None:
-        """该键覆盖区间的并集外框（用于分组增量拉取/展示）；无记录返回 None。"""
+        """该键覆盖区间的**并集外框**；无记录返回 None。
+
+        注意：这是外框，**不是**「已连续覆盖」。两段互不相连的区间
+        （如 [2016,2018] ∪ [2024,2026]）外框是 (2016, 2026)，中间的
+        2019~2023 空洞会被外框掩盖。判断「该窗口是否已覆盖」必须用
+        `covers()`，判断增量起点必须用 `covered_until()` —— 用外框做这两件
+        事会让空洞永不被回补（2026-10-03 审计 P0-4）。本方法只适合展示。
+        """
         spans = self._spans(key)
         if not spans:
             return None
         return min(a for a, _ in spans), max(b for _, b in spans)
+
+    def covered_until(self, key: str, start: date) -> date | None:
+        """从 `start` 起**连续**覆盖到的最后一天（含）；`start` 未被覆盖 → None。
+
+        与 `covered_window` 的关键区别：只认「从 start 起不间断」的那一段，
+        不会被并集外框里的空洞骗过。增量任务的起点必须由它推导 —— 否则
+        一次停摆（覆盖 [2016,2018] 与 [2024,2026] 两段）之后，中间的空洞
+        在外框口径下看起来「已覆盖」，永远不会被重拉。
+        """
+        hi: date | None = None
+        for a, b in self._spans(key):
+            if a <= start and (hi is None or b > hi):
+                hi = b
+        return hi
 
     def set_meta(self, **kw) -> None:
         self._data.setdefault("meta", {}).update(kw)

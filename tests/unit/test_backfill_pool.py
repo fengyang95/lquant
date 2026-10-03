@@ -279,7 +279,7 @@ def test_empty_pool(fake_settings, no_lake):
 
     res = backfill_pool([], date(2024, 1, 1), provider=FakeProvider([]))
     assert res == {"done": 0, "failed": [], "rows": 0, "early_stopped": False,
-                   "canceled": False}
+                   "canceled": False, "unprocessed": []}
 
 
 def test_empty_pool_keeps_meta(fake_settings, no_lake):

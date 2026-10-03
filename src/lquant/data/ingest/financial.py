@@ -25,25 +25,26 @@ def _todo_windows(cp: Checkpoint, symbols: list[str],
                   start_d: date, end_d: date) -> dict[date, list[str]]:
     """按「需要补拉的起点」把标的分组：{eff_start: [symbol, ...]}。
 
-    - 已有区间完整覆盖 [start_d, end_d] → 跳过
-    - 已覆盖到 hi 但请求窗口更晚 → 只拉 [hi+1, end_d]（公告日增量）
-    - 已覆盖区间起点晚于请求起点（请求更早）→ 从 start_d 整段重拉
-      （宁可重复拉，也不漏更早公告日的报告）
-    - 没记过区间（老 checkpoint / 新标的）→ 从 start_d 整段拉
+    - 已有**单个**区间完整覆盖 [start_d, end_d] → 跳过（用 covers，不用外框）
+    - 从 start_d 起连续覆盖到 until → 只拉 [until+1, end_d]（公告日增量）
+    - start_d 本身未被覆盖（新标的 / 老 checkpoint / 中间有洞）→ 从 start_d 整段重拉
+      （宁可重复拉，也不漏）
+
+    2026-10-03 审计 P0-4：此处原先用 `covered_window`（并集外框）判断跳过，
+    于是覆盖 [2016,2018] ∪ [2024,2026] 会被外框 (2016,2026) 判成「整段已覆盖」，
+    **2019~2023 的空洞永不回补** —— 而两段互不相连正是「停摆一段时间 + 两次
+    滚动 90 天窗口」产生的形状。改用 covers/covered_until 后，起点从 2019 起算，
+    重拉会与已有区间合并成连续覆盖，一次收敛。
 
     返回空 dict 表示「该窗口确实无事可做」—— 与「被断点静默跳过」在日志
     里是两个不同结论，调用方据此区分。
     """
     groups: dict[date, list[str]] = {}
     for sym in dict.fromkeys(symbols):  # 去重：重复标的会让 pending/skipped 口径错乱
-        span = cp.covered_window(sym)
-        if span is None:
-            eff = start_d
-        else:
-            lo, hi = span
-            if lo <= start_d and hi >= end_d:
-                continue
-            eff = start_d if lo > start_d else hi + timedelta(days=1)
+        if cp.covers(sym, start_d, end_d):
+            continue
+        until = cp.covered_until(sym, start_d)
+        eff = start_d if until is None else until + timedelta(days=1)
         if eff > end_d:
             continue
         groups.setdefault(eff, []).append(sym)

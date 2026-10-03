@@ -338,7 +338,12 @@ def _run_task(task_id: str, cancel_check: Any = None) -> dict:
                                 cancel_check=cancel_check)
             failed_set = {f["symbol"] for f in base["failed"]} | {
                 f["symbol"] for f in res["failed"]}
-            newly = [s for s, _ in remaining if s not in failed_set]
+            # 取消/提前停止时 backfill_pool 会 break，尾部标的**从未尝试**：
+            # 它们既不在 failed_set、也不在 done 里，若不显式排除就会被
+            # cp.mark() 记成完成。后续 retry 只 unmark failed_symbols，
+            # remaining 变空 → 任务报 ok，而那段历史永久缺失（审计 P0-2）。
+            unprocessed = set(res.get("unprocessed") or ())
+            newly = [s for s, _ in remaining if s not in failed_set and s not in unprocessed]
             cp.mark(newly)
             base = {
                 "done": base["done"] + res["done"],
