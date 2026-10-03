@@ -12,6 +12,8 @@ const PAGES: { path: string; heading: RegExp }[] = [
   { path: '/monitor', heading: /监控/i },
   { path: '/news', heading: /新闻|资讯|快讯/i },
   { path: '/ask', heading: /问 AI|问答|提问|Ask|智能/i },
+  // 因子编辑画布：后端不在时算子目录拉不到，但页面壳与输出积木必须正常渲染
+  { path: '/factors/editor', heading: /因子编辑/ },
 ];
 
 for (const { path, heading } of PAGES) {
