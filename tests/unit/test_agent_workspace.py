@@ -94,6 +94,35 @@ def test_skill_api_base_placeholder_is_substituted(
     assert "${LQ_API_BASE}" in skill.read_text(encoding="utf-8")
 
 
+def test_real_repo_skills_sync(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """真实仓库的两套 skill：外部 a-stock-data **原样**拷入（无占位符、不被改写），
+    本地 lquant-market 的 ${LQ_API_BASE} 被替换成本机地址。
+
+    直接调 _sync_skills（workspace 与 root 分开传），免得 ensure_workspace 把
+    工作区写进真实仓库的 data/ 下。
+    """
+    from lquant.agent.workspace import _sync_skills
+
+    monkeypatch.setenv("LQ_API_HOST", "127.0.0.1")
+    monkeypatch.setenv("LQ_API_PORT", "8123")
+    repo = Path(__file__).resolve().parents[2]
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    _sync_skills(ws, repo)
+
+    skills = ws / ".claude" / "skills"
+    external = (skills / "a-stock-data" / "SKILL.md").read_text(encoding="utf-8")
+    source = (repo / "config" / "skills" / "a-stock-data" / "SKILL.md").read_text(
+        encoding="utf-8")
+    assert external == source, "外部 vendored skill 必须原样拷入，不能被改写"
+
+    local = (skills / "lquant-market" / "SKILL.md").read_text(encoding="utf-8")
+    assert "${LQ_API_BASE}" not in local
+    assert "http://127.0.0.1:8123" in local
+
+
 def test_mcp_json_structure(root: Path) -> None:
     ws = ensure_workspace("ws", root)
     data = json.loads((ws / ".claude" / "mcp.json").read_text(encoding="utf-8"))

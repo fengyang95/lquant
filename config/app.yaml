@@ -34,9 +34,10 @@ agent:
   # 「问 AI」页新建会话时按它预填；建会话后 skill / MCP 工具仍可改
   # （PATCH /api/ask/sessions/{id}/config），provider 建后锁定。
   #
-  # 默认只开 a-stock-data：skill 一多，全塞给 agent 会稀释注意力，
-  # 按会话需要勾选更划算。想要全开就设 LQ_AGENT_DEFAULT_SKILLS=all。
-  default_skills: ${LQ_AGENT_DEFAULT_SKILLS:a-stock-data}
+  # 默认只开 lquant-market（本地数据湖，快且离线）：skill 一多，全塞给 agent 会
+  # 稀释注意力，按会话需要勾选更划算。外部 a-stock-data（公开源直连、需联网）
+  # 按会话勾选；想要全开就设 LQ_AGENT_DEFAULT_SKILLS=all。
+  default_skills: ${LQ_AGENT_DEFAULT_SKILLS:lquant-market}
   default_mcp_tools: ${LQ_AGENT_DEFAULT_MCP_TOOLS:all}
 
 store:

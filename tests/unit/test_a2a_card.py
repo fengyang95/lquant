@@ -57,9 +57,26 @@ def test_load_skills_on_repo_config():
     """仓库自带的 skill 必须都能进卡片（新增 skill 不用改代码）。"""
     got = load_skills(_REPO_ROOT / "config" / "skills")
     ids = {s.id for s in got}
-    assert {"a-stock-data", "factor-mining"} <= ids
+    assert {"a-stock-data", "lquant-market", "factor-mining"} <= ids
     for s in got:
-        assert s.description and s.tags
+        # 只要求有 description：a-stock-data 是 vendored 的上游 skill，frontmatter
+        # 没有 tags 字段，不能因此把它挡在卡片外
+        assert s.description
+    # 但本仓库自己写的 skill 必须有 tags（卡片与能力选择器按 tags 展示）
+    by_id = {s.id: s for s in got}
+    for own in ("lquant-market", "factor-mining"):
+        assert by_id[own].tags, f"{own} 缺 tags"
+
+
+def test_vendored_a_stock_data_keeps_upstream_identity():
+    """a-stock-data 目录是**外部** vendored skill（Apache-2.0）：目录名与 frontmatter
+    name 都必须是 a-stock-data，且带 SOURCE.md 溯源；本地湖 skill 已改名 lquant-market。"""
+    d = _REPO_ROOT / "config" / "skills"
+    meta = parse_frontmatter((d / "a-stock-data" / "SKILL.md").read_text(encoding="utf-8"))
+    assert meta is not None and meta["name"] == "a-stock-data"
+    assert (d / "a-stock-data" / "SOURCE.md").is_file(), "vendored 外部 skill 缺 SOURCE.md"
+    local = parse_frontmatter((d / "lquant-market" / "SKILL.md").read_text(encoding="utf-8"))
+    assert local is not None and local["name"] == "lquant-market"
 
 
 def test_build_agent_card_shape():

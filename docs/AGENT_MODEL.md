@@ -193,12 +193,23 @@ agent:
   skip_permissions: ${LQ_AGENT_SKIP_PERMISSIONS:true}
   partial_messages: ${LQ_AGENT_PARTIAL_MESSAGES:true}  # claude 的 token 级流式
   # 新建会话的默认能力集（逗号分隔或 YAML 列表）；all / 留空 = 全开
-  default_skills: ${LQ_AGENT_DEFAULT_SKILLS:a-stock-data}
+  default_skills: ${LQ_AGENT_DEFAULT_SKILLS:lquant-market}
   default_mcp_tools: ${LQ_AGENT_DEFAULT_MCP_TOOLS:all}
 ```
 
-`default_skills` 默认只给 `a-stock-data`：skill 一多，全塞给 agent 反而稀释
+`default_skills` 默认只给 `lquant-market`：skill 一多，全塞给 agent 反而稀释
 注意力，按会话勾选更划算；想要全开就设 `LQ_AGENT_DEFAULT_SKILLS=all`。
+
+工作区里可用的 skill：
+
+| skill | 数据面 | 说明 |
+|---|---|---|
+| `lquant-market` | **lquant 本地数据湖** | 本仓库编写；大盘/板块/资金流/涨停/龙虎榜/热榜/指数/ETF/覆盖度/日线，走本机 HTTP/MCP，快且离线 |
+| `a-stock-data` | **公开源直连** | 外部第三方（[simonlin1212/a-stock-data](https://github.com/simonlin1212/a-stock-data)，Apache-2.0，vendored）；研报/公告/财务/期货/期权/可转债/宏观等本地湖没有的面，需联网 |
+| `factor-mining` | lquant 因子流程 | 本仓库编写；因子挖掘与体检 |
+
+外部 `a-stock-data` 由 `scripts/update_astock_skill.sh` 刷新，来源/版本见
+`config/skills/a-stock-data/SOURCE.md`。
 
 `skip_permissions` 等于给 CLI 全自主权限（无头模式必须，否则会挂在/被拒掉），
 边界与风险见 `docs/SECURITY.md`。
