@@ -75,6 +75,11 @@ mlruns/
 data/qlib/
 data/qlib-smoke/
 
+# AlphaPurify 交叉验证：专用 venv、uv 缓存与运行产物
+.venv-alphapurify/
+.uv-cache/
+.xval-out*/
+
 web/coverage/
 web/test-results/
 web/playwright-report/
