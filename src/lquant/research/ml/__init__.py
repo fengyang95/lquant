@@ -31,6 +31,20 @@ from lquant.research.ml.model import (
     available_backends,
     make_model,
 )
+from lquant.research.ml.online import (
+    OnlineConfig,
+    daily_inference,
+    load_signals,
+    persist_signals,
+    rolling_retrain,
+    safe_promote,
+    verify_version,
+)
+from lquant.research.ml.panel import (
+    available_features,
+    build_feature_panel,
+    resolve_feature,
+)
 from lquant.research.ml.processor import (
     ClipProcessor,
     CrossSectionalProcessor,
@@ -74,4 +88,8 @@ __all__ = [
     "STAGES", "ModelVersion", "model_root", "model_paths", "save_artifact",
     "register_run", "list_models", "get_model", "load_model", "load_processor",
     "promote", "rollback", "archive", "production", "production_asof", "events",
+    # 特征面板 + 在线编排（Phase 2.2/2.3）
+    "resolve_feature", "build_feature_panel", "available_features",
+    "OnlineConfig", "rolling_retrain", "safe_promote", "verify_version",
+    "daily_inference", "persist_signals", "load_signals",
 ]

@@ -16,7 +16,7 @@ from lquant.server.jobs import (
 
 router = APIRouter(prefix="/tasks", tags=["task-center"])
 
-KINDS = ("data", "sync", "backtest", "factor", "qlib")
+KINDS = ("data", "sync", "backtest", "factor", "qlib", "ml")
 
 # 各自原生状态 → 统一 state（queued/running/finished/failed/canceled）
 _DATA_STATE = {
@@ -29,7 +29,12 @@ _JOB_STATE = {
     "queued": "queued", "enqueued": "queued", "deferred": "queued", "started": "running",
     "finished": "finished", "failed": "failed", "canceled": "canceled",
 }
-_QUEUE_OF_KIND = {"backtest": "lquant-backtest", "factor": "lquant-mining"}
+_QUEUE_OF_KIND = {"backtest": "lquant-backtest", "factor": "lquant-mining",
+                  "qlib": "lquant-qlib", "ml": "lquant-ml"}
+
+#: 队列任务的兜底显示名（任务体没登记名字时用）
+_DEFAULT_JOB_NAME = {"backtest": "参数扫描", "factor": "因子挖掘",
+                     "qlib": "Qlib 任务", "ml": "ML 训练"}
 
 
 def _ts(v) -> float:
@@ -72,10 +77,10 @@ def _sync_items(limit: int) -> list[dict]:
 
 
 def _job_items(queue: str, kind: str, limit: int) -> list[dict]:
-    """队列任务（backtest 扫描 / factor 挖掘 / 因子评价）归一。
+    """队列任务（backtest 扫描 / factor 挖掘 / qlib 工作流 / ml 训练）归一。
 
     进度取自进度注册表（enqueue 时任务体声明 progress 回调才会写入），
-    显示名优先取登记名（因子评价 / 参数扫描 / 因子挖掘）。
+    显示名优先取登记名（因子评价 / 参数扫描 / ML 训练）。
     """
     from lquant.server.progress import get_job_name, get_progress
 
@@ -86,9 +91,7 @@ def _job_items(queue: str, kind: str, limit: int) -> list[dict]:
         status = j.get("status") or "queued"
         jid = j["id"]
         out.append({"id": jid, "kind": kind,
-                    "name": get_job_name(jid)
-                    or ("参数扫描" if kind == "backtest"
-                        else ("Qlib 任务" if kind == "qlib" else "因子挖掘")),
+                    "name": get_job_name(jid) or _DEFAULT_JOB_NAME.get(kind, "因子挖掘"),
                     "status": status, "state": _JOB_STATE.get(status, "queued"),
                     "created_at": j.get("created_at", 0.0),
                     "params": {}, "error": j.get("error"),
@@ -116,6 +119,8 @@ def _items(kind: str, limit: int) -> list[dict]:
         return _job_items("lquant-mining", "factor", limit)
     if kind == "qlib":
         return _job_items("lquant-qlib", "qlib", limit)
+    if kind == "ml":
+        return _job_items("lquant-ml", "ml", limit)
     raise HTTPException(422, f"未知任务类别: {kind!r}（可选 {KINDS}）")
 
 
@@ -124,7 +129,7 @@ def list_tasks_ep(
     kind: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
 ) -> list[dict]:
-    """四类任务统一列表：{id, kind, name, status, state, created_at, params}，
+    """各类任务统一列表：{id, kind, name, status, state, created_at, params}，
     按 created_at 倒序，kind 可选过滤。"""
     if kind is not None and kind not in KINDS:
         raise HTTPException(422, f"未知任务类别: {kind!r}（可选 {KINDS}）")

@@ -184,6 +184,18 @@ DDL_STATEMENTS: list[str] = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS ml_signal (
+        name          VARCHAR,          -- 逻辑模型线（与 ml_model.name 对应）
+        trade_date    DATE,
+        symbol        VARCHAR,
+        signal        DOUBLE,           -- 模型原始输出（未做组合权重）
+        model_version INTEGER,          -- 出这个信号时线上是哪一版（可审计）
+        run_id        VARCHAR,
+        created_at    TIMESTAMP,
+        PRIMARY KEY (name, trade_date, symbol)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS ml_model_event (
         event_id   VARCHAR PRIMARY KEY,
         name       VARCHAR,          -- 逻辑模型线

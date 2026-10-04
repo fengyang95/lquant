@@ -50,15 +50,20 @@ class MLResult:
         return out
 
 
-def train_and_predict(ds: Dataset, train_end, valid_end, *, kind: str = "auto",
+def train_and_predict(ds: Dataset, train_end, valid_end, *, test_end=None,
+                      kind: str = "auto",
                       signal_col: str = "ml_signal", **params) -> MLResult:
     """按日期切分训练，输出测试集的预测信号。
 
     特征处理器（``DatasetConfig.processors``）**只在训练段 fit**，valid/test
     只 transform —— 这是 qlib ``DataHandlerLP`` 的 learn/infer 纪律：
     处理器参数是训练窗口的函数，测试段的分布信息绝不参与拟合。
+
+    ``test_end``：测试段右端点。**滚动重训必须传** —— 不传时测试段一直取到
+    数据末端，早期窗口的"样本外"指标会把后面所有窗口的数据都算进来，
+    越早的窗口看起来越好（未来信息泄漏进评估）。
     """
-    train_raw, _, test_raw = ds.split(train_end, valid_end)
+    train_raw, _, test_raw = ds.split(train_end, valid_end, test_end)
     if not len(train_raw) or not len(test_raw):
         raise ValueError("训练集或测试集为空，检查切分日期")
 
@@ -79,6 +84,7 @@ def train_and_predict(ds: Dataset, train_end, valid_end, *, kind: str = "auto",
     ic.pop("series", None)
     fit_window = {
         "train_end": str(train_end), "valid_end": str(valid_end),
+        "test_end": str(test_end) if test_end else None,
         "train_rows": len(train), "test_rows": len(test),
         "train_start": str(train[ds.cfg.date_col].min()) if len(train) else None,
         "train_stop": str(train[ds.cfg.date_col].max()) if len(train) else None,
