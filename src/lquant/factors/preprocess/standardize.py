@@ -42,18 +42,35 @@ def _inv_norm(p: float) -> float:
 
 
 def _safe_std(std: pl.Expr) -> pl.Expr:
+    """零方差兜底：σ≤1e-12 时用 1.0，使 ``(x-mean)/1`` 恒等于 0。
+
+    语义是**「零方差截面的标准化结果记为 0」**，不是 null、也不是 1。
+    选 0 而非 null 的理由：后续中性化/正交化的设计矩阵不接受 null 行，
+    返回 null 会把一整天的样本静默剔掉；返回 0 则等价于「无信息」，中性。
+    """
     return pl.when(std > 1e-12).then(std).otherwise(pl.lit(1.0))
 
 
-@method("zscore", stage="standardize", label="Z-Score")
+@method("zscore", stage="standardize", label="Z-Score",
+        formula="(x - mean) / σ",
+        notes="截面均值 0、标准差 1。零方差截面见 zero_variance。",
+        zero_variance="σ≈0（全截面同值）时用 σ=1.0 兜底 → 输出恒为 0（记 0，不记 null）。"
+                      "AlphaPurify `zscore_standardize` 在同样场景返回 **null** —— 口径差异，"
+                      "交叉验证时需先对齐：lquant 的 0 与 AP 的 null 都表示「该日无信息」。")
 def zscore(df: pl.DataFrame, col: str, *, by: str = "trade_date") -> pl.DataFrame:
-    """截面均值 0、标准差 1。"""
+    """截面均值 0、标准差 1。
+
+    零方差截面（全截面同值）返回 **0**：``_safe_std`` 兜底 1.0，``(x-mean)`` 本身为 0。
+    """
     mean = pl.col(col).mean().over(by)
     std = _safe_std(pl.col(col).std().over(by))
     return df.with_columns(((pl.col(col) - mean) / std).alias(col))
 
 
-@method("minmax", stage="standardize", label="Min-Max")
+@method("minmax", stage="standardize", label="Min-Max", params={"lo": 0.0, "hi": 1.0},
+        formula="lo + (x - min) / (max - min) × (hi - lo)",
+        notes="线性映射到 [lo, hi]。对极值不如 Rank 稳健。",
+        zero_variance="max-min≈0 时分母兜底 1.0 → 输出恒为 lo。")
 def minmax(df: pl.DataFrame, col: str, *, by: str = "trade_date",
            lo: float = 0.0, hi: float = 1.0) -> pl.DataFrame:
     """线性映射到 [lo, hi]。对极值不如 Rank 稳健。"""
@@ -63,7 +80,13 @@ def minmax(df: pl.DataFrame, col: str, *, by: str = "trade_date",
     return df.with_columns((lo + (pl.col(col) - mn) / span * (hi - lo)).alias(col))
 
 
-@method("rank", stage="standardize", label="截面排名", params={"to": "uniform"})
+@method("rank", stage="standardize", label="截面排名", params={"to": "uniform"},
+        formula="pct = rank_avg(x)/n → to=uniform: pct; to=normal: Φ⁻¹(pct)",
+        notes="截面排名归一化。to=uniform → [0,1]（已 clip 到 0.5/n ~ 1-0.5/n）；"
+              "to=normal → 近似标准正态（逆正态变换，Acklam 近似，不用 scipy）。"
+              "Rank 同时完成标准化与非线性压缩，是 A 股最常用口径。",
+        zero_variance="排名对「全值相同」仍给出 1..n 的确定序（依赖行序），不产生 null 或 0；"
+                      "此时结果**不含信息**，是真·无信号，而非数值退化。")
 def rank(df: pl.DataFrame, col: str, *, by: str = "trade_date",
          to: str = "uniform") -> pl.DataFrame:
     """截面排名归一化。to=uniform → [0,1]；to=normal → 近似标准正态。
@@ -77,6 +100,6 @@ def rank(df: pl.DataFrame, col: str, *, by: str = "trade_date",
     return df.with_columns(pct.alias(col))
 
 
-@method("none", stage="standardize", label="不标准化")
+@method("none", stage="standardize", label="不标准化", formula="x")
 def none(df: pl.DataFrame, col: str, *, by: str = "trade_date") -> pl.DataFrame:
     return df

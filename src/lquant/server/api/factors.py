@@ -983,8 +983,13 @@ def list_preprocess_methods(
     """预处理方法枚举 + 默认配方（M2.5「配方接入 API/UI」）。
 
     前端据此渲染配方选择器，不必硬编码方法名 —— 加新方法不用改前端。
+
+    每个方法带口径自省字段（``formula`` / ``notes`` / ``zero_variance``，见
+    ``preprocess.registry`` 的元数据词汇表），用于消除与 AlphaPurify 交叉验证时的
+    「同名不同义」歧义。顶层另附 ``mad_convention`` 说明 MAD 的 1.4826 修正。
     """
     from lquant.factors.preprocess.registry import STAGES, default_pipeline, list_methods
+    from lquant.factors.preprocess.winsorize import MAD_K
 
     if stage is not None and stage not in STAGES:
         raise HTTPException(422, f"未知预处理阶段 {stage!r}，可选: {list(STAGES)}")
@@ -992,6 +997,14 @@ def list_preprocess_methods(
         "stages": list(STAGES),
         "methods": list_methods(stage),
         "default_recipe": default_pipeline(),
+        "mad_convention": {
+            "scale_factor": MAD_K,
+            "formula": "median ± n × 1.4826 × MAD",
+            "n_semantics": "equivalent_sigma_multiple",
+            "alphapurify_conversion": "n_lquant = n_alphapurify / 1.4826",
+            "note": "AlphaPurify mad_winsorize 的 n 是 MAD 倍数（默认 3），"
+                    "本仓 n 是等效 σ 倍数（默认 5）—— 同名不同义。",
+        },
     }
 
 

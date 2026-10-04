@@ -4,7 +4,18 @@
 
 注册键是 `{stage}.{name}` 而不是裸 name —— 因为 `none` 在四个 stage 都要有
 （「不做处理」本身是个合法选项，用于对照实验），裸名会撞车。
+
+**元数据词汇表**（经 `describe()` / `GET /factors/preprocess/methods` 暴露给
+API 与前端，用于消除「同名不同义」口径歧义，尤其是与 AlphaPurify 交叉验证时）：
+
+- ``params``：默认参数，前端据此构造 step
+- ``formula``：该方法的数学口径（人可读）
+- ``notes``：补充说明 / 与 AlphaPurify 的换算关系
+- ``zero_variance``：零方差（退化截面）时的行为语义
+
+字段是**约定俗成**的：没写不报错，写了就自动透出 —— 加新方法不用改注册表代码。
 """
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -12,6 +23,10 @@ from typing import Any
 
 from lquant.core.errors import FactorError
 from lquant.core.registry import Registry
+
+# 口径自省字段：写进 method(**meta) 的这些键会被 describe() 原样透出（Registry
+# 保存整个 meta），此处仅作声明，供读者与该 API 的消费者对齐词汇。
+SELF_DESCRIBE_KEYS = ("formula", "notes", "zero_variance")
 
 METHODS: Registry = Registry("preprocess")
 
