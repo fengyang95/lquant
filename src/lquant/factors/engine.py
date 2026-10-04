@@ -21,7 +21,13 @@ class FactorEngine:
         公因子 compute 与 compute_many 的逐因子求值。多算子表达式要按
         plan 分步物化（打断 Polars 的嵌套 over 优化），命名用因子名前缀
         避免多因子共用 panel 时中间列互相覆盖。
+
+        先过 ``normalize``：库里历史遗留的 qlib 写法（Slope/Mean/Ref…）在这里
+        翻译成 DSL 再算，否则「打开得了、算不出来」会在评价阶段才炸。
         """
+        from lquant.factors.dsl.normalize import normalize
+
+        expr = normalize(expr)
         ast = parse(expr, name)
         check(ast, allowed_fields=set(df.columns))   # 静态分析：未来函数 + 未注册算子 + 字段白名单
 

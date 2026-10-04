@@ -261,3 +261,97 @@ def test_every_catalog_op_roundtrips_through_validate(client):
         r = client.post("/api/factors/validate", json={"expression": expr})
         assert r.status_code == 200
         assert r.json()["ok"] is True, f"{expr} 校验失败: {r.json()['error']}"
+
+
+# ---------------- 历史 qlib 写法的兼容归一（打开 BETA10 那类老因子） ----------------
+
+def test_normalize_unit():
+    """normalize：DSL 原样返回；qlib 写法翻译；两者都不是则保留原始 DSL 报错。"""
+    from lquant.core.errors import DSLParseError, FactorError
+    from lquant.factors.dsl.normalize import normalize
+
+    assert normalize("Rank(Ts_Mean($close,5)/$close-1)") == "Rank(Ts_Mean($close,5)/$close-1)"
+    assert normalize("Slope($close,10)/$close") == "Ts_Slope($close,10)/$close"
+    assert normalize("Mean($close,20)/$close") == "Ts_Mean($close,20)/$close"
+    assert normalize("  ") == ""
+
+    # 同名不同义：lquant 的 Rank(x) 是截面秩（1 参），qlib 的 Rank(x,n) 是时序秩
+    # （2 参）。静态检查只认名字不认元数，必须靠元数把两者分开，否则老 RANK 因子
+    # 会被当成截面秩，求值时炸 `rank() takes 1 positional argument`。
+    assert normalize("Rank($close)") == "Rank($close)"
+    assert normalize("Rank($close,5)") == "Ts_Rank($close,5)"
+    assert normalize("Rank(Ts_Mean($close,5)/$close-1)") == "Rank(Ts_Mean($close,5)/$close-1)"
+
+    # 可选参数：省略 / 给出都要接受
+    assert normalize("Ts_Quantile($close,5)") == "Ts_Quantile($close,5)"
+    assert normalize("Ts_Quantile($close,5,0.8)") == "Ts_Quantile($close,5,0.8)"
+
+    # 元数写错要静态报错，而不是拖到求值才炸 TypeError（那是 500 不是 422）
+    with pytest.raises(FactorError, match="参数个数不对"):
+        normalize("Ts_Mean($close)")
+
+    # qlib 专有字段 $vwap 在 lquant 面板里没有列 → 译成 amount/volume 代理
+    assert normalize("$vwap/$close") == "$amount/$volume/$close"
+
+    # 字段白名单**不在这里**校验：引擎会用真实面板列校验（合成路径会引用
+    # `f` 这类派生列），这里只保证语法/算子/元数成立。
+    assert normalize("Rank($no_such_col)") == "Rank($no_such_col)"
+
+    # 未注册算子要报**DSL**的错，而不是 qlib 翻译的错 —— 否则用户会以为
+    # 自己写的是 qlib 公式
+    with pytest.raises(FactorError, match="未注册算子: Nope"):
+        normalize("Nope($close)")
+    with pytest.raises(DSLParseError):
+        normalize("1 + ")
+
+    # fail-soft（列表 / 详情这类展示路径）：坏表达式不抛，原样返回
+    from lquant.factors.dsl.normalize import normalize_soft
+
+    assert normalize_soft("Nope($close)") == "Nope($close)"
+    assert normalize_soft("  ") == ""
+
+
+def test_ast_endpoint_translates_legacy_qlib(client):
+    """打开 BETA10：库里存的是 qlib 写法，/ast 必须先翻译再出树。
+
+    回归：此前直接 parse+check，Slope 未注册 → 422，画布永远打不开。
+    """
+    r = client.post("/api/factors/ast", json={"expression": "Slope($close,10)/$close"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["translated"] is True
+    assert body["expression"] == "Ts_Slope($close,10)/$close"
+    assert body["ast"]["kind"] == "binary" and body["ast"]["op"] == "/"
+    assert body["ast"]["left"]["name"] == "Ts_Slope"
+
+    # 已经是 DSL 的表达式不标 translated
+    ok = client.post("/api/factors/ast", json={"expression": "Ts_Slope($close,10)/$close"})
+    assert ok.status_code == 200
+    assert ok.json()["translated"] is False
+
+
+def test_validate_endpoint_translates_legacy_qlib(client):
+    """历史 qlib 写法也要能过校验（此前 Slope 未注册 → ok=False）。"""
+    r = client.post("/api/factors/validate", json={"expression": "Slope($close,10)/$close"})
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "error": None}
+
+    # 响应形状保持 {ok, error}：不接受 qlib 的坏算子仍如实报错
+    bad = client.post("/api/factors/validate", json={"expression": "Nope($close)"})
+    assert bad.status_code == 200
+    assert bad.json()["ok"] is False
+    assert "未注册算子: Nope" in bad.json()["error"]
+
+
+def test_register_and_read_normalize_legacy_qlib(client):
+    """落库即归一：注册 qlib 写法，读回来必须是 DSL（列表 / 详情同口径）。"""
+    r = client.post("/api/factors", json={
+        "name": "legacy_beta10", "expression": "Slope($close,10)/$close",
+        "description": "历史 qlib 写法"})
+    assert r.status_code == 200, r.text
+
+    detail = client.get("/api/factors/legacy_beta10").json()
+    assert detail["expression"] == "Ts_Slope($close,10)/$close"
+
+    listed = {f["name"]: f for f in client.get("/api/factors?limit=500").json()}
+    assert listed["legacy_beta10"]["expression"] == "Ts_Slope($close,10)/$close"

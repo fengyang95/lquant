@@ -90,8 +90,19 @@ export type AstNode =
   | { kind: 'call'; name: string; args: AstNode[] };
 
 export type AstResponse = {
+  /** 服务端归一后的表达式（历史 qlib 写法会在此变成 lquant DSL） */
   expression: string;
   ast: AstNode;
+  /** 服务端是否把历史 qlib 写法翻译成了 lquant DSL */
+  translated?: boolean;
+};
+
+/** 打开已有因子 / 粘贴表达式的结果 */
+export type LoadExpressionResult = {
+  /** 画布映射告警（有损映射时禁止保存） */
+  warnings: string[];
+  /** 是否发生过 qlib → DSL 兼容翻译 */
+  translated: boolean;
 };
 
 /** 窗口控件缺省值：服务端如实报告 required 但无默认，UI 给一个常识值 */
