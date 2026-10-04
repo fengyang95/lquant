@@ -186,10 +186,10 @@
 | 任务 | 说明 |
 |---|---|
 | 4.1 算子补齐 | **已完成**（2026-10-04）。移植 `Not/And/Or/Eq/Ne/Ge/Le`（新增 `ops/bool_ops.py`，逻辑语义 0/1 浮点，非 qlib 的按位语义）+ `Ts_Var/Ts_Kurt/Ts_Med/Ts_Count`。**不移植** `Mask`/`ChangeInstrument`：二者语义是「换标的再算」（依赖 qlib 表达式树的隐藏 instrument 上下文），在 lquant 的 symbol×date 长表上没有对应概念，硬套会静默读错列 —— 算相对指数的东西应 join 指数列后用 `Ts_Corr`。**不移植** `Mad`：qlib 自己是逐窗口 Python 回调（源码标注 TODO Cython），绕不开逐窗口扫描（绝对差和不可分解为累积量），留给 `lq-ops` Rust 侧按同名覆盖注册。 |
-| 4.2 多 horizon 并行 IC | 复用 `forward_return_matrix`，并行化 |
-| 4.3 overnight 切分 | 隔夜/日内收益分开统计 |
-| 4.4 方法扩容 | `boxcox`/`yeo_johnson`/`rolling_*`/`EWMA`/`volatility_scaling` |
-| 4.5 多 seed / 集成 | 训练多 seed 取均值，降单次训练噪声 |
+| 4.2 多 horizon 并行 IC | **已完成**（2026-10-04）。`evaluate/ic.py::ic_by_horizon`：按 horizon 各自取有效样本（不是全局掩码），输出每日 IC 序列 + 汇总，供因子衰减曲线直接用。 |
+| 4.3 overnight 切分 | **已完成**（2026-10-04）。`evaluate/sessions.py`：`session_returns`/`session_ic`/`session_ic_summary`，把收益拆成 overnight/intraday 两段分别算 IC，回答「因子到底在赚哪一段」。 |
+| 4.4 方法扩容 | **已完成**（2026-10-04）。新增 `preprocess/rolling.py`（`rolling_zscore`/`rolling_robust_zscore`/`rolling_minmax`/`volatility_scaling`/`ewma`）与 `preprocess/power.py`（`boxcox`/`yeo_johnson`）。全部注册进 standardize 阶段，自动出现在 `/factors/preprocess/methods` 与画布。**发现并修正两处上游前视泄漏**：AP `boxcox_standardize` 用全样本最小值做平移（含未来日期）→ 本仓改为当日截面最小值；AP `EWMA_standardize` 的权重挂在绝对时间下标上再反向累加，等价于 `σ²_t = Σ_{u≥t}(1−λ)λ^u x²_u`（用到 t 之后的数据）→ 本仓改为递归 `ewma_mean(adjust=False)`。另：AP 滚动方法 `sort()` 后直接返回、会改调用方行序；本仓先记原序、算完还原。 |
+| 4.5 多 seed / 集成 | **已完成**（2026-10-04）。`research/ml/model.py::EnsembleModel` + `make_model(n_seeds=)`；`base`/`n_seeds` 随 artifact 落盘（否则载入后静默退回默认值），子后端参数单独放 `sub_params` 以免透传 base/n_seeds。 |
 | 4.6 交叉验证常态化 | `scripts/xval/alphapurify/` 扩因子/扩方法；qlib workflow 纳入定期任务做回归哨兵 |
 
 ---
