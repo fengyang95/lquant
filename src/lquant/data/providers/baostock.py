@@ -562,6 +562,21 @@ class BaoStockProvider(MappingProvider):
         out = self.request("daily_bar", _raw=raw)
         return _attach_is_st(out, raw)
 
+    def index_daily_bars(
+        self, symbols: list[str], start: date, end: date
+    ) -> pl.DataFrame:
+        """指数日线：BaoStock 对指数同样走 ``query_history_k_data_plus``
+        （公共 helper ``_fetch_daily`` 已把 ``000300.SH`` 转成 ``sh.000300``），
+        因此复用同一抓取路径，只把 ``sec_type`` 覆盖成 index。
+
+        ETF 与股票在 baostock 上还能混在 ``daily_bars`` 里，指数则必须区分：
+        yaml 里 ``sec_type`` 的默认 fill 是 ``stock``，不覆盖会让指数行在
+        ``security`` 口径下被当成个股（虽然 ``index_daily`` 表不带这一列，
+        但下游派生物会读到错误类别）。
+        """
+        raw = self._fetch_daily(symbols, start, end)
+        return self.request("daily_bar", _raw=raw, sec_type="index")
+
     def minute_bars(
         self, symbols: list[str], start: date, end: date, freq: str = "60min"
     ) -> pl.DataFrame:

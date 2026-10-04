@@ -311,10 +311,11 @@ def test_capability_set(provider: AkShareProvider) -> None:
     caps = {c.value for c in AkShareProvider().capability}
     assert caps == {
         "daily", "minute_1", "minute_5", "minute_15", "minute_30", "minute_60",
-        "adj_factor", "reference", "etf_daily",
+        "adj_factor", "reference", "etf_daily", "index_daily",
     }
     assert not AkShareProvider().has(Capability.FINANCIAL_PIT)
     assert not AkShareProvider().has(Capability.CALENDAR)
+    assert hasattr(AkShareProvider(), "index_daily_bars")
 
 
 def test_real_yaml_loads() -> None:

@@ -33,9 +33,11 @@ BATCH = 200
 SUB_BATCH = 20
 EARLY_STOP_BATCHES = 10
 
-# 取数方法名（provider 侧）：基金段优先 etf_daily_bars，其余走 daily_bars
+# 取数方法名（provider 侧）：基金段优先 etf_daily_bars，指数段优先
+# index_daily_bars，其余走 daily_bars
 _DAILY_METHOD = "daily_bars"
 _FUND_METHOD = "etf_daily_bars"
+_INDEX_METHOD = "index_daily_bars"
 _FUND_TYPES = ("etf", "lof")
 
 ProgressFn = Callable[[dict], None]
@@ -49,32 +51,59 @@ def _is_fund(symbol: str) -> bool:
         return False
 
 
-def resolve_ingest_source(*, fund: bool, provider=None) -> tuple[object, str]:
+def _is_index(symbol: str) -> bool:
+    """指数判定（代码段规则，与 ``Symbol.sec_type`` 同一真源，不查库）。
+
+    沪市 ``000xxx`` 全段 + 深市 ``399xxx`` 是指数（``000001.SH`` 上证指数与
+    ``000001.SZ`` 平安银行同名不同指 —— 必须带交易所后缀判定）。
+    """
+    try:
+        return parse_symbol(symbol).sec_type.value == "index"
+    except Exception:  # noqa: BLE001 - 解析不了的代码按非指数处理
+        return False
+
+
+def resolve_ingest_source(*, fund: bool, index: bool = False,
+                          provider=None) -> tuple[object, str]:
     """解析该标的类别的**实际取数源**与取数方法（不盲取链头）。
 
     为什么不能一律用 ``chain.providers[0]``：各源对「日线」的覆盖面不同 ——
     tushare 的 pro.daily 只有股票（ETF 在 fund_daily、指数在 index_daily），
     盲取链头时整个 ETF/LOF 段会逐日返回零行，被记成 empty_response（实测
     2026-09-17 任务：1582 只 ETF + 85 只 LOF 全段零行，ETF 湖停更 6 天）。
-    基金段因此按 etf_daily 能力选源；源没有 etf_daily_bars 时回落 daily_bars
-    （baostock 没有 etf_daily_bars 但 daily_bars 能取 ETF —— 注意它只覆盖
-    近端：实测 510300.SH / 159915.SZ 在 2026-03 有行、2024-06 零行）。
+    指数同理：指数走 ``Capability.INDEX_DAILY`` 选源，方法优先
+    ``index_daily_bars``（tushare 的 pro.index_daily）—— 用 ``daily_bars``
+    取指数在 tushare 上必然零行。基金段因此按 etf_daily 能力选源；源没有
+    etf_daily_bars 时回落 daily_bars（baostock 没有 etf_daily_bars 但
+    daily_bars 能取 ETF —— 注意它只覆盖近端：实测 510300.SH / 159915.SZ
+    在 2026-03 有行、2024-06 零行）。
 
     provider 显式注入（测试/单源场景）时原样返回，不做能力路由。
     """
     if provider is not None:
+        if index:
+            return provider, _INDEX_METHOD if hasattr(provider, _INDEX_METHOD) \
+                else _DAILY_METHOD
         return provider, _FUND_METHOD if fund else _DAILY_METHOD
 
     from lquant.data.providers import get_provider
 
     chain = get_provider()
     if not hasattr(chain, "providers"):
+        if index:
+            return chain, (_INDEX_METHOD if hasattr(chain, _INDEX_METHOD)
+                           else _DAILY_METHOD)
         return chain, _DAILY_METHOD
-    want = Capability.ETF_DAILY if fund else Capability.DAILY
+    want = (Capability.INDEX_DAILY if index
+            else Capability.ETF_DAILY if fund
+            else Capability.DAILY)
     for p in chain.providers:
         if not p.has(want):
             continue
-        method = _FUND_METHOD if fund and hasattr(p, _FUND_METHOD) else _DAILY_METHOD
+        if index:
+            method = _INDEX_METHOD if hasattr(p, _INDEX_METHOD) else _DAILY_METHOD
+        else:
+            method = _FUND_METHOD if fund and hasattr(p, _FUND_METHOD) else _DAILY_METHOD
         return p, method
     return chain.providers[0], _DAILY_METHOD
 
@@ -152,12 +181,13 @@ def backfill_pool(
                 # 交易日，视为完成（0 行），不算 empty_response 失败
                 continue
             # 显式注入 provider（测试/单源）时整组走它；否则按标的类别分流，
-            # 基金段路由到支持 etf_daily 的源（盲取链头会让基金段全零行）
+            # 基金段路由到支持 etf_daily 的源、指数段路由到 index_daily 能力的源
+            # （盲取链头会让基金/指数段全零行）
             buckets = ([("all", group)] if explicit_provider
                        else _by_class(group))
             for cls, syms in buckets:
                 src, method = resolve_ingest_source(
-                    fund=(cls == "fund"), provider=provider)
+                    fund=(cls == "fund"), index=(cls == "index"), provider=provider)
                 df, grp_failed = _pull_group(src, syms, start, end_d, method)
                 batch_rows += len(df)
                 batch_failed.update(grp_failed)
@@ -172,7 +202,10 @@ def backfill_pool(
                             f"empty_response: 源({_provider_source(src)})零行返回")
                 if len(df):
                     try:
-                        write_daily(_stamp(df, _provider_source(src)))
+                        if cls == "index":
+                            _write_index_bars(df)
+                        else:
+                            write_daily(_stamp(df, _provider_source(src)))
                     except DataQualityError as e:
                         # 质量门禁 fatal 拦批：不入湖，标失败留待重试（H2）
                         logger.error(f"质量门禁拦截（fatal，不入湖）: {e}")
@@ -241,22 +274,61 @@ def _by_end(chunk: list[tuple[str, date]]) -> list[tuple[date, list[str]]]:
 
 
 def _by_class(chunk: list[str]) -> list[tuple[str, list[str]]]:
-    """同组内按标的类别分流（基金 / 其余），保持各自首次出现顺序。
+    """同组内按标的类别分流（基金 / 指数 / 其余），保持各自首次出现顺序。
 
-    只分两类即可：基金（ETF/LOF，可能需要 etf_daily 通道）与其余
-    （股票，走 daily 通道）。股票段若混入指数，由上游回填池负责排除
-    （指数点位超价格护栏，见 SecurityRepo.active_symbols 的口径注释）。
+    只分三类即可：基金（ETF/LOF，可能需要 etf_daily 通道）、指数
+    （index_daily 通道，写入 DuckDB ``index_daily`` 表而非日线湖）、
+    其余（股票，走 daily 通道）。
+
+    指数**不入日线 parquet 湖**：点位超价格护栏、量纲断言不成立
+    （详见 ``SecurityRepo.active_symbols``）；但混入的指数必须被识别出来，
+    否则会走 ``daily_bars`` 拉零行、或被质量门禁拦成整批失败。
     """
     fund: list[str] = []
+    index: list[str] = []
     other: list[str] = []
     for sym in chunk:
-        (fund if _is_fund(sym) else other).append(sym)
+        if _is_index(sym):
+            index.append(sym)
+        elif _is_fund(sym):
+            fund.append(sym)
+        else:
+            other.append(sym)
     out: list[tuple[str, list[str]]] = []
     if other:
         out.append(("other", other))
     if fund:
         out.append(("fund", fund))
+    if index:
+        out.append(("index", index))
     return out
+
+
+def _write_index_bars(df: pl.DataFrame) -> int:
+    """指数序列写入 DuckDB ``index_daily``（回测基准 / 大盘看板的数据源）。
+
+    与日线湖的差别是有意的：指数是**点位**不是价格，不进 parquet 湖、不走
+    ``gate_daily``（价格护栏对点位无意义）。列对齐 ``TABLE_COLUMNS["index_daily"]``，
+    缺列由 market.persist 的 upsert 处理。
+    """
+    from loguru import logger
+
+    if not len(df):
+        return 0
+    from lquant.market.collectors.index_daily import INDEX_POOL
+    from lquant.market.scheduler import persist
+
+    keep_cols = ["trade_date", "symbol", "open", "high", "low", "close",
+                 "pre_close", "volume", "amount"]
+    cols = [c for c in keep_cols if c in df.columns]
+    out = df.select(cols).with_columns(
+        pl.col("symbol").replace_strict(INDEX_POOL, default=None).alias("name"),
+        collected_at=pl.lit(now_cn(), dtype=pl.Datetime("us")),
+    )
+    counts = persist({"index_daily": out})
+    n = int(counts.get("index_daily", 0))
+    logger.info(f"指数日线入库 index_daily: {n} 行")
+    return n
 
 
 def _pull_group(

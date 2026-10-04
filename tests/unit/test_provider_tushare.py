@@ -257,9 +257,13 @@ def test_capability_set(provider: TushareProvider) -> None:
     assert caps == {
         "daily", "minute_1", "minute_5", "minute_15", "minute_30", "minute_60",
         "adj_factor", "financial_pit", "reference", "calendar", "etf_daily",
+        "index_daily",
     }
     assert TushareProvider(token="t").has(Capability.FINANCIAL_PIT)
     assert TushareProvider(token="t").has(Capability.CALENDAR)
+    # 指数独立于个股：pro.daily 取不到指数，必须有 index_daily 能力与专用方法
+    assert TushareProvider(token="t").has(Capability.INDEX_DAILY)
+    assert hasattr(TushareProvider(token="t"), "index_daily_bars")
 
 
 def test_real_yaml_loads() -> None:

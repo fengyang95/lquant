@@ -77,6 +77,7 @@ class AkShareProvider(MappingProvider):
         Capability.DAILY, Capability.MINUTE_1, Capability.MINUTE_5,
         Capability.MINUTE_15, Capability.MINUTE_30, Capability.MINUTE_60,
         Capability.ADJ_FACTOR, Capability.REFERENCE, Capability.ETF_DAILY,
+        Capability.INDEX_DAILY,
     })
 
     def __init__(self, qps: float = 3, capability: frozenset[Capability] | None = None) -> None:
@@ -188,6 +189,31 @@ class AkShareProvider(MappingProvider):
             frames.append(_select_daily(df, sym))
         raw = pl.concat(frames, how="diagonal") if frames else pl.DataFrame()
         return self.request("daily_bar", _raw=raw, sec_type="etf")
+
+    def index_daily_bars(
+        self, symbols: list[str], start: date, end: date
+    ) -> pl.DataFrame:
+        """指数日线：``ak.index_zh_a_hist``（东财指数接口，列与个股同形）。
+
+        与 ``stock_zh_a_hist`` 区分开——个股接口取 ``000300.SH`` 会返回平安银行
+        一类的个股数据或直接空表，基准序列就此错位。
+        """
+        import akshare as ak  # noqa: PLC0415  延迟导入：akshare 可选依赖
+
+        frames = []
+        for sym in symbols:
+            self._bucket.acquire()
+            df = _from_pandas(ak.index_zh_a_hist(
+                symbol=_to_code(sym),
+                period="daily",
+                start_date=start.strftime("%Y%m%d"),
+                end_date=end.strftime("%Y%m%d"),
+            ))
+            if df.is_empty():
+                continue
+            frames.append(_select_daily(df, sym))
+        raw = pl.concat(frames, how="diagonal") if frames else pl.DataFrame()
+        return self.request("daily_bar", _raw=raw, sec_type="index")
 
     def minute_bars(
         self, symbols: list[str], start: date, end: date, freq: str = "1min"

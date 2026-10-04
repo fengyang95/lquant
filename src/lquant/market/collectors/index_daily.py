@@ -48,11 +48,15 @@ def fetch_index_daily(trade_date=None, start: str | None = None,
         return _demo(start_d, end_d)
 
     try:
-        from lquant.data.providers import get_provider
+        from lquant.data.ingest.daily import resolve_ingest_source
 
-        provider = get_provider()
-        target = provider.providers[0] if hasattr(provider, "providers") else provider
-        df = target.daily_bars(list(INDEX_POOL), start_d, end_d)
+        # 必须按 INDEX_DAILY 能力选源：盲取链头（providers[0]）时若链头是
+        # tushare，pro.daily 不含指数 → 整段零行、基准永久缺失（这就是
+        # 「指数无路由」时的真实故障形态）。resolve_ingest_source 会挑出
+        # 声明 INDEX_DAILY 的源并优先用 index_daily_bars。
+        src, method = resolve_ingest_source(fund=False, index=True)
+        fn = getattr(src, method, None) or src.daily_bars
+        df = fn(list(INDEX_POOL), start_d, end_d)
     except Exception as e:  # noqa: BLE001
         print(f"[warn] 指数日线拉取失败（可 demo 模式验证链路）: {e}")
         return _empty()
