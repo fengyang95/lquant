@@ -33,12 +33,17 @@ echo "==> 2/2 基准口径对拍（原生 index_daily ↔ qlib bin）"
 LQ_DUCKDB_PATH="$REPO_ROOT/data/duckdb/lquant.duckdb" \
   "$PY" "$HERE/benchmark_parity.py" \
     --qlib-dir "$QLIB_DIR" --symbol 000300.SH \
-    --repo-root "$REPO_ROOT" \
+    --src-root "$WORKTREE" --repo-root "$REPO_ROOT" \
     --out "$QLIB_DIR/benchmark_parity.json"
 
 echo
-echo "==> 完成。qlib 工作流可另跑：
+echo "==> 完成（基准口径一致）。qlib 工作流可另跑：
   $REPO_ROOT/.venv-qlib/bin/python $WORKTREE/src/lquant/qlib_io/runner.py \\
       --provider $QLIB_DIR \\
       --config $WORKTREE/config/qlib/workflow_alpha158_smoke.yaml \\
-      --market top60 --out $QLIB_DIR/last_metrics.json"
+      --market top60 --out $QLIB_DIR/last_metrics.json
+  # 注意：上面这个 config 的窗口是生产窗口。只导出了 index_daily 覆盖的
+  # 2026-09 窗口时，用窗口对齐的 scripts/xval/qlib/workflow_xval_smoke.yaml
+  # （sentinel.sh 走的就是它）。
+
+  或一键跑两套对拍（含 workflow 断言）：bash scripts/xval/sentinel.sh"

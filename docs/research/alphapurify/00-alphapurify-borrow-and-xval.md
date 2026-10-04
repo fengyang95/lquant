@@ -259,8 +259,53 @@ bash scripts/xval/alphapurify/run_xval.sh
 bash scripts/xval/alphapurify/run_xval.sh 2023-01-01 2024-12-31 800
 ```
 
-产物：`.xval-out/{panel,lquant_ic,lquant_prep,ap_ic,ap_rank_ic,ap_prep,reference_ic}.parquet`
+产物：`.xval-out/<factor>/{panel,lquant_ic,lquant_prep,ap_ic,ap_rank_ic,ap_prep,reference_ic}.parquet`
 + `xval_report.json` + `lquant_summary.json` + `ap_summary.json`。
+
+### 3.5 扩展复跑（2026-10-04，Phase 4.4/4.6）：4 因子 × 9 变体 + 上游 bug 看门狗
+
+方法与预处理清单改为单一真源 `scripts/xval/alphapurify/variants.py`，
+`expect` 三态判定：`match` 必须一致、`diverge` 必须**仍然分歧**、
+`upstream_broken` 必须**仍然坏**。规模：400 只 × 2023-01-01~2024-12-31。
+
+**IC/RankIC**：4 个因子（mom20/mom5/ma20_ratio/std20_ratio）的逐日 IC 与 RankIC
+三方（lquant / AlphaPurify / 独立 `pl.corr` 参考）`max|Δ| = 0.0`。
+
+**预处理**（`max|Δ|`，四因子）：
+
+| 变体 | mom20 | mom5 | ma20_ratio | std20_ratio |
+|---|---|---|---|---|
+| `winsor_mad_n3`（AP 默认口径） | 8.9e-16 | 8.9e-16 | 6.4e-15 | 1.1e-15 |
+| `winsor_mad_n5_sigma`（lquant 默认口径） | 1.8e-15 | 1.8e-15 | 3.6e-15 | 1.8e-15 |
+| `rolling_zscore_w20` | **0** | **0** | **0** | **0** |
+| `rolling_robust_w20` | **0** | **0** | **0** | **0** |
+| `volatility_scaling_w20_shift` | **0** | **0** | **0** | **0** |
+| `yeo_johnson_l05` | 1.1e-7 | 1.9e-7 | 2.4e-7 | 3.7e-7 |
+| `ewma_l094`（预期分歧） | 6.8e+6 | 1.1e+7 | 7.0e+6 | 7.0e+6 |
+| `boxcox_l025`（预期分歧） | 7.0 | 8.1 | 8.7 | 4.3 |
+| `rolling_minmax_w20` | 上游不可用 | 同左 | 同左 | 同左 |
+
+→ 新增的滚动族标准化与 AP **逐位一致**；`yeo_johnson` 的 ~1e-7 只来自分母
+（AP `σ+1e-9` vs 本仓 `σ≈0→1.0`）；`ewma`/`boxcox` 的大差值是本仓**修正上游
+前视泄漏**的直接后果（见 `docs/research/00-borrow-and-port-plan.md` §1.7.2）。
+
+**新发现的上游缺陷（3 个，均已原生绕开并留看门狗）**
+
+1. `rolling_minmax_standardize` 的签名参数顺序与同族其它函数相反，而分发按统一
+   顺序传参 → 它对 **`trade_date` 列**做滚动 Min-Max 并写回（dtype 变 `Float64`、
+   值为 null），真正的因子列原封不动 —— 该方法**不可用**。
+2. `EWMA_standardize` 把权重挂在**绝对时间下标**上再反向累加，等价于
+   `σ²_t = Σ_{u≥t}(1−λ)λ^u x²_u`，**用到 t 之后的数据**（前视泄漏）。
+3. `boxcox_standardize` 用**全样本**（含未来日期）最小值做平移，因子值随新数据
+   整体漂移（同样是前视）。
+
+**顺带修掉自己的 bug（教训比结论更值钱）**：`compare.py::_diff` 原来在两侧列名
+相同时，join 后两侧取值表达式**都解析到左列** ⇒ `left-left ≡ 0`，任何同名比较都
+「永远通过」。发现方式是给新变体两侧用同名列后 17 个变体齐刷刷 `0.000e+00`。
+现在先 alias 成 `__left`/`__right` 再比，并让 `diverge`/`upstream_broken` 两类
+判定去**要求分歧与缺陷仍然存在** —— 让「两边一样」有反证，而不是默认成立。
+（§3.2 的 IC 结论未受此 bug 影响：两侧各自的汇总统计逐项相同，
+且修正 harness 后复跑仍为 `max|Δ| = 0.0`。）
 
 ---
 

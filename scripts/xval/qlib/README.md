@@ -63,6 +63,22 @@ ret   max|Δ| = 7.438e-08
 原生引擎侧的对应实现对拍在 `tests/unit/test_backtest_benchmark.py`：
 `1 + 超额 = (1 + 组合总收益) / (1 + 基准区间收益)` 的定义式被断言。
 
+## 作为定期哨兵
+
+```bash
+bash scripts/xval/sentinel.sh        # 或 make xval-sentinel
+```
+
+`sentinel.sh` 会把这一套（导出 → 基准对拍 → 真跑 workflow）与 AlphaPurify 侧
+（见 [`../alphapurify/README.md`](../alphapurify/README.md)）串起来，任一失败即
+非零退出。它**不进 CI**：需要真实数据湖与 `.venv-qlib` / `.venv-alphapurify`，
+CI runner 上都没有 —— 塞进去只会得到一个永远 skip 的绿灯。
+
+哨兵对 workflow 只断言两件事（收益数字会随窗口/股票池漂移，不能当判据）：
+
+- `excess_return_with_cost.mean` 存在且有限 —— 基准链路活着；
+- `ffr == 1.0` —— 基准序列覆盖整个回测窗口（`ffr < 1` 说明基准数据有缺口）。
+
 ## 边界
 
 - 只对拍**基准腿**。两侧的组合腿（TopkDropout vs FactorTopN、成本模型）

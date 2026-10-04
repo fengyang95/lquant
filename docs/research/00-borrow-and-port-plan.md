@@ -122,6 +122,21 @@
 | 滚动算子预热 | `min_periods=1`，部分窗口也出值 | 满窗口，窗口内有空值即为空 | 部分窗口会把预热期噪声当信号喂给 IC。唯一例外是 `Ts_Count`（数据完整度指标，满窗恒等于 `n` 而无信息量） |
 | `Not`/`And`/`Or` | numpy **按位**语义（`~1.0 == -2.0`） | 逻辑语义，真值判据 `x > 0`，输出 0/1 浮点 | 按位语义只在「输入只可能是 0/1」时成立，喂进 0~1 连续值（如 `Ts_Rank`）就产负数；逻辑语义不依赖输入范围 |
 
+#### 1.7.2 交叉验证发现的上游缺陷（都已原生绕开，并留了看门狗）
+
+| 上游实现 | 缺陷 | 实测证据 | lquant 处置 |
+|---|---|---|---|
+| `rolling_minmax_standardize` | 签名 `(df, factor_col, trade_date, symbol_col)` 与同族其它函数相反，而分发按 `(df, trade_date, symbol_col, factor_col)` 传参 → 对 **`trade_date` 列**做滚动 Min-Max 并写回，真正的因子列没被处理 | 该列 dtype 变 `Float64`、值为 null | 原生实现（语义正确）；哨兵按 `upstream_broken` 盯「上游是否修好」 |
+| `EWMA_standardize` | 权重 `(1−λ)λ^k` 挂在**绝对时间下标**上再反向累加 ⇒ `σ²_t = Σ_{u≥t}(1−λ)λ^u x²_u`，**用到 t 之后的数据**（前视泄漏）；且权重随绝对下标而非距离衰减，不是 EWMA | 与递归口径 `max\|Δ\|` 达 1e+7 量级 | 递归 `ewm_mean(adjust=False)`；哨兵按 `diverge` 盯 |
+| `boxcox_standardize` | 用**全样本**（含未来日期）最小值做平移 `shift=-min+eps`，因子值随新数据整体漂移 | 与当日截面平移 `max\|Δ\|` 4~9 | 当日截面最小值平移；哨兵按 `diverge` 盯 |
+| `neutralize("random_forest")` | 注册表/分发不一致：能用的名字 `randomforest` 不在注册表里 | `NotImplementedError` | 不借鉴其契约（自持单一真源注册表） |
+
+**另一条更值得记的教训**：出问题的还有**我们自己的对拍工具**。`compare.py::_diff`
+原先两侧列名相同时，join 后 `j[col_a]`/`j[col_b]` 都解析到左列 ⇒ `left-left ≡ 0`，
+17 个变体齐刷刷「0.000e+00 全通过」。发现方式是给新变体两侧用同名列。
+→ 对拍工具本身必须先被怀疑：现在 `diverge` 要求「确实仍然分歧」、
+`upstream_broken` 要求「确实仍然坏」，让「两边一样」有反证而非默认成立。
+
 ---
 
 ## 2. 移植计划
@@ -190,7 +205,7 @@
 | 4.3 overnight 切分 | **已完成**（2026-10-04）。`evaluate/sessions.py`：`session_returns`/`session_ic`/`session_ic_summary`，把收益拆成 overnight/intraday 两段分别算 IC，回答「因子到底在赚哪一段」。 |
 | 4.4 方法扩容 | **已完成**（2026-10-04）。新增 `preprocess/rolling.py`（`rolling_zscore`/`rolling_robust_zscore`/`rolling_minmax`/`volatility_scaling`/`ewma`）与 `preprocess/power.py`（`boxcox`/`yeo_johnson`）。全部注册进 standardize 阶段，自动出现在 `/factors/preprocess/methods` 与画布。**发现并修正两处上游前视泄漏**：AP `boxcox_standardize` 用全样本最小值做平移（含未来日期）→ 本仓改为当日截面最小值；AP `EWMA_standardize` 的权重挂在绝对时间下标上再反向累加，等价于 `σ²_t = Σ_{u≥t}(1−λ)λ^u x²_u`（用到 t 之后的数据）→ 本仓改为递归 `ewma_mean(adjust=False)`。另：AP 滚动方法 `sort()` 后直接返回、会改调用方行序；本仓先记原序、算完还原。 |
 | 4.5 多 seed / 集成 | **已完成**（2026-10-04）。`research/ml/model.py::EnsembleModel` + `make_model(n_seeds=)`；`base`/`n_seeds` 随 artifact 落盘（否则载入后静默退回默认值），子后端参数单独放 `sub_params` 以免透传 base/n_seeds。 |
-| 4.6 交叉验证常态化 | `scripts/xval/alphapurify/` 扩因子/扩方法；qlib workflow 纳入定期任务做回归哨兵 |
+| 4.6 交叉验证常态化 | **已完成**（2026-10-04）。① 清单单一真源 `scripts/xval/alphapurify/variants.py`（4 因子 × 9 变体，加因子/加方法只改这一个文件）；② `expect` 三态判定（`match` 必须一致 / `diverge` 必须仍然分歧 / `upstream_broken` 必须仍然坏）—— **让「两侧一样」这件事有反证**；③ `scripts/xval/sentinel.sh` + `make xval-sentinel` 把 AP 对拍（`--check`）与 qlib 基准对拍 + workflow 真跑串起来，任一失败非零退出。不进 CI：需要真实数据湖与两个隔离 venv，塞进去只会得到永远 skip 的绿灯。④ 实测（400 只 × 2023-01-01~2024-12-31，4 因子）：IC/RankIC 逐日三方 `max\|Δ\|=0.0`；`rolling_zscore`/`rolling_robust`/`volatility_scaling` 预处理 `max\|Δ\|=0.0`；`winsor_mad_*` ~1e-15；`yeo_johnson` ~1e-7（分母 eps 差）；`ewma`/`boxcox` 预期分歧（上游前视泄漏，见 4.4）。⑤ 顺带修掉 harness 自身的**自比较 bug**（同名比较恒 0，见 §1.7.2）。 |
 
 ---
 

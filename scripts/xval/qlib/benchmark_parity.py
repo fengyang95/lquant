@@ -18,12 +18,21 @@ Phase 1.3 把 qlib 工作流的基准从 `SH600000` 机械代理换成真实指�
 
     python scripts/xval/qlib/benchmark_parity.py \
         --qlib-dir data/qlib-xval --symbol 000300.SH \
-        [--repo-root /path/to/lquant] [--tol 1e-6]
+        [--src-root /path/to/worktree] [--repo-root /path/to/data-repo] [--tol 1e-6]
+
+**代码源与数据源是两个不同的东西**（踩过坑）：
+- `--src-root`：`import lquant` 从哪个 checkout 取（默认 = 本脚本所在 worktree，
+  可用 `LQ_SRC` 覆盖）。被测代码是**当前开发分支**。
+- `--repo-root`：数据湖/`index_daily` 所在 repo，仅作元信息记录 ——
+  真正读哪个 DuckDB 由 `LQ_DUCKDB_PATH` 决定，与代码位置无关。
+把两者混为一谈时，主仓 main 的旧 `lquant` 会冒充被测对象，
+`lquant.backtest.benchmark` 这种本分支新增的模块会直接 `ModuleNotFoundError`。
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import date
 from pathlib import Path
@@ -53,9 +62,12 @@ def _read_bin(qlib_dir: Path, qsym: str, field: str = "close") -> tuple[int, np.
     return int(arr[0]), arr[1:]
 
 
-def _native_series(symbol: str, repo_root: Path) -> dict[date, float]:
-    """从 DuckDB index_daily 读原生基准序列（与引擎用的是同一个函数）。"""
-    sys.path.insert(0, str(repo_root / "src"))
+def _native_series(symbol: str, src_root: Path) -> dict[date, float]:
+    """从 DuckDB index_daily 读原生基准序列（与引擎用的是同一个函数）。
+
+    `src_root` 是**代码**所在 checkout；DB 文件由 `LQ_DUCKDB_PATH` 指定。
+    """
+    sys.path.insert(0, str(src_root / "src"))
     from lquant.backtest.benchmark import load_index_series
 
     series = load_index_series(symbol)
@@ -68,7 +80,10 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="基准口径对拍（lquant index_daily ↔ qlib bin）")
     ap.add_argument("--qlib-dir", default="data/qlib-xval")
     ap.add_argument("--symbol", default="000300.SH", help="lquant 形态指数代码")
-    ap.add_argument("--repo-root", default=str(REPO_ROOT))
+    ap.add_argument("--src-root", default=os.environ.get("LQ_SRC", str(REPO_ROOT)),
+                    help="被测代码所在 checkout（import lquant 用）")
+    ap.add_argument("--repo-root", default=str(REPO_ROOT),
+                    help="数据湖所在 repo（仅记录进报告；DuckDB 路径由 LQ_DUCKDB_PATH 定）")
     ap.add_argument("--tol", type=float, default=1e-6,
                     help="日收益的绝对容差（收益是小数，1e-6 已是 float32 极限）")
     ap.add_argument("--rtol", type=float, default=1e-4,
@@ -78,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     qlib_dir = Path(args.qlib_dir).resolve()
-    repo_root = Path(args.repo_root).resolve()
+    src_root = Path(args.src_root).resolve()
     qsym = _qlib_symbol(args.symbol)
 
     cal = _read_calendar(qlib_dir)
@@ -92,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
         if np.isfinite(v) and v > 0:
             qlib_series[cal[idx]] = float(v)
 
-    native = _native_series(args.symbol, repo_root)
+    native = _native_series(args.symbol, src_root)
 
     common = sorted(set(qlib_series) & set(native))
     only_qlib = sorted(set(qlib_series) - set(native))
@@ -100,6 +115,8 @@ def main(argv: list[str] | None = None) -> int:
 
     report: dict = {
         "qlib_dir": str(qlib_dir),
+        "src_root": str(src_root),
+        "repo_root": str(Path(args.repo_root).resolve()),
         "symbol": args.symbol,
         "qlib_symbol": qsym,
         "calendar_days": len(cal),
