@@ -126,44 +126,76 @@ def test_run_ml_pipeline_record_false(monkeypatch):
     assert "turnover" not in out["backtest"]
 
 
-def test_run_ml_pipeline_record_success_and_failure(tmp_path, monkeypatch):
-    """record=True：落库成功拿 run_id；落库抛异常被吞掉只打 warn。"""
+def test_run_ml_pipeline_record_registers_version(tmp_path, monkeypatch):
+    """record=True：注册进模型注册表 —— 拿 run_id、版本号、artifact 可定位。
+
+    这条链路是 Phase 2.1 的核心：训练记录必须能回放到模型文件，
+    而不是「有一行指标但不知道模型在哪」。
+    """
     import json as _json
+
+    monkeypatch.setenv("LQ_ROOT", str(tmp_path))
+    monkeypatch.setenv("LQ_DUCKDB_PATH", str(tmp_path / "lq.duckdb"))
+    monkeypatch.setenv("LQ_MODEL_DIR", str(tmp_path / "models"))
+    monkeypatch.chdir(tmp_path)     # 让相对路径的 duckdb 落在 tmp 而不是工作区
+    # 回测引擎要读 config/rules/cn_a_share.yaml（相对 root 解析）——
+    # 不复制的话本测试只能靠 load_yaml 的 lru_cache 余温通过，单独跑必挂。
+    import shutil as _shutil
+    from pathlib import Path as _Path
+
+    _shutil.copytree(_Path(__file__).resolve().parents[2] / "config",
+                     tmp_path / "config", dirs_exist_ok=True)
+    from lquant.core.config import get_settings
+
+    get_settings.cache_clear()
+    from lquant.core.db import reader, writer
+    from lquant.data.store.ddl import DDL_STATEMENTS, ensure_ml_run_columns
+
+    with writer() as con:
+        for stmt in DDL_STATEMENTS:
+            con.execute(stmt)
+        ensure_ml_run_columns(con)   # 老库增列迁移（新库是空操作）
 
     from lquant.research.ml.backtest import run_ml_pipeline
 
-    saved: list = []
-
-    class FakeCon:
-        def execute(self, sql, params):
-            saved.append((sql, params))
-
-    class FakeWriter:
-        def __enter__(self):
-            return FakeCon()
-
-        def __exit__(self, *a):
-            return False
-
-    monkeypatch.setattr("lquant.core.db.writer", lambda: FakeWriter())
     out = run_ml_pipeline(make_ohlcv(), ["mom"], label_horizon=5,
                           train_end=date(2024, 1, 31), valid_end=date(2024, 2, 10),
-                          kind="ridge", top_n=3, record=True)
+                          kind="ridge", top_n=3, record=True,
+                          model_name="unit_line",
+                          processors=[{"kind": "standardize"}])
     assert out["ml_run_id"]
-    sql, params = saved[0]
-    assert "INSERT OR REPLACE INTO ml_run" in sql
-    assert len(params) == 10
-    assert _json.loads(params[3]) == ["mom"]
+    mv = out["model"]
+    assert mv["name"] == "unit_line" and mv["version"] == 1
+    assert mv["stage"] == "candidate"
+    assert (tmp_path / mv["artifact_path"]).exists()
+    assert (tmp_path / mv["processor_path"]).exists()
 
-    # 落库失败：不阻断主流程
-    def bad_writer():
-        raise RuntimeError("db down")
+    with reader() as con:
+        row = con.execute(
+            "SELECT features, model_name, model_version, artifact_path"
+            " FROM ml_run WHERE run_id = ?", [out["ml_run_id"]]).fetchone()
+    assert _json.loads(row[0]) == ["mom"]
+    assert (row[1], row[2]) == ("unit_line", 1)
+    assert row[3] == mv["artifact_path"]
 
-    monkeypatch.setattr("lquant.core.db.writer", bad_writer)
+    # 第二次训练同一 model_name → 版本递增（同一模型线的版本流）
     out2 = run_ml_pipeline(make_ohlcv(), ["mom"], label_horizon=5,
                            train_end=date(2024, 1, 31), valid_end=date(2024, 2, 10),
+                           kind="ridge", top_n=3, record=True,
+                           model_name="unit_line",
+                           processors=[{"kind": "standardize"}])
+    assert out2["model"]["version"] == 2
+
+    # 注册失败：不阻断主流程（研究脚本不该因为库坏了跑不完）
+    def bad_register(**kw):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr("lquant.research.ml.registry.register_run", bad_register)
+    out3 = run_ml_pipeline(make_ohlcv(), ["mom"], label_horizon=5,
+                           train_end=date(2024, 1, 31), valid_end=date(2024, 2, 10),
                            kind="ridge", top_n=3, record=True)
-    assert "ml_run_id" not in out2
+    assert "ml_run_id" not in out3
+    get_settings.cache_clear()
 
 
 def test_mlresult_summary_empty_ic():

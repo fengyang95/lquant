@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import polars as pl
 
+from lquant.factors.ops.bool_ops import truth
 from lquant.factors.ops.registry import op
 
 
@@ -46,6 +47,6 @@ def el_signed_power(x: pl.Expr, p: pl.Expr) -> pl.Expr:
     return x.sign() * x.abs().pow(p)
 
 
-@op("If", "EL", 0, "逐元素条件 If(cond, a, b)")
+@op("If", "EL", 0, "逐元素条件 If(cond, a, b)（真值判据 cond>0，与 Not/And/Or 同源）")
 def el_if(c: pl.Expr, a: pl.Expr, b: pl.Expr) -> pl.Expr:
-    return pl.when(c > 0).then(a).otherwise(b)
+    return pl.when(truth(c)).then(a).otherwise(b)

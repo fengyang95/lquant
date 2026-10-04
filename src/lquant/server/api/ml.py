@@ -1,0 +1,428 @@
+"""/ml API：模型注册表、训练/滚动重训任务、每日推理与信号。
+
+设计要点（与 Phase 2 的目标对齐：**可调度、可回放、可回滚**）：
+
+- 训练与重训都是**队列任务**（``lquant-ml``），返回 job_id 供任务中心轮询；
+  长训练不能占住请求线程（Alpha158 + LGBM 在几千只票上是分钟级）。
+- 模型版本、晋级、回滚、as-of 查询走 ``research.ml.registry``；
+  **同一份状态只有一个真源**，API 不自己拼 SQL 逻辑。
+- 推理端点把信号落 ``ml_signal``（带 model_version），
+  事后可审计「某天的信号是哪一版出的」。
+"""
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import date
+
+import polars as pl
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field, field_validator
+
+from lquant.core.db import reader
+from lquant.core.errors import MLError
+from lquant.data.store.parquet import read_daily
+from lquant.research.ml import registry
+from lquant.server.jobs import enqueue, get_job, request_cancel
+
+router = APIRouter(prefix="/ml", tags=["ml"])
+
+_QUEUE = "lquant-ml"
+_MAX_FEATURES = 400
+
+
+# ---------------------------------------------------------------- 请求模型
+
+class _Base(BaseModel):
+    features: list[str] = Field(min_length=1, max_length=_MAX_FEATURES)
+    start: str = Field(default="2024-01-01", pattern=r"^\d{4}-\d{2}-\d{2}$")
+    end: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    universe: str = "all"
+    label_horizon: int = Field(default=5, ge=1, le=60)
+    kind: str = "auto"
+    top_n: int = Field(default=30, ge=1, le=200)
+    processors: list[dict] | None = Field(default=None, max_length=8)
+    model_name: str | None = Field(default=None, max_length=64,
+                                   pattern=r"^[A-Za-z0-9_-]*$")
+    model_params: dict = Field(default_factory=dict)
+
+    @field_validator("kind")
+    @classmethod
+    def _kind(cls, v: str) -> str:
+        from lquant.research.ml.model import available_backends
+
+        if v != "auto" and v not in available_backends():
+            raise ValueError(f"未知/不可用的模型后端 {v!r}，可选: {available_backends()}")
+        return v
+
+    @field_validator("processors")
+    @classmethod
+    def _procs(cls, v: list[dict] | None) -> list[dict] | None:
+        if not v:
+            return v
+        from lquant.research.ml.processor import make_processor
+
+        for spec in v:
+            try:
+                make_processor(spec)      # 未知 kind 直接 422，别等任务跑起来才炸
+            except (KeyError, MLError) as e:
+                # pydantic 只把 ValueError/AssertionError 转 422；注册表查不到
+                # 抛的是 KeyError、我们的领域错误是 MLError，都会穿透成 500。
+                raise ValueError(str(e)) from e
+        return v
+
+
+class TrainIn(_Base):
+    train_end: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    valid_end: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    stage: str = "candidate"
+
+
+class RetrainIn(_Base):
+    train_months: int = Field(default=24, ge=3, le=120)
+    valid_months: int = Field(default=6, ge=1, le=24)
+    test_months: int = Field(default=6, ge=1, le=24)
+    step_months: int = Field(default=6, ge=1, le=24)
+    promote: bool = True
+    min_improvement: float = 0.0
+    promote_metric: str = "test_rank_ic_mean"
+
+
+class PredictIn(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    features: list[str] = Field(min_length=1, max_length=_MAX_FEATURES)
+    date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    version: int | None = Field(default=None, ge=1)
+    start: str = Field(default="2024-01-01", pattern=r"^\d{4}-\d{2}-\d{2}$")
+    end: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    universe: str = "all"
+    persist: bool = True
+
+
+class PromoteIn(BaseModel):
+    stage: str = "production"
+    note: str | None = Field(default=None, max_length=500)
+
+
+# ---------------------------------------------------------------- 数据装载
+
+def _load(start: str, end: str | None, universe: str) -> pl.DataFrame:
+    """读日线面板。universe != all 时按指数最新成分过滤。"""
+    from lquant.factors.universe import resolve_index_code
+
+    symbols = None
+    if universe and universe != "all":
+        from lquant.data.store.catalog import IndexConsRepo
+
+        code = resolve_index_code(universe)
+        symbols = IndexConsRepo().latest_symbols(code)
+        if not symbols:
+            raise HTTPException(
+                503, f"指数 {code} 成分股为空，先在数据页同步指数成分（index_cons）")
+    df = read_daily(start=start, end=end, symbols=symbols).collect()
+    if not len(df):
+        raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
+    return df
+
+
+# ---------------------------------------------------------------- 任务体
+
+def _run_train_job(req: dict, progress=None, cancel_check=None) -> dict:
+    """enqueue 任务体：一次性训练 + 注册版本。"""
+    from lquant.research.ml.backtest import run_ml_pipeline
+
+    if cancel_check is not None and cancel_check():
+        from lquant.server.jobs import JobCanceled
+
+        raise JobCanceled("训练已取消")
+    if progress is not None:
+        progress(done=0, total=3, phase="load", message="读取日线")
+    df = _load(req["start"], req.get("end"), req.get("universe", "all"))
+    if progress is not None:
+        progress(done=1, total=3, phase="train", message="训练中")
+    out = run_ml_pipeline(
+        df, req["features"], label_horizon=req["label_horizon"],
+        train_end=req["train_end"], valid_end=req["valid_end"],
+        kind=req["kind"], top_n=req["top_n"],
+        processors=req.get("processors"),
+        model_name=req.get("model_name"),
+        stage=req.get("stage", "candidate"),
+        note="api: /ml/train",
+        **req.get("model_params", {}),
+    )
+    if progress is not None:
+        progress(done=3, total=3, phase="done", message="完成")
+    return {"ml_run_id": out.get("ml_run_id"), "model": out.get("model"),
+            "ml": out.get("ml"), "dataset": out.get("dataset"),
+            "backtest": out.get("backtest")}
+
+
+def _run_retrain_job(req: dict, progress=None, cancel_check=None) -> dict:
+    """enqueue 任务体：滚动重训 + 先验证再晋级。"""
+    from lquant.research.ml.online import OnlineConfig, rolling_retrain
+
+    df = _load(req["start"], req.get("end"), req.get("universe", "all"))
+    name = req.get("model_name") or _default_name(req)
+    cfg = OnlineConfig(
+        name=name, features=req["features"], label_horizon=req["label_horizon"],
+        kind=req["kind"], processors=req.get("processors"), top_n=req["top_n"],
+        train_months=req["train_months"], valid_months=req["valid_months"],
+        test_months=req["test_months"], step_months=req["step_months"],
+        promote_metric=req.get("promote_metric", "test_rank_ic_mean"),
+        min_improvement=req.get("min_improvement", 0.0),
+        model_params=req.get("model_params", {}),
+    )
+    return rolling_retrain(df, cfg, promote=req.get("promote", True),
+                           progress=progress, cancel_check=cancel_check)
+
+
+def _default_name(req: dict) -> str:
+    h = req.get("label_horizon", 5)
+    return f"ml_h{h}_top{req.get('top_n', 30)}"
+
+
+# ---------------------------------------------------------------- 状态 / 自省
+
+@router.get("/status")
+def status_ep() -> dict:
+    """ML 子系统状态：可用后端、版本统计、线上版本、最近信号。"""
+    from lquant.research.ml.model import available_backends
+
+    models = registry.list_models()
+    names = sorted({m.name for m in models})
+    prods = {}
+    for n in names:
+        p = registry.production(n)
+        if p is not None:
+            prods[n] = {"version": p.version,
+                        "metric": (p.metrics or {}).get("ml", {}).get(
+                            "test_rank_ic_mean")}
+    signals: list[dict] = []
+    try:
+        with reader() as con:
+            signals = [
+                {"name": r[0], "days": r[1], "last": str(r[2]),
+                 "version": r[3]}
+                for r in con.execute(
+                    "SELECT name, COUNT(DISTINCT trade_date), MAX(trade_date),"
+                    " MAX(model_version) FROM ml_signal GROUP BY name").fetchall()
+            ]
+    except Exception:  # noqa: BLE001  表未建
+        signals = []
+    return {
+        "backends": available_backends(),
+        "model_lines": len(names),
+        "versions": len(models),
+        "by_stage": {s: sum(1 for m in models if m.stage == s)
+                     for s in registry.STAGES},
+        "production": prods,
+        "signals": signals,
+        "model_dir": str(registry.model_root()),
+    }
+
+
+@router.get("/features")
+def features_ep(universe: str = "all", start: str = "2024-01-01",
+                end: str | None = None, limit: int = Query(default=200, ge=1, le=1000)) -> dict:
+    """可用特征清单（湖列 + Alpha158 内置 + 简单公式），供前端选择器。"""
+    from lquant.research.ml.panel import available_features
+
+    try:
+        df = _load(start, end, universe)
+        out = available_features(df, limit=limit)
+    except HTTPException:
+        # 湖空时仍给出内置因子与公式模板（前端选择器不至于空白）
+        out = available_features(None, limit=limit)
+    return out
+
+
+# ---------------------------------------------------------------- 训练
+
+@router.post("/train", status_code=202)
+def train_ep(req: TrainIn) -> dict:
+    """提交一次性训练（异步）。返回 job_id。"""
+    if req.valid_end <= req.train_end:
+        raise HTTPException(422, "valid_end 必须晚于 train_end")
+    params = req.model_dump()
+    job = enqueue(_QUEUE, _run_train_job, params,
+                  job_id=uuid.uuid4().hex[:12], name="ML 训练")
+    return {"job_id": getattr(job, "id", None) or str(job)}
+
+
+@router.post("/retrain", status_code=202)
+def retrain_ep(req: RetrainIn) -> dict:
+    """提交滚动重训（异步）。返回 job_id。"""
+    params = req.model_dump()
+    job = enqueue(_QUEUE, _run_retrain_job, params,
+                  job_id=uuid.uuid4().hex[:12], name="ML 滚动重训")
+    return {"job_id": getattr(job, "id", None) or str(job)}
+
+
+@router.get("/jobs/{job_id}")
+def job_ep(job_id: str) -> dict:
+    from lquant.server.progress import get_progress
+
+    j = get_job(job_id)
+    if j is None:
+        raise HTTPException(404, f"任务不存在: {job_id}")
+    return {"job_id": job_id, "status": j.get_status(),
+            "result": j.result if j.is_finished else None,
+            "error": getattr(j, "error", None),
+            "progress": get_progress(job_id)}
+
+
+@router.post("/jobs/{job_id}/cancel")
+def cancel_ep(job_id: str) -> dict:
+    return {"canceled": request_cancel(job_id)}
+
+
+# ---------------------------------------------------------------- 训练记录
+
+@router.get("/runs")
+def list_runs_ep(limit: int = Query(default=50, ge=1, le=500),
+                 model_name: str | None = None,
+                 stage: str | None = None) -> list[dict]:
+    """训练记录列表（ml_run）。老库缺新列时降级为旧列子集，不 500。"""
+    sql = ("SELECT run_id, model, model_name, model_version, stage,"
+           " metrics, train_rows, test_rows, train_end, test_end, created_at,"
+           " artifact_path FROM ml_run")
+    where, args = [], []
+    if model_name:
+        where.append("model_name = ?")
+        args.append(model_name)
+    if stage:
+        where.append("stage = ?")
+        args.append(stage)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    args.append(limit)
+    try:
+        with reader() as con:
+            rows = con.execute(sql, args).fetchall()
+    except Exception as e:  # noqa: BLE001  迁移未跑
+        raise HTTPException(503, f"ml_run 表结构未迁移（重启服务会自动迁移）: {e}") from e
+    return [{"run_id": r[0], "model": r[1], "model_name": r[2],
+             "model_version": r[3], "stage": r[4],
+             "metrics": _safe_json(r[5]), "train_rows": r[6], "test_rows": r[7],
+             "train_end": str(r[8]) if r[8] else None,
+             "test_end": str(r[9]) if r[9] else None,
+             "created_at": str(r[10]) if r[10] else None,
+             "artifact_path": r[11]} for r in rows]
+
+
+@router.get("/runs/{run_id}")
+def get_run_ep(run_id: str) -> dict:
+    with reader() as con:
+        row = con.execute(
+            "SELECT run_id, model, params, features, metrics, train_rows, test_rows,"
+            " train_end, test_end, created_at, model_name, model_version, stage,"
+            " artifact_path, processor_path, processor_state, fit_window, dataset"
+            " FROM ml_run WHERE run_id = ?", [run_id]).fetchone()
+    if row is None:
+        raise HTTPException(404, f"训练记录不存在: {run_id}")
+    return {
+        "run_id": row[0], "model": row[1], "params": _safe_json(row[2]),
+        "features": _safe_json(row[3]), "metrics": _safe_json(row[4]),
+        "train_rows": row[5], "test_rows": row[6],
+        "train_end": str(row[7]) if row[7] else None,
+        "test_end": str(row[8]) if row[8] else None,
+        "created_at": str(row[9]) if row[9] else None,
+        "model_name": row[10], "model_version": row[11], "stage": row[12],
+        "artifact_path": row[13], "processor_path": row[14],
+        "processor_state": _safe_json(row[15]), "fit_window": _safe_json(row[16]),
+        "dataset": _safe_json(row[17]),
+    }
+
+
+# ---------------------------------------------------------------- 模型版本
+
+@router.get("/models")
+def list_models_ep(name: str | None = None, stage: str | None = None) -> list[dict]:
+    return [m.as_dict() for m in registry.list_models(name, stage)]
+
+
+@router.get("/models/{name}/production")
+def production_ep(name: str, asof: str | None = Query(
+        default=None, description="ISO 时刻；给了就重放事件流回答当时在线的版本")):
+    """当前线上版本；``asof`` 给了就回答**当时**在线的版本（审计用）。"""
+    mv = registry.production_asof(name, asof) if asof else registry.production(name)
+    if mv is None:
+        raise HTTPException(404, f"模型线 {name} 没有线上版本"
+                                 + ("（或该时刻尚无线上版本）" if asof else ""))
+    return mv.as_dict()
+
+
+@router.post("/models/{name}/{version}/promote")
+def promote_ep(name: str, version: int, req: PromoteIn) -> dict:
+    from lquant.core.errors import MLError
+
+    try:
+        mv = registry.promote(name, version, req.stage, note=req.note or "api: promote")
+    except MLError as e:
+        raise HTTPException(404, str(e)) from e
+    return mv.as_dict()
+
+
+@router.post("/models/{name}/rollback")
+def rollback_ep(name: str, note: str | None = None) -> dict:
+    mv = registry.rollback(name, note=note or "api: rollback")
+    if mv is None:
+        raise HTTPException(409, f"模型线 {name} 没有可回滚的历史线上版本")
+    return mv.as_dict()
+
+
+@router.get("/models/{name}/events")
+def events_ep(name: str) -> list[dict]:
+    return registry.events(name)
+
+
+# ---------------------------------------------------------------- 推理 / 信号
+
+@router.post("/predict")
+def predict_ep(req: PredictIn) -> dict:
+    """用线上版本（或指定版本）产出信号并落库。
+
+    同步执行：推理是单次前向，毫秒级；训练才需要异步。
+    """
+    from lquant.core.errors import MLError
+    from lquant.research.ml.online import OnlineConfig, daily_inference
+
+    df = _load(req.start, req.end, req.universe)
+    cfg = OnlineConfig(name=req.name, features=req.features)
+    try:
+        return daily_inference(df, cfg, date=req.date, version=req.version,
+                               persist=req.persist)
+    except MLError as e:
+        raise HTTPException(409, str(e)) from e
+
+
+@router.get("/signals")
+def signals_ep(name: str, start: str | None = None, end: str | None = None,
+               version: int | None = None,
+               limit: int = Query(default=500, ge=1, le=10000)) -> dict:
+    """读已落库的模型信号（回测/监控用）。"""
+    from lquant.research.ml.online import load_signals
+
+    sig = load_signals(name, start=start, end=end, version=version)
+    rows = sig.head(limit).to_dicts() if len(sig) else []
+    for r in rows:
+        r["trade_date"] = str(r["trade_date"])
+    return {"name": name, "rows": len(sig), "items": rows,
+            "versions": sorted(sig["model_version"].unique().to_list())
+            if len(sig) else []}
+
+
+def _safe_json(v):
+    if v is None:
+        return None
+    if isinstance(v, (dict, list)):
+        return v
+    try:
+        return json.loads(v)
+    except (TypeError, json.JSONDecodeError):
+        return v
+
+
+def _as_date(v: str | date | None) -> date | None:
+    return date.fromisoformat(v) if isinstance(v, str) else v

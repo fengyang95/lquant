@@ -18,6 +18,24 @@ from lquant.portfolio.dedup import (
     correlation_matrix,
     dedup,
 )
+from lquant.portfolio.optimizer import (
+    EnhancedIndexingResult,
+    OptimizerError,
+    active_share,
+    enhanced_indexing_weight,
+    tracking_error,
+)
+from lquant.portfolio.riskmodel import (
+    COV_ESTIMATORS,
+    condition_number,
+    estimate_cov,
+    is_psd,
+    nearest_psd,
+    poet_cov,
+    sample_cov,
+    shrink_cov,
+    structured_cov,
+)
 from lquant.portfolio.screener import (
     FilterConfig,
     apply_filters,
@@ -44,4 +62,10 @@ __all__ = [
     "weights", "METHODS", "equal_weight", "score_weight", "market_cap_weight",
     "inverse_vol_weight", "risk_parity_weight", "min_variance_weight", "hrp_weight",
     "weight_report",
+    # 风险模型（Phase 3.1）
+    "COV_ESTIMATORS", "estimate_cov", "sample_cov", "shrink_cov",
+    "structured_cov", "poet_cov", "condition_number", "is_psd", "nearest_psd",
+    # 基准相对优化（Phase 3.2）
+    "enhanced_indexing_weight", "EnhancedIndexingResult", "OptimizerError",
+    "tracking_error", "active_share",
 ]

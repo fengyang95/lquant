@@ -19,8 +19,8 @@ import polars as pl
 # 凡 std < STD_EPS 一律按零方差处理（t/IR 无定义，不能进显著性门槛）
 STD_EPS = 1e-9
 
-__all__ = ["ic_series", "ic_summary", "ic_by_year", "newey_west_tstat",
-           "ic_autocorr"]
+__all__ = ["ic_series", "ic_summary", "ic_by_year", "ic_by_horizon",
+           "newey_west_tstat", "ic_autocorr"]
 
 
 def ic_series(
@@ -214,3 +214,91 @@ def ic_by_year(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", **kw) 
         )
         .sort("year")
     )
+
+
+def ic_by_horizon(
+    df: pl.DataFrame,
+    factor: str,
+    horizons: list[int] | None = None,
+    *,
+    ret_suffix: str = "fwd_ret",
+    date_col: str = "trade_date",
+    min_obs: int = 5,
+    price_col: str | None = None,
+    nw_lags: int | None = None,
+) -> pl.DataFrame:
+    """一次扫描算完多个持有期的 IC（借 AlphaPurify 对 (1,5,10) 并行统计的做法）。
+
+    **为什么不是循环调 ``ic_summary``**：每个 horizon 都跑一遍 ``ic_series``
+    意味着 N 次全表扫描 + N 次 group_by。这里把全部 horizon 的相关性放进
+    **同一个 group_by**，扫描次数与 horizon 数无关。
+
+    ``horizons`` 缺省 ``[1, 5, 10, 20]``。收益列 ``fwd_ret_{h}`` 不存在时，
+    若给了 ``price_col`` 就现算（复用 ``returns.forward_return``）。
+
+    返回长表，每行一个 horizon：``horizon, ic_mean, ic_std, ic_ir, ic_t,
+    rank_ic_mean, rank_ic_ir, rank_ic_t, positive_rate, n_days``。
+    """
+    # 显式 [] 与「未指定」必须区分：前者是用户明确说「不要任何 horizon」，
+    # 用 `if horizons` 会让 [] 静默变成默认的 [1,5,10,20]（实测踩过）。
+    hs = list(horizons) if horizons is not None else [1, 5, 10, 20]
+    if not hs:
+        raise ValueError("horizons 不能为空")
+    if len(set(hs)) != len(hs):
+        raise ValueError(f"horizons 有重复: {hs}")
+    if any(h < 1 for h in hs):
+        raise ValueError(f"horizons 必须为正整数: {hs}")
+    if factor not in df.columns:
+        raise KeyError(f"缺少因子列 {factor}")
+
+    d = df
+    cols = [f"{ret_suffix}_{h}" for h in hs]
+    missing = [c for c in cols if c not in d.columns]
+    if missing:
+        if price_col is None:
+            raise KeyError(f"缺少收益列 {missing}（或传 price_col 让本函数现算）")
+        from lquant.factors.evaluate.returns import forward_return
+
+        d = forward_return(d, price_col, periods=hs, date_col=date_col)
+        missing = [c for c in cols if c not in d.columns]
+        if missing:
+            raise KeyError(f"现算后仍缺少收益列 {missing}")
+
+    # 每个 horizon **各自**用自己的有效样本：只要求因子有限，收益按列置 null
+    # 让 pl.corr 逐对跳过。这与逐 horizon 调 ic_summary 的样本完全一致 ——
+    # 「合并扫描」只该省扫描，不该改变口径（早期版本用「全部 horizon 都有限」
+    # 的公共样本，导致 h=1 的 IC 与 ic_summary 差一倍）。
+    sel = d.select([date_col, factor, *cols]).with_columns(
+        pl.col(factor).cast(pl.Float64, strict=False))
+    sel = sel.filter(pl.col(factor).is_finite())
+    for c in cols:
+        sel = sel.with_columns(
+            pl.when(pl.col(c).cast(pl.Float64, strict=False).is_finite())
+            .then(pl.col(c).cast(pl.Float64, strict=False))
+            .otherwise(None).alias(c))
+
+    aggs: list[pl.Expr] = []
+    for h in hs:
+        c = f"{ret_suffix}_{h}"
+        # 逐 horizon 的有效样本数（min_obs 必须按 horizon 判）
+        aggs.append(pl.col(c).is_not_null().sum().alias(f"n_{h}"))
+        aggs.append(pl.corr(factor, c, method="pearson").alias(f"ic_{h}"))
+        aggs.append(pl.corr(factor, c, method="spearman").alias(f"ric_{h}"))
+    daily = sel.group_by(date_col).agg(aggs).sort(date_col)
+
+    rows: list[dict] = []
+    for h in hs:
+        sub = daily.filter((pl.col(f"n_{h}") >= min_obs) & pl.col(f"ic_{h}").is_not_null())
+        ic = _summarize(sub[f"ic_{h}"], nw_lags=nw_lags)
+        ric = _summarize(sub[f"ric_{h}"], nw_lags=nw_lags)
+        rows.append({
+            "horizon": h,
+            "ic_mean": ic["mean"], "ic_std": ic["std"], "ic_ir": ic["ir"],
+            "ic_t": ic["t_stat"], "ic_t_nw": ic["t_stat_nw"],
+            "rank_ic_mean": ric["mean"], "rank_ic_ir": ric["ir"],
+            "rank_ic_t": ric["t_stat"],
+            "positive_rate": ic["positive_rate"],
+            "ic_autocorr": ic["ic_autocorr"],
+            "n_days": ic["n_days"],
+        })
+    return pl.DataFrame(rows)

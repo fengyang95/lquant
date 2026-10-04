@@ -64,11 +64,18 @@ type EvalResult = {
 /** 预处理方法枚举（GET /factors/preprocess/methods） */
 type PreprocessMethod = {
   name: string; stage: string; label: string; params?: Record<string, unknown>;
+  /** 口径自省：数学定义 / 补充说明 / 零方差语义（见后端 registry 元数据词汇表） */
+  formula?: string; notes?: string; zero_variance?: string;
+};
+type MadConvention = {
+  scale_factor: number; formula: string; n_semantics: string;
+  alphapurify_conversion: string; note: string;
 };
 type PreprocessMethods = {
   stages: string[];
   methods: PreprocessMethod[];
   default_recipe: PreprocessStep[];
+  mad_convention?: MadConvention;
 };
 type CorrResult = {
   factors: string[];
@@ -447,10 +454,38 @@ export default function FactorsPage() {
                   <option value="">不启用</option>
                   {(preprocess?.methods ?? [])
                     .filter((m) => m.stage === stage)
-                    .map((m) => <option key={m.name} value={m.name}>{m.label}</option>)}
+                    .map((m) => (
+                      <option
+                        key={m.name}
+                        value={m.name}
+                        /* 口径自省：悬停即见数学定义与零方差语义，避免「同名不同义」误用 */
+                        title={[m.formula, m.notes, m.zero_variance && `零方差：${m.zero_variance}`]
+                          .filter(Boolean).join('\n')}
+                      >
+                        {m.label}
+                      </option>
+                    ))}
                 </select>
+                {(() => {
+                  const sel = (preprocess?.methods ?? [])
+                    .find((m) => m.stage === stage && m.name === recipeChoice[stage]);
+                  if (!sel?.formula) return null;
+                  return (
+                    <span className="text-ink-faint" title={sel.notes ?? ''}>
+                      {sel.formula}
+                    </span>
+                  );
+                })()}
               </label>
             ))}
+            {recipeMode === 'custom' && preprocess?.mad_convention && (
+              <span
+                className="text-ink-faint"
+                title={`${preprocess.mad_convention.note}\n换算：${preprocess.mad_convention.alphapurify_conversion}`}
+              >
+                MAD 口径：{preprocess.mad_convention.formula}
+              </span>
+            )}
             {recipeMode === 'custom' && !preprocess && (
               <span className="text-xs text-ink-faint">预处理方法清单加载失败，暂只能用内置默认配方</span>
             )}

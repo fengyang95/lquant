@@ -27,9 +27,13 @@ class MLResult:
     test_rows: int
     test_ic: dict
     predictions: pl.DataFrame | None = None
+    #: 特征处理器（None = 未声明处理器）。随 artifact 一起存，推理时必须复用
+    #: 同一份状态 —— 用测试段重算标准化参数就是泄漏。
+    processor: object | None = None
+    fit_window: dict | None = None
 
     def summary(self) -> dict:
-        return {
+        out = {
             "model": self.model.name,
             "train_rows": self.train_rows,
             "test_rows": self.test_rows,
@@ -38,18 +42,42 @@ class MLResult:
             "test_ir": self.test_ic.get("ic", {}).get("ir"),
             "test_t_stat": self.test_ic.get("ic", {}).get("t_stat"),
         }
+        if self.processor is not None:
+            out["processor"] = self.processor.name
+            out["processor_state"] = self.processor.state()
+        if hasattr(self.model, "summary"):
+            out["ensemble"] = self.model.summary()
+        if self.fit_window:
+            out["fit_window"] = dict(self.fit_window)
+        return out
 
 
-def train_and_predict(ds: Dataset, train_end, valid_end, *, kind: str = "auto",
+def train_and_predict(ds: Dataset, train_end, valid_end, *, test_end=None,
+                      kind: str = "auto", n_seeds: int = 1,
                       signal_col: str = "ml_signal", **params) -> MLResult:
-    """按日期切分训练，输出测试集的预测信号。"""
-    train, _, test = ds.split(train_end, valid_end)
-    if not len(train) or not len(test):
+    """按日期切分训练，输出测试集的预测信号。
+
+    特征处理器（``DatasetConfig.processors``）**只在训练段 fit**，valid/test
+    只 transform —— 这是 qlib ``DataHandlerLP`` 的 learn/infer 纪律：
+    处理器参数是训练窗口的函数，测试段的分布信息绝不参与拟合。
+
+    ``test_end``：测试段右端点。**滚动重训必须传** —— 不传时测试段一直取到
+    数据末端，早期窗口的"样本外"指标会把后面所有窗口的数据都算进来，
+    越早的窗口看起来越好（未来信息泄漏进评估）。
+
+    ``n_seeds > 1`` 时训 N 个种子取均值（``EnsembleModel``），
+    压低单次训练对随机种子的敏感性；代价是训练时间 ×N。
+    """
+    train_raw, _, test_raw = ds.split(train_end, valid_end, test_end)
+    if not len(train_raw) or not len(test_raw):
         raise ValueError("训练集或测试集为空，检查切分日期")
+
+    proc, train = ds.fit_processor(train_raw)
+    test = proc.transform(test_raw) if proc is not None else test_raw
 
     Xtr, ytr, _ = ds.xy(train)
     Xte, yte, dte = ds.xy(test)
-    model = make_model(kind, **params)
+    model = make_model(kind, n_seeds=n_seeds, **params)
     model.feature_names = ds.features
     model.fit(Xtr, ytr)
 
@@ -59,8 +87,16 @@ def train_and_predict(ds: Dataset, train_end, valid_end, *, kind: str = "auto",
     # 用预测值直接算 IC（预测 vs 真实前瞻收益）
     ic = ic_summary(out, signal_col, ds.cfg.label_col(), date_col=ds.cfg.date_col)
     ic.pop("series", None)
+    fit_window = {
+        "train_end": str(train_end), "valid_end": str(valid_end),
+        "test_end": str(test_end) if test_end else None,
+        "train_rows": len(train), "test_rows": len(test),
+        "train_start": str(train[ds.cfg.date_col].min()) if len(train) else None,
+        "train_stop": str(train[ds.cfg.date_col].max()) if len(train) else None,
+    }
     return MLResult(model=model, signal_col=signal_col, train_rows=len(train),
-                    test_rows=len(test), test_ic=ic, predictions=out)
+                    test_rows=len(test), test_ic=ic, predictions=out,
+                    processor=proc, fit_window=fit_window)
 
 
 def signal_backtest(ds: Dataset, predictions: pl.DataFrame, *,
@@ -90,25 +126,45 @@ def run_ml_pipeline(df: pl.DataFrame, features: list[str], *,
                     kind: str = "auto", top_n: int = 30,
                     strategy_cls=None, engine_cfg: EngineConfig | None = None,
                     record: bool = True,
+                    processors: list[dict] | None = None,
+                    n_seeds: int = 1,
+                    model_name: str | None = None,
+                    stage: str = "candidate",
+                    note: str | None = None,
                     **model_params) -> dict:
-    """一站式：建数据集 → 训练 → 预测 → 回测（R-ML5 实验记录落 ml_run 表）。
+    """一站式：建数据集 → 训练 → 预测 → 回测 → 注册模型版本。
 
-    默认策略用因子 TopN；未安装任何 ML 后端时会明确报错而不是静默跳过。
-    record=False 可关掉落库（快速试验）。
+    ``record=True`` 时通过 ``research.ml.registry`` 注册：写 ``ml_run`` 记录、
+    落模型与处理器 artifact、分配单调版本号。默认策略用因子 TopN；
+    未安装任何 ML 后端时会明确报错而不是静默跳过。
+
+    ``processors``：可 fit 的特征处理器声明（``research.ml.processor``）。
+    未填时**不做任何全样本标准化** —— 树模型不需要，线性/神经网络必须显式声明，
+    且一律只在训练段 fit。
+
+    ``model_name``：逻辑模型线（同一策略反复重训共享一个 name，版本号递增）。
+    缺省按「horizon + top_n」拼一个稳定名字，使同一配置的多次训练聚成版本流。
     """
-    import json as _json
     import uuid as _uuid
-    from datetime import datetime as _dt
 
     from lquant.research.ml.dataset import DatasetConfig, build_dataset
+    from lquant.research.ml.panel import build_feature_panel
+
+    # features 可以是**原始湖表**里的列，也可以是待计算的内置因子/公式名
+    # （MA20、pct_change_20…）。不先算一遍的话，API/CLI 把裸日线递进来时会
+    # 直接 KeyError「特征列不存在」—— 而 /ml/features 恰恰在向用户宣传这些名字。
+    # build_feature_panel 对已存在的列是幂等透传，预featurize 的调用方不受影响。
+    df = build_feature_panel(df, features)
 
     if strategy_cls is None:
         from lquant.backtest.strategy.factor_topn import FactorTopNStrategy
         strategy_cls = FactorTopNStrategy
 
-    cfg = DatasetConfig(features=features, label_horizon=label_horizon)
+    cfg = DatasetConfig(features=features, label_horizon=label_horizon,
+                        processors=processors)
     ds = build_dataset(df, cfg)
-    ml = train_and_predict(ds, train_end, valid_end, kind=kind, **model_params)
+    ml = train_and_predict(ds, train_end, valid_end, kind=kind,
+                           n_seeds=n_seeds, **model_params)
     bt = signal_backtest(ds, ml.predictions, strategy_cls=strategy_cls, top_n=top_n,
                          engine_cfg=engine_cfg)
     out = {
@@ -119,22 +175,22 @@ def run_ml_pipeline(df: pl.DataFrame, features: list[str], *,
     }
 
     if record:
+        run_id = _uuid.uuid4().hex[:12]
+        name = model_name or f"ml_h{label_horizon}_top{top_n}"
         try:
-            from lquant.core.db import writer
+            from lquant.research.ml.registry import register_run
 
-            run_id = _uuid.uuid4().hex[:12]
-            with writer() as con:
-                con.execute(
-                    "INSERT OR REPLACE INTO ml_run VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [run_id, ml.model.name,
-                     _json.dumps(model_params, default=str),
-                     _json.dumps(features),
-                     _json.dumps({"ml": ml.summary(),
-                                  "backtest": out["backtest"]}, default=str),
-                     ml.train_rows, ml.test_rows,
-                     str(train_end), str(valid_end), _dt.now()],
-                )
+            mv = register_run(
+                run_id=run_id, name=name, model=ml.model, processor=ml.processor,
+                metrics={"ml": ml.summary(), "backtest": out["backtest"]},
+                params=model_params, features=features,
+                fit_window=ml.fit_window, dataset=ds.summary(),
+                train_rows=ml.train_rows, test_rows=ml.test_rows,
+                train_end=train_end, test_end=valid_end,
+                stage=stage, note=note,
+            )
             out["ml_run_id"] = run_id
-        except Exception as e:  # noqa: BLE001 - 实验记录失败不阻断研究主流程
-            print(f"[warn] ml_run 记录失败: {e}")
+            out["model"] = mv.as_dict()
+        except Exception as e:  # noqa: BLE001 - 注册失败不阻断研究主流程
+            print(f"[warn] 模型注册失败: {e}")
     return out

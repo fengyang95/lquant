@@ -1,7 +1,8 @@
 .PHONY: help setup hooks db-init db-reset bootstrap dev api worker web \
         test coverage diff-cov lint fmt type rust-build rust-test \
         docker-up docker-down clean smoke start stop status logs bundle \
-        secrets secrets-history secrets-dir secrets-install public-ready
+        secrets secrets-history secrets-dir secrets-install public-ready \
+        xval-sentinel
 
 UV      ?= uv
 PY      ?= .venv/bin/python
@@ -29,6 +30,7 @@ help:
 	@echo "  make secrets-history 全历史密钥审计（所有分支，含 merge diff）"
 	@echo "  make secrets-install 安装固定版本 gitleaks（免 sudo，所有 worktree 共享）"
 	@echo "  make public-ready    公开前体检：全历史 + 工作区 + 卫生（严格）"
+	@echo "  make xval-sentinel   交叉验证回归哨兵（需真实数据湖 + 两个隔离 venv）"
 
 setup:
 	bash lquant.sh install
@@ -125,6 +127,11 @@ coverage:
 diff-cov:
 	$(PY) -m diff_cover.diff_cover_tool coverage.xml \
 	  --compare-branch=origin/main --fail-under=95
+
+# 交叉验证回归哨兵：AlphaPurify 对拍 + qlib 基准对拍 + qlib workflow 真跑。
+# 不进 CI（需要真实数据湖与 .venv-qlib / .venv-alphapurify），定期手动跑。
+xval-sentinel:
+	bash scripts/xval/sentinel.sh
 
 lint:
 	.venv/bin/ruff check src tests

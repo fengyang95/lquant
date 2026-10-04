@@ -271,3 +271,149 @@ def test_pool_full_backfill_keeps_delisted_excludes_index(fake_settings):
     assert ends["000003.SZ"] == date(2002, 6, 3)     # end 被 delist_date 截断
     assert "000001.SH" not in ends and "399001.SZ" not in ends
     assert {s for s, _ in pool["etf"]} == {"510300.SH","161725.SZ"}
+
+
+# ---------- 指数段路由（Phase 1.1：基准链路的数据入口） ----------
+
+
+class _IndexCapableProvider(_FakeProv):
+    """tushare/akshare 形态：个股走 daily_bars，指数走 index_daily_bars。"""
+
+    name = "tushare"
+    source = "tushare"
+    capability = frozenset({Capability.DAILY, Capability.ETF_DAILY,
+                            Capability.INDEX_DAILY})
+
+    def __init__(self) -> None:
+        self.daily_calls: list[list[str]] = []
+        self.etf_calls: list[list[str]] = []
+        self.index_calls: list[list[str]] = []
+
+    def daily_bars(self, symbols, start, end):
+        self.daily_calls.append(list(symbols))
+        return _frame(list(symbols))
+
+    def etf_daily_bars(self, symbols, start, end):
+        self.etf_calls.append(list(symbols))
+        return _frame(list(symbols))
+
+    def index_daily_bars(self, symbols, start, end):
+        self.index_calls.append(list(symbols))
+        return _frame(list(symbols))
+
+
+class _IndexViaDailyProvider(_FakeProv):
+    """baostock 形态：声明 INDEX_DAILY 但没有 index_daily_bars，回落 daily_bars。"""
+
+    name = "baostock"
+    source = "baostock"
+    capability = frozenset({Capability.DAILY, Capability.INDEX_DAILY})
+
+    def __init__(self) -> None:
+        self.daily_calls: list[list[str]] = []
+
+    def daily_bars(self, symbols, start, end):
+        self.daily_calls.append(list(symbols))
+        return _frame(list(symbols))
+
+
+def test_is_index_uses_sec_type_not_code_prefix_alone():
+    """``000001.SH`` 是指数，``000001.SZ`` 是股票 —— 必须按 sec_type 判。"""
+    from lquant.data.ingest.daily import _is_index
+
+    assert _is_index("000001.SH") is True          # 上证指数
+    assert _is_index("000300.SH") is True          # 沪深300
+    assert _is_index("399001.SZ") is True          # 深证成指
+    assert _is_index("000001.SZ") is False         # 平安银行
+    assert _is_index("600000.SH") is False
+    assert _is_index("???") is False               # 解析失败按非指数
+
+
+def test_by_class_splits_index_out_of_stock_bucket(fake_settings):
+    """指数必须单独成一桶，不能混进股票段（会被价格护栏拦成整批失败）。"""
+    from lquant.data.ingest.daily import _by_class
+
+    buckets = dict(_by_class(["600000.SH", "000300.SH", "510300.SH", "399001.SZ"]))
+    assert buckets == {"other": ["600000.SH"], "fund": ["510300.SH"],
+                       "index": ["000300.SH", "399001.SZ"]}
+
+
+def test_index_symbols_route_to_index_capable_source(fake_settings, no_lake, monkeypatch):
+    """指数段取链中第一个声明 INDEX_DAILY 的源，并优先 index_daily_bars。"""
+    from lquant.data.ingest import daily as daily_mod
+    from lquant.data.ingest.daily import backfill_pool
+
+    stock_head = _StockOnlyProvider()
+    index_src = _IndexCapableProvider()
+    _patch_chain(monkeypatch, _Chain([stock_head, index_src]))
+    written: list = []
+    monkeypatch.setattr(daily_mod, "_write_index_bars", written.append)
+
+    res = backfill_pool([("600000.SH", D), ("000300.SH", D)], START,
+                        provider=None, cp_name="route-index1")
+
+    assert stock_head.daily_calls == [["600000.SH"]]
+    assert index_src.index_calls == [["000300.SH"]]     # 不是 daily_bars
+    assert len(written) == 1 and written[0]["symbol"].to_list() == ["000300.SH"]
+    assert res["failed"] == [] and res["done"] == 2
+
+
+def test_index_falls_back_to_daily_bars_without_index_method(
+        fake_settings, no_lake, monkeypatch):
+    """源声明 INDEX_DAILY 但无 index_daily_bars（baostock）→ 回落 daily_bars。"""
+    from lquant.data.ingest import daily as daily_mod
+    from lquant.data.ingest.daily import backfill_pool
+
+    only = _IndexViaDailyProvider()
+    _patch_chain(monkeypatch, _Chain([only]))
+    monkeypatch.setattr(daily_mod, "_write_index_bars", lambda df: 0)
+
+    backfill_pool([("000300.SH", D)], START, provider=None, cp_name="route-index2")
+    assert only.daily_calls == [["000300.SH"]]
+
+
+def test_resolve_ingest_source_index_prefers_index_capability(fake_settings, monkeypatch):
+    """resolve_ingest_source(index=True) 与 fund/stock 一样按能力选源。"""
+    from lquant.data.ingest.daily import resolve_ingest_source
+
+    daily_only = _StockOnlyProvider()          # 有 DAILY 但没有 INDEX_DAILY
+    index_src = _IndexCapableProvider()
+    _patch_chain(monkeypatch, _Chain([daily_only, index_src]))
+
+    p, method = resolve_ingest_source(fund=False, index=True)
+    assert (p.name, method) == ("tushare", "index_daily_bars")
+    # 显式注入 provider 时同样优先专用方法
+    p2, m2 = resolve_ingest_source(fund=False, index=True, provider=index_src)
+    assert (p2.name, m2) == ("tushare", "index_daily_bars")
+    p3, m3 = resolve_ingest_source(fund=False, index=True, provider=daily_only)
+    assert (p3.name, m3) == ("tushare", "daily_bars")
+
+
+def test_write_index_bars_shapes_market_table(fake_settings, monkeypatch):
+    """指数入库走 market 表口径：补 name（INDEX_POOL 映射）与 collected_at。"""
+    import polars as pl
+
+    from lquant.data.ingest import daily as daily_mod
+
+    captured: dict = {}
+
+    def _fake_persist(frames):
+        captured.update(frames)
+        return {"index_daily": len(frames["index_daily"])}
+
+    monkeypatch.setattr("lquant.market.scheduler.persist", _fake_persist)
+    df = pl.DataFrame({
+        "trade_date": [D, D], "symbol": ["000300.SH", "399001.SZ"],
+        "open": [1.0, 2.0], "high": [1.0, 2.0], "low": [1.0, 2.0],
+        "close": [1.0, 2.0], "pre_close": [1.0, 2.0],
+        "volume": [1.0, 1.0], "amount": [1.0, 1.0],
+    })
+    n = daily_mod._write_index_bars(df)
+    assert n == 2
+    out = captured["index_daily"]
+    assert out["symbol"].to_list() == ["000300.SH", "399001.SZ"]
+    assert out["name"].to_list() == ["沪深300", "深证成指"]
+    assert "collected_at" in out.columns
+    assert out.columns == ["trade_date", "symbol", "open", "high", "low", "close",
+                           "pre_close", "volume", "amount", "name", "collected_at"]
+

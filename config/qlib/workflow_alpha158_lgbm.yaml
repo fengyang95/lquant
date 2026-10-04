@@ -3,7 +3,11 @@
 # 数据由 `lq qlib export` 从 lquant 日线湖导出（默认 data/qlib）。
 #
 # 口径说明：
-# - 湖内无指数数据，benchmark 置 null：回测只看绝对收益，不算超额收益；
+# - 基准是**真实指数** 000300.SH（qlib symbol SH000300），由 `lq qlib export`
+#   从 DuckDB index_daily 一并导出（指数不进 parquet 湖，点位不是价格）。
+#   先跑 `lq data index --start 2016-01-01` 回填指数；若 index_daily 为空，
+#   导出 manifest 的 benchmark 会是 null，此时必须把下面的 benchmark 也置
+#   null，否则 qlib 会因找不到标的而报错。
 # - 价格为「前复权到最新」序列（$factor = adj_factor/adj_factor_latest），
 #   收益率与真实一致，deal_price 用 $close 即可。
 qlib_init:
@@ -11,9 +15,8 @@ qlib_init:
     region: cn
 
 market: &market all
-# 湖内暂无指数日线：基准用 SH600000 机械代理（qlib 0.9.7 里 benchmark:null
-# 会被默认成 SH000300 然后报不存在），超额收益数字仅作参考。
-benchmark: &benchmark SH600000
+# 真实基准：沪深300。换 SH000905（中证500）等需先把对应指数导出。
+benchmark: &benchmark SH000300
 
 data_handler_config: &data_handler_config
     start_time: 2024-01-01

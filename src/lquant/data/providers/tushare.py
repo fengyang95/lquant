@@ -138,7 +138,7 @@ class TushareProvider(MappingProvider):
         Capability.DAILY, Capability.MINUTE_1, Capability.MINUTE_5,
         Capability.MINUTE_15, Capability.MINUTE_30, Capability.MINUTE_60,
         Capability.ADJ_FACTOR, Capability.FINANCIAL_PIT, Capability.REFERENCE,
-        Capability.CALENDAR, Capability.ETF_DAILY,
+        Capability.CALENDAR, Capability.ETF_DAILY, Capability.INDEX_DAILY,
     })
 
     def __init__(
@@ -300,6 +300,33 @@ class TushareProvider(MappingProvider):
             frames.append(_prepare_daily(df))
         raw = pl.concat(frames, how="diagonal") if frames else pl.DataFrame()
         return self.request("daily_bar", _raw=raw, sec_type="etf")
+
+    def index_daily_bars(
+        self, symbols: list[str], start: date, end: date
+    ) -> pl.DataFrame:
+        """指数日线：pro.index_daily。
+
+        必须独立于 ``daily_bars``：``pro.daily`` 只有股票，拿它取 ``000300.SH``
+        必然整段零行（这正是「指数无路由」时期基准缺口的成因）。列结构与
+        量纲（vol 手 / amount 千元）与 daily 一致，故复用 ``_prepare_daily``，
+        只把 sec_type 覆盖成 index。
+
+        指数**不进日线 parquet 湖**：调用方（``_write_index_bars``）把它写入
+        DuckDB ``index_daily`` 表。
+        """
+        frames = []
+        for sym in symbols:
+            df = self._call(
+                "index_daily",
+                ts_code=sym,
+                start_date=start.strftime("%Y%m%d"),
+                end_date=end.strftime("%Y%m%d"),
+            )
+            if df.is_empty():
+                continue
+            frames.append(_prepare_daily(df))
+        raw = pl.concat(frames, how="diagonal") if frames else pl.DataFrame()
+        return self.request("daily_bar", _raw=raw, sec_type="index")
 
     def adj_factors(
         self, symbols: list[str], start: date, end: date

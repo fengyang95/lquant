@@ -19,7 +19,8 @@ import polars as pl
 from lquant.core.types import now_cn
 from lquant.market.collectors.index_daily import INDEX_POOL
 
-__all__ = ["missing_trade_dates", "ensure_market_coverage", "DEFAULT_LOOKBACK_DAYS"]
+__all__ = ["missing_trade_dates", "ensure_market_coverage", "backfill_index_history",
+           "DEFAULT_LOOKBACK_DAYS"]
 
 DEFAULT_LOOKBACK_DAYS = 90
 
@@ -127,6 +128,59 @@ def _fetch_index(start: date, end: str, *, demo: bool) -> pl.DataFrame:
     from lquant.market.collectors import fetch_index_daily
 
     return fetch_index_daily(start=start.isoformat(), end=end, demo=demo)
+
+
+def backfill_index_history(
+    start: date,
+    end: date,
+    *,
+    symbols: list[str] | None = None,
+    demo: bool = False,
+) -> dict:
+    """把 [start, end] 的指数日线补齐进 ``index_daily``（回测基准的历史来源）。
+
+    与 ``ensure_market_coverage`` 的分工：后者是**近端补齐**（默认 90 天，
+    交给盘前调度兜底漏采），本函数是**历史回填**（首次建基准或扩窗口时
+    一次性拉多年）。指数可回溯，因此可以安全重跑 —— upsert 幂等。
+
+    symbols 缺省用 ``INDEX_POOL``；传入后只回填这些标的（如单独补 000300.SH）。
+    """
+    from loguru import logger
+
+    only = list(symbols) if symbols else list(INDEX_POOL)
+    unknown = [s for s in only if s not in INDEX_POOL]
+    if unknown:
+        # 不在池里的指数名映射不到中文名，落库后 name 为 NULL，看板会显示裸代码。
+        # 不阻断（调用方可能就是想补冷门指数），但要显式告知。
+        logger.warning(f"以下指数不在 INDEX_POOL，name 将为空: {unknown}")
+
+    before = _index_have()
+    have_in_window = {
+        sym: {d for d in before.get(sym, set()) if start <= d <= end}
+        for sym in only
+    }
+    df = _fetch_index(start=start, end=end.isoformat(), demo=demo)
+    fetched = len(df)
+    persisted = 0
+    if fetched:
+        if symbols:
+            df = df.filter(pl.col("symbol").is_in(only))
+        persisted = _persist_index(df) if len(df) else 0
+
+    after = _index_have()
+    returned = {
+        "symbols": only,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "fetched": fetched,
+        "persisted": persisted,
+        "coverage_before": {k: len(v) for k, v in have_in_window.items()},
+        "coverage_after": {
+            k: len({d for d in after.get(k, set()) if start <= d <= end})
+            for k in only
+        },
+    }
+    return returned
 
 
 def _snapshot_coverage() -> dict:

@@ -15,6 +15,8 @@ from __future__ import annotations
 from lquant.factors.preprocess import (  # noqa: F401  触发注册
     neutralize,
     orthogonalize,
+    power,
+    rolling,
     standardize,
     winsorize,
 )
@@ -27,9 +29,15 @@ from lquant.factors.preprocess.registry import (
     list_methods,
     method,
 )
+from lquant.factors.preprocess.winsorize import (
+    MAD_K,
+    from_alphapurify_n,
+    to_alphapurify_n,
+)
 
 __all__ = [
     "METHODS", "STAGES", "method", "get_method", "list_methods", "default_pipeline",
     "run", "normalize_steps", "describe",
-    "winsorize", "standardize", "neutralize", "orthogonalize",
+    "MAD_K", "to_alphapurify_n", "from_alphapurify_n",
+    "winsorize", "standardize", "neutralize", "orthogonalize", "rolling", "power",
 ]

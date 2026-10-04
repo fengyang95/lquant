@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
 from lquant.core.db import reader
+from lquant.core.errors import FactorError
 from lquant.data.store.catalog import IndexConsRepo, upsert
 from lquant.data.store.parquet import read_daily
 from lquant.factors.evaluate import evaluate, forward_return
@@ -983,8 +984,13 @@ def list_preprocess_methods(
     """预处理方法枚举 + 默认配方（M2.5「配方接入 API/UI」）。
 
     前端据此渲染配方选择器，不必硬编码方法名 —— 加新方法不用改前端。
+
+    每个方法带口径自省字段（``formula`` / ``notes`` / ``zero_variance``，见
+    ``preprocess.registry`` 的元数据词汇表），用于消除与 AlphaPurify 交叉验证时的
+    「同名不同义」歧义。顶层另附 ``mad_convention`` 说明 MAD 的 1.4826 修正。
     """
     from lquant.factors.preprocess.registry import STAGES, default_pipeline, list_methods
+    from lquant.factors.preprocess.winsorize import MAD_K
 
     if stage is not None and stage not in STAGES:
         raise HTTPException(422, f"未知预处理阶段 {stage!r}，可选: {list(STAGES)}")
@@ -992,7 +998,64 @@ def list_preprocess_methods(
         "stages": list(STAGES),
         "methods": list_methods(stage),
         "default_recipe": default_pipeline(),
+        "mad_convention": {
+            "scale_factor": MAD_K,
+            "formula": "median ± n × 1.4826 × MAD",
+            "n_semantics": "equivalent_sigma_multiple",
+            "alphapurify_conversion": "n_lquant = n_alphapurify / 1.4826",
+            "note": "AlphaPurify mad_winsorize 的 n 是 MAD 倍数（默认 3），"
+                    "本仓 n 是等效 σ 倍数（默认 5）—— 同名不同义。",
+        },
     }
+
+
+class TraceIn(BaseModel):
+    """截面快照请求（Phase 3.3）。
+
+    ``factor`` 是**展示名**（原样回显在结果里），不是列名 —— 实际计算列固定为
+    ``_factor``，与 ``/evaluate/series`` 同一约定。
+    """
+
+    factor: str = Field(default="mom20", max_length=64)
+    formula: str = "pct_change_20"
+    date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    bins: int = Field(default=10, ge=2, le=50)
+    side: str = Field(default="long", pattern=r"^(long|short|top|bottom)$")
+    horizon: int = Field(default=1, ge=1, le=60)
+    top: int | None = Field(default=50, ge=1, le=1000)
+    start: str = "2026-01-01"
+    end: str | None = None
+    universe: str = "all"
+
+
+@router.post("/trace")
+def trace_ep(req: TraceIn) -> dict:
+    """某日某箱的成分与收益明细 —— 排查「净值跳变是哪几只票」的最快路径。
+
+    分箱口径与 ``/factors/evaluate/series`` 的分层回测**同一实现**
+    （``evaluate.quantile.add_quantile``），所以快照里的「第 N 组」与曲线上的
+    第 N 组一定是同一批票。
+    """
+    from lquant.factors.evaluate import trace_snapshot
+    from lquant.factors.evaluate.returns import forward_return
+
+    df = read_daily(start=req.start, end=req.end,
+                    symbols=_universe_symbols(req.universe)).collect()
+    if not len(df):
+        raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
+    d = _compute_factor(df, req.formula)
+    d = forward_return(d, "close", periods=[req.horizon])
+    d = drop_nonfinite(d, f"fwd_ret_{req.horizon}")
+    try:
+        # 计算列固定是 `_factor`（与 /evaluate/series 同一约定），
+        # `req.factor` 只是**展示名** —— 早先直接拿它当列名，
+        # 用默认值 `mom20` 调这个端点必然 422「因子列不存在」。
+        snap = trace_snapshot(d, "_factor", date=req.date, bins=req.bins,
+                              side=req.side, horizon=req.horizon, top=req.top)
+    except FactorError as e:
+        raise HTTPException(422, str(e)) from e
+    snap["factor"] = req.factor
+    return snap
 
 
 @router.get("/builtin")

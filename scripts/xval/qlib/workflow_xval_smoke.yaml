@@ -1,0 +1,76 @@
+# 交叉验证专用冒烟工作流：Alpha158 + Ridge（不依赖 libomp），窗口取 2026 年。
+#
+# 与 config/qlib/workflow_alpha158_smoke.yaml 的差别只在**窗口**：本机
+# index_daily 目前只覆盖 2026-09 起的 20 余个交易日，所以回测段必须落在
+# 这个窗口内，基准才拿得到数。真实生产窗口见 config/qlib/。
+#
+# 用途：配合 scripts/xval/qlib/run_xval.sh，验证「导出基准 → qlib 找到基准 →
+# 算出超额收益」这条链路真的通，而不只是写了配置。
+qlib_init:
+    provider_uri: "data/qlib-xval"
+    region: cn
+
+market: &market stocks60
+# 真实基准：沪深300（SH000300 = lquant 000300.SH），由 lq qlib export 导出
+benchmark: &benchmark SH000300
+
+data_handler_config: &data_handler_config
+    start_time: 2026-01-05
+    end_time: 2026-09-30
+    fit_start_time: 2026-01-05
+    fit_end_time: 2026-06-30
+    instruments: *market
+    infer_processors:
+        - class: RobustZScoreNorm
+          kwargs:
+              fields_group: feature
+              clip_outlier: true
+    learn_processors:
+        - class: DropnaLabel
+        - class: CSRankNorm
+          kwargs:
+              fields_group: label
+
+label: &label ["Ref($close, -2) / Ref($close, -1) - 1"]
+
+dataset:
+    class: DatasetH
+    module_path: qlib.data.dataset
+    kwargs:
+        handler:
+            class: Alpha158
+            module_path: qlib.contrib.data.handler
+            kwargs:
+                <<: *data_handler_config
+                label: *label
+        segments:
+            train: [2026-01-05, 2026-06-30]
+            valid: [2026-07-01, 2026-08-14]
+            test: [2026-08-17, 2026-09-30]
+
+model:
+    class: SmokeRidge
+    module_path: src/lquant/qlib_io/smoke_model.py
+    kwargs:
+        alpha: 1.0
+
+port_analysis: &port_analysis
+    strategy:
+        class: TopkDropoutStrategy
+        module_path: qlib.contrib.strategy
+        kwargs:
+            signal: <PRED>
+            topk: 20
+            n_drop: 3
+    backtest:
+        # 与 index_daily 的覆盖窗口对齐（基准要在这个区间内有数）
+        start_time: 2026-09-02
+        end_time: 2026-09-29
+        account: 100000000
+        benchmark: *benchmark
+        exchange_kwargs:
+            deal_price: close
+            open_cost: 0.0005
+            close_cost: 0.0015
+            min_cost: 5
+            trade_unit: 100

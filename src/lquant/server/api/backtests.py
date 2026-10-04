@@ -16,6 +16,7 @@ import polars as pl
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
 
+from lquant.backtest.benchmark import DEFAULT_BENCHMARK
 from lquant.backtest.engine import Engine, EngineConfig
 from lquant.backtest.strategy.factor_topn import FactorTopNStrategy
 from lquant.backtest.sweep import VECTOR_AUTO_MIN_POINTS, SweepSpec, run_sweep_auto
@@ -152,31 +153,29 @@ def _run_saved_analyses(res) -> list[dict]:
 
 
 def _benchmark_nav_aligned(run_dates: set, run_nav: dict) -> tuple[list[dict], str, dict[str, float]]:
-    """基准净值（优先沪深300 指数，降级全市场等权），与 run 日期对齐且首日归一。
+    """基准净值（优先默认指数，降级全市场等权），与 run 日期对齐且首日归一。
+
+    指数分支复用 ``lquant.backtest.benchmark``（与引擎的 ``_benchmark_metrics``
+    同一实现，避免「图表基准」和「指标基准」两套口径漂移）；指数缺失时降级
+    全市场等权，并在 label 里标明「非真基准」。
 
     返回 (benchmark 序列, 标签, {date: 基准净值})。
     """
-    benchmark: list[dict] = []
-    label = "全市场等权"
-    try:
-        with reader() as con:
-            rows = con.execute(
-                "SELECT trade_date, close, pre_close FROM index_daily "
-                "WHERE symbol = '000300.SH' ORDER BY trade_date").fetchall()
-        if rows:
-            cur = 1.0
-            for d, c, pc in rows:
-                if d in run_dates and pc:
-                    cur *= float(c) / float(pc)      # c/pc 是价格比例（日收益 = c/pc - 1）
-                    benchmark.append({"date": str(d), "nav": cur})
-            if benchmark and benchmark[0]["nav"] > 0:
-                base = benchmark[0]["nav"]
-                benchmark = [{"date": x["date"], "nav": round(x["nav"] / base, 6)}
-                             for x in benchmark]
-                label = "沪深300"
-    except Exception:  # noqa: BLE001
-        benchmark = []
+    from lquant.backtest.benchmark import (
+        DEFAULT_BENCHMARK,
+        benchmark_nav_aligned,
+        equal_weight_benchmark,
+    )
 
+    benchmark: list[dict] = []
+    label = "全市场等权（非真基准）"
+    if run_dates:
+        try:
+            benchmark, reason = benchmark_nav_aligned(run_dates, DEFAULT_BENCHMARK)
+            if benchmark:
+                label = reason
+        except Exception:  # noqa: BLE001  指数读取失败 → 走等权兜底
+            benchmark = []
     if not benchmark and run_dates:
         try:
             start = min(run_dates)
@@ -186,16 +185,10 @@ def _benchmark_nav_aligned(run_dates: set, run_nav: dict) -> tuple[list[dict], s
                 b = (bdf.with_columns((pl.col("close") / pl.col("pre_close") - 1).alias("r"))
                      .group_by("trade_date").agg(pl.col("r").mean().alias("r"))
                      .sort("trade_date"))
-                cur = 1.0
-                for d, rr in zip(b["trade_date"].to_list(), b["r"].to_list(), strict=False):
-                    if d in run_dates:
-                        if rr is not None and math.isfinite(rr):
-                            cur *= 1 + float(rr)
-                        benchmark.append({"date": str(d), "nav": cur})
-                if benchmark and benchmark[0]["nav"] > 0:
-                    base = benchmark[0]["nav"]
-                    benchmark = [{"date": x["date"], "nav": round(x["nav"] / base, 6)}
-                                 for x in benchmark]
+                mean_ret = {d: float(rr) for d, rr in
+                            zip(b["trade_date"].to_list(), b["r"].to_list(), strict=False)
+                            if rr is not None}
+                benchmark = equal_weight_benchmark(mean_ret, run_dates)
         except Exception:  # noqa: BLE001  湖里没数据时基准留空，前端降级
             benchmark = []
     return benchmark, label, {date.fromisoformat(x["date"]): x["nav"] for x in benchmark}
@@ -219,6 +212,9 @@ class BacktestIn(BaseModel):
     #: 退出策略注册名（见 GET /backtests/exit-strategies）；None = 不加退出规则
     exit_strategy: str | None = None
     exit_params: dict = Field(default_factory=dict)
+    #: 考核基准指数：默认沪深300；支持 hs300/沪深300/000300 等别名；
+    #: 显式传 null = 不挂基准（只报绝对收益）
+    benchmark: str | None = DEFAULT_BENCHMARK
 
 
 def _parse_formula_n(formula: str) -> int:
@@ -361,14 +357,16 @@ def run_backtest(req: BacktestIn) -> dict:
     run_id = uuid.uuid4().hex[:12]
     res = Engine(
         strategy,
-        config=EngineConfig(initial_cash=req.initial_cash, rebalance=req.rebalance),
+        config=EngineConfig(initial_cash=req.initial_cash, rebalance=req.rebalance,
+                            benchmark=req.benchmark),
     ).run(d, extra_fields=[col])
 
     _persist_result(run_id, "factor_topn",
                     {"factor": col, "top_n": req.top_n, "rebalance": req.rebalance,
                      "formula": req.formula, "start": req.start,
                      "exit_strategy": req.exit_strategy,
-                     "exit_params": req.exit_params}, res)
+                     "exit_params": req.exit_params,
+                     "benchmark": req.benchmark}, res)
 
     m = res.metrics
     return {"run_id": run_id, "metrics": _metrics_response(m),

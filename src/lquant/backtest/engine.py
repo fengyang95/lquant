@@ -47,6 +47,13 @@ class EngineConfig:
     delist_recovery: float = 0.0
     # 资金不足口径：reject（真实券商/backtrader）| truncate（聚宽 order_value）
     insufficient_cash: str = "reject"
+    # 考核基准指数代码。None/"" = 不挂基准（只有绝对收益）。
+    # 别名（hs300/沪深300/000300）会被 parse_benchmark 规范化；指数序列缺失时
+    # 该回测**不报错**，只在 metrics 里标 benchmark_available=False。
+    benchmark: str | None = "000300.SH"
+    # 注入基准收盘序列 [(date, close)]，规避 DB 依赖（测试/离线回放）。
+    # 给了它就不再查 index_daily；空列表 = 显式声明「没有基准」。
+    benchmark_series: list[tuple[date, float]] | None = None
 
 
 @dataclass
@@ -593,3 +600,67 @@ class Engine:
             "total_fee": sum(f.fee for f in res.trades),
             "turnover": to,
         }
+        res.metrics.update(self._benchmark_metrics(dates, rets))
+
+    def _benchmark_metrics(self, dates: list[date], rets: list[float]) -> dict:
+        """挂基准后的相对指标（总超额 / 跟踪误差 / 信息比率 / α / β）。
+
+        基准口径：``parse_benchmark`` 规范化后的指数；``benchmark_series``
+        注入时优先用它（离线/测试）。任何环节失败都降级成
+        ``benchmark_available=False`` + ``benchmark_note``，**绝不让回测失败** ——
+        主产物是净值，基准是可选的对照物。
+        """
+        from lquant.backtest.attribution import risk_vs_benchmark
+        from lquant.backtest.benchmark import (
+            benchmark_returns_by_date,
+            parse_benchmark,
+        )
+
+        symbol = parse_benchmark(self.cfg.benchmark)
+        if symbol is None:
+            return {"benchmark": None, "benchmark_available": False,
+                    "benchmark_note": "未配置基准（benchmark=None）"}
+        if not dates or not rets:
+            return {"benchmark": symbol, "benchmark_available": False,
+                    "benchmark_note": "无净值序列，无法计算相对指标"}
+        try:
+            if self.cfg.benchmark_series is not None:
+                series = list(self.cfg.benchmark_series)
+                note_src = "injected"
+            else:
+                from lquant.backtest.benchmark import load_index_series
+
+                series = load_index_series(symbol, start=dates[0], end=dates[-1])
+                note_src = "index_daily"
+            bmap = benchmark_returns_by_date(series)
+        except Exception as e:  # noqa: BLE001  基准读取失败不阻断回测
+            return {"benchmark": symbol, "benchmark_available": False,
+                    "benchmark_note": f"{symbol}: 基准读取失败（{type(e).__name__}: {e}）"}
+        port: list[float] = []
+        bench: list[float] = []
+        for d, r in zip(dates[1:], rets, strict=False):
+            b = bmap.get(d)
+            if b is None or r is None or not math.isfinite(float(r)):
+                continue
+            port.append(float(r))
+            bench.append(b)
+        base = {"benchmark": symbol, "benchmark_source": note_src,
+                "benchmark_days": len(port)}
+        if not series:
+            base |= {"benchmark_available": False,
+                     "benchmark_note": f"{symbol}: index_daily 无数据（跑 `lq data index`）"}
+            return base
+        if len(port) < 20:
+            base |= {"benchmark_available": False,
+                     "benchmark_note": f"{symbol}: 对齐后仅 {len(port)} 期（<20 不下结论）"}
+            return base
+        try:
+            rel = risk_vs_benchmark(port, bench)
+        except ValueError as e:
+            base |= {"benchmark_available": False, "benchmark_note": str(e)}
+            return base
+        base |= {"benchmark_available": True, **rel}
+        if len(port) < len(rets):
+            base["benchmark_note"] = (
+                f"{symbol}: 对齐 {len(port)}/{len(rets)} 期（缺口双边丢弃，不补造）")
+        return base

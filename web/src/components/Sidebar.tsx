@@ -23,6 +23,7 @@ const GROUPS: { label: string; items: { href: string; label: string }[] }[] = [
       { href: '/factors/reports', label: '因子报告' },
       { href: '/fundamental', label: '基本面' },
       { href: '/backtests', label: '回测' },
+      { href: '/ml', label: '模型' },
       { href: '/paper', label: '模拟盘' },
     ],
   },

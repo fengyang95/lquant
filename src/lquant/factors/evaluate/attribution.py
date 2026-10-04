@@ -9,9 +9,11 @@
 """
 from __future__ import annotations
 
+import numpy as np
 import polars as pl
 
-__all__ = ["exposure", "group_exposure", "return_contribution", "attribution_summary"]
+__all__ = ["exposure", "group_exposure", "return_contribution", "attribution_summary",
+           "pure_exposure", "portfolio_exposure", "exposure_views", "ExposureDivergence"]
 
 
 def exposure(df: pl.DataFrame, factor: str, by: str = "industry_sw1",
@@ -107,3 +109,154 @@ def attribution_summary(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1
         "group_profile": group_exposure(df, factor, num_cols, date_col=date_col),
         "contribution": return_contribution(df, factor, ret_col, by=cat_col, date_col=date_col),
     }
+
+
+# ---------------------------------------------------------------- 双视角暴露
+
+def _style_cols(df: pl.DataFrame, covs: list[str] | None) -> list[str]:
+    if covs:
+        return [c for c in covs if c in df.columns]
+    return [c for c in ("market_cap", "float_mv", "turnover_rate", "volatility",
+                        "mom20", "bp", "ep") if c in df.columns]
+
+
+def pure_exposure(df: pl.DataFrame, factor: str, covs: list[str] | None = None,
+                  *, date_col: str = "trade_date") -> pl.DataFrame:
+    """**纯暴露**：把因子本身当成一个组合（权重 ``w_i = f_i / Σ|f_i|``）看它载荷在什么上。
+
+    与 :func:`portfolio_exposure` 的区别是这个模块存在的理由：
+
+    - 纯暴露回答「**信号本身**在赌什么」—— 不做分箱、不做多空、不设持仓约束，
+      所以它反映的是因子的**内在**风格倾向；
+    - 组合暴露回答「**实际持仓**表现得像什么」—— 含分箱、权重方案、约束。
+
+    两者背离时，说明「可交易的组合」与「信号」不是一回事：例如信号本身
+    只轻微偏向小市值，但取 Top 10% 后组合变成极端小市值 —— 这种背离在
+    只看组合暴露时完全不可见。
+
+    权重用 ``Σ|f_i|`` 归一（而不是 ``Σf_i``）：因子可能有负值，
+    用净和归一会让权重爆炸或符号翻转。
+    """
+    cols = _style_cols(df, covs)
+    if not cols:
+        return pl.DataFrame()
+    d = df.drop_nulls([factor, *cols])
+    if not len(d):
+        return pl.DataFrame()
+
+    def _per_day(g: pl.DataFrame) -> pl.DataFrame:
+        f = g[factor].cast(pl.Float64, strict=False)
+        denom = float(f.abs().sum())
+        if denom <= 1e-12:
+            return pl.DataFrame({date_col: [], **{c: [] for c in cols}})
+        w = f / denom
+        return pl.DataFrame({
+            date_col: [g[date_col][0]],
+            **{c: [float((g[c].cast(pl.Float64, strict=False) * w).sum())] for c in cols},
+        })
+
+    parts = [_per_day(g) for _, g in d.group_by(date_col, maintain_order=True)]
+    parts = [p for p in parts if len(p)]
+    if not parts:
+        return pl.DataFrame()
+    # 返回**逐期**暴露（不在这里做汇总）：汇总口径留给调用方，
+    # 因为「均值」和「均值/t 值」在不同场景下的解读不同（见 exposure_views）。
+    return pl.concat(parts).sort(date_col)
+
+
+def portfolio_exposure(df: pl.DataFrame, factor: str, covs: list[str] | None = None,
+                       *, date_col: str = "trade_date", n_groups: int = 10,
+                       side: str = "long_short") -> pl.DataFrame:
+    """**组合暴露**：实际可交易组合在风格因子上的暴露（逐期）。
+
+    ``side``：``long_short`` = 第 N 组减第 1 组（等权）；``long`` = 只取第 N 组。
+    """
+    from lquant.factors.evaluate.quantile import add_quantile
+
+    cols = _style_cols(df, covs)
+    if not cols:
+        return pl.DataFrame()
+    d = add_quantile(df, factor, n_groups, date_col=date_col).drop_nulls(cols)
+
+    def _per_day(g: pl.DataFrame) -> pl.DataFrame:
+        hi = g.filter(pl.col("q") == n_groups)
+        lo = g.filter(pl.col("q") == 1)
+        row: dict = {date_col: g[date_col][0]}
+        for c in cols:
+            h = hi[c].cast(pl.Float64, strict=False)
+            l = lo[c].cast(pl.Float64, strict=False)
+            row[c] = float(h.mean() - l.mean()) if side == "long_short" else float(h.mean())
+        return pl.DataFrame({k: [v] for k, v in row.items()})
+
+    parts = [_per_day(g) for _, g in d.group_by(date_col, maintain_order=True)]
+    parts = [p for p in parts if len(p)]
+    return pl.concat(parts).sort(date_col) if parts else pl.DataFrame()
+
+
+def _style_scale(df: pl.DataFrame, cols: list[str], *, date_col: str) -> dict[str, float]:
+    """各风格变量的**截面标准差**（逐日均值）—— 背离的天然量纲。
+
+    用它而不是「纯暴露的时间序列标准差」：后者会随耦合强度一起变大，
+    导致「耦合越强、标准化背离越小」的反直觉结果（实测 coupling 从 0.6
+    升到 1.2，gap_z 反而从 0.98 掉到 0.09）。截面标准差是稳定的外生尺度，
+    含义也直白：「组合暴露比信号暴露多出几个截面标准差」。
+    """
+    out: dict[str, float] = {}
+    for c in cols:
+        if c not in df.columns:
+            continue
+        g = (df.drop_nulls(c).group_by(date_col)
+             .agg(pl.col(c).cast(pl.Float64, strict=False).std().alias("s")))
+        vals = [float(x) for x in g["s"].to_list() if x is not None and np.isfinite(x)]
+        out[c] = float(np.mean(vals)) if vals else 0.0
+    return out
+
+
+def exposure_views(df: pl.DataFrame, factor: str, covs: list[str] | None = None,
+                   *, date_col: str = "trade_date", n_groups: int = 10,
+                   side: str = "long_short") -> dict:
+    """双视角对照：返回 ``{pure, portfolio, compare, divergences, ...}``。
+
+    ``compare`` 逐风格列给出背离：
+
+    - ``gap = portfolio_mean - pure_mean``（原始量纲）；
+    - ``gap_z = gap / 该风格变量的截面标准差``（标准化，跨列可比）。
+
+    ``|gap_z| ≥ 1`` 记为一个 ``divergence``：组合在该风格上的暴露比信号本身
+    多出一个截面标准差 —— 「信号与组合不是一回事」的量化门槛。
+    """
+    pure = pure_exposure(df, factor, covs, date_col=date_col)
+    port = portfolio_exposure(df, factor, covs, date_col=date_col,
+                              n_groups=n_groups, side=side)
+    cols = [c for c in (covs or [c for c in pure.columns if c != date_col])
+            if c in pure.columns and c in port.columns]
+    scale = _style_scale(df, cols, date_col=date_col)
+    rows: list[dict] = []
+    for c in cols:
+        p = pure[c].cast(pl.Float64, strict=False).to_numpy()
+        q = port[c].cast(pl.Float64, strict=False).to_numpy()
+        if not len(p) or not len(q):
+            continue
+        pm, qm = float(np.nanmean(p)), float(np.nanmean(q))
+        sc = scale.get(c, 0.0)
+        rows.append({
+            "cov": c,
+            "pure_mean": pm,
+            "portfolio_mean": qm,
+            "pure_std": float(np.nanstd(p, ddof=1)) if len(p) > 1 else 0.0,
+            "style_scale": sc,
+            "gap": qm - pm,
+            "gap_z": (qm - pm) / sc if sc > 1e-12 else None,
+            "n_days": int(min(len(p), len(q))),
+        })
+    divergences = [r for r in rows if r["gap_z"] is not None and abs(r["gap_z"]) >= 1.0]
+    return {"pure": pure, "portfolio": port, "compare": rows,
+            "divergences": divergences, "side": side, "n_groups": n_groups}
+
+
+class ExposureDivergence(dict):
+    """双视角背离的结论包装（``dict`` 子类，便于直接进 API 响应）。"""
+
+    @property
+    def has_divergence(self) -> bool:
+        return bool(self.get("divergences"))

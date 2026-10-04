@@ -363,35 +363,25 @@ def test_attribution_edge_branches(client, monkeypatch):
 
 
 def test_get_run_benchmark_fallback_exception(client, monkeypatch):
-    """基准指数查询异常 → 降级全市场等权（湖兜底路径）。"""
-    from contextlib import contextmanager
+    """基准指数查询异常 → 降级全市场等权（湖兜底路径）。
 
-    from lquant.server.api import backtests as bt
+    指数读取已收敛到 ``lquant.backtest.benchmark.load_index_series``（图表基准
+    与引擎指标同一实现）；本用例在该接缝上打桩，验证「指数挂掉 → 等权兜底
+    → 200 且明确标注非真基准」。
+    """
+    import lquant.backtest.benchmark as bm
 
-    class _Proxy:
-        def __init__(self, con):
-            self._con = con
+    def _boom(*a, **k):
+        raise RuntimeError("index query down")
 
-        def execute(self, sql, *a, **k):
-            if "index_daily" in sql:
-                raise RuntimeError("index query down")
-            return self._con.execute(sql, *a, **k)
-
-    real_reader = bt.reader
-
-    @contextmanager
-    def fake_reader():
-        with real_reader() as con:
-            yield _Proxy(con)
-
+    monkeypatch.setattr(bm, "load_index_series", _boom)
     rb = client.post("/api/backtests/run", json={"formula": "pct_change_20",
                                                  "top_n": 2, "start": "2026-01-01"})
     run_id = rb.json()["run_id"]
-    monkeypatch.setattr(bt, "reader", fake_reader)
     # 指数查询失败 → 走全市场等权兜底（read_daily 真实读 demo 湖）
     d = client.get(f"/api/backtests/{run_id}")
     assert d.status_code == 200
-    assert d.json()["benchmark_label"] == "全市场等权"
+    assert d.json()["benchmark_label"] == "全市场等权（非真基准）"
 
 
 def test_compare_no_nav_422(client):
@@ -660,32 +650,18 @@ def test_run_code_analysis_crash_swallowed(client, monkeypatch):
 
 def test_get_run_benchmark_both_fail(client, monkeypatch):
     """指数查询与全市场等权兜底都失败 → benchmark 置空而非 500。"""
-    from contextlib import contextmanager
-
+    import lquant.backtest.benchmark as bm
     from lquant.server.api import backtests as bt
 
-    class _Proxy:
-        def __init__(self, con):
-            self._con = con
+    def _boom(*a, **k):
+        raise RuntimeError("index query down")
 
-        def execute(self, sql, *a, **k):
-            if "index_daily" in sql:
-                raise RuntimeError("index query down")
-            return self._con.execute(sql, *a, **k)
-
-    real_reader = bt.reader
-
-    @contextmanager
-    def fake_reader():
-        with real_reader() as con:
-            yield _Proxy(con)
-
+    monkeypatch.setattr(bm, "load_index_series", _boom)
     rb = client.post("/api/backtests/run", json={"formula": "pct_change_20",
                                                  "top_n": 2, "start": "2026-01-01"})
     run_id = rb.json()["run_id"]
     monkeypatch.setattr(bt, "read_daily", lambda *a, **k: (_ for _ in ()).throw(
         RuntimeError("lake down")))
-    monkeypatch.setattr(bt, "reader", fake_reader)
     d = client.get(f"/api/backtests/{run_id}")
     assert d.status_code == 200
     assert d.json()["benchmark"] == []

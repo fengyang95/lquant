@@ -154,7 +154,56 @@ DDL_STATEMENTS: list[str] = [
         test_rows  INTEGER,
         train_end  DATE,
         test_end   DATE,
-        created_at TIMESTAMP
+        created_at TIMESTAMP,
+        -- Phase 2.1：模型注册表。此前 ml_run 只有指标，没有 artifact 指针，
+        -- 「这条记录对应哪个模型文件」无从回答，滚动重训也就无法回放。
+        model_name      VARCHAR,          -- 逻辑模型线（同一策略的多个版本共享）
+        model_version   INTEGER,          -- 该 model_name 下单调递增
+        stage           VARCHAR,          -- candidate|staging|production|archived
+        artifact_path   VARCHAR,          -- 模型文件（相对仓库根，便于迁移）
+        processor_path  VARCHAR,          -- 特征处理器状态 JSON
+        processor_state JSON,             -- 处理器的可读副本（不必开文件即可看口径）
+        fit_window      JSON,             -- {train_start,train_stop,train_rows,...}
+        dataset         JSON              -- 数据集摘要（行数/票数/交易日数）
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ml_model (
+        name           VARCHAR,          -- 逻辑模型线，如 momentum_lgbm
+        version        INTEGER,          -- 该 name 下单调递增（1 起）
+        run_id         VARCHAR,          -- 对应的 ml_run（训练记录）
+        stage          VARCHAR,          -- candidate|staging|production|archived
+        artifact_path  VARCHAR,
+        processor_path VARCHAR,
+        metrics        JSON,
+        fit_window     JSON,
+        note           VARCHAR,          -- 晋级/回滚备注（审计用）
+        created_at     TIMESTAMP,
+        promoted_at    TIMESTAMP,        -- 进入当前 stage 的时刻（as-of 回放依据）
+        PRIMARY KEY (name, version)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ml_signal (
+        name          VARCHAR,          -- 逻辑模型线（与 ml_model.name 对应）
+        trade_date    DATE,
+        symbol        VARCHAR,
+        signal        DOUBLE,           -- 模型原始输出（未做组合权重）
+        model_version INTEGER,          -- 出这个信号时线上是哪一版（可审计）
+        run_id        VARCHAR,
+        created_at    TIMESTAMP,
+        PRIMARY KEY (name, trade_date, symbol)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ml_model_event (
+        event_id   VARCHAR PRIMARY KEY,
+        name       VARCHAR,          -- 逻辑模型线
+        version    INTEGER,
+        from_stage VARCHAR,
+        to_stage   VARCHAR,
+        note       VARCHAR,
+        occurred_at TIMESTAMP
     )
     """,
     """
@@ -362,3 +411,28 @@ def ensure_collect_log(con) -> int:
     new_ddl = next(s for s in DDL_STATEMENTS if "CREATE TABLE IF NOT EXISTS collect_log" in s)
     con.execute(new_ddl)
     return 1
+
+
+def ensure_ml_run_columns(con) -> int:
+    """ml_run 增列迁移（Phase 2.1 模型注册表）。
+
+    老库的 ml_run 只有指标列，没有 artifact 指针 —— 训练记录无法回放到模型
+    文件。加列是幂等且无损的（旧行新列为 NULL，`ml_model` 另行补齐版本信息）。
+    返回新增列数。
+    """
+    cols = {r[0] for r in con.execute("DESCRIBE ml_run").fetchall()}
+    n = 0
+    for col, typ in (
+        ("model_name", "VARCHAR"),
+        ("model_version", "INTEGER"),
+        ("stage", "VARCHAR"),
+        ("artifact_path", "VARCHAR"),
+        ("processor_path", "VARCHAR"),
+        ("processor_state", "JSON"),
+        ("fit_window", "JSON"),
+        ("dataset", "JSON"),
+    ):
+        if col not in cols:
+            con.execute(f"ALTER TABLE ml_run ADD COLUMN {col} {typ}")
+            n += 1
+    return n

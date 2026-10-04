@@ -167,3 +167,17 @@ def test_add_months_edge():
     assert _add_months(date(2024, 1, 31), 1) == date(2024, 2, 29)   # 月末截断 + 闰年
     assert _add_months(date(2023, 11, 15), 2) == date(2024, 1, 15)  # 跨年
     assert _add_months(date(2024, 3, 31), 11) == date(2025, 2, 28)
+
+
+# ----------------------------------------------------------- 特征解析退化分支
+
+def test_resolve_feature_handles_unparsable_suffix():
+    """``mom_x`` 这类前缀对但后缀不是数字的名字，不能当成窗口特征。"""
+    from lquant.research.ml.panel import resolve_feature
+
+    df = make_panel()
+    with pytest.raises(Exception, match="无法解析特征"):
+        resolve_feature(df, "MA_x")
+    # 窗口 <= 0 同样不算（否则 rolling(0) 会在 Polars 里炸）
+    with pytest.raises(Exception, match="无法解析特征"):
+        resolve_feature(df, "MA_0")

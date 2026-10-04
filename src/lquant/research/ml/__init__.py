@@ -24,6 +24,7 @@ from lquant.research.ml.dataset import (
     walk_forward_splits,
 )
 from lquant.research.ml.model import (
+    EnsembleModel,
     LGBMModel,
     Model,
     RidgeModel,
@@ -31,9 +32,66 @@ from lquant.research.ml.model import (
     available_backends,
     make_model,
 )
+from lquant.research.ml.online import (
+    OnlineConfig,
+    daily_inference,
+    load_signals,
+    persist_signals,
+    rolling_retrain,
+    safe_promote,
+    verify_version,
+)
+from lquant.research.ml.panel import (
+    available_features,
+    build_feature_panel,
+    resolve_feature,
+)
+from lquant.research.ml.processor import (
+    ClipProcessor,
+    CrossSectionalProcessor,
+    LeakageError,
+    LeakageReport,
+    Pipeline,
+    Processor,
+    ProcessorSpec,
+    StandardizeProcessor,
+    assert_fit_isolated,
+    leakage_guard,
+    make_processor,
+)
+from lquant.research.ml.registry import (
+    STAGES,
+    ModelVersion,
+    archive,
+    events,
+    get_model,
+    list_models,
+    load_model,
+    load_processor,
+    model_paths,
+    model_root,
+    production,
+    production_asof,
+    promote,
+    register_run,
+    rollback,
+    save_artifact,
+)
 
 __all__ = [
     "Dataset", "DatasetConfig", "build_dataset", "walk_forward_splits",
-    "Model", "LGBMModel", "SklearnModel", "RidgeModel", "make_model", "available_backends",
+    "Model", "LGBMModel", "SklearnModel", "RidgeModel", "EnsembleModel",
+    "make_model", "available_backends",
     "train_and_predict", "signal_backtest", "run_ml_pipeline", "MLResult",
+    "Processor", "StandardizeProcessor", "ClipProcessor", "CrossSectionalProcessor",
+    "Pipeline", "ProcessorSpec", "make_processor",
+    "leakage_guard", "assert_fit_isolated", "LeakageReport", "LeakageError",
+    # 模型注册表（Phase 2.1）
+    "STAGES", "ModelVersion", "model_root", "model_paths", "save_artifact",
+    "register_run", "list_models", "get_model", "load_model", "load_processor",
+    "promote", "rollback", "archive", "production", "production_asof", "events",
+    # 特征面板 + 在线编排（Phase 2.2/2.3）
+    "resolve_feature", "build_feature_panel", "available_features",
+    "OnlineConfig", "rolling_retrain", "safe_promote", "verify_version",
+    "daily_inference", "persist_signals", "load_signals",
 ]

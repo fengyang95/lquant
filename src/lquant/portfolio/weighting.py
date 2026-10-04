@@ -12,6 +12,8 @@ from __future__ import annotations
 import numpy as np
 import polars as pl
 
+from lquant.portfolio.optimizer import OptimizerError
+
 __all__ = ["equal_weight", "score_weight", "market_cap_weight", "inverse_vol_weight",
            "risk_parity_weight", "min_variance_weight", "hrp_weight",
            "weights", "METHODS", "weight_report"]
@@ -29,6 +31,20 @@ def _returns_matrix(returns, symbols: list[str] | None = None) -> tuple[np.ndarr
         if symbols is None:
             symbols = [f"a{i}" for i in range(M.shape[1])]
     return np.nan_to_num(M, nan=0.0), list(symbols)
+
+
+def _cov_for(M: np.ndarray, cov_method: str | None, cov_params: dict | None) -> np.ndarray:
+    """按 ``cov_method`` 估计协方差；None/``sample`` 用样本协方差。
+
+    这是风险模型（``portfolio/riskmodel.py``）接入权重层的入口。默认仍是
+    样本协方差 —— 保持既有行为不变（1/N 与样本口径是既有回归基准），
+    要用收缩/因子模型必须**显式**指定，避免静默换口径。
+    """
+    if not cov_method or cov_method == "sample":
+        return np.atleast_2d(np.cov(M, rowvar=False))
+    from lquant.portfolio.riskmodel import estimate_cov
+
+    return estimate_cov(M, cov_method, **(cov_params or {}))
 
 
 def _clean(w: np.ndarray) -> np.ndarray:
@@ -81,18 +97,23 @@ def inverse_vol_weight(returns, symbols: list[str] | None = None,
 
 
 def risk_parity_weight(returns, symbols: list[str] | None = None, *,
-                       max_iter: int = 500, tol: float = 1e-9, **kw) -> dict[str, float]:
+                       max_iter: int = 500, tol: float = 1e-9,
+                       cov_method: str | None = None,
+                       cov_params: dict | None = None, **kw) -> dict[str, float]:
     """等风险贡献（ERC）：每只票对组合风险的贡献相同。
 
     用 SLSQP 最小化风险贡献与目标值的偏离，n 较大时慢，建议 ≤ 100 只。
     优化失败（协方差奇异等）时降级为逆波动率 —— 它本来就是 ERC 的近似解。
+
+    ``cov_method``：协方差估计口径（``sample`` 默认；``shrink_lw``/``poet`` 等
+    见 ``portfolio.riskmodel.COV_ESTIMATORS``）。T<N 时样本协方差奇异，
+    ERC 会退化成逆波动率；显式指定收缩口径可以避免这次静默降级。
     """
     M, syms = _returns_matrix(returns, symbols)
     n = len(syms)
     if n < 2 or M.shape[0] < 3:
         return inverse_vol_weight(M, syms)
-    cov = np.cov(M, rowvar=False)
-    cov = np.atleast_2d(cov)
+    cov = _cov_for(M, cov_method, cov_params)
     try:
         from scipy.optimize import minimize
 
@@ -120,13 +141,20 @@ def risk_parity_weight(returns, symbols: list[str] | None = None, *,
 
 
 def min_variance_weight(returns, symbols: list[str] | None = None, *,
-                        max_weight: float = 1.0, **kw) -> dict[str, float]:
-    """最小方差组合。对协方差估计误差最敏感，慎用。"""
+                        max_weight: float = 1.0,
+                        cov_method: str | None = None,
+                        cov_params: dict | None = None, **kw) -> dict[str, float]:
+    """最小方差组合。对协方差估计误差最敏感，慎用。
+
+    ``cov_method``：协方差口径（见 ``portfolio.riskmodel``）。样本协方差在
+    T<N 时奇异 → 权重由数值噪声决定；指定 ``shrink_lw`` 或 ``structured_pca``
+    才能让这个优化器真正可用。
+    """
     M, syms = _returns_matrix(returns, symbols)
     n = len(syms)
     if n < 2 or M.shape[0] < 3:
         return equal_weight(M, syms)
-    cov = np.atleast_2d(np.cov(M, rowvar=False))
+    cov = _cov_for(M, cov_method, cov_params)
     try:
         from scipy.optimize import minimize
 
@@ -203,35 +231,72 @@ def hrp_weight(returns, symbols: list[str] | None = None, *,
     return dict(zip(syms, _clean(w), strict=False))
 
 
+def _enhanced_indexing(returns, symbols=None, **kw):
+    """``weighting.METHODS`` 适配器：基准相对优化。
+
+    没给 ``benchmark_weights`` 时按**等权基准**处理（与 ``backtest.benchmark``
+    的等权代理同一口径），这样通用入口 ``weights(method="enhanced_indexing")``
+    也能调 —— 注册表里的方法必须都能被统一入口调用。是不是等权兜底看结果里的
+    ``_benchmark_source``，别把它当真指数基准。
+    """
+    from lquant.portfolio.optimizer import enhanced_indexing_weight
+
+    # 只回权重本身：结果对象还带 _ 前缀的诊断字段（含字符串），
+    # 整个 dict 化会让权重字典混进非数值，调用方 sum() 直接炸。
+    return enhanced_indexing_weight(returns, symbols, **kw).weights()
+
+
 METHODS = {
     "equal": equal_weight,
     "inverse_vol": inverse_vol_weight,
     "risk_parity": risk_parity_weight,
     "min_variance": min_variance_weight,
     "hrp": hrp_weight,
+    # 需要 benchmark_weights（见 portfolio/optimizer.py）
+    "enhanced_indexing": _enhanced_indexing,
 }
 
 
 def weights(returns, method: str = "equal", symbols: list[str] | None = None,
             **kw) -> dict[str, float]:
-    """统一入口。未知方法退回等权而不是报错 —— 权重算不出来不该让整个流程崩。"""
+    """统一入口。
+
+    未知方法（多半是拼错的名字）退回等权而不是报错 —— 权重算不出来不该让
+    整个流程崩。但**已注册方法**抛的错要照实往上抛：那通常是「缺了必需输入」
+    （如 ``enhanced_indexing`` 没给 ``scores``/``expected_returns``），
+    静默退回等权会让人以为约束真的生效了。这条不对称是刻意的。
+    """
     if method not in METHODS:
         return equal_weight(returns, symbols)
     return METHODS[method](returns, symbols, **kw)
 
 
 def weight_report(returns, symbols: list[str] | None = None,
-                  methods: list[str] | None = None) -> pl.DataFrame:
-    """各权重方案的对比：组合波动、有效持仓数（分散度）。"""
+                  methods: list[str] | None = None, **kw) -> pl.DataFrame:
+    """各权重方案的对比：组合波动、有效持仓数（分散度）、**算不出来的原因**。
+
+    需要额外输入的方法（``enhanced_indexing`` 要 α 视图，可用 ``scores=`` 传入）
+    会在 ``note`` 里说明原因，对应指标留空 —— 报告要能列全注册方法，
+    而不是因为其中一个缺输入就整体崩掉。
+    """
     M, syms = _returns_matrix(returns, symbols)
     cov = np.atleast_2d(np.cov(M, rowvar=False)) if M.shape[0] > 2 and len(syms) > 1 \
         else np.eye(len(syms)) * 1e-8
     rows = []
     for name in (methods or list(METHODS)):
-        w = np.array([weights(M, name, syms).get(s, 0.0) for s in syms])
+        try:
+            w = np.array([weights(M, name, syms, **kw).get(s, 0.0) for s in syms])
+        except (OptimizerError, ValueError) as e:
+            # 需要额外输入的方法（enhanced_indexing 要 α 视图）不该让整张报告炸 ——
+            # 记一行 note 说明为什么算不出来，报告仍能列全所有注册方法。
+            rows.append({"method": name, "vol": None, "effective_n": None,
+                         "max_weight": None, "n_holdings": None, "note": str(e)})
+            continue
         vol = float(np.sqrt(w @ cov @ w))
         # 有效持仓数 = 1 / HHI，衡量分散度
         eff = float(1.0 / (w ** 2).sum()) if (w ** 2).sum() > 0 else 0.0
         rows.append({"method": name, "vol": vol, "effective_n": eff,
-                     "max_weight": float(w.max()), "n_holdings": int((w > 1e-6).sum())})
-    return pl.DataFrame(rows).sort("vol")
+                     "max_weight": float(w.max()), "n_holdings": int((w > 1e-6).sum()),
+                     "note": None})
+    # nulls_last：算不出来的方法排到最后，而不是让 NaN 打乱波动率排序
+    return pl.DataFrame(rows).sort("vol", nulls_last=True)

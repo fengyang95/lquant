@@ -23,6 +23,7 @@ from lquant.server.api import (
     fundamental,
     health,
     market,
+    ml,
     monitor,
     news,
     paper,
@@ -60,7 +61,7 @@ def create_app() -> FastAPI:
     )
     for r in (health, data, data_admin, factors, backtests, market, paper, watchlist,
               strategies, analyses, sync, etf, news, settings, ask, agent,
-              qlib, task_center, monitor, fundamental):
+              qlib, task_center, monitor, fundamental, ml):
         app.include_router(r.router, prefix="/api")
     app.include_router(ws.router)  # /ws/jobs/{id}，无 /api 前缀（与前端代理一致）
     # A2A：Agent Card 按 RFC 8615 挂在 /.well-known/，POST 落在 /a2a —— 两者都
@@ -129,6 +130,7 @@ def _startup() -> None:
             ensure_collect_log,
             ensure_factor_def,
             ensure_factor_def_columns,
+            ensure_ml_run_columns,
         )
 
         with writer() as con:
@@ -142,6 +144,8 @@ def _startup() -> None:
                 print("[migrate] industry_classify → 补 (symbol, std_date) 主键")
             if ensure_factor_def_columns(con):
                 print("[migrate] factor_def → 补 source/source_ref/factor_id 列")
+            if ensure_ml_run_columns(con):
+                print("[migrate] ml_run → 补 model_name/model_version/artifact 列")
     except Exception as e:  # noqa: BLE001 - 库未初始化时不应阻断服务启动
         print(f"[startup] schema 迁移跳过: {e}")
 

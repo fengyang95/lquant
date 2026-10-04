@@ -130,6 +130,35 @@ def index_cons_cmd(indexes: str | None) -> None:
     click.echo("index-cons done")
 
 
+@data.command("index")
+@click.option("--start", default="2016-01-01", help="起始日（ISO）")
+@click.option("--end", default=None, help="结束日（ISO，缺省今天）")
+@click.option("--symbols", default=None,
+              help="逗号分隔指数代码（缺省 INDEX_POOL 全部）")
+def index_cmd(start: str, end: str | None, symbols: str | None) -> None:
+    """回填指数日线（回测基准的历史来源）。
+
+    指数走 ``Capability.INDEX_DAILY`` 选源（tushare pro.index_daily /
+    akshare index_zh_a_hist / baostock 指数通道），落 DuckDB ``index_daily``，
+    **不进日线 parquet 湖**（点位不是价格）。可安全重跑（upsert 幂等）。
+    """
+    from datetime import date as _date
+
+    from lquant.core.types import today_cn
+    from lquant.market.backfill import backfill_index_history
+
+    end_d = _date.fromisoformat(end) if end else today_cn()
+    syms = [s.strip() for s in symbols.split(",")] if symbols else None
+    rep = backfill_index_history(_date.fromisoformat(start), end_d, symbols=syms)
+    click.echo(f"  窗口: {rep['start']} ~ {rep['end']}")
+    click.echo(f"  拉取: {rep['fetched']} 行，入库: {rep['persisted']} 行")
+    click.echo("  区间内覆盖（回填前 → 后）:")
+    for sym in rep["symbols"]:
+        click.echo(f"    {sym}: {rep['coverage_before'].get(sym, 0)}"
+                   f" → {rep['coverage_after'].get(sym, 0)}")
+    click.echo("index done")
+
+
 @data.command()
 def status() -> None:
     """数据覆盖度一览。"""
@@ -162,6 +191,47 @@ def status() -> None:
     files = sorted(root.rglob("*.parquet")) if root.is_dir() else []
     click.echo(f"  daily parquet 年分区: {len(files)}"
                + ("（湖为空，先跑 lq data sync）" if lake_is_empty("daily") else ""))
+
+    _index_coverage_line()
+
+
+def _index_coverage_line() -> None:
+    """指数日线覆盖一览（回测基准的数据源，Phase 1.1 的可见性出口）。
+
+    没有这行时「基准缺失」只能靠回测跑出 NaN 才发现 —— 显式给出
+    「有哪些指数、各自覆盖到哪天、基准是否可用」。
+    """
+    from lquant.core.db import reader
+    from lquant.market.collectors.index_daily import INDEX_POOL
+
+    try:
+        with reader() as con:
+            rows = con.execute(
+                "SELECT symbol, count(*) AS n, min(trade_date) AS lo, "
+                "max(trade_date) AS hi, count(DISTINCT trade_date) AS days "
+                "FROM index_daily GROUP BY symbol ORDER BY symbol"
+            ).fetchall()
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"  index_daily: - ({type(e).__name__})")
+        return
+
+    if not rows:
+        click.echo("  index_daily: 0（基准缺失，跑 `lq data index --start 2016-01-01`）")
+        return
+    click.echo(f"  index_daily: {len(rows)} 只指数 / {sum(r[1] for r in rows)} 行")
+    have = {str(r[0]) for r in rows}
+    for sym, _n, lo, hi, days in rows:
+        click.echo(f"    {sym} {INDEX_POOL.get(str(sym), '?'):<8} "
+                   f"{days:>5} 交易日 {lo} ~ {hi}")
+    missing = [s for s in INDEX_POOL if s not in have]
+    if missing:
+        click.echo(f"    缺: {', '.join(missing)}（`lq data index` 可补）")
+    # 回测默认基准是否就绪 —— Phase 1.2 的默认值是 000300.SH
+    from lquant.backtest.benchmark import DEFAULT_BENCHMARK
+
+    if DEFAULT_BENCHMARK not in have:
+        click.echo(f"    ⚠ 默认基准 {DEFAULT_BENCHMARK} 尚无数据，"
+                   "回测超额收益会缺失（跑 `lq data index`）")
 
 
 @data.command()
