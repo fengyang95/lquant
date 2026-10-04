@@ -52,7 +52,7 @@ describe('createdText 时间展示', () => {
 
 describe('映射表完整性', () => {
   it('KIND_TEXT / STATE_TEXT / STATE_BADGE 覆盖全部枚举键', () => {
-    const kinds = ['data', 'sync', 'backtest', 'factor', 'qlib'] as const;
+    const kinds = ['data', 'sync', 'backtest', 'factor', 'qlib', 'ml'] as const;
     const states = ['queued', 'running', 'finished', 'failed', 'canceled'] as const;
     for (const k of kinds) expect(KIND_TEXT[k]).toBeTruthy();
     for (const s of states) {

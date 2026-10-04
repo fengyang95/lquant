@@ -11,10 +11,11 @@ import SyncPanel from './panels/SyncPanel';
 import BacktestPanel from './panels/BacktestPanel';
 import FactorPanel from './panels/FactorPanel';
 import QlibTaskPanel from './panels/QlibTaskPanel';
+import MLTaskPanel from './panels/MLTaskPanel';
 import { KIND_TEXT } from './types';
 import type { TaskSummary, TaskItem } from './types';
 
-const TABS: TaskItem['kind'][] = ['data', 'sync', 'backtest', 'factor', 'qlib'];
+const TABS: TaskItem['kind'][] = ['data', 'sync', 'backtest', 'factor', 'qlib', 'ml'];
 
 const TAB_LABEL: Record<TaskItem['kind'], string> = {
   data: '数据',
@@ -22,6 +23,7 @@ const TAB_LABEL: Record<TaskItem['kind'], string> = {
   backtest: '回测',
   factor: '因子挖掘',
   qlib: 'Qlib',
+  ml: 'ML',
 };
 
 /** summary 数字 → 语气色：失败红、运行中蓝 */
@@ -43,7 +45,7 @@ export default function TasksPage() {
 
   return (
     <div className="space-y-5">
-      <PageHeader title="任务管理" sub="四类后台任务统一入口 · 顶卡为全局状态，面板内各自轮询" />
+      <PageHeader title="任务管理" sub="各类后台任务统一入口 · 顶卡为全局状态，面板内各自轮询" />
       {summary ? (
         <div className="grid grid-cols-2 gap-4 border border-line bg-panel p-4 lg:grid-cols-4">
           {TABS.map((k) => {
@@ -80,6 +82,7 @@ export default function TasksPage() {
         {tab === 'backtest' && <BacktestPanel />}
         {tab === 'factor' && <FactorPanel />}
         {tab === 'qlib' && <QlibTaskPanel />}
+        {tab === 'ml' && <MLTaskPanel />}
       </div>
     </div>
   );
