@@ -74,8 +74,30 @@ jobs:
           assert all(v == 'rust' for v in st.values()), 'Rust 扩展加载失败（ABI 错配？）: ' + repr(st)
           "
 
+      - name: 准备数据环境（与 pre-push 钩子一致：建库 + 空湖时生成演示数据）
+        # 钩子跑测试前会先自愈环境（建库、空湖生成演示数据），CI 一直没这一步 ——
+        # 于是 CI 全部落在「无库 / 空湖」分支上，而本地从来不是。本地用干净
+        # checkout（无数据）跑整套时直接 native 崩溃，加上这一步就正常跑完，
+        # 所以先把环境对齐，再谈测试本身。
+        run: |
+          set -euo pipefail
+          mkdir -p data/duckdb data/parquet data/cache
+          if [ ! -f data/duckdb/lquant.duckdb ]; then
+            .venv/bin/python scripts/init_db.py
+          fi
+          if [ -z "$(find -L data/parquet -name '*.parquet' -print -quit 2>/dev/null)" ]; then
+            .venv/bin/python -c "from lquant.cli.main import cli; cli(['data','demo'], standalone_mode=False)" >/dev/null
+          fi
+
       - name: Run pytest
-        run: .venv/bin/python -m pytest tests -m "not slow"
+        # timeout -s ABRT：卡住时用 SIGABRT 触发 faulthandler，把所有线程栈 dump
+        # 进日志 —— 哪个用例卡住、卡在哪一行一眼可见，而不是白烧到 6 小时 job
+        # 超时（这次就烧了 3 小时以上还没结束）。2400s 是本地 5'40" 的 ~7 倍余量。
+        # 去掉 -m "not slow"：全仓没有任何用例带 slow 标记（selected == all），
+        # 这个过滤是空操作，留着只会让人误以为网络/大数据用例已经被排掉。
+        env:
+          PYTHONFAULTHANDLER: "1"
+        run: timeout -s ABRT 2400 .venv/bin/python -m pytest tests
 
   web:
     name: Web (Next.js)
