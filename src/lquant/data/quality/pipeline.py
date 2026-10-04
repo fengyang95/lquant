@@ -17,7 +17,28 @@ from lquant.data.quality.issues import Issue, save_issues
 
 log = get_logger(__name__)
 
-__all__ = ["gate_daily", "run_lake_checks"]
+__all__ = ["gate_daily", "run_lake_checks", "check_lake_structure"]
+
+
+def check_lake_structure() -> list[Issue]:
+    """只跑结构性检查（数据根 + 分区连续性），不读全湖日线帧。
+
+    给「启动自检 / 同步后门禁」这类**要求廉价且必须跑**的场景用：
+    run_lake_checks 会物化整个日线帧，不适合每次同步后都调。
+    """
+    from lquant.data.store import integrity
+
+    found: list[Issue] = []
+    for label, probe in (
+        ("数据根自检", integrity.check_data_root),
+        ("分区连续性检查",
+         lambda: integrity.check_partition_continuity(_try_load_full_calendar())),
+    ):
+        try:
+            found.extend(probe())
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"{label}跳过: {e}")
+    return found
 
 # 涨跌停检查只用当前 board/is_st 快照（PIT 局限），只跑近端窗口
 _LIMIT_WINDOW_DAYS = 400
@@ -63,9 +84,21 @@ def run_lake_checks(start: str | None = None, end: str | None = None,
     """
     from lquant.data.store.parquet import read_daily
 
+    if data_version is None:
+        from lquant.data import lineage
+        data_version = lineage.latest("daily_bar")
+
+    found: list[Issue] = []
+
+    # 结构性检查**先跑，且不受「日线帧为空」影响**：湖整年缺失时帧恰恰可能
+    # 为空或依然「看起来正常」（latest_trade_date 仍是最新），早退会让最该
+    # 报的问题永远不报。实测真实湖整年缺 2025 却无人发现（审计 A1/A2）。
+    found.extend(check_lake_structure())
+
     df = read_daily(start=start, end=end).collect()
     if not len(df):
-        return []
+        _save_lake_issues(found, data_version)
+        return found
 
     # 只挑检查需要的列 —— 全湖宽表全量物化是纯浪费（M5）
     keep = [c for c in ("symbol", "trade_date", "open", "high", "low",
@@ -73,11 +106,6 @@ def run_lake_checks(start: str | None = None, end: str | None = None,
             if c in df.columns]
     df = df.select(keep)
 
-    if data_version is None:
-        from lquant.data import lineage
-        data_version = lineage.latest("daily_bar")
-
-    found: list[Issue] = []
     security = _try_load_security()
     if security is not None:
         recent = _recent_window(df)
@@ -125,12 +153,16 @@ def run_lake_checks(start: str | None = None, end: str | None = None,
     # 不接 tradability：flag_tradability 是写回型打标（改湖内数据），
     # lake 检查只读不写回，接线无意义。
 
+    _save_lake_issues(found, data_version)
+    return found
+
+
+def _save_lake_issues(found: list[Issue], data_version: str | None) -> None:
+    """issue 落库失败不抛 —— 检查结果落不了库也不该阻断同步链路。"""
     try:
         save_issues(found, data_version=data_version)
-    except Exception as e:  # noqa: BLE001  同上：检查结果落库失败不抛
-        from loguru import logger
-        logger.error(f"issue 落库失败: {e}")
-    return found
+    except Exception as e:  # noqa: BLE001
+        log.error(f"issue 落库失败: {e}")
 
 
 def _recent_window(df: pl.DataFrame) -> pl.DataFrame:
@@ -162,4 +194,23 @@ def _try_load_calendar(df: pl.DataFrame) -> list:
         return TradeCalendarRepo().range(df["trade_date"].min(), df["trade_date"].max())
     except Exception:
         log.exception("交易日历加载失败，涨跌停检查降级跳过")
+        return []
+
+
+def _try_load_full_calendar() -> list:
+    """全量交易日历（供分区连续性检查用）。
+
+    不能用日线帧的 min/max：帧本身缺整年时 min/max 依然是一个「正常」的
+    跨度（2021~2026 之间缺 2025），连续性检查必须拿到完整年份才知道哪一年
+    本该有数据。日历表很小（约 1.3 万行），全量查询代价可忽略。
+    """
+    try:
+        from datetime import date as _date
+
+        from lquant.core.types import today_cn
+        from lquant.data.store.catalog import TradeCalendarRepo
+        return TradeCalendarRepo().range(_date(1990, 1, 1),
+                                        _date(today_cn().year + 1, 12, 31))
+    except Exception:
+        log.exception("交易日历加载失败，分区连续性检查降级跳过")
         return []

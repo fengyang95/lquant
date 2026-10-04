@@ -174,11 +174,21 @@ async def test_message_slot_released_after_completion(client):
 
     r = await client.post(f"/api/ask/sessions/{sid}/messages", json={"content": "第一问"})
     assert r.status_code == 202
-    await asyncio.sleep(1.5)
-    r = await client.post(f"/api/ask/sessions/{sid}/messages", json={"content": "第二问"})
-    assert r.status_code == 202, r.text
-    await asyncio.sleep(1.5)
 
+    # 槽位是后台任务跑完才释放的，耗时随机器负载浮动：实测恰好在 ~1.5s 释放，
+    # 而原来正好 sleep(1.5) 后立刻发第二条 —— 慢一点点就 409（CI 上随机红）。
+    # 改成有上限的轮询：断言的是「最终会释放」，不再隐含「机器必须够快」。
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 20
+    while True:
+        r = await client.post(f"/api/ask/sessions/{sid}/messages", json={"content": "第二问"})
+        if r.status_code != 409:
+            break
+        assert loop.time() < deadline, f"槽位 20s 内没有释放：{r.text}"
+        await asyncio.sleep(0.05)
+    assert r.status_code == 202, r.text
+
+    # DELETE 内部会先 cancel 后台任务，所以不用再等第二问跑完。
     await client.delete(f"/api/ask/sessions/{sid}")
 
 
