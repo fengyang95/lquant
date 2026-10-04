@@ -17,7 +17,13 @@ import polars as pl
 from lquant.factors.evaluate.attribution import attribution_summary, exposure
 from lquant.factors.evaluate.decay import decay_profile, decay_summary, half_life, suggest_rebalance
 from lquant.factors.evaluate.event_study import event_study, event_study_summary
-from lquant.factors.evaluate.ic import ic_autocorr, ic_by_year, ic_series, ic_summary
+from lquant.factors.evaluate.ic import (
+    ic_autocorr,
+    ic_by_horizon,
+    ic_by_year,
+    ic_series,
+    ic_summary,
+)
 from lquant.factors.evaluate.outliers import (
     filter_zscore,
     zscore_filter_stats,
@@ -42,11 +48,17 @@ from lquant.factors.evaluate.robustness import (
     start_date_sensitivity,
     time_stability,
 )
+from lquant.factors.evaluate.sessions import (
+    session_ic,
+    session_ic_summary,
+    session_returns,
+)
 from lquant.factors.evaluate.trace import trace_periods, trace_snapshot
 
 __all__ = [
     "forward_return", "forward_return_matrix",
-    "ic_series", "ic_summary", "ic_by_year", "ic_autocorr",
+    "ic_series", "ic_summary", "ic_by_year", "ic_by_horizon", "ic_autocorr",
+    "session_returns", "session_ic", "session_ic_summary",
     "add_quantile", "group_returns", "quantile_nav", "long_short_nav", "quantile_summary",
     "pivot_group_returns", "filter_zscore", "zscore_filter_stats",
     "trace_snapshot", "trace_periods",
