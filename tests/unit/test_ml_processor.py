@@ -350,3 +350,80 @@ def test_train_and_predict_without_processors_keeps_raw_features():
     assert "processor" not in ml.summary()
     # 特征未被缩放：信号仍保留原始量级（预测值是 f 的线性函数）
     assert float(ml.predictions["ml_signal"].std()) > 0
+
+
+# ----------------------------------------------------------- 状态序列化 / 组合
+
+def test_fit_transform_and_state_roundtrip():
+    """``fit_transform`` 必须等于 ``fit().transform()``；状态可 JSON 往返。"""
+    df = _frame({"f1": [1.0, 2.0, 3.0, 4.0]})
+    a = StandardizeProcessor().fit_transform(df, features=["f1"])
+    b = StandardizeProcessor().fit(df, features=["f1"]).transform(df)
+    assert a["f1"].to_list() == b["f1"].to_list()
+
+    st = StandardizeProcessor().fit(df, features=["f1"]).state()
+    assert st["name"] == "standardize"
+    revived = StandardizeProcessor().load_state(st)
+    assert revived.describe()["fitted"] is True
+    assert revived.describe()["features"] == ["f1"]
+    assert revived.transform(df)["f1"].to_list() == b["f1"].to_list()
+    # 未 fit 的 describe 也要能回答（前端据此灰掉 infer 按钮）
+    assert StandardizeProcessor().describe()["fitted"] is False
+
+
+def test_pipeline_requires_at_least_one_processor():
+    with pytest.raises(ValueError, match="至少要有一个处理器"):
+        Pipeline([])
+
+
+def test_pipeline_state_roundtrip():
+    df = _frame({"f1": [1.0, 2.0, 3.0], "f2": [10.0, 20.0, 30.0]})
+    feats = ["f1", "f2"]
+    p = Pipeline([StandardizeProcessor(),
+                  ClipProcessor(lower=0.1, upper=0.9)]).fit(df, features=feats)
+    out = p.transform(df)
+    revived = Pipeline([StandardizeProcessor(),
+                        ClipProcessor()]).load_state(p.state())
+    assert revived.transform(df)["f1"].to_list() == out["f1"].to_list()
+    assert revived.describe()["fitted"] is True
+
+
+def test_make_processor_accepts_str_and_dict_spec():
+    """声明式入口要能吃字符串/字典/ProcessorSpec 三种写法。"""
+    assert isinstance(make_processor("zscore"), StandardizeProcessor)
+    assert isinstance(make_processor({"kind": "clip", "lower": 0.05, "upper": 0.95}),
+                      ClipProcessor)
+    assert isinstance(make_processor({"name": "cross_sectional"}),
+                      CrossSectionalProcessor)
+    nested = make_processor({"kind": "pipeline",
+                             "steps": ["zscore", {"kind": "clip"}]})
+    assert isinstance(nested, Pipeline) and len(nested.processors) == 2
+    with pytest.raises(KeyError, match="未知处理器"):
+        make_processor({"kind": "nope"})
+
+
+def test_clip_processor_skips_missing_bounds():
+    """某列没拿到分位（空列）时跳过该列，而不是整帧崩掉。"""
+    df = _frame({"f1": [1.0, 2.0, 3.0]})
+    p = ClipProcessor().fit(df, features=["f1"])
+    st = dict(p.state())
+    st["lo"] = [None]
+    st["hi"] = [None]
+    out = ClipProcessor().load_state(st).transform(df)
+    assert out["f1"].to_list() == [1.0, 2.0, 3.0]      # 未截断
+
+
+def test_leakage_guard_requires_features():
+    with pytest.raises(ValueError, match="需要 features"):
+        leakage_guard(StandardizeProcessor(),
+                      _frame({"f1": [1.0, 2.0]}), _frame({"f1": [3.0, 4.0]}))
+
+
+def test_assert_fit_isolated_passes_when_leak_detected(train_test_split):
+    """有状态 + 分布漂移 → 哨兵必须报 leak_detected 并按原样返回报告。"""
+    train, test = train_test_split
+    rep = assert_fit_isolated(StandardizeProcessor(), train, test,
+                              features=["f1", "f2"])
+    assert rep.fit_uses_data is True
+    assert rep.leak_detected is True
+

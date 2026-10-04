@@ -263,3 +263,11 @@ def test_trace_periods_requires_factor_and_return():
         trace_periods(df, "nope")
     with pytest.raises(FactorError, match="缺少收益列"):
         trace_periods(df.drop("fwd_ret_1").drop("close"), "factor")
+
+
+def test_trace_requires_returns_or_price():
+    """既没有 fwd_ret 也没有 close 时明确报错，而不是产出空快照。"""
+    df = _panel().drop(["close", *[c for c in _panel().columns
+                                   if c.startswith("fwd_ret")]])
+    with pytest.raises(FactorError, match="缺少收益列"):
+        trace_snapshot(df, "factor", date=D0, horizon=1, top=3)

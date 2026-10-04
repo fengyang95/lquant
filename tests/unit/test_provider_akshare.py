@@ -328,3 +328,31 @@ def test_real_yaml_loads() -> None:
     mm = load_table_mapping("minute_bar", "akshare")
     assert mm.fill["freq"] == "1min"
     assert "volume" in mm.derive
+
+
+def test_index_daily_uses_index_endpoint_not_stock_endpoint(
+    provider: AkShareProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """指数必须走 ``ak.index_zh_a_hist``：个股接口取 000300.SH 会返回平安银行
+    一类的个股数据（或空表），基准序列就此错位。"""
+    captured: dict[str, Any] = {}
+
+    def fake_index(**kw: Any) -> pd.DataFrame:
+        captured.update(kw)
+        return _DAILY_PANDAS.drop(columns=["股票代码"])
+
+    def _boom(**kw: Any) -> pd.DataFrame:      # pragma: no cover - 不该被调用
+        raise AssertionError("指数不能用个股接口")
+
+    _install_fake_ak(monkeypatch, index_zh_a_hist=fake_index,
+                     stock_zh_a_hist=_boom)
+    out = provider.index_daily_bars(["000300.SH"], date(2024, 1, 1), date(2024, 1, 3))
+    assert captured["symbol"] == "000300"      # 去后缀，不带 .SH
+    assert captured["period"] == "daily"
+    assert out["sec_type"].to_list() == ["index", "index"]
+    assert out["symbol"].to_list() == ["000300.SH", "000300.SH"]
+
+    # 空表安全跳过（继续下一个标的），不能 pl.concat 空列表炸掉
+    _install_fake_ak(monkeypatch, index_zh_a_hist=lambda **kw: pd.DataFrame())
+    assert provider.index_daily_bars(["000300.SH"], date(2024, 1, 1),
+                                     date(2024, 1, 3)).height == 0

@@ -323,3 +323,77 @@ def test_list_models_without_table_returns_empty(tmp_path, monkeypatch):
     assert registry.list_models() == []
     assert registry.events() == []
     get_settings.cache_clear()
+
+
+# ----------------------------------------------------------- 路径与退化口径
+
+def test_model_root_defaults_under_repo_data_dir(ml_env, monkeypatch):
+    """未设 LQ_MODEL_DIR 时落在 ``<root>/data/models``（可随仓库搬家）。"""
+    from lquant.core.config import get_settings
+    from lquant.research.ml import registry
+
+    monkeypatch.delenv("LQ_MODEL_DIR", raising=False)
+    get_settings.cache_clear()
+    assert registry.model_root() == ml_env / "data" / "models"
+    # LQ_MODEL_DIR 优先
+    monkeypatch.setenv("LQ_MODEL_DIR", str(ml_env / "elsewhere"))
+    get_settings.cache_clear()
+    assert registry.model_root() == ml_env / "elsewhere"
+
+
+def test_rel_path_falls_back_to_absolute_outside_root(ml_env, tmp_path):
+    """仓库外的 artifact 路径没法相对化 → 存绝对路径（而不是抛异常丢记录）。"""
+    from lquant.research.ml.registry import _abs, _rel
+
+    outside = tmp_path.parent / "outside-root" / "model.pkl"
+    assert _rel(outside) == str(outside)
+    # 相对路径进库、绝对路径直接用；空值 → None
+    assert _abs(None) is None
+    assert _abs(str(ml_env / "models" / "m.pkl")) == ml_env / "models" / "m.pkl"
+    assert _abs("/tmp/abs.pkl").as_posix() == "/tmp/abs.pkl"
+
+
+def test_list_models_and_events_survive_missing_tables(ml_env, monkeypatch):
+    """迁移没跑/表缺失时返回空列表，而不是让调用方 500。"""
+    from lquant.research.ml import registry
+
+    def _boom():
+        raise RuntimeError("no such table: ml_model")
+
+    monkeypatch.setattr(registry, "reader", _boom, raising=False)
+    monkeypatch.setattr("lquant.core.db.reader", _boom)
+    assert registry.list_models("nope") == []
+    assert registry.events("nope") == []
+
+
+# ----------------------------------------------------------- archive / production 不变量
+
+def test_archive_is_a_stage_transition(ml_env):
+    from lquant.research.ml import registry
+
+    ml, _ds, _ = _trained()
+    mv = registry.register_run(run_id="a", name="line", model=ml.model,
+                               metrics={}, features=["f1"], stage="candidate")
+    archived = registry.archive("line", mv.version, note="手工下架")
+    assert archived.stage == "archived"
+    assert registry.get_model("line", mv.version).stage == "archived"
+    # 事件流里能看到这次流转，as-of 才答得出来
+    evs = [e for e in registry.events("line") if e["to_stage"] == "archived"]
+    assert evs and evs[-1]["note"] == "手工下架"
+
+
+def test_production_picks_highest_when_invariant_broken(ml_env):
+    """手改库/并发写导致多个 production 时取版本号最大者并告警，而不是随机取。"""
+    from lquant.core.db import writer
+    from lquant.research.ml import registry
+
+    ml, _ds, _ = _trained()
+    v1 = registry.register_run(run_id="a", name="line", model=ml.model,
+                               metrics={}, features=["f1"], stage="candidate")
+    v2 = registry.register_run(run_id="b", name="line", model=ml.model,
+                               metrics={}, features=["f1"], stage="candidate")
+    # 直接改库制造「两个 production」（绕过 promote 的不变量维护）
+    with writer() as con:
+        con.execute("UPDATE ml_model SET stage='production' WHERE name='line'")
+    got = registry.production("line")
+    assert got.version == max(v1.version, v2.version)

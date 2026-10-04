@@ -27,11 +27,13 @@ def cli_env(tmp_path_factory):
     from lquant.core.db import writer
     from lquant.data.ingest.demo import generate_demo
     from lquant.data.store.ddl import DDL_STATEMENTS, ensure_factor_def_columns
+    from lquant.market.schema import ensure_market_tables
 
     with writer() as con:
         for stmt in DDL_STATEMENTS:
             con.execute(stmt)
         ensure_factor_def_columns(con)
+        ensure_market_tables(con)      # index_daily 等看板表（data index/status 要用）
     generate_demo(start="2024-01-01", end="2026-06-30")
     yield base
     os.chdir(prev_cwd)
@@ -96,3 +98,47 @@ def test_report_writes_html(tmp_path):
     r = _invoke("report", "Ts_Mean($close,5)", "--out", str(out))
     assert r.exit_code == 0, r.output
     assert out.exists() and len(out.read_text(encoding="utf-8")) > 100
+
+
+# ---------------- lq data index / status（Phase 1.2） ----------------
+
+def test_data_index_backfills_demo_then_status(cli_env, monkeypatch):
+    """`lq data index` 落 index_daily，`lq data status` 报告覆盖与默认基准。
+
+    用 demo 数据源（monkeypatch 选源）避免测试触网。
+    """
+    # 直接打桩 backfill 的取数函数：_fetch_index 是它自己模块里的名字，
+    # 改 collectors 模块属性对已绑定的引用无效（打桩最常见的坑）
+    from datetime import date as _d
+
+    from lquant.market import backfill as bf_mod
+    from lquant.market.collectors.index_daily import _demo as _demo_index
+
+    monkeypatch.setattr(bf_mod, "_fetch_index",
+                        lambda start, end, *, demo: _demo_index(
+                            _d.fromisoformat(str(start)), _d.fromisoformat(str(end))))
+    from lquant.cli.main import cli
+
+    r = CliRunner().invoke(cli, ["data", "index", "--start", "2026-09-01",
+                                 "--end", "2026-09-10",
+                                 "--symbols", "000300.SH,000905.SH"])
+    assert r.exit_code == 0, r.output
+    assert "index done" in r.output
+    assert "000300.SH" in r.output
+
+    # 幂等重跑：入库行数不翻倍
+    r2 = CliRunner().invoke(cli, ["data", "index", "--start", "2026-09-01",
+                                  "--end", "2026-09-10",
+                                  "--symbols", "000300.SH,000905.SH"])
+    assert r2.exit_code == 0, r2.output
+
+    from lquant.core.db import reader
+
+    with reader() as con:
+        n = con.execute("SELECT count(*) FROM index_daily").fetchone()[0]
+    assert n > 0
+
+    st = CliRunner().invoke(cli, ["data", "status"])
+    assert st.exit_code == 0, st.output
+    assert "index_daily" in st.output
+    assert "000300.SH" in st.output

@@ -338,3 +338,71 @@ def test_engine_default_benchmark_does_not_raise_without_db(monkeypatch):
     assert m["benchmark_available"] is False
     assert "基准读取失败" in m["benchmark_note"]
     assert res.nav[-1][1] > 0
+
+
+# ----------------------------------------------------------- 解析 / 读库边界
+
+def test_parse_benchmark_alias_case_and_bare_code():
+    """别名大小写不敏感；六位裸代码按指数段补后缀（000/399），其余原样。"""
+    assert parse_benchmark("HS300") == "000300.SH"
+    assert parse_benchmark("沪深300") == "000300.SH"
+    assert parse_benchmark("000905") == "000905.SH"
+    assert parse_benchmark("399001") == "399001.SZ"
+    assert parse_benchmark("123456") == "123456"      # 非指数段无法判定，原样
+    assert parse_benchmark("  600000.sh  ") == "600000.SH"
+
+
+def test_load_index_series_skips_bad_rows(index_con):
+    """null / 非有限 / ≤0 的收盘价必须跳过 —— 它们会让收益与净值变成垃圾。"""
+    ds = _days(5)
+    index_con.executemany(
+        "INSERT INTO index_daily VALUES (?, ?, ?, ?)",
+        [(ds[0], "000300.SH", 100.0, 100.0),
+         (ds[1], "000300.SH", None, 100.0),
+         (ds[2], "000300.SH", float("nan"), 100.0),
+         (ds[3], "000300.SH", 0.0, 100.0),
+         (ds[4], "000300.SH", 110.0, 100.0)],
+    )
+    out = load_index_series("000300.SH", con=index_con)
+    assert [c for _d, c in out] == [100.0, 110.0]
+
+
+def test_benchmark_returns_skips_nonpositive_prev(index_con):
+    """前值为 0（脏数据）时该期收益不可定义 → 跳过而不是 inf。"""
+    ds = _days(3)
+    r = benchmark_returns_by_date([(ds[0], 0.0), (ds[1], 10.0), (ds[2], 11.0)])
+    assert ds[1] not in r and r[ds[2]] == pytest.approx(0.1)
+
+
+def test_pair_returns_empty_inputs_and_nonfinite_port(index_con):
+    """空净值 → 明确 note；组合收益非有限 → 该期两边一起丢。"""
+    p, b, note = pair_returns_with_benchmark([], [], "000300.SH", con=index_con)
+    assert p == [] and b == [] and "无净值序列" in note
+
+    ds = _days(4)
+    _seed(index_con, "000300.SH", [(d, 100.0 + i) for i, d in enumerate(ds)])
+    p2, b2, _ = pair_returns_with_benchmark(
+        ds, [0.01, float("nan"), 0.03], "000300.SH", con=index_con)
+    assert len(p2) == len(b2) == 2
+    assert 0.01 in p2 and 0.03 in p2
+
+
+def test_benchmark_nav_aligned_guard_branches(index_con):
+    """空日期集 / 区间内不足 2 个交易日 → 返回空并给出可读原因。"""
+    assert benchmark_nav_aligned(set(), "000300.SH", con=index_con)[1].endswith("回测日期为空")
+    ds = _days(3)
+    _seed(index_con, "000300.SH", [(d, 100.0 + i) for i, d in enumerate(ds)])
+    nav, reason = benchmark_nav_aligned({ds[0]}, "000300.SH", con=index_con)
+    assert nav == [] and "无法作基准" in reason
+
+
+def test_dedupe_and_series_frame_helpers():
+    from lquant.backtest.benchmark import dedupe_series, series_frame
+
+    ds = _days(3)
+    dup = [(ds[0], 1.0), (ds[1], 2.0), (ds[0], 9.0)]
+    assert dedupe_series(dup) == [(ds[0], 9.0), (ds[1], 2.0)]   # 同日取最后一条
+    frame = series_frame([(ds[0], 1.5)], "000300.SH")
+    assert frame.columns == ["trade_date", "close", "symbol"]
+    assert frame["symbol"][0] == "000300.SH"
+    assert frame["close"][0] == pytest.approx(1.5)

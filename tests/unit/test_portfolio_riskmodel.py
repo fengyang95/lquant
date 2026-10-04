@@ -436,3 +436,76 @@ def test_unknown_cov_method_raises():
 
     with pytest.raises(RiskModelError, match="未知协方差估计器"):
         min_variance_weight(_fat(20, 20), cov_method="nope")
+
+
+# ----------------------------------------------------------- 边界与退化口径
+
+def test_matrix_accepts_1d_and_require_2d_rejects_degenerate():
+    """1 列输入要自动变成矩阵；行数/列数不足必须报错而不是产出垃圾。"""
+    x = np.array([0.01, -0.02, 0.03, 0.005])
+    cov = sample_cov(x)
+    assert cov.shape == (1, 1)
+    with pytest.raises(RiskModelError, match="样本不足"):
+        sample_cov(np.array([[0.01]]))
+    with pytest.raises(RiskModelError, match="没有资产列"):
+        sample_cov(np.zeros((10, 0)))
+
+
+def test_shrink_target_rejects_unknown_name():
+    with pytest.raises(RiskModelError, match="未知收缩目标"):
+        shrink_cov(_fat(10, 30), shrinkage="lw", target="not_a_target")
+
+
+def test_single_factor_target_rejects_zero_market_variance():
+    """市场因子方差为 0（每期横截面均值都是 0）时单因子目标无定义。"""
+    M = np.array([[1.0, -1.0], [2.0, -2.0], [3.0, -3.0]]) * 0.01
+    with pytest.raises(RiskModelError, match="市场因子方差为 0"):
+        shrink_cov(M, shrinkage="lw", target="single_factor")
+
+
+def test_lw_shrinkage_edge_branches():
+    """LW 强度：市场方差为 0（无信息）→ 0；未知目标 → 报错。"""
+    M = np.array([[1.0, -1.0], [2.0, -2.0], [3.0, -3.0]]) * 0.01 + 1e-6
+    S = np.cov(M, rowvar=False) + np.eye(2)
+    F = np.eye(2)
+    assert ledoit_wolf_shrinkage(M, S, F, target="single_factor") == 0.0
+    with pytest.raises(RiskModelError, match="未知收缩目标"):
+        ledoit_wolf_shrinkage(M, S, F, target="nope")
+
+
+def test_oas_shrinkage_edge_branches():
+    M = _fat(6, 30)
+    with pytest.raises(RiskModelError, match="至少 1 个资产"):
+        oas_shrinkage(np.zeros((10, 0)))
+    with pytest.raises(RiskModelError, match="未知 OAS 口径"):
+        oas_shrinkage(M, variant="nope")
+    # b == 0（p=2、S=I 时 tr(S²)=ΣS²=2 恰好等于 tr(S)²/p）→ 记 0 而不是除零。
+    # 注意 p 取自**收益矩阵**的列数，所以这里要给 2 列的 M。
+    M2 = _fat(2, 30)
+    assert oas_shrinkage(M2, np.eye(2), variant="sklearn") == 0.0
+
+
+def test_structured_cov_fa_falls_back_to_pca(monkeypatch):
+    """因子分析不可用（未装/发散）时退回 PCA，而不是让整条链路崩。"""
+    import sklearn.decomposition as skd
+
+    def _boom(*a, **k):
+        raise RuntimeError("factor analysis unavailable")
+
+    monkeypatch.setattr(skd, "FactorAnalysis", _boom)
+    cov = structured_cov(_fat(20, 40), n_factors=3, method="fa")
+    assert cov.shape == (20, 20)
+    assert is_psd(cov)
+
+
+def test_poet_rejects_bad_params():
+    M = _fat(10, 30)
+    with pytest.raises(RiskModelError, match="n_factors 必须 ≥ 1"):
+        poet_cov(M, n_factors=0)
+    with pytest.raises(RiskModelError, match="未知阈值化方法"):
+        poet_cov(M, method="median")
+
+
+def test_is_psd_rejects_asymmetric():
+    assert is_psd(np.array([[1.0, 0.5], [0.0, 1.0]])) is False
+    assert is_psd(np.eye(2)) is True

@@ -240,3 +240,9 @@ def test_session_ic_summary_detects_intraday_driven_signal():
 def test_session_ic_summary_empty_input():
     s = session_ic_summary(_panel(n_days=5, n_sym=2), "factor", horizon=1, min_obs=999)
     assert s["dominant"] is None and s["overnight_share"] is None
+
+
+def test_session_ic_summary_missing_factor_column():
+    with pytest.raises(KeyError, match="缺少因子列"):
+        session_ic_summary(_panel(), "not_a_factor", horizon=1)
+

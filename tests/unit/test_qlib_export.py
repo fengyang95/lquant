@@ -583,3 +583,20 @@ def test_workflow_warns_when_export_has_no_benchmark(tmp_path, capsys):
     _check_benchmark_consistency(provider, cfg)
     err = capsys.readouterr().err
     assert "不一致" in err and "lq data index" in err
+
+
+def test_check_flags_benchmark_bin_missing(mini_lake, tmp_path):
+    """manifest 声明了 benchmark，但 features/<bench>/close.day.bin 不在 → 报错。
+
+    qlib 找不到 benchmark 标的不报错，只在回测里静默退化成「无超额收益」——
+    这正是 Phase 1.3 要消掉的坑，所以 check() 必须显式点出来。
+    """
+    from lquant.qlib_io.export import check, export
+
+    _seed_index([(d, 3000.0 + i * 10) for i, d in enumerate(DATES)])
+    out = tmp_path / "qdata"
+    export(out)
+    # 删掉基准的 bin，manifest 仍在声明它
+    (out / "features" / "SH000300" / "close.day.bin").unlink()
+    r = check(out)
+    assert any("close.day.bin 缺失" in p for p in r["problems"])

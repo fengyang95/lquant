@@ -415,3 +415,27 @@ def test_financial_pit_baostock_kinds_map_to_fina_indicator(
     api_calls = [a for a, _ in pro.calls]
     assert api_calls == ["fina_indicator"]   # 去重：三 kind 只拉一次
     assert out["item"].to_list() == ["indicator.roe"]
+
+
+def test_index_daily_uses_index_api_and_marks_sec_type(
+    monkeypatch: pytest.MonkeyPatch, provider: TushareProvider
+) -> None:
+    """指数必须走 pro.index_daily：pro.daily 拿 000300.SH 只会得到零行。
+
+    这正是「指数无路由」时期基准缺口的成因，也是 capability 路由存在的理由。
+    """
+    pro = _install_fake_ts(monkeypatch, {"index_daily": lambda **kw: _DAILY})
+    df = provider.index_daily_bars(["000300.SH"], date(2024, 1, 2), date(2024, 1, 3))
+    assert [api for api, _ in pro.calls] == ["index_daily"]
+    assert pro.calls[0][1]["ts_code"] == "000300.SH"
+    assert pro.calls[0][1]["start_date"] == "20240102"
+    assert df.height == 2
+    assert set(df["sec_type"].unique()) == {"index"}
+
+    # 空表要安全跳过（继续下一个标的），不能 pl.concat 空列表炸掉。
+    # 注意用**新的 provider 实例**：pro 客户端在实例内被缓存，
+    # 换 sys.modules 里的假模块对它无效。
+    _install_fake_ts(monkeypatch, {"index_daily": lambda **kw: pd.DataFrame()})
+    fresh = TushareProvider(token="fake-token")
+    empty = fresh.index_daily_bars(["000300.SH"], date(2024, 1, 2), date(2024, 1, 3))
+    assert empty.height == 0

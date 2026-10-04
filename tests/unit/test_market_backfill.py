@@ -141,3 +141,109 @@ def test_days_clamped_via_calendar_error(monkeypatch):
     ensure_market_coverage(days=100000)
     span = seen["span"][1] - seen["span"][0]
     assert span.days <= 366  # clamp 到 365
+
+
+# ---------------------------------------------------------------- 历史回填
+
+def test_fetch_index_daily_demo_and_provider_failure(monkeypatch):
+    """demo 分支产出完整 schema；数据源不可用时返回**空表而非抛异常**。
+
+    后者是刻意的：盘前调度里指数拉取失败不该让整个调度崩掉，
+    空表让 `ensure_market_coverage` 如实报告「缺失仍在」。
+    """
+    from lquant.market.collectors.index_daily import _SCHEMA, fetch_index_daily
+
+    df = fetch_index_daily(start="2026-09-01", end="2026-09-10", demo=True)
+    assert df.schema == _SCHEMA or df.schema == pl.Schema(_SCHEMA)
+    assert set(df["symbol"].unique()) == set(INDEX_POOL)
+    assert df.height > 0
+
+    def _boom(*a, **k):
+        raise RuntimeError("no provider")
+
+    monkeypatch.setattr("lquant.data.ingest.daily.resolve_ingest_source", _boom)
+    empty = fetch_index_daily(start="2026-09-01", end="2026-09-10")
+    assert empty.height == 0
+    assert empty.schema == df.schema
+
+
+def test_fetch_index_daily_routes_by_capability(monkeypatch):
+    """必须按 INDEX_DAILY 能力选源，而不是盲取链头。
+
+    链头是 tushare 时 `pro.daily` 不含指数 → 整段零行、基准永久缺失。
+    """
+    import lquant.market.collectors.index_daily as idx
+
+    seen = {}
+    frame = pl.DataFrame({
+        "trade_date": [date(2026, 9, 1)], "symbol": ["000300.SH"],
+        "open": [1.0], "high": [1.0], "low": [1.0], "close": [2.0],
+        "pre_close": [1.0], "volume": [1.0], "amount": [1.0],
+    })
+
+    class _Src:
+        def index_daily_bars(self, symbols, start, end):
+            seen["called"] = (list(symbols), start, end)
+            return frame
+
+    monkeypatch.setattr("lquant.data.ingest.daily.resolve_ingest_source",
+                        lambda **kw: (_Src(), "index_daily_bars"))
+    out = idx.fetch_index_daily(start="2026-09-01", end="2026-09-02")
+    assert seen["called"][0] == list(INDEX_POOL)
+    assert out.height == 1
+    assert out["name"][0] == "沪深300"
+    assert "sec_type" not in out.columns
+
+
+def test_backfill_index_history_with_real_db(tmp_path, monkeypatch):
+    """历史回填端到端（demo 数据 + 真 temp DuckDB）：读-拉-写-复查。"""
+    monkeypatch.chdir(tmp_path)
+    from lquant.core.config import get_settings
+
+    get_settings.cache_clear()
+    from lquant.core.db import writer
+    from lquant.data.store.ddl import DDL_STATEMENTS
+    from lquant.market.schema import ensure_market_tables
+
+    with writer() as con:
+        for stmt in DDL_STATEMENTS:
+            con.execute(stmt)
+        # index_daily 属于市场看板表（market/schema.py），不在主 DDL 里
+        ensure_market_tables(con)
+
+    from lquant.market.backfill import backfill_index_history
+
+    out = backfill_index_history(date(2026, 9, 1), date(2026, 9, 10),
+                                 symbols=["000300.SH"], demo=True)
+    assert out["fetched"] > 0
+    assert out["persisted"] > 0
+    assert out["coverage_before"]["000300.SH"] == 0
+    assert out["coverage_after"]["000300.SH"] == out["persisted"]
+    # 幂等：重跑一次不产生重复行（upsert）
+    again = backfill_index_history(date(2026, 9, 1), date(2026, 9, 10),
+                                   symbols=["000300.SH"], demo=True)
+    assert again["persisted"] == out["persisted"]
+    assert again["coverage_after"]["000300.SH"] == out["coverage_after"]["000300.SH"]
+    get_settings.cache_clear()
+
+
+def test_backfill_index_history_unknown_symbol_warns(monkeypatch):
+    """不在 INDEX_POOL 的标的只告警不阻断（name 落空，看板显示裸代码）。"""
+    from loguru import logger
+
+    from lquant.market import backfill as bf
+
+    msgs: list[str] = []
+    sink_id = logger.add(lambda m: msgs.append(m), level="WARNING")
+    monkeypatch.setattr(bf, "_index_have", lambda: {})
+    monkeypatch.setattr(bf, "_fetch_index",
+                        lambda start, end, *, demo: _index_frame([date(2026, 9, 1)],
+                                                                symbols=["000300.SH"]))
+    monkeypatch.setattr(bf, "_persist_index", lambda df: df.height)
+    try:
+        out = bf.backfill_index_history(date(2026, 9, 1), date(2026, 9, 1),
+                                        symbols=["000300.SH", "999999.SH"])
+    finally:
+        logger.remove(sink_id)
+    assert any("999999.SH" in m for m in msgs)
+    assert out["symbols"] == ["000300.SH", "999999.SH"]

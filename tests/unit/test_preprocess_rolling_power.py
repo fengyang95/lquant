@@ -17,6 +17,7 @@ import numpy as np
 import polars as pl
 import pytest
 
+from lquant.core.errors import FactorError
 from lquant.factors.preprocess import list_methods
 from lquant.factors.preprocess.power import boxcox, yeo_johnson
 from lquant.factors.preprocess.rolling import (
@@ -271,3 +272,22 @@ def test_pipeline_runs_all_new_methods():
         assert "f_clean" in out.columns
         assert out["f_clean"].null_count() < out.height or m.startswith("rolling_"), m
         assert not out["f_clean"].is_nan().any(), f"{m} 产生了 NaN"
+
+
+# ---------------- 防御分支 ----------------
+
+def test_ts_prepare_rejects_reserved_temp_column():
+    """面板里已有临时列名时必须报错 —— 覆盖它会让原序还原静默错位。"""
+    from lquant.factors.preprocess.rolling import _ts_prepare
+
+    df = _panel({"A": [1.0, 2.0, 3.0]}).with_columns(pl.lit(0).alias("__pp_row_idx"))
+    with pytest.raises(FactorError, match="临时列名"):
+        _ts_prepare(df, "symbol", "trade_date")
+
+
+def test_ts_restore_checks_row_count():
+    from lquant.factors.preprocess.rolling import _ts_restore
+
+    short = _panel({"A": [1.0, 2.0]}).with_row_index("__pp_row_idx")
+    with pytest.raises(FactorError, match="行数不一致"):
+        _ts_restore(short, 5)

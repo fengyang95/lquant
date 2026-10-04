@@ -220,3 +220,49 @@ def test_exposure_views_side_passthrough():
     # 只做多与多空的暴露不同（前者含市场 beta）
     assert a["compare"][0]["portfolio_mean"] != pytest.approx(
         b["compare"][0]["portfolio_mean"])
+
+
+# ----------------------------------------------------------- 空输入与私有工具
+
+def test_pure_exposure_empty_inputs():
+    """没有可用风格列 / 风格列全空 / 因子恒为 0 —— 三种情况都返回空帧。"""
+    df = _panel(n_days=5, n_sym=20)
+    assert pure_exposure(df, "factor", covs=["not_a_column"]).height == 0
+    blank = df.with_columns(pl.lit(None, dtype=pl.Float64).alias("market_cap"))
+    assert pure_exposure(blank, "factor", covs=["market_cap"]).height == 0
+    zero = df.with_columns(pl.lit(0.0).alias("factor"))
+    assert pure_exposure(zero, "factor", covs=["market_cap"]).height == 0
+
+
+def test_portfolio_exposure_no_style_columns():
+    df = _panel(n_days=5, n_sym=20)
+    assert portfolio_exposure(df, "factor", covs=["not_a_column"]).height == 0
+
+
+def test_style_scale_skips_missing_column():
+    from lquant.factors.evaluate.attribution import _style_scale
+
+    df = _panel(n_days=5, n_sym=20)
+    out = _style_scale(df, ["market_cap", "not_a_column"], date_col="trade_date")
+    assert "market_cap" in out and out["market_cap"] > 0
+    assert "not_a_column" not in out
+
+
+def test_exposure_views_skips_styles_without_observations(monkeypatch):
+    """两侧都缺样本时逐列跳过，而不是让 nanmean 产出垃圾。"""
+    import lquant.factors.evaluate.attribution as attr
+
+    df = _panel(n_days=5, n_sym=20)
+    empty_pure = pl.DataFrame(schema={"trade_date": pl.Date,
+                                      "market_cap": pl.Float64})
+    monkeypatch.setattr(attr, "pure_exposure", lambda *a, **k: empty_pure)
+    monkeypatch.setattr(attr, "portfolio_exposure", lambda *a, **k: empty_pure)
+    views = attr.exposure_views(df, "factor", covs=["market_cap"])
+    assert views["compare"] == []
+
+
+def test_exposure_divergence_wrapper():
+    from lquant.factors.evaluate.attribution import ExposureDivergence
+
+    assert ExposureDivergence().has_divergence is False
+    assert ExposureDivergence(divergences=[{"cov": "market_cap"}]).has_divergence is True
