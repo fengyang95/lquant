@@ -172,7 +172,8 @@ git push --force-with-lease origin main
   不要加目录级 `paths` 例外（除非该目录确实不可能有凭证，比如锁文件）。
 - **升 gitleaks 版本**：三处一起改 ——
   `scripts/install_gitleaks.sh` 的默认值、`.github/workflows/secret-scan.yml`
-  的 `GITLEAKS_VERSION`、本文档。只改一处会导致「本地过了 CI 挂」。
+  的 `LQ_GITLEAKS_VERSION`、本文档。只改一处会导致「本地过了 CI 挂」。
+  CI 与本地跑的是同一个 `scripts/install_gitleaks.sh`，安装实现只有一份。
 - **新增凭证面**：如果引入了新的数据源/服务凭证，在 `.gitleaks.toml` 补一条自定义规则
   （参照 `lquant-tushare-token`），否则裸十六进制/无前缀的 token 内置规则抓不到。
 - **不要**为了让 push 过而用 `--no-verify`。真密钥要轮换，假阳性要进白名单并说明理由 ——
