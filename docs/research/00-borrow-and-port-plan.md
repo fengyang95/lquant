@@ -114,6 +114,14 @@
 | 注册表与 if/elif 分发分离 | AlphaPurify | 会重演「列得出、调不到」；lquant 单一真源更好 |
 | 把上游 tests/examples 当规格 | AlphaPurify | 实测自带测试 2/3 失败、examples keyword 写法 `TypeError` |
 
+#### 1.7.1 已核实但**不追随**的上游口径（对拍时必须先换算，别误判成 bug）
+
+| 项 | 上游做法 | lquant 做法 | 为什么要分开 |
+|---|---|---|---|
+| 滚动偏度/峰度的矩估计 | qlib 走 pandas，**无偏修正**（`G1`/`G2`） | Polars **总体矩**（`g1`/`g2`） | 与既有 `Ts_Skew` 保持家族内一致，而不是在同一个注册表里混两套矩定义。换算：`G1 = g1·√(n(n-1))/(n-2)`、`G2 = ((n+1)g2+6)(n-1)/((n-2)(n-3))`；`Ts_Std`/`Ts_Var` 无此问题（两边都是 ddof=1） |
+| 滚动算子预热 | `min_periods=1`，部分窗口也出值 | 满窗口，窗口内有空值即为空 | 部分窗口会把预热期噪声当信号喂给 IC。唯一例外是 `Ts_Count`（数据完整度指标，满窗恒等于 `n` 而无信息量） |
+| `Not`/`And`/`Or` | numpy **按位**语义（`~1.0 == -2.0`） | 逻辑语义，真值判据 `x > 0`，输出 0/1 浮点 | 按位语义只在「输入只可能是 0/1」时成立，喂进 0~1 连续值（如 `Ts_Rank`）就产负数；逻辑语义不依赖输入范围 |
+
 ---
 
 ## 2. 移植计划
@@ -177,7 +185,7 @@
 
 | 任务 | 说明 |
 |---|---|
-| 4.1 算子补齐 | `Mask/Not/And/Or/Eq/Ne/Ge/Le/Var/Kurt/Med/Count/ChangeInstrument` |
+| 4.1 算子补齐 | **已完成**（2026-10-04）。移植 `Not/And/Or/Eq/Ne/Ge/Le`（新增 `ops/bool_ops.py`，逻辑语义 0/1 浮点，非 qlib 的按位语义）+ `Ts_Var/Ts_Kurt/Ts_Med/Ts_Count`。**不移植** `Mask`/`ChangeInstrument`：二者语义是「换标的再算」（依赖 qlib 表达式树的隐藏 instrument 上下文），在 lquant 的 symbol×date 长表上没有对应概念，硬套会静默读错列 —— 算相对指数的东西应 join 指数列后用 `Ts_Corr`。**不移植** `Mad`：qlib 自己是逐窗口 Python 回调（源码标注 TODO Cython），绕不开逐窗口扫描（绝对差和不可分解为累积量），留给 `lq-ops` Rust 侧按同名覆盖注册。 |
 | 4.2 多 horizon 并行 IC | 复用 `forward_return_matrix`，并行化 |
 | 4.3 overnight 切分 | 隔夜/日内收益分开统计 |
 | 4.4 方法扩容 | `boxcox`/`yeo_johnson`/`rolling_*`/`EWMA`/`volatility_scaling` |
