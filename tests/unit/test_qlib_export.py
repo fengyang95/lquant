@@ -31,15 +31,41 @@ DATES = [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 5)]
 
 @pytest.fixture()
 def lake_root(tmp_path, monkeypatch):
-    """把 parquet 湖指向 tmp：patch 模块级 get_settings（parquet_dir 缺省是
-    相对 CWD 的路径，LQ_ROOT 只影响 find_root，环境变量隔离不可靠）。"""
+    """把 parquet 湖与 DuckDB 都指向 tmp：patch 模块级 get_settings（parquet_dir
+    缺省是相对 CWD 的路径，LQ_ROOT 只影响 find_root，环境变量隔离不可靠）。
+
+    同时隔离 ``LQ_DUCKDB_PATH``：``export()`` 默认会从 DuckDB ``index_daily``
+    导出基准指数，不隔离就会读到工作区的真实库 —— 测试结果随本机数据变化。
+    """
     import lquant.data.store.parquet as pq_store
 
     class _S:
         parquet_dir = str(tmp_path / "parquet")
 
     monkeypatch.setattr(pq_store, "get_settings", lambda: _S())
-    return tmp_path
+    monkeypatch.setenv("LQ_DUCKDB_PATH", str(tmp_path / "lq.duckdb"))
+    from lquant.core.config import get_settings
+
+    get_settings.cache_clear()
+    yield tmp_path
+    get_settings.cache_clear()
+
+
+def _seed_index(rows: list[tuple[date, float]]) -> None:
+    """在隔离库里建 index_daily 并写入 000300.SH 序列（基准导出用）。"""
+    from lquant.core.db import writer
+
+    with writer() as con:
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS index_daily (trade_date DATE, symbol VARCHAR, "
+            "name VARCHAR, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, "
+            "pre_close DOUBLE, volume DOUBLE, amount DOUBLE, collected_at TIMESTAMP)")
+        con.executemany(
+            "INSERT INTO index_daily (trade_date, symbol, name, open, high, low, close,"
+            " pre_close) VALUES (?, '000300.SH', '沪深300', ?, ?, ?, ?, ?)",
+            [(d, c, c, c, c, (rows[i - 1][1] if i else c))
+             for i, (d, c) in enumerate(rows)],
+        )
 
 
 def _bar(sym: str, d: date, close: float, adj: float = 1.0,
@@ -382,3 +408,178 @@ def test_find_qlib_python_env(tmp_path, monkeypatch):
     assert _find_qlib_python(None) is None  # 当前解释器可用 → 进程内
     monkeypatch.delitem(sys.modules, "qlib")
     assert _find_qlib_python(None) == ""  # 找不到 → 提示安装
+
+
+# ---------------------------------------------------------------- 基准指数导出（Phase 1.3）
+
+def test_export_without_index_writes_no_benchmark(mini_lake, tmp_path):
+    """index_daily 为空 → manifest benchmark=null，且不虚增 instruments。"""
+    out = tmp_path / "qdata"
+    manifest = export(out)
+    assert manifest["benchmark"] is None
+    assert manifest["instruments"] == 2
+    assert not (out / "features" / "SH000300").exists()
+
+
+def test_export_benchmark_from_index_daily(mini_lake, tmp_path):
+    """基准从 DuckDB index_daily 导出：features/SH000300/close.day.bin + instruments。
+
+    指数不进 parquet 湖（点位不是价格），所以必须单独取；没有它 qlib 的超额
+    收益只能是空的 —— 这正是去掉了 SH600000 机械代理后的依赖。
+    """
+    _seed_index([(d, 3000.0 + i * 10) for i, d in enumerate(DATES)])
+    out = tmp_path / "qdata"
+    manifest = export(out)
+
+    assert manifest["benchmark"] == "SH000300"
+    assert manifest["benchmark_symbol_lquant"] == "000300.SH"
+    assert manifest["instruments"] == 3          # 2 只股票 + 基准
+    assert manifest["calendar_days"] == 4
+
+    ins = (out / "instruments" / "all.txt").read_text().strip().splitlines()
+    assert "SH000300\t2024-01-02\t2024-01-05" in ins
+
+    start_i, close = _read_bin(out / "features" / "SH000300" / "close.day.bin")
+    assert start_i == 0
+    np.testing.assert_allclose(close, [3000.0, 3010.0, 3020.0, 3030.0], rtol=1e-6)
+    # 指数不复权：factor 恒 1.0
+    _, factor = _read_bin(out / "features" / "SH000300" / "factor.day.bin")
+    np.testing.assert_allclose(factor, [1.0] * 4)
+
+
+def test_export_benchmark_extends_calendar_and_nans_missing_days(mini_lake, tmp_path):
+    """基准比股票多出的交易日要进日历，基准自身缺失日为 NaN。"""
+    extra = date(2024, 1, 8)
+    _seed_index([(d, 3000.0 + i) for i, d in enumerate([*DATES, extra])])
+    out = tmp_path / "qdata"
+    manifest = export(out)
+    assert manifest["calendar_days"] == 5
+    assert (out / "calendars" / "day.txt").read_text().split()[-1] == "2024-01-08"
+    _, close = _read_bin(out / "features" / "SH000300" / "close.day.bin")
+    assert close.size == 5
+
+
+def test_export_no_benchmark_flag(mini_lake, tmp_path):
+    _seed_index([(d, 3000.0 + i) for i, d in enumerate(DATES)])
+    out = tmp_path / "qdata"
+    manifest = export(out, benchmark=None)
+    assert manifest["benchmark"] is None
+    assert manifest["instruments"] == 2
+    assert not (out / "features" / "SH000300").exists()
+
+
+def test_export_custom_benchmark_symbol(mini_lake, tmp_path):
+    from lquant.core.db import writer
+
+    with writer() as con:
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS index_daily (trade_date DATE, symbol VARCHAR, "
+            "name VARCHAR, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, "
+            "pre_close DOUBLE, volume DOUBLE, amount DOUBLE, collected_at TIMESTAMP)")
+        con.executemany(
+            "INSERT INTO index_daily (trade_date, symbol, close) VALUES (?,?,?)",
+            [(d, "000905.SH", 5000.0 + i) for i, d in enumerate(DATES)])
+    out = tmp_path / "qdata"
+    manifest = export(out, benchmark="000905.SH")
+    assert manifest["benchmark"] == "SH000905"
+    assert (out / "features" / "SH000905" / "close.day.bin").exists()
+
+
+def test_check_verifies_benchmark_presence(mini_lake, tmp_path):
+    _seed_index([(d, 3000.0 + i) for i, d in enumerate(DATES)])
+    out = tmp_path / "qdata"
+    export(out)
+    r = check(out)
+    assert r["benchmark"] == "SH000300"
+    assert r["problems"] == []
+
+    # 基准 features 被删 → check 必须报出来，而不是让 qlib 静默少算超额
+    import shutil
+
+    shutil.rmtree(out / "features" / "SH000300")
+    r2 = check(out)
+    assert any("SH000300" in p for p in r2["problems"])
+
+
+def test_check_flags_benchmark_missing_from_instruments(mini_lake, tmp_path):
+    _seed_index([(d, 3000.0 + i) for i, d in enumerate(DATES)])
+    out = tmp_path / "qdata"
+    export(out)
+    ins_p = out / "instruments" / "all.txt"
+    ins_p.write_text("\n".join(ln for ln in ins_p.read_text().splitlines()
+                               if "SH000300" not in ln) + "\n", encoding="utf-8")
+    r = check(out)
+    assert any("instruments" in p for p in r["problems"])
+
+
+def test_cli_export_benchmark_and_no_benchmark(mini_lake, tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from lquant.cli.commands.qlib import qlib as qlib_grp
+
+    _seed_index([(d, 3000.0 + i) for i, d in enumerate(DATES)])
+    monkeypatch.chdir(tmp_path)
+    out = str(tmp_path / "qdata")
+    runner = CliRunner()
+    r = runner.invoke(qlib_grp, ["export", "--out", out, "--field", "close"])
+    assert r.exit_code == 0, r.output
+    assert '"benchmark": "SH000300"' in r.output
+
+    out2 = str(tmp_path / "qdata2")
+    r2 = runner.invoke(qlib_grp, ["export", "--out", out2, "--field", "close",
+                                  "--no-benchmark"])
+    assert r2.exit_code == 0, r2.output
+    assert '"benchmark": null' in r2.output
+
+
+def test_cli_export_warns_when_benchmark_missing(mini_lake, tmp_path, monkeypatch):
+    """index_daily 空时导出：必须显式告警（否则 qlib 超额收益静默为空）。"""
+    from click.testing import CliRunner
+
+    from lquant.cli.commands.qlib import qlib as qlib_grp
+
+    monkeypatch.chdir(tmp_path)
+    r = CliRunner().invoke(qlib_grp, ["export", "--out", str(tmp_path / "q"),
+                                      "--field", "close"])
+    assert r.exit_code == 0, r.output
+    assert "未导出基准" in r.output and "lq data index" in r.output
+
+
+def test_workflow_warns_on_benchmark_mismatch(tmp_path, capsys):
+    """导出物与 yaml 的基准不一致时必须告警（否则超额收益算在别的标的上）。"""
+    import json as _json
+
+    from lquant.cli.commands.qlib import _check_benchmark_consistency
+
+    provider = tmp_path / "qdata"
+    provider.mkdir()
+    (provider / "qlib_export_meta.json").write_text(
+        _json.dumps({"benchmark": "SH000300"}), encoding="utf-8")
+    cfg = tmp_path / "wf.yaml"
+
+    cfg.write_text("benchmark: SH600000\n", encoding="utf-8")
+    _check_benchmark_consistency(provider, cfg)
+    err = capsys.readouterr().err
+    assert "不一致" in err and "SH600000" in err and "SH000300" in err
+
+    # 一致时不告警
+    cfg.write_text("benchmark: SH000300\n", encoding="utf-8")
+    _check_benchmark_consistency(provider, cfg)
+    assert "不一致" not in capsys.readouterr().err
+
+
+def test_workflow_warns_when_export_has_no_benchmark(tmp_path, capsys):
+    """导出物没基准但 yaml 配了 → 告警并给出修补命令。"""
+    import json as _json
+
+    from lquant.cli.commands.qlib import _check_benchmark_consistency
+
+    provider = tmp_path / "qdata"
+    provider.mkdir()
+    (provider / "qlib_export_meta.json").write_text(
+        _json.dumps({"benchmark": None}), encoding="utf-8")
+    cfg = tmp_path / "wf.yaml"
+    cfg.write_text("benchmark: SH000300\n", encoding="utf-8")
+    _check_benchmark_consistency(provider, cfg)
+    err = capsys.readouterr().err
+    assert "不一致" in err and "lq data index" in err

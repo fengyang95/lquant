@@ -307,6 +307,23 @@ def test_engine_benchmark_days_drops_unmatched_dates():
         "不补造" in m.get("benchmark_note", "")
 
 
+def test_excess_return_decomposes_against_benchmark_total():
+    """超额收益必须能还原：1+超额 = (1+组合总收益)/(1+基准区间收益)。
+
+    这是「超额收益」这个词的定义式。两侧（原生引擎 / qlib）算超额用的都是
+    同一个基准序列（见 scripts/xval/qlib/benchmark_parity.py 的位级对拍），
+    所以超额收益的差异只能来自组合腿，不可能来自基准口径。
+    """
+    res, dates = _run()
+    m = res.metrics
+    assert m["benchmark_available"] is True
+    bmap = benchmark_returns_by_date(_bench_series(dates))
+    b_total = float(np.prod([1 + b for d, b in bmap.items() if d in set(dates[1:])]) - 1)
+    implied = (1 + m["total_return"]) / (1 + b_total) - 1
+    # risk_vs_benchmark 的返回值保留 6 位小数，容差按半个末位给。
+    assert m["excess_return"] == pytest.approx(implied, abs=1e-6)
+
+
 def test_engine_default_benchmark_does_not_raise_without_db(monkeypatch):
     """默认配置（查 index_daily）在库不可用时也不能炸回测。"""
     import lquant.backtest.benchmark as bm

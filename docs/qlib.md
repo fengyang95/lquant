@@ -26,10 +26,14 @@ brew install libomp
 ## 用法
 
 ```bash
+# 0. 指数回填（基准的唯一来源；指数不入日线湖，走 DuckDB index_daily）
+lq data index --start 2016-01-01
+
 # 1. 导出（默认 stock、默认字段 OHLCV+amount+vwap+factor；--top 300 额外产出流动性池）
+#    默认一并导出基准 000300.SH（qlib symbol SH000300）
 lq qlib export --out data/qlib --top 300
 
-# 2. 自检（日历有序、清单与 features 一致、bin 抽样回读）
+# 2. 自检（日历有序、清单与 features 一致、基准就位、bin 抽样回读）
 lq qlib check --dir data/qlib
 
 # 3. 跑工作流：Alpha158 特征 + LGBM 训练 + IC 分析 + TopkDropout 回测
@@ -39,7 +43,25 @@ lq qlib workflow --config config/qlib/workflow_alpha158_lgbm.yaml \
 ```
 
 `--market` 覆盖股票池：`all`（默认，instruments/all.txt）/ `top300` 等。
-metrics JSON 含 IC / ICIR / Rank IC / Rank ICIR 及回测年化、最大回撤等。
+metrics JSON 含 IC / ICIR / Rank IC / Rank ICIR 及回测年化、最大回撤、超额收益等。
+
+## 基准口径（Phase 1.3）
+
+qlib 回测的 `benchmark` 是 **`SH000300`（真实沪深300）**，不再是 `SH600000`
+机械代理 —— 后者的「超额收益」是拿招商银行当大盘，数字没有解释力。
+
+- 指数**不在 parquet 日线湖里**（点位不是价格，会触发价格护栏），所以
+  `lq qlib export` 单独从 DuckDB `index_daily` 读基准，写成
+  `features/SH000300/$close.day.bin` 并登记进 `instruments/all.txt`。
+- 导出清单 `qlib_export_meta.json` 记录 `benchmark` / `benchmark_symbol_lquant`；
+  `lq qlib check` 会校验「清单里的基准确实在 features 与 instruments 里」。
+- `lq qlib workflow` 开跑前比对「yaml 的 benchmark」与「导出物的 benchmark」，
+  不一致直接告警并给出修补命令（否则 qlib 找不到标的、超额收益静默为空）。
+- `--no-benchmark` 可关闭基准导出；此时 yaml 里的 `benchmark` 也必须置 `null`。
+- 指数**不复权**：`$factor = 1.0`，其余字段（volume/amount/turnover 等）补 NaN。
+
+原生引擎侧对应实现是 `backtest/benchmark.py`（默认同为 `000300.SH`）；两侧
+超额收益的**符号应一致、量级应接近**，这正是 qlib 交叉验证的用途。
 
 ## 价格口径（重要）
 
@@ -60,6 +82,8 @@ metrics JSON 含 IC / ICIR / Rank IC / Rank ICIR 及回测年化、最大回撤�
 
 ## 已知边界
 
-- 湖内无指数日线 → workflow 的 `benchmark: null`，回测只看绝对收益，
-  不算超额收益（后续接入指数数据后可打开）。
-- 导出不覆盖 DuckDB 参考表，纯读 parquet 湖。
+- 基准来自 DuckDB `index_daily`；该表为空时导出物的 `benchmark` 为 `null`，
+  此时 workflow 只能看绝对收益 —— `lq qlib export` 会显式告警并提示
+  `lq data index`，不会静默退化。
+- 导出不覆盖 DuckDB 参考表：股票走 parquet 湖、基准走 `index_daily` 表，
+  两者是**各自唯一的真源**。
