@@ -31,6 +31,20 @@ def _returns_matrix(returns, symbols: list[str] | None = None) -> tuple[np.ndarr
     return np.nan_to_num(M, nan=0.0), list(symbols)
 
 
+def _cov_for(M: np.ndarray, cov_method: str | None, cov_params: dict | None) -> np.ndarray:
+    """按 ``cov_method`` 估计协方差；None/``sample`` 用样本协方差。
+
+    这是风险模型（``portfolio/riskmodel.py``）接入权重层的入口。默认仍是
+    样本协方差 —— 保持既有行为不变（1/N 与样本口径是既有回归基准），
+    要用收缩/因子模型必须**显式**指定，避免静默换口径。
+    """
+    if not cov_method or cov_method == "sample":
+        return np.atleast_2d(np.cov(M, rowvar=False))
+    from lquant.portfolio.riskmodel import estimate_cov
+
+    return estimate_cov(M, cov_method, **(cov_params or {}))
+
+
 def _clean(w: np.ndarray) -> np.ndarray:
     w = np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
     w = np.clip(w, 0.0, None)
@@ -81,18 +95,23 @@ def inverse_vol_weight(returns, symbols: list[str] | None = None,
 
 
 def risk_parity_weight(returns, symbols: list[str] | None = None, *,
-                       max_iter: int = 500, tol: float = 1e-9, **kw) -> dict[str, float]:
+                       max_iter: int = 500, tol: float = 1e-9,
+                       cov_method: str | None = None,
+                       cov_params: dict | None = None, **kw) -> dict[str, float]:
     """等风险贡献（ERC）：每只票对组合风险的贡献相同。
 
     用 SLSQP 最小化风险贡献与目标值的偏离，n 较大时慢，建议 ≤ 100 只。
     优化失败（协方差奇异等）时降级为逆波动率 —— 它本来就是 ERC 的近似解。
+
+    ``cov_method``：协方差估计口径（``sample`` 默认；``shrink_lw``/``poet`` 等
+    见 ``portfolio.riskmodel.COV_ESTIMATORS``）。T<N 时样本协方差奇异，
+    ERC 会退化成逆波动率；显式指定收缩口径可以避免这次静默降级。
     """
     M, syms = _returns_matrix(returns, symbols)
     n = len(syms)
     if n < 2 or M.shape[0] < 3:
         return inverse_vol_weight(M, syms)
-    cov = np.cov(M, rowvar=False)
-    cov = np.atleast_2d(cov)
+    cov = _cov_for(M, cov_method, cov_params)
     try:
         from scipy.optimize import minimize
 
@@ -120,13 +139,20 @@ def risk_parity_weight(returns, symbols: list[str] | None = None, *,
 
 
 def min_variance_weight(returns, symbols: list[str] | None = None, *,
-                        max_weight: float = 1.0, **kw) -> dict[str, float]:
-    """最小方差组合。对协方差估计误差最敏感，慎用。"""
+                        max_weight: float = 1.0,
+                        cov_method: str | None = None,
+                        cov_params: dict | None = None, **kw) -> dict[str, float]:
+    """最小方差组合。对协方差估计误差最敏感，慎用。
+
+    ``cov_method``：协方差口径（见 ``portfolio.riskmodel``）。样本协方差在
+    T<N 时奇异 → 权重由数值噪声决定；指定 ``shrink_lw`` 或 ``structured_pca``
+    才能让这个优化器真正可用。
+    """
     M, syms = _returns_matrix(returns, symbols)
     n = len(syms)
     if n < 2 or M.shape[0] < 3:
         return equal_weight(M, syms)
-    cov = np.atleast_2d(np.cov(M, rowvar=False))
+    cov = _cov_for(M, cov_method, cov_params)
     try:
         from scipy.optimize import minimize
 

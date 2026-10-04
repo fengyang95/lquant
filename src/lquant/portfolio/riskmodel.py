@@ -18,6 +18,21 @@ A 股截面常见 ``T < N``（回看 60 天、持仓 300 只）—— 样本协�
 - **POET**（:func:`poet_cov`）：因子部分同结构化，**残差做阈值化**而不是直接
   丢成对角 —— 保留了残差里可能存在的稀疏相关。
 
+## 一条必须写明的边界：朴素因子截断不改善 Frobenius 误差
+
+``structured_cov`` / ``poet_cov`` 对样本协方差做**朴素 PCA 截断**（与 qlib 的
+``StructuredCovEstimator`` 一致）。在 ``T ≈ N`` 时，样本协方差的前几个特征值
+被噪声抬高（Marchenko-Pastur 体把谱撑开），截断会**高估**因子部分 ——
+于是「与真协方差的 Frobenius 距离」可能比样本协方差还略差。
+
+它们的价值体现在另外两处，也是本项目验收的判据：
+
+1. **条件数**（组合优化能不能用）显著更低（实测 200 量级 vs 样本的 2e4）；
+2. **样本外高斯对数似然**更好（见 ``tests/unit/test_portfolio_riskmodel.py``）。
+
+想要同时改善 Frobenius，需要特征值偏差校正（MP 校正 / 非线性收缩）——
+那是后续可做的增强，当前不做，但**不假装已经做了**。
+
 ## 关于 qlib OAS 公式的一处不一致（重要）
 
 qlib ``shrink.py::_get_shrink_param_oas`` 的 docstring 写的是
@@ -187,35 +202,62 @@ def ledoit_wolf_shrinkage(M: np.ndarray, S: np.ndarray, F: np.ndarray,
     return float(min(1.0, max(0.0, kappa / t)))
 
 
-def oas_shrinkage(M: np.ndarray, S: np.ndarray | None = None) -> float:
-    """Oracle Approximating Shrinkage（Chen et al. 2010，向 ``μI`` 收缩）。
+def oas_shrinkage(M: np.ndarray, S: np.ndarray | None = None, *,
+                  variant: str = "paper") -> float:
+    """Oracle Approximating Shrinkage（向 ``μI`` 收缩）。
+
+    上游有**三个互不相同**的实现，本函数把它们都列出来并默认用论文口径：
+
+    ``variant="paper"`` —— Chen et al. (2010) Eq. 23（默认）::
 
         A = (1 - 2/p)·tr(S²) + tr(S)²
         B = (n + 1 - 2/p)·(tr(S²) - tr(S)²/p)
         α = min(1, A / B)
 
-    ``S`` 用 **MLE（ddof=0）** 口径 —— 论文与 sklearn 都基于 MLE 推导，
-    用 ddof=1 会让 α 偏小（收缩不足）。这是本函数与 ``sample_cov`` 口径
-    不同的**唯一**地方，特此写明。
+    ``variant="sklearn"`` —— sklearn ``covariance.oas`` 的口径。它**有意**
+    省略 Eq. 23 里的 ``2/p`` 项（文档写明「for large p it doesn't affect
+    the estimator」）::
 
-    注意与 qlib 的差异：qlib 代码把 ``A`` 写成 ``(1-2/p)·(tr(S²) + tr(S)²)``
-    （整和乘系数），与它自己的 docstring 及原始论文都不符。这里按论文实现。
+        A = tr(S²) + tr(S)²
+        B = (n + 1)·(tr(S²) - tr(S)²/p)
+
+    p 小时两者不可忽略地不同（实测 p=10 时 0.935 vs 0.952，差约 2%）。
+    需要与 sklearn 逐位对齐时显式传 ``variant="sklearn"``。
+
+    **qlib 的实现两个地方都不对**（见 ``qlib/model/riskmodel/shrink.py``）：
+    代码把 ``A`` 写成 ``(1-2/p)·(tr(S²) + tr(S)²)``（整和乘系数，而 docstring
+    是只乘第一项），且 ``B`` 的括号里写成 ``tr(S²) + tr(S)²/p``（**符号反了**，
+    docstring 是减号）。实测同一份数据：论文 0.9347、sklearn 0.9520、
+    qlib 代码 0.0351 —— 相差 27 倍。所以这里**不**提供 ``qlib`` 口径，
+    只把它作为「上游代码不等于上游公式」的案例记在文档里。
+
+    ``S`` 用 **MLE（ddof=0）** 口径且**先中心化** —— 论文与 sklearn 都基于
+    中心化的 MLE 推导；用 ddof=1 会让 α 偏小（收缩不足）。
     """
     t, p = M.shape
     if p < 1:
         raise RiskModelError("OAS 需要至少 1 个资产")
-    Sm = np.atleast_2d(np.cov(M, rowvar=False, ddof=0)) if S is None else S
+    Mc = M - M.mean(axis=0, keepdims=True)
+    Sm = np.atleast_2d(np.cov(Mc, rowvar=False, ddof=0)) if S is None else S
     tr_s2 = float(np.sum(Sm ** 2))
     tr2_s = float(np.trace(Sm) ** 2)
-    a = (1.0 - 2.0 / p) * tr_s2 + tr2_s
-    b = (t + 1.0 - 2.0 / p) * (tr_s2 - tr2_s / p)
+    if variant == "paper":
+        a = (1.0 - 2.0 / p) * tr_s2 + tr2_s
+        b = (t + 1.0 - 2.0 / p) * (tr_s2 - tr2_s / p)
+    elif variant == "sklearn":
+        a = tr_s2 + tr2_s
+        b = (t + 1.0) * (tr_s2 - tr2_s / p)
+    else:
+        raise RiskModelError(
+            f"未知 OAS 口径 {variant!r}（可选 paper/sklearn）")
     if abs(b) <= 1e-300:
         return 0.0
     return float(min(1.0, max(0.0, a / b)))
 
 
 def shrink_cov(returns, *, shrinkage: str = "lw", target: str = "const_var",
-               alpha: float | None = None) -> ShrinkResult:
+               alpha: float | None = None,
+               oas_variant: str = "paper") -> ShrinkResult:
     """收缩协方差：``S_hat = (1-α)S + αF``。
 
     Parameters
@@ -224,6 +266,7 @@ def shrink_cov(returns, *, shrinkage: str = "lw", target: str = "const_var",
         或直接给 ``alpha``（0~1 手调）。
     target : 收缩目标，见 :data:`SHRINKAGE_TARGETS`。
     alpha : 显式指定收缩强度；给了就忽略 ``shrinkage`` 的估计器。
+    oas_variant : OAS 口径（``paper`` / ``sklearn``），见 :func:`oas_shrinkage`。
 
     返回 :class:`ShrinkResult`（可解包成 ``(cov, intensity)``）。
     """
@@ -240,7 +283,7 @@ def shrink_cov(returns, *, shrinkage: str = "lw", target: str = "const_var",
     S = np.atleast_2d(np.cov(M, rowvar=False))
     F = _shrink_target(M, S, target)
     if alpha is None:
-        a = (oas_shrinkage(M) if shrinkage == "oas"
+        a = (oas_shrinkage(M, variant=oas_variant) if shrinkage == "oas"
              else ledoit_wolf_shrinkage(M, S, F, target))
     else:
         a = float(alpha)
