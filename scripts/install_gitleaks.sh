@@ -16,7 +16,10 @@
 #   scripts/install_gitleaks.sh --force      # 已存在也重装
 #
 # 版本升级时同步改：本脚本默认值、.github/workflows/secret-scan.yml 的
-# GITLEAKS_VERSION、docs/SECRET_HYGIENE.md 里写的版本。
+# LQ_GITLEAKS_VERSION、docs/SECRET_HYGIENE.md 里写的版本。
+#
+# CI 也直接调用本脚本（不再在 workflow 里内联抄一遍下载/校验逻辑），
+# 「本地过了 CI 挂」的实现漂移从根上没有了。
 # =============================================================================
 set -euo pipefail
 
@@ -55,12 +58,21 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/lq-gitleaks.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "==> 下载 $ASSET"
-curl -sSL --retry 5 --retry-delay 3 --max-time 900 -o "$TMP/$ASSET" "$BASE/$ASSET"
-curl -sSL --retry 5 --retry-delay 3 --max-time 120 -o "$TMP/sums.txt" "$BASE/gitleaks_${VERSION}_checksums.txt"
+# -f：HTTP 4xx/5xx 直接失败。不加的话 curl 会把错误页当成功存下来，
+# 一路走到 checksum 才炸，报错信息和真实原因对不上。
+curl -fsSL --retry 5 --retry-delay 3 --max-time 900 -o "$TMP/$ASSET" "$BASE/$ASSET"
+curl -fsSL --retry 5 --retry-delay 3 --max-time 120 -o "$TMP/sums.txt" "$BASE/gitleaks_${VERSION}_checksums.txt"
 
 echo "==> 校验 checksum"
-# 不校验的话，release 被投毒 = 在开发机/CI 上跑任意二进制
-( cd "$TMP" && grep "$ASSET" sums.txt | shasum -a 256 -c - )
+# 不校验的话，release 被投毒 = 在开发机/CI 上跑任意二进制。
+# 必须在 $TMP 里按 release 原始文件名校验：checksums.txt 里记的就是这个名字，
+# `-c` 会按名字去当前目录找文件（存成别的名字就会 "No such file or directory"）。
+# macOS 自带 shasum，Linux(GNU coreutils) 用 sha256sum，两者 -c 语义一致。
+if command -v sha256sum >/dev/null 2>&1; then
+  ( cd "$TMP" && grep "$ASSET" sums.txt | sha256sum -c - )
+else
+  ( cd "$TMP" && grep "$ASSET" sums.txt | shasum -a 256 -c - )
+fi
 
 echo "==> 安装到 $BIN"
 ( cd "$TMP" && tar -xzf "$ASSET" gitleaks )
