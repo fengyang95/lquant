@@ -24,6 +24,7 @@ from lquant.research.ml.dataset import (
     walk_forward_splits,
 )
 from lquant.research.ml.model import (
+    EnsembleModel,
     LGBMModel,
     Model,
     RidgeModel,
@@ -79,7 +80,8 @@ from lquant.research.ml.registry import (
 
 __all__ = [
     "Dataset", "DatasetConfig", "build_dataset", "walk_forward_splits",
-    "Model", "LGBMModel", "SklearnModel", "RidgeModel", "make_model", "available_backends",
+    "Model", "LGBMModel", "SklearnModel", "RidgeModel", "EnsembleModel",
+    "make_model", "available_backends",
     "train_and_predict", "signal_backtest", "run_ml_pipeline", "MLResult",
     "Processor", "StandardizeProcessor", "ClipProcessor", "CrossSectionalProcessor",
     "Pipeline", "ProcessorSpec", "make_processor",

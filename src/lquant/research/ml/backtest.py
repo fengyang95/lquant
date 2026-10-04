@@ -45,13 +45,15 @@ class MLResult:
         if self.processor is not None:
             out["processor"] = self.processor.name
             out["processor_state"] = self.processor.state()
+        if hasattr(self.model, "summary"):
+            out["ensemble"] = self.model.summary()
         if self.fit_window:
             out["fit_window"] = dict(self.fit_window)
         return out
 
 
 def train_and_predict(ds: Dataset, train_end, valid_end, *, test_end=None,
-                      kind: str = "auto",
+                      kind: str = "auto", n_seeds: int = 1,
                       signal_col: str = "ml_signal", **params) -> MLResult:
     """按日期切分训练，输出测试集的预测信号。
 
@@ -62,6 +64,9 @@ def train_and_predict(ds: Dataset, train_end, valid_end, *, test_end=None,
     ``test_end``：测试段右端点。**滚动重训必须传** —— 不传时测试段一直取到
     数据末端，早期窗口的"样本外"指标会把后面所有窗口的数据都算进来，
     越早的窗口看起来越好（未来信息泄漏进评估）。
+
+    ``n_seeds > 1`` 时训 N 个种子取均值（``EnsembleModel``），
+    压低单次训练对随机种子的敏感性；代价是训练时间 ×N。
     """
     train_raw, _, test_raw = ds.split(train_end, valid_end, test_end)
     if not len(train_raw) or not len(test_raw):
@@ -72,7 +77,7 @@ def train_and_predict(ds: Dataset, train_end, valid_end, *, test_end=None,
 
     Xtr, ytr, _ = ds.xy(train)
     Xte, yte, dte = ds.xy(test)
-    model = make_model(kind, **params)
+    model = make_model(kind, n_seeds=n_seeds, **params)
     model.feature_names = ds.features
     model.fit(Xtr, ytr)
 
@@ -122,6 +127,7 @@ def run_ml_pipeline(df: pl.DataFrame, features: list[str], *,
                     strategy_cls=None, engine_cfg: EngineConfig | None = None,
                     record: bool = True,
                     processors: list[dict] | None = None,
+                    n_seeds: int = 1,
                     model_name: str | None = None,
                     stage: str = "candidate",
                     note: str | None = None,
@@ -151,7 +157,8 @@ def run_ml_pipeline(df: pl.DataFrame, features: list[str], *,
     cfg = DatasetConfig(features=features, label_horizon=label_horizon,
                         processors=processors)
     ds = build_dataset(df, cfg)
-    ml = train_and_predict(ds, train_end, valid_end, kind=kind, **model_params)
+    ml = train_and_predict(ds, train_end, valid_end, kind=kind,
+                           n_seeds=n_seeds, **model_params)
     bt = signal_backtest(ds, ml.predictions, strategy_cls=strategy_cls, top_n=top_n,
                          engine_cfg=engine_cfg)
     out = {
