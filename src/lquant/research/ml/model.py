@@ -48,15 +48,25 @@ class Model:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "wb") as f:
+            # kind 必须落盘：Model.load 是基类 classmethod，只凭 params 无法
+            # 知道该还原成哪个后端 —— 缺了它会把 RidgeModel 还原成抽象
+            # Model，predict 直接 NotImplementedError（artifact 不可回放）。
             pickle.dump({"params": self.params, "features": self.feature_names,
-                         "model": self.model}, f)
+                         "model": self.model, "kind": self.name,
+                         "cls": type(self).__name__}, f)
         return p
 
     @classmethod
     def load(cls, path: str | Path) -> Model:
         with open(path, "rb") as f:
             blob = pickle.load(f)
-        obj = cls(**blob.get("params", {}))
+        target = cls
+        if cls is Model:
+            # 基类调用：按落盘的 kind 还原具体后端；找不到就退化为基类
+            # （至少 .name/.params 可读，而不是静默用错后端）。
+            kind = blob.get("kind")
+            target = _BACKENDS.get(kind) or _BACKENDS.get(blob.get("cls", ""), Model)
+        obj = target(**blob.get("params", {}))
         obj.model = blob["model"]
         obj.feature_names = blob.get("features", [])
         return obj

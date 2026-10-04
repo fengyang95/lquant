@@ -116,21 +116,27 @@ def run_ml_pipeline(df: pl.DataFrame, features: list[str], *,
                     strategy_cls=None, engine_cfg: EngineConfig | None = None,
                     record: bool = True,
                     processors: list[dict] | None = None,
+                    model_name: str | None = None,
+                    stage: str = "candidate",
+                    note: str | None = None,
                     **model_params) -> dict:
-    """一站式：建数据集 → 训练 → 预测 → 回测（R-ML5 实验记录落 ml_run 表）。
+    """一站式：建数据集 → 训练 → 预测 → 回测 → 注册模型版本。
 
-    默认策略用因子 TopN；未安装任何 ML 后端时会明确报错而不是静默跳过。
-    record=False 可关掉落库（快速试验）。
+    ``record=True`` 时通过 ``research.ml.registry`` 注册：写 ``ml_run`` 记录、
+    落模型与处理器 artifact、分配单调版本号。默认策略用因子 TopN；
+    未安装任何 ML 后端时会明确报错而不是静默跳过。
 
     ``processors``：可 fit 的特征处理器声明（``research.ml.processor``）。
     未填时**不做任何全样本标准化** —— 树模型不需要，线性/神经网络必须显式声明，
     且一律只在训练段 fit。
+
+    ``model_name``：逻辑模型线（同一策略反复重训共享一个 name，版本号递增）。
+    缺省按「horizon + top_n」拼一个稳定名字，使同一配置的多次训练聚成版本流。
     """
-    import json as _json
     import uuid as _uuid
-    from datetime import datetime as _dt
 
     from lquant.research.ml.dataset import DatasetConfig, build_dataset
+
 
     if strategy_cls is None:
         from lquant.backtest.strategy.factor_topn import FactorTopNStrategy
@@ -150,22 +156,22 @@ def run_ml_pipeline(df: pl.DataFrame, features: list[str], *,
     }
 
     if record:
+        run_id = _uuid.uuid4().hex[:12]
+        name = model_name or f"ml_h{label_horizon}_top{top_n}"
         try:
-            from lquant.core.db import writer
+            from lquant.research.ml.registry import register_run
 
-            run_id = _uuid.uuid4().hex[:12]
-            with writer() as con:
-                con.execute(
-                    "INSERT OR REPLACE INTO ml_run VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [run_id, ml.model.name,
-                     _json.dumps(model_params, default=str),
-                     _json.dumps(features),
-                     _json.dumps({"ml": ml.summary(),
-                                  "backtest": out["backtest"]}, default=str),
-                     ml.train_rows, ml.test_rows,
-                     str(train_end), str(valid_end), _dt.now()],
-                )
+            mv = register_run(
+                run_id=run_id, name=name, model=ml.model, processor=ml.processor,
+                metrics={"ml": ml.summary(), "backtest": out["backtest"]},
+                params=model_params, features=features,
+                fit_window=ml.fit_window, dataset=ds.summary(),
+                train_rows=ml.train_rows, test_rows=ml.test_rows,
+                train_end=train_end, test_end=valid_end,
+                stage=stage, note=note,
+            )
             out["ml_run_id"] = run_id
-        except Exception as e:  # noqa: BLE001 - 实验记录失败不阻断研究主流程
-            print(f"[warn] ml_run 记录失败: {e}")
+            out["model"] = mv.as_dict()
+        except Exception as e:  # noqa: BLE001 - 注册失败不阻断研究主流程
+            print(f"[warn] 模型注册失败: {e}")
     return out

@@ -44,6 +44,24 @@ from lquant.research.ml.processor import (
     leakage_guard,
     make_processor,
 )
+from lquant.research.ml.registry import (
+    STAGES,
+    ModelVersion,
+    archive,
+    events,
+    get_model,
+    list_models,
+    load_model,
+    load_processor,
+    model_paths,
+    model_root,
+    production,
+    production_asof,
+    promote,
+    register_run,
+    rollback,
+    save_artifact,
+)
 
 __all__ = [
     "Dataset", "DatasetConfig", "build_dataset", "walk_forward_splits",
@@ -52,4 +70,8 @@ __all__ = [
     "Processor", "StandardizeProcessor", "ClipProcessor", "CrossSectionalProcessor",
     "Pipeline", "ProcessorSpec", "make_processor",
     "leakage_guard", "assert_fit_isolated", "LeakageReport", "LeakageError",
+    # 模型注册表（Phase 2.1）
+    "STAGES", "ModelVersion", "model_root", "model_paths", "save_artifact",
+    "register_run", "list_models", "get_model", "load_model", "load_processor",
+    "promote", "rollback", "archive", "production", "production_asof", "events",
 ]
