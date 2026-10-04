@@ -28,6 +28,8 @@
 
 ### 0.3 一页总表
 
+**状态：14 项全部完成（2026-10-04）**，逐项落地说明见 §2 各期表格。
+
 | # | 借鉴项 | 来源 | 移植形态 | 优先级 | 成本 |
 |---|---|---|---|---|---|
 | 1 | 基准/超额收益打通 | qlib | 原生重实现 | **P0** | 低 |
@@ -196,6 +198,16 @@
 
 **出口标准**：新基线与风险优化进入常规评估流程。
 
+**Phase 4 收尾时补齐回归测试，又挖出 4 个自身缺陷（都已修）** —— 都是"功能能跑、
+但入口/边界不对"的类型，值得单列：
+
+| 缺陷 | 后果 | 修法 |
+|---|---|---|
+| `POST /factors/trace` 把 `req.factor`（默认 `mom20`）当**列名** | 用默认值调这个端点必然 422「因子列不存在」——接口等于不可用 | 实际计算列固定 `_factor`（与 `/evaluate/series` 同约定），`req.factor` 只作展示名回显 |
+| `run_ml_pipeline(df, features)` 不计算特征列 | `/ml/train` 与 `lq ml train` 把裸日线递进来 → `KeyError 特征列不存在`；而 `/ml/features` 正在向用户宣传这些名字 | 入口先走 `build_feature_panel`（对已存在列幂等透传） |
+| `enhanced_indexing` 的 `benchmark_weights` 是必填 | 通用入口 `weights(method=...)` / `weight_report()` 直接 `TypeError`，注册表退化成 AlphaPurify 那种「列得出、调不到」 | `None` = 等权基准（A 股最常用的大盘代理），并在 `_benchmark_source` 里标明；`weight_report` 对"缺输入"的方法记 note 而不是整体崩 |
+| `test_run_ml_pipeline_record_registers_version` 只在借 `load_yaml` 的 lru_cache 余温 | 单独跑必挂（测试顺序依赖） | 隔离 root 里复制仓库 `config/`；顺带在测试里点明这个坑 |
+
 ### Phase 4 — 打磨与常态化（P2）
 
 | 任务 | 说明 |
@@ -244,8 +256,16 @@ Phase 0（基线）
 | 隔离 venv（`.venv-qlib`） | **延续**，新增 `.venv-alphapurify` 同构处理 |
 | 单一真源注册表（`METHODS`） | **强化**，并作为 AlphaPurify 的反面教材 |
 
-## 6. 下一步
+## 6. 收尾与后续
 
-1. 按 Phase 1 拆出 TDD 任务书，落到 `docs/superpowers/plans/2026-10-03-*.md`（沿用仓库既有 Task/Step 格式）。
-2. 先做 **1.5**（文档化，极低成本，立刻消除口径歧义），再做 **1.1→1.2→1.3**（基准链路）。
-3. **1.4** 与 Phase 2 一起排期（同属 ML 链路，避免重复改动 `research/ml/`）。
+计划内的 14 项已全部落地。剩下的不是「继续移植」，而是**让已落地的口径不漂移**：
+
+1. **定期跑哨兵**：`make xval-sentinel`（见 `scripts/xval/README.md`）。它不进 CI
+   （需要真实数据湖 + 两个隔离 venv），所以是「发版前/大改后在开发机跑一次」的纪律项。
+2. **新方法上线时同步加变体**：`scripts/xval/alphapurify/variants.py` 里加一条，
+   声明 `expect`（match / diverge / upstream_broken）与容差 —— 不声明就等于没对拍。
+3. **上游版本升级后看两类信号**：`diverge` 变体「分歧消失」、`upstream_broken`
+   变体「bug 消失」，都是提醒去复核口径的哨兵，不是可以忽略的噪声。
+4. **留作观察但未移植**：qlib 的 nested/日内执行、RL、DDG-DA（与日频选股定位不符）；
+   AlphaPurify 的 Plotly 报告、pandas 契约（净增依赖/技术栈倒退）。
+   qlib 的 `Mad` 算子留给 `lq-ops` Rust 侧（见 `ops/ts_ops.py` docstring）。

@@ -148,7 +148,13 @@ def run_ml_pipeline(df: pl.DataFrame, features: list[str], *,
     import uuid as _uuid
 
     from lquant.research.ml.dataset import DatasetConfig, build_dataset
+    from lquant.research.ml.panel import build_feature_panel
 
+    # features 可以是**原始湖表**里的列，也可以是待计算的内置因子/公式名
+    # （MA20、pct_change_20…）。不先算一遍的话，API/CLI 把裸日线递进来时会
+    # 直接 KeyError「特征列不存在」—— 而 /ml/features 恰恰在向用户宣传这些名字。
+    # build_feature_panel 对已存在的列是幂等透传，预featurize 的调用方不受影响。
+    df = build_feature_panel(df, features)
 
     if strategy_cls is None:
         from lquant.backtest.strategy.factor_topn import FactorTopNStrategy

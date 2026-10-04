@@ -206,17 +206,31 @@ def test_impossible_bounds_returns_benchmark():
 
 # ----------------------------------------------------------- 权重层接线
 
-def test_registered_in_methods_and_requires_benchmark():
+def test_registered_in_methods_and_default_benchmark():
+    """注册进 METHODS 且能被通用入口调到；缺 α 视图要报错，缺基准则用等权。"""
     assert "enhanced_indexing" in METHODS
     X, cov, alpha = _market(n=6, t=120)
     syms = [f"s{i}" for i in range(6)]
     b = dict(zip(syms, _benchmark_weights(cov), strict=True))
+    # max_weight 默认 0.10 要求 n ≥ 10，否则边界与 Σw=1 矛盾、直接退回基准；
+    # 6 只标的要显式放宽，否则测的其实是 fallback 分支
     w = weights(X, "enhanced_indexing", syms, benchmark_weights=b,
-                expected_returns=alpha, te_target=0.05)
+                expected_returns=alpha, te_target=0.05, max_weight=0.3)
     assert abs(sum(w.values()) - 1.0) < 1e-9
-    # 没给基准 → 明确报错，而不是静默退回等权
-    with pytest.raises(TypeError):
-        weights(X, "enhanced_indexing", syms, expected_returns=alpha)
+
+    # 缺 α 视图 → 明确报错（只给风险约束的话目标函数无意义），
+    # 而不是静默退回等权让人以为约束生效了
+    with pytest.raises(OptimizerError, match="scores"):
+        weights(X, "enhanced_indexing", syms, benchmark_weights=b)
+
+    # 缺基准 → 等权基准兜底，并在诊断里标明来源（不是真指数基准）
+    r = enhanced_indexing_weight(X, syms, expected_returns=alpha, max_weight=0.3)
+    assert r["_benchmark_source"] == "equal_weight_default"
+    assert r["_fallback"] is False
+    assert abs(sum(r.weights().values()) - 1.0) < 1e-9
+    r2 = enhanced_indexing_weight(X, syms, benchmark_weights=b,
+                                  expected_returns=alpha, max_weight=0.3)
+    assert r2["_benchmark_source"] == "provided"
 
 
 # ----------------------------------------------------------- 样本外 IR 验收
@@ -267,3 +281,73 @@ def test_out_of_sample_ir_not_worse_than_baselines():
     # 不劣于两个纯风险基线（它们对 α 无感，样本外均值应接近 0）
     assert mean["enh"] > mean["rp"], mean
     assert mean["enh"] > mean["mv"], mean
+
+
+# ----------------------------------------------------------- 边界与诊断
+
+def test_result_diagnostics_and_weight_split():
+    X, cov, alpha = _market(n=12, t=200)
+    syms = [f"s{i}" for i in range(12)]
+    r = enhanced_indexing_weight(X, syms, expected_returns=alpha, max_weight=0.2)
+    diag = r.diagnostics
+    assert all(k.startswith("_") for k in diag)
+    assert set(r.weights()) | set(diag) == set(r)
+    assert diag["_n_active"] >= 0
+    assert 0.0 <= diag["_active_share"] <= 1.0
+
+
+def test_optimizer_rejects_degenerate_inputs():
+    X, _cov, alpha = _market(n=6, t=120)
+    empty = X[:, :0]
+    with pytest.raises(OptimizerError, match="没有标的"):
+        enhanced_indexing_weight(empty, [], expected_returns=[])
+    with pytest.raises(OptimizerError, match="te_target 必须为正"):
+        enhanced_indexing_weight(X, [f"s{i}" for i in range(6)],
+                                 expected_returns=alpha, te_target=0.0)
+    with pytest.raises(OptimizerError, match="长度与标的数不一致"):
+        enhanced_indexing_weight(X, [f"s{i}" for i in range(6)],
+                                 expected_returns=alpha[:-1])
+    with pytest.raises(OptimizerError, match="必须给 scores 或 expected_returns"):
+        enhanced_indexing_weight(X, [f"s{i}" for i in range(6)])
+
+
+def test_expected_returns_accepts_dict_and_risk_aversion_runs():
+    X, _cov, alpha = _market(n=8, t=200)
+    syms = [f"s{i}" for i in range(8)]
+    d = dict(zip(syms, alpha, strict=True))
+    r_dict = enhanced_indexing_weight(X, syms, expected_returns=d, max_weight=0.3)
+    r_arr = enhanced_indexing_weight(X, syms, expected_returns=alpha, max_weight=0.3)
+    assert r_dict.weights() == pytest.approx(r_arr.weights(), abs=1e-12)
+    # risk_aversion > 0：目标里多一项 dᵀΣd，解必须变（否则说明这一项没生效）
+    r_risk = enhanced_indexing_weight(X, syms, expected_returns=d, max_weight=0.3,
+                                      risk_aversion=5.0)
+    assert r_risk.weights() != pytest.approx(r_dict.weights(), abs=1e-9)
+
+
+def test_optimizer_falls_back_on_zero_solution_and_te_violation(monkeypatch):
+    """SLSQP 给「全零解」或「超出 TE 的解」时必须退回基准，而不是照单全收。"""
+    import scipy.optimize as opt
+
+    X, _cov, alpha = _market(n=10, t=200)
+    syms = [f"s{i}" for i in range(10)]
+    b = dict(zip(syms, _benchmark_weights(_cov), strict=True))
+
+    class _Res:
+        success = True
+
+        def __init__(self, x):
+            self.x = x
+            self.message = "ok"
+
+    monkeypatch.setattr(opt, "minimize", lambda *a, **k: _Res(np.zeros(10)))
+    r0 = enhanced_indexing_weight(X, syms, benchmark_weights=b,
+                                  expected_returns=alpha, max_weight=0.3)
+    assert r0["_fallback"] is True and "全为 0" in r0["_fallback_reason"]
+
+    huge = np.full(10, 0.5)          # 权重和 5 → 明显越界/超 TE
+    monkeypatch.setattr(opt, "minimize", lambda *a, **k: _Res(huge))
+    r1 = enhanced_indexing_weight(X, syms, benchmark_weights=b,
+                                  expected_returns=alpha, max_weight=0.3,
+                                  te_target=0.01)
+    assert r1["_fallback"] is True
+    assert "TE 约束" in r1["_fallback_reason"]

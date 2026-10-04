@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 
+import polars as pl
 import pytest
 from fastapi.testclient import TestClient
 
@@ -275,3 +276,90 @@ def test_safe_json_handles_text_and_objects():
     assert ml_api._safe_json({"a": 1}) == {"a": 1}
     assert ml_api._safe_json("not json") == "not json"
     assert json.dumps(ml_api._safe_json('{"a": 1}'))
+
+
+# ---------------------------------------------------------------- 任务体直驱
+
+@pytest.fixture()
+def demo_lake(tmp_path, monkeypatch):
+    """隔离 root + demo 日线 + 表结构：让任务体能真跑一遍（不经过队列）。
+
+    **必须把仓库的 config/ 复制进隔离 root**：`run_ml_pipeline` 会顺带跑一遍
+    回测引擎，引擎要读 `config/rules/cn_a_share.yaml`（相对 root 解析）。
+    不复制的话，这条测试只是在借 `load_yaml` 的 lru_cache 余温 ——
+    单独跑就会失败，属于典型的测试顺序依赖。
+    """
+    import shutil
+    from pathlib import Path as _Path
+
+    monkeypatch.setenv("LQ_ROOT", str(tmp_path))
+    monkeypatch.setenv("LQ_MODEL_DIR", str(tmp_path / "models"))
+    monkeypatch.chdir(tmp_path)
+    shutil.copytree(_Path(__file__).resolve().parents[2] / "config",
+                    tmp_path / "config", dirs_exist_ok=True)
+    from lquant.core.config import get_settings
+
+    get_settings.cache_clear()
+    from lquant.core.db import writer
+    from lquant.data.ingest.demo import generate_demo
+    from lquant.data.store.ddl import DDL_STATEMENTS, ensure_ml_run_columns
+
+    with writer() as con:
+        for stmt in DDL_STATEMENTS:
+            con.execute(stmt)
+        ensure_ml_run_columns(con)
+    generate_demo(start="2025-01-01", end="2026-06-30")
+    yield tmp_path
+    get_settings.cache_clear()
+
+
+def _train_req(**kw) -> dict:
+    base = dict(start="2025-01-01", end="2026-06-30", universe="all",
+                features=["MA20"], label_horizon=5,
+                train_end="2026-01-31", valid_end="2026-03-31",
+                kind="ridge", top_n=3, model_name="api_line",
+                stage="candidate", processors=[{"kind": "standardize"}])
+    base.update(kw)
+    return base
+
+
+def test_load_rejects_empty_lake_and_unknown_universe(demo_lake, monkeypatch):
+    """_load：股票池为空/日线为空都要给 503（可读错误，而不是空面板后续崩）。"""
+    from lquant.server.api import ml as api
+
+    with pytest.raises(api.HTTPException, match="成分股为空"):
+        api._load("2025-01-01", "2026-06-30", universe="000300.SH")
+    monkeypatch.setattr(api, "read_daily",
+                        lambda *a, **k: pl.DataFrame().lazy())
+    with pytest.raises(api.HTTPException, match="日线数据为空"):
+        api._load("2025-01-01", "2026-06-30", "all")
+
+
+def test_run_train_job_and_cancel(demo_lake):
+    """任务体：训练 + 注册 + 进度回调；取消时抛 JobCanceled。"""
+    from lquant.server.api import ml as api
+    from lquant.server.jobs import JobCanceled
+
+    seen: list[dict] = []
+    out = api._run_train_job(_train_req(), progress=lambda **kw: seen.append(kw))
+    assert out["ml_run_id"]
+    assert out["model"]["name"] == "api_line"
+    assert [s["phase"] for s in seen] == ["load", "train", "done"]
+
+    with pytest.raises(JobCanceled):
+        api._run_train_job(_train_req(), cancel_check=lambda: True)
+
+
+def test_run_retrain_job_rolls_windows(demo_lake):
+    from lquant.server.api import ml as api
+
+    req = dict(start="2025-01-01", end="2026-06-30", universe="all",
+               features=["MA20"], label_horizon=5, kind="ridge",
+               top_n=3, model_name="api_roll", train_months=6, valid_months=2,
+               test_months=2, step_months=2, promote=False)
+    out = api._run_retrain_job(req)
+    assert out["windows"] >= 1
+    assert out["name"] == "api_roll"
+    assert out["n_promoted"] == 0
+    # 未给 model_name 时按 horizon/top_n 拼默认线名
+    assert api._default_name({"label_horizon": 5, "top_n": 30}) == "ml_h5_top30"

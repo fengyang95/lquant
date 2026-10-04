@@ -1010,7 +1010,11 @@ def list_preprocess_methods(
 
 
 class TraceIn(BaseModel):
-    """截面快照请求（Phase 3.3）。"""
+    """截面快照请求（Phase 3.3）。
+
+    ``factor`` 是**展示名**（原样回显在结果里），不是列名 —— 实际计算列固定为
+    ``_factor``，与 ``/evaluate/series`` 同一约定。
+    """
 
     factor: str = Field(default="mom20", max_length=64)
     formula: str = "pct_change_20"
@@ -1043,10 +1047,15 @@ def trace_ep(req: TraceIn) -> dict:
     d = forward_return(d, "close", periods=[req.horizon])
     d = drop_nonfinite(d, f"fwd_ret_{req.horizon}")
     try:
-        return trace_snapshot(d, req.factor, date=req.date, bins=req.bins,
+        # 计算列固定是 `_factor`（与 /evaluate/series 同一约定），
+        # `req.factor` 只是**展示名** —— 早先直接拿它当列名，
+        # 用默认值 `mom20` 调这个端点必然 422「因子列不存在」。
+        snap = trace_snapshot(d, "_factor", date=req.date, bins=req.bins,
                               side=req.side, horizon=req.horizon, top=req.top)
     except FactorError as e:
         raise HTTPException(422, str(e)) from e
+    snap["factor"] = req.factor
+    return snap
 
 
 @router.get("/builtin")

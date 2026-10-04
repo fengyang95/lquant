@@ -699,3 +699,75 @@ def test_check_formula_supported_returns(client):
                         json={"factor": f"covpre_{formula.replace('$', 'd').replace(' ', '')}",
                               "formula": formula, "start": "2026-05-01"})
         assert r.status_code == 202, r.text
+
+
+# ---------------- 截面快照 /factors/trace（Phase 3.3） ----------------
+
+def test_trace_endpoint_returns_snapshot(client):
+    """trace 端点：分箱口径与分层回测同一实现（evaluate.quantile.add_quantile）。
+
+    `factor` 是展示名而不是列名 —— 早先直接拿它当列名，用默认值调这个端点
+    必然 422「因子列不存在」（真实缺陷，已被本测试钉住）。
+    """
+    r = client.post("/api/factors/trace", json={
+        "factor": "mom20", "formula": "pct_change_20",
+        "date": "2026-05-20", "bins": 5, "side": "long", "horizon": 1, "top": 3,
+        "start": "2026-01-01", "end": "2026-06-30"})
+    assert r.status_code == 200, r.text
+    # 这个端点返回裸 dict（不进统一 envelope）—— 与 /evaluate/series 不同
+    body = r.json()
+    assert body["date"] == "2026-05-20"
+    assert body["factor"] == "mom20"          # 回显展示名
+    assert body["bins"] == 5
+    assert body["group"] == 5                 # long → 最高箱
+    assert body["horizon"] == 1
+    assert body["n_members"] >= len(body["members"]) == 3   # top 只截断展示
+    assert body["returned"] == 3
+    assert len(body["groups"]) == 5                          # rank 分箱 → 5 组
+    assert body["weight_scheme"] == "equal_within_group"
+    # 组内等权：总贡献 = 组收益均值（与 group_returns 的 weighted=False 一致）
+    assert body["total_contribution"] == pytest.approx(body["mean_return"], abs=1e-12)
+    for m in body["members"]:
+        if m["return"] is not None:
+            assert m["contribution"] == pytest.approx(
+                m["return"] / body["n_members"], abs=1e-12)
+
+
+def test_trace_endpoint_short_side_takes_lowest_bin(client):
+    r = client.post("/api/factors/trace", json={
+        "factor": "mom20", "formula": "pct_change_20",
+        "date": "2026-05-20", "bins": 10, "side": "short", "horizon": 5,
+        "start": "2026-01-01", "end": "2026-06-30"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["group"] == 1                 # short → 最低箱
+    assert body["n_symbols"] > 0
+
+
+def test_trace_endpoint_date_not_in_data_422(client):
+    r = client.post("/api/factors/trace", json={
+        "factor": "mom20", "formula": "pct_change_20",
+        "date": "2020-01-02", "bins": 5,
+        "start": "2026-01-01", "end": "2026-06-30"})
+    assert r.status_code == 422
+    assert "不在数据里" in r.text
+
+
+def test_trace_endpoint_bad_request_422(client):
+    # side 枚举非法 → pydantic 422
+    assert client.post("/api/factors/trace", json={
+        "date": "2026-05-20", "side": "middle"}).status_code == 422
+    # bins 越界 → 422
+    assert client.post("/api/factors/trace", json={
+        "date": "2026-05-20", "bins": 1}).status_code == 422
+    # 日期格式非法 → 422
+    assert client.post("/api/factors/trace", json={
+        "date": "20260520"}).status_code == 422
+
+
+def test_trace_endpoint_empty_lake_503(client, monkeypatch):
+    from lquant.server.api import factors as fmod
+
+    monkeypatch.setattr(fmod, "read_daily", lambda *a, **k: pl.DataFrame().lazy())
+    r = client.post("/api/factors/trace", json={"date": "2026-05-20"})
+    assert r.status_code == 503

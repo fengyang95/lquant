@@ -83,7 +83,7 @@ def enhanced_indexing_weight(
     returns,
     symbols: list[str] | None = None,
     *,
-    benchmark_weights,
+    benchmark_weights=None,
     scores: dict[str, float] | None = None,
     expected_returns=None,
     te_target: float = 0.05,
@@ -98,6 +98,12 @@ def enhanced_indexing_weight(
     Parameters
     ----------
     benchmark_weights : dict ``{symbol: weight}`` 或与 ``symbols`` 等长的数组。
+        **None（默认）= 等权基准**，不是「省略」。等权是 A 股最常用的大盘代理
+        （与 ``backtest/benchmark.py::equal_weight_benchmark`` 同一口径），
+        且这条默认值让本方法能被通用入口 ``weighting.weights(method="enhanced_indexing")``
+        调到 —— 注册表里的方法必须都能被统一入口调用，否则就退化成
+        AlphaPurify 那种「列得出、调不到」。用了默认值时 ``_benchmark_source``
+        会标成 ``equal_weight_default``，别把它当成真指数基准。
     scores : ``{symbol: 分数}``；作为预期收益的**截面标准化**代理
         （分数本身不是收益率，直接当 α 用会让目标函数量纲失真）。
     expected_returns : 直接给预期收益（与 symbols 等长或 dict）；给了就忽略 scores。
@@ -119,7 +125,12 @@ def enhanced_indexing_weight(
     if te_target <= 0:
         raise OptimizerError(f"te_target 必须为正，收到 {te_target}")
 
-    b = _as_weights(benchmark_weights, syms)
+    if benchmark_weights is None:
+        b = np.full(n, 1.0 / n)
+        benchmark_source = "equal_weight_default"
+    else:
+        b = _as_weights(benchmark_weights, syms)
+        benchmark_source = "provided"
 
     # 预期收益：直接给 → 用；给分数 → 截面标准化（分数不是收益率）
     if expected_returns is not None:
@@ -152,7 +163,7 @@ def enhanced_indexing_weight(
         hi = np.minimum(hi, b + float(max_active))
     if lo.sum() > 1.0 + 1e-9 or hi.sum() < 1.0 - 1e-9:
         # 边界与「权重和为 1」矛盾 → 无法行。直接退回基准（见模块 docstring）
-        return _fallback(b, syms, cov, "权重边界与 Σw=1 矛盾")
+        return _fallback(b, syms, cov, "权重边界与 Σw=1 矛盾", benchmark_source)
 
     te_daily = float(te_target) / np.sqrt(252)
 
@@ -186,33 +197,36 @@ def enhanced_indexing_weight(
 
     if not res.success or not np.all(np.isfinite(res.x)):
         return _fallback(b, syms, cov,
-                         f"优化未收敛（{getattr(res, 'message', '未知')}）")
+                         f"优化未收敛（{getattr(res, 'message', '未知')}）",
+                         benchmark_source)
 
     w = np.clip(np.asarray(res.x, dtype=float), lo, hi)
     tot = w.sum()
     if tot <= 1e-12:
-        return _fallback(b, syms, cov, "解全为 0")
+        return _fallback(b, syms, cov, "解全为 0", benchmark_source)
     w = w / tot
 
     # 收敛后仍可能因数值误差轻微越界 → 显式核验，越界就退回基准
     realized_te = tracking_error(w, b, cov)
     if realized_te > float(te_target) * 1.001:
         return _fallback(b, syms, cov,
-                         f"解违反 TE 约束（{realized_te:.4f} > {te_target:.4f}）")
+                         f"解违反 TE 约束（{realized_te:.4f} > {te_target:.4f}）",
+                         benchmark_source)
 
     out = EnhancedIndexingResult({s: float(v) for s, v in zip(syms, w, strict=True)})
     out["_tracking_error"] = realized_te
     out["_active_share"] = active_share(w, b)
     out["_expected_excess"] = float(alpha @ (w - b))
     out["_cov_method"] = cov_method or "sample"
+    out["_benchmark_source"] = benchmark_source
     out["_fallback"] = False
     out["_fallback_reason"] = None
     out["_n_active"] = int((np.abs(w - b) > 1e-6).sum())
     return out
 
 
-def _fallback(b: np.ndarray, syms: list[str], cov: np.ndarray,
-              reason: str) -> EnhancedIndexingResult:
+def _fallback(b: np.ndarray, syms: list[str], cov: np.ndarray, reason: str,
+              benchmark_source: str = "provided") -> EnhancedIndexingResult:
     """不可行时退回基准权重（主动权重全 0）。
 
     比「报错让上游崩」安全：基准组合是可解释的、可交易的；而一个违反
@@ -223,6 +237,7 @@ def _fallback(b: np.ndarray, syms: list[str], cov: np.ndarray,
     out["_active_share"] = 0.0
     out["_expected_excess"] = 0.0
     out["_cov_method"] = "n/a"
+    out["_benchmark_source"] = benchmark_source
     out["_fallback"] = True
     out["_fallback_reason"] = reason
     out["_n_active"] = 0

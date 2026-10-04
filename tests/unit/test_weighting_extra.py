@@ -118,14 +118,30 @@ def test_weights_unknown_method_falls_back_to_equal():
 
 def test_methods_registry_complete():
     assert set(METHODS) == {"equal", "inverse_vol", "risk_parity",
-                            "min_variance", "hrp"}
+                            "min_variance", "hrp", "enhanced_indexing"}
+
+
+#: 需要额外输入的方法：走通用入口时必须显式给这些 kw，见下面两个测试。
+NEEDS_INPUT = {
+    # enhanced_indexing 只给风险约束、不给 α 视图时目标函数无意义，
+    # 所以要求 scores / expected_returns（基准可省，缺省等权基准）
+    "enhanced_indexing": {"scores": {"A": 1.0, "B": 0.0, "C": -1.0, "D": -2.0}},
+}
 
 
 def test_weights_passes_kwargs():
     r = make_returns_df()
     for name in METHODS:
-        w = weights(r, method=name)
+        w = weights(r, method=name, **NEEDS_INPUT.get(name, {}))
         assert sum(w.values()) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_weights_missing_view_raises_not_silently_equal():
+    """缺输入要报错，不能静默退回等权 —— 那会让人以为约束生效了。"""
+    from lquant.portfolio.optimizer import OptimizerError
+
+    with pytest.raises(OptimizerError, match="scores"):
+        weights(make_returns_df(), method="enhanced_indexing")
 
 
 def test_risk_parity_degrades_on_singular_cov():
@@ -173,17 +189,23 @@ def test_weight_report_columns_and_sort():
     assert rep["vol"].to_list() == sorted(rep["vol"].to_list())
     rep2 = weight_report(r)  # 默认全部方法，按 vol 升序
     assert set(rep2["method"].to_list()) == set(METHODS)
-    assert rep2["vol"].to_list() == sorted(rep2["vol"].to_list())
     assert set(rep2.columns) >= {"method", "vol", "effective_n",
-                                 "max_weight", "n_holdings"}
-    assert (rep2["n_holdings"] == 4).all()
+                                 "max_weight", "n_holdings", "note"}
+    # 需要 α 视图的方法算不出来 → 指标留空 + note 说明，而不是让整张报告炸
+    ok_rows = rep2.filter(pl.col("vol").is_not_null())
+    assert ok_rows["vol"].to_list() == sorted(ok_rows["vol"].to_list())
+    assert (ok_rows["n_holdings"] == 4).all()
+    skipped = rep2.filter(pl.col("vol").is_null())
+    assert skipped["method"].to_list() == ["enhanced_indexing"]
+    assert "scores" in skipped["note"][0]
 
 
 def test_weight_report_tiny_sample_uses_identity_cov():
     r = make_returns_df(2)
     rep = weight_report(r)
     assert rep.height == len(METHODS)
-    assert (rep["vol"] > 0).all()
+    # 样本太小 → 走单位协方差兜底；缺 α 视图的那一行没有 vol，排除掉再看
+    assert (rep.filter(pl.col("vol").is_not_null())["vol"] > 0).all()
 
 
 # ---------- 强制注入异常覆盖降级分支 ----------

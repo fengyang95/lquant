@@ -138,6 +138,13 @@ def test_run_ml_pipeline_record_registers_version(tmp_path, monkeypatch):
     monkeypatch.setenv("LQ_DUCKDB_PATH", str(tmp_path / "lq.duckdb"))
     monkeypatch.setenv("LQ_MODEL_DIR", str(tmp_path / "models"))
     monkeypatch.chdir(tmp_path)     # 让相对路径的 duckdb 落在 tmp 而不是工作区
+    # 回测引擎要读 config/rules/cn_a_share.yaml（相对 root 解析）——
+    # 不复制的话本测试只能靠 load_yaml 的 lru_cache 余温通过，单独跑必挂。
+    import shutil as _shutil
+    from pathlib import Path as _Path
+
+    _shutil.copytree(_Path(__file__).resolve().parents[2] / "config",
+                     tmp_path / "config", dirs_exist_ok=True)
     from lquant.core.config import get_settings
 
     get_settings.cache_clear()
