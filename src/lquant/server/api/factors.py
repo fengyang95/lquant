@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
 from lquant.core.db import reader
+from lquant.core.errors import FactorError
 from lquant.data.store.catalog import IndexConsRepo, upsert
 from lquant.data.store.parquet import read_daily
 from lquant.factors.evaluate import evaluate, forward_return
@@ -1006,6 +1007,46 @@ def list_preprocess_methods(
                     "本仓 n 是等效 σ 倍数（默认 5）—— 同名不同义。",
         },
     }
+
+
+class TraceIn(BaseModel):
+    """截面快照请求（Phase 3.3）。"""
+
+    factor: str = Field(default="mom20", max_length=64)
+    formula: str = "pct_change_20"
+    date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    bins: int = Field(default=10, ge=2, le=50)
+    side: str = Field(default="long", pattern=r"^(long|short|top|bottom)$")
+    horizon: int = Field(default=1, ge=1, le=60)
+    top: int | None = Field(default=50, ge=1, le=1000)
+    start: str = "2026-01-01"
+    end: str | None = None
+    universe: str = "all"
+
+
+@router.post("/trace")
+def trace_ep(req: TraceIn) -> dict:
+    """某日某箱的成分与收益明细 —— 排查「净值跳变是哪几只票」的最快路径。
+
+    分箱口径与 ``/factors/evaluate/series`` 的分层回测**同一实现**
+    （``evaluate.quantile.add_quantile``），所以快照里的「第 N 组」与曲线上的
+    第 N 组一定是同一批票。
+    """
+    from lquant.factors.evaluate import trace_snapshot
+    from lquant.factors.evaluate.returns import forward_return
+
+    df = read_daily(start=req.start, end=req.end,
+                    symbols=_universe_symbols(req.universe)).collect()
+    if not len(df):
+        raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
+    d = _compute_factor(df, req.formula)
+    d = forward_return(d, "close", periods=[req.horizon])
+    d = drop_nonfinite(d, f"fwd_ret_{req.horizon}")
+    try:
+        return trace_snapshot(d, req.factor, date=req.date, bins=req.bins,
+                              side=req.side, horizon=req.horizon, top=req.top)
+    except FactorError as e:
+        raise HTTPException(422, str(e)) from e
 
 
 @router.get("/builtin")

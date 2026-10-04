@@ -42,12 +42,14 @@ from lquant.factors.evaluate.robustness import (
     start_date_sensitivity,
     time_stability,
 )
+from lquant.factors.evaluate.trace import trace_periods, trace_snapshot
 
 __all__ = [
     "forward_return", "forward_return_matrix",
     "ic_series", "ic_summary", "ic_by_year", "ic_autocorr",
     "add_quantile", "group_returns", "quantile_nav", "long_short_nav", "quantile_summary",
     "pivot_group_returns", "filter_zscore", "zscore_filter_stats",
+    "trace_snapshot", "trace_periods",
     "zscore_filter_with_stats",
     "event_study", "event_study_summary",
     "decay_profile", "decay_summary", "half_life", "suggest_rebalance",

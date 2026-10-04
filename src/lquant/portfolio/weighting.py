@@ -229,12 +229,27 @@ def hrp_weight(returns, symbols: list[str] | None = None, *,
     return dict(zip(syms, _clean(w), strict=False))
 
 
+def _enhanced_indexing(returns, symbols=None, **kw):
+    """``weighting.METHODS`` 适配器：基准相对优化需要 ``benchmark_weights``。
+
+    没给基准时**明确报错**而不是退回等权 —— 「我要相对基准优化」和
+    「给我等权」是两件完全不同的事，静默替换会让人以为约束生效了。
+    """
+    from lquant.portfolio.optimizer import enhanced_indexing_weight
+
+    # 只回权重本身：结果对象还带 _ 前缀的诊断字段（含字符串），
+    # 整个 dict 化会让权重字典混进非数值，调用方 sum() 直接炸。
+    return enhanced_indexing_weight(returns, symbols, **kw).weights()
+
+
 METHODS = {
     "equal": equal_weight,
     "inverse_vol": inverse_vol_weight,
     "risk_parity": risk_parity_weight,
     "min_variance": min_variance_weight,
     "hrp": hrp_weight,
+    # 需要 benchmark_weights（见 portfolio/optimizer.py）
+    "enhanced_indexing": _enhanced_indexing,
 }
 
 

@@ -18,6 +18,13 @@ from lquant.portfolio.dedup import (
     correlation_matrix,
     dedup,
 )
+from lquant.portfolio.optimizer import (
+    EnhancedIndexingResult,
+    OptimizerError,
+    active_share,
+    enhanced_indexing_weight,
+    tracking_error,
+)
 from lquant.portfolio.riskmodel import (
     COV_ESTIMATORS,
     condition_number,
@@ -58,4 +65,7 @@ __all__ = [
     # 风险模型（Phase 3.1）
     "COV_ESTIMATORS", "estimate_cov", "sample_cov", "shrink_cov",
     "structured_cov", "poet_cov", "condition_number", "is_psd", "nearest_psd",
+    # 基准相对优化（Phase 3.2）
+    "enhanced_indexing_weight", "EnhancedIndexingResult", "OptimizerError",
+    "tracking_error", "active_share",
 ]
