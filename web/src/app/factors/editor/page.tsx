@@ -51,6 +51,7 @@ export default function FactorEditorPage() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [loadWarnings, setLoadWarnings] = useState<string[]>([]);
+  const [loadTranslated, setLoadTranslated] = useState(false);
   const [openError, setOpenError] = useState('');
 
   const [evalJob, setEvalJob] = useState<{ id: string; factor: string } | null>(null);
@@ -103,8 +104,9 @@ export default function FactorEditorPage() {
       setMessage('');
       setOpenError('');
       try {
-        const warnings = await api.loadExpression(factor.expression);
+        const { warnings, translated } = await api.loadExpression(factor.expression);
         setLoadWarnings(warnings);
+        setLoadTranslated(translated);
         // 种子因子换个名字，避免把 qlib/yaml 的批量种子覆盖掉
         const isSeed = SEEDED_SOURCES.has(factor.source);
         setSeedName(isSeed ? factor.name : null);
@@ -113,8 +115,10 @@ export default function FactorEditorPage() {
         setEvalJob(null);
         setEvalResult(null);
       } catch (e: unknown) {
-        // 最常见的原因：库里的表达式是历史遗留的 Qlib 写法（Mean/Ref/Slope…），
-        // lquant DSL 只认 Ts_* 那一套 —— 如实说明，不要假装画布能打开。
+        // 到这一步说明连统一引擎的兼容翻译都救不回来（真语法错 / 未知字段 / 未注册算子）。
+        // 如实说明原因，不要假装画布能打开。
+        setLoadWarnings([]);
+        setLoadTranslated(false);
         setOpenError(
           `打开 ${factor.name} 失败：${e instanceof Error ? e.message : String(e)}`,
         );
@@ -200,6 +204,7 @@ export default function FactorEditorPage() {
                 setDescription('');
                 setSeedName(null);
                 setLoadWarnings([]);
+                setLoadTranslated(false);
                 setOpenError('');
                 setEvalJob(null);
                 setEvalResult(null);
@@ -251,6 +256,12 @@ export default function FactorEditorPage() {
               <li key={w}>打开时的近似：{w}</li>
             ))}
           </ul>
+        ) : null}
+        {loadTranslated ? (
+          <p className="mt-2 border-l-2 border-gold pl-2 text-xs text-gold">
+            该因子库里存的是历史 qlib 写法，已按统一引擎翻译成 lquant DSL 打开；
+            保存后以 DSL 存储。
+          </p>
         ) : null}
       </Panel>
 

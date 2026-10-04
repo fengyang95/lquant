@@ -30,6 +30,7 @@ import type {
   CanvasEdge,
   CanvasNode,
   Catalog,
+  LoadExpressionResult,
   NodeKind,
 } from '@/lib/factor-canvas/types';
 
@@ -166,16 +167,18 @@ export function useFactorEditor() {
 
   /** 用 DSL 表达式铺画布（打开已有因子 / 粘贴表达式） */
   const loadExpression = useCallback(
-    async (expression: string): Promise<string[]> => {
+    async (expression: string): Promise<LoadExpressionResult> => {
       const trimmed = expression.trim();
       if (!trimmed) {
         reset();
-        return [];
+        return { warnings: [], translated: false };
       }
       const res = await post<AstResponse>('/factors/ast', { expression: trimmed });
       const { nodes, edges, warnings } = decompileAst(res.ast, catalog);
-      setState(loadState(nodes, edges, trimmed));
-      return warnings;
+      // 基线用服务端**归一后**的表达式：历史 qlib 写法打开后画布产出的是 DSL，
+      // 拿原始 qlib 串当基线，脏标记会一直为真（打开即脏）。
+      setState(loadState(nodes, edges, res.expression || trimmed));
+      return { warnings, translated: res.translated === true };
     },
     [catalog, reset],
   );

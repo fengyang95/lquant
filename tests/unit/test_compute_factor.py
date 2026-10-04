@@ -51,14 +51,48 @@ def test_missing_column_error_not_swallowed():
 
 def test_dsl_error_raises_422_not_500():
     """缺陷：DSL 公式错误（解析失败/未注册算子/未知字段）直接炸 500，
-    必须转成 422 并带原始错误信息。"""
+    必须转成 422 并带原始错误信息。
+
+    注意：`Mean($close,0)` 不再是「未注册算子」——它是合法的 qlib 写法，
+    会被统一引擎翻译成 `Ts_Mean`（见 test_legacy_qlib_expression_computes）。
+    这里改用真正未注册的 `Nope` 钉住「坏算子 → 422」这条契约。
+    """
     from lquant.server.api.factors import _compute_factor
 
-    for bad in ("$bad + ", "Mean($close, 0)", "Rank($no_such_col)"):
+    for bad in ("$bad + ", "Nope($close)", "Rank($no_such_col)"):
         with pytest.raises(HTTPException) as ei:
             _compute_factor(_panel(), bad)
         assert ei.value.status_code == 422, f"{bad!r} 应为 422，实际 {ei.value.status_code}"
         assert str(ei.value.detail), "detail 应带原始错误信息"
+
+
+def test_legacy_qlib_expression_computes_via_engine():
+    """历史 qlib 写法（Slope/Mean/Ref…）在统一引擎里应翻译后照常计算。
+
+    回归「打开得了、算不出来」：库里老因子表达式是 qlib 写法，评价阶段
+    会走 FactorEngine —— 不翻译就在这里炸。
+    """
+    from lquant.factors.analysis import compute_factor_col
+
+    out = compute_factor_col(_panel(), "Slope($close,10)/$close", "_factor")
+    assert "_factor" in out.columns
+    assert out["_factor"].is_not_null().sum() > 0
+
+
+def test_legacy_rank_disambiguated_from_cross_section_rank():
+    """qlib `Rank($close,5)`（时序秩，2 参）不能被当成 lquant 截面秩。
+
+    lquant 也有 `Rank`（截面秩，1 参）；若按名字放行，`Rank($close,5)` 会
+    在 Polars 里炸 `rank() takes 1 positional argument but 2 were given`。
+    """
+    from lquant.factors.analysis import compute_factor_col
+
+    out = compute_factor_col(_panel(), "Rank($close,5)", "_factor")
+    assert out["_factor"].is_not_null().sum() > 0
+
+    # 真·截面秩（1 参）仍走 lquant Rank
+    cs = compute_factor_col(_panel(), "Rank($close)", "_factor")
+    assert cs["_factor"].is_not_null().sum() > 0
 
 
 def test_dsl_error_is_factor_error():

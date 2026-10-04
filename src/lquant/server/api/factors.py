@@ -188,12 +188,16 @@ def list_factors(
         builtin_family = {x["name"]: x["family"] for x in list_builtin()}
     except Exception:  # noqa: BLE001   builtin 枚举失败不挡列表
         pass
+    from lquant.factors.dsl.normalize import normalize_soft
+
     out = []
     for r in rows:
         cat = r[7] or None
         if not cat and r[3] == "qlib" and r[0] in builtin_family:
             cat = f"alpha158·{builtin_family[r[0]]}"
-        out.append({"name": r[0], "expression": r[1], "description": r[2],
+        # 历史遗留的 qlib 写法（Slope/Mean/Ref…）在这里就翻译成 DSL：
+        # 画布预览与「打开已有因子」拿到的必须是引擎真能解析的表达式。
+        out.append({"name": r[0], "expression": normalize_soft(r[1]), "description": r[2],
                     "source": r[3], "factor_id": r[4], "ic_neutral": r[5],
                     "created_at": str(r[6]), "category": cat or "自定义"})
     return out
@@ -201,17 +205,17 @@ def list_factors(
 
 @router.post("")
 def register_factor(f: FactorIn) -> dict:
-    """注册因子定义。给了 expression 就先过 DSL 语法检查。"""
-    if f.expression:
-        try:
-            from lquant.factors.dsl.analyzer import check
-            from lquant.factors.dsl.parser import parse
+    """注册因子定义。给了 expression 就先归一 + 过 DSL 语法检查。"""
+    from lquant.factors.dsl.normalize import normalize
 
-            check(parse(f.expression, f.name))
+    expr = (f.expression or "").strip()
+    if expr:
+        try:
+            expr = normalize(expr)     # 兼容历史 qlib 写法，落库统一存 DSL
         except Exception as e:  # noqa: BLE001
             raise HTTPException(422, f"DSL 校验失败: {e}") from e
     n = upsert("factor_def", pl.DataFrame([{
-        "name": f.name, "expression": f.expression,
+        "name": f.name, "expression": expr,
         "description": f.description, "created_at": datetime.now(),
     }]))
     return {"registered": f.name, "rows": n}
@@ -223,15 +227,18 @@ class _ValidateIn(BaseModel):
 
 @router.post("/validate")
 def validate_expression(v: _ValidateIn) -> dict:
-    """DSL 表达式 AST 校验（不落库），供前端注册 / 编辑表单实时校验。"""
+    """DSL 表达式 AST 校验（不落库），供前端注册 / 编辑表单实时校验。
+
+    兼容历史 qlib 写法：归一通过即 ok。响应保持既有 ``{ok, error}`` 形状，
+    调用方要 DSL 文本走 ``/ast``（它返回归一后的 ``expression``）。
+    """
     expr = (v.expression or "").strip()
     if not expr:
         return {"ok": False, "error": "表达式为空"}
     try:
-        from lquant.factors.dsl.analyzer import check
-        from lquant.factors.dsl.parser import parse
+        from lquant.factors.dsl.normalize import normalize
 
-        check(parse(expr, "validate"))
+        normalize(expr)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": str(e)}
     return {"ok": True, "error": None}
@@ -271,20 +278,26 @@ def expression_ast(v: _AstIn) -> dict:
 
     前端不重写词法/语法分析器（两份解析器必然漂移），只消费这里产出的树
     做形状映射。解析或静态检查失败返回 422 + 原因原文。
+
+    兼容历史 qlib 写法（``Slope($close,10)/$close``）：先经统一翻译器归一成
+    lquant DSL 再出 AST，否则老因子在画布上永远打不开。响应里 ``translated``
+    标明是否发生过翻译，前端据此提示用户「打开的是兼容翻译后的表达式」。
     """
-    expr = (v.expression or "").strip()
-    if not expr:
+    raw = (v.expression or "").strip()
+    if not raw:
         raise HTTPException(422, "表达式为空")
     try:
         from lquant.factors.dsl.analyzer import check
         from lquant.factors.dsl.json_ast import to_dict
+        from lquant.factors.dsl.normalize import normalize
         from lquant.factors.dsl.parser import parse
 
+        expr = normalize(raw)
         ast = parse(expr, "ast")
         check(ast)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(422, f"DSL 解析失败: {e}") from e
-    return {"expression": expr, "ast": to_dict(ast.root)}
+    return {"expression": expr, "ast": to_dict(ast.root), "translated": expr != raw}
 
 
 class FactorUpdateIn(BaseModel):
@@ -316,15 +329,17 @@ def update_factor(name: str, f: FactorUpdateIn) -> dict:
            "source_ref": r[6], "factor_id": r[7], "category": r[8] or ""}
     if (cur["source"] or "manual") not in ("manual", "mined"):
         raise HTTPException(422, f"{cur['source']} 来源因子为种子灌入，不可编辑（可复制为新因子）")
-    new_expr = cur["expression"] if f.expression is None else f.expression.strip()
-    if new_expr and new_expr != cur["expression"]:
-        try:
-            from lquant.factors.dsl.analyzer import check
-            from lquant.factors.dsl.parser import parse
+    if f.expression is None:
+        new_expr = cur["expression"]
+    else:
+        new_expr = f.expression.strip()
+        if new_expr:
+            try:
+                from lquant.factors.dsl.normalize import normalize
 
-            check(parse(new_expr, name))
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(422, f"DSL 校验失败: {e}") from e
+                new_expr = normalize(new_expr)   # 兼容 qlib 写法，落库统一存 DSL
+            except Exception as e:  # noqa: BLE001
+                raise HTTPException(422, f"DSL 校验失败: {e}") from e
     row = {**cur,
            "expression": new_expr,
            "description": cur["description"] if f.description is None else f.description,
@@ -1268,6 +1283,8 @@ def get_report(name: str) -> FileResponse:
 @router.get("/{name}")
 def get_factor(name: str) -> dict:
     """因子详情：定义 + 关联报告列表。"""
+    from lquant.factors.dsl.normalize import normalize_soft
+
     with reader() as con:
         try:
             r = con.execute(
@@ -1281,7 +1298,7 @@ def get_factor(name: str) -> dict:
     if REPORT_DIR.exists():
         for p in sorted(REPORT_DIR.glob(f"{name}*.html"), key=lambda x: -x.stat().st_mtime):
             reports.append({"name": p.stem, "url": f"/api/factors/reports/{p.stem}"})
-    return {"name": r[0], "expression": r[1], "description": r[2],
+    return {"name": r[0], "expression": normalize_soft(r[1]), "description": r[2],
             "created_at": str(r[3]), "source": r[4] or "manual",
             "category": r[5] or "", "reports": reports}
 

@@ -22,12 +22,17 @@ _LOOKUP.update({k.lower(): k for k in _PASSTHROUGH})
 
 
 def _translate_call(node: Call) -> Call:
+    """Qlib 算子名 → lquant DSL 算子名。
+
+    **不要按参数个数区分 `Max`/`Min` 与 `Greater`/`Less`。** Qlib 里
+    `Max($high, 20)` 是**滚动** 20 期最高价，`Greater($open, $close)` 才是
+    逐元素取大 —— 两者参数个数都是 2。曾有一版按 `len(args) == 2` 把
+    `Max`/`Min` 改写成 `Greater`/`Less`，于是 25 处滚动算子被静默译成
+    「与常数 20 逐元素取大」（`max(最高价, 常数20)` = 最高价本身），
+    MAX/MIN/RSV 整族因子退化成错误值。一律走 _OP_MAP。
+    """
     name = node.name
     low = name.lower()
-    if low == "max" and len(node.args) == 2:
-        return Call("Greater", node.args)
-    if low == "min" and len(node.args) == 2:
-        return Call("Less", node.args)
     if low == "quantile" and len(node.args) == 3:
         return Call("Ts_Quantile", node.args)
     key = _LOOKUP.get(low)
