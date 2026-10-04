@@ -31,9 +31,25 @@ from lquant.research.ml.model import (
     available_backends,
     make_model,
 )
+from lquant.research.ml.processor import (
+    ClipProcessor,
+    CrossSectionalProcessor,
+    LeakageError,
+    LeakageReport,
+    Pipeline,
+    Processor,
+    ProcessorSpec,
+    StandardizeProcessor,
+    assert_fit_isolated,
+    leakage_guard,
+    make_processor,
+)
 
 __all__ = [
     "Dataset", "DatasetConfig", "build_dataset", "walk_forward_splits",
     "Model", "LGBMModel", "SklearnModel", "RidgeModel", "make_model", "available_backends",
     "train_and_predict", "signal_backtest", "run_ml_pipeline", "MLResult",
+    "Processor", "StandardizeProcessor", "ClipProcessor", "CrossSectionalProcessor",
+    "Pipeline", "ProcessorSpec", "make_processor",
+    "leakage_guard", "assert_fit_isolated", "LeakageReport", "LeakageError",
 ]

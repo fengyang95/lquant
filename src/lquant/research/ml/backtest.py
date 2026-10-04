@@ -27,9 +27,13 @@ class MLResult:
     test_rows: int
     test_ic: dict
     predictions: pl.DataFrame | None = None
+    #: 特征处理器（None = 未声明处理器）。随 artifact 一起存，推理时必须复用
+    #: 同一份状态 —— 用测试段重算标准化参数就是泄漏。
+    processor: object | None = None
+    fit_window: dict | None = None
 
     def summary(self) -> dict:
-        return {
+        out = {
             "model": self.model.name,
             "train_rows": self.train_rows,
             "test_rows": self.test_rows,
@@ -38,14 +42,28 @@ class MLResult:
             "test_ir": self.test_ic.get("ic", {}).get("ir"),
             "test_t_stat": self.test_ic.get("ic", {}).get("t_stat"),
         }
+        if self.processor is not None:
+            out["processor"] = self.processor.name
+            out["processor_state"] = self.processor.state()
+        if self.fit_window:
+            out["fit_window"] = dict(self.fit_window)
+        return out
 
 
 def train_and_predict(ds: Dataset, train_end, valid_end, *, kind: str = "auto",
                       signal_col: str = "ml_signal", **params) -> MLResult:
-    """按日期切分训练，输出测试集的预测信号。"""
-    train, _, test = ds.split(train_end, valid_end)
-    if not len(train) or not len(test):
+    """按日期切分训练，输出测试集的预测信号。
+
+    特征处理器（``DatasetConfig.processors``）**只在训练段 fit**，valid/test
+    只 transform —— 这是 qlib ``DataHandlerLP`` 的 learn/infer 纪律：
+    处理器参数是训练窗口的函数，测试段的分布信息绝不参与拟合。
+    """
+    train_raw, _, test_raw = ds.split(train_end, valid_end)
+    if not len(train_raw) or not len(test_raw):
         raise ValueError("训练集或测试集为空，检查切分日期")
+
+    proc, train = ds.fit_processor(train_raw)
+    test = proc.transform(test_raw) if proc is not None else test_raw
 
     Xtr, ytr, _ = ds.xy(train)
     Xte, yte, dte = ds.xy(test)
@@ -59,8 +77,15 @@ def train_and_predict(ds: Dataset, train_end, valid_end, *, kind: str = "auto",
     # 用预测值直接算 IC（预测 vs 真实前瞻收益）
     ic = ic_summary(out, signal_col, ds.cfg.label_col(), date_col=ds.cfg.date_col)
     ic.pop("series", None)
+    fit_window = {
+        "train_end": str(train_end), "valid_end": str(valid_end),
+        "train_rows": len(train), "test_rows": len(test),
+        "train_start": str(train[ds.cfg.date_col].min()) if len(train) else None,
+        "train_stop": str(train[ds.cfg.date_col].max()) if len(train) else None,
+    }
     return MLResult(model=model, signal_col=signal_col, train_rows=len(train),
-                    test_rows=len(test), test_ic=ic, predictions=out)
+                    test_rows=len(test), test_ic=ic, predictions=out,
+                    processor=proc, fit_window=fit_window)
 
 
 def signal_backtest(ds: Dataset, predictions: pl.DataFrame, *,
@@ -90,11 +115,16 @@ def run_ml_pipeline(df: pl.DataFrame, features: list[str], *,
                     kind: str = "auto", top_n: int = 30,
                     strategy_cls=None, engine_cfg: EngineConfig | None = None,
                     record: bool = True,
+                    processors: list[dict] | None = None,
                     **model_params) -> dict:
     """一站式：建数据集 → 训练 → 预测 → 回测（R-ML5 实验记录落 ml_run 表）。
 
     默认策略用因子 TopN；未安装任何 ML 后端时会明确报错而不是静默跳过。
     record=False 可关掉落库（快速试验）。
+
+    ``processors``：可 fit 的特征处理器声明（``research.ml.processor``）。
+    未填时**不做任何全样本标准化** —— 树模型不需要，线性/神经网络必须显式声明，
+    且一律只在训练段 fit。
     """
     import json as _json
     import uuid as _uuid
@@ -106,7 +136,8 @@ def run_ml_pipeline(df: pl.DataFrame, features: list[str], *,
         from lquant.backtest.strategy.factor_topn import FactorTopNStrategy
         strategy_cls = FactorTopNStrategy
 
-    cfg = DatasetConfig(features=features, label_horizon=label_horizon)
+    cfg = DatasetConfig(features=features, label_horizon=label_horizon,
+                        processors=processors)
     ds = build_dataset(df, cfg)
     ml = train_and_predict(ds, train_end, valid_end, kind=kind, **model_params)
     bt = signal_backtest(ds, ml.predictions, strategy_cls=strategy_cls, top_n=top_n,

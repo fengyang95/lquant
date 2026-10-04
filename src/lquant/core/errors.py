@@ -80,3 +80,12 @@ class BacktestError(LQuantError):
 
 class RuleNotFound(BacktestError):
     pass
+
+
+# ---- 机器学习研究链路 ----
+class MLError(LQuantError):
+    """ML 研究链路的基类异常（数据集/处理器/训练/注册表）。"""
+
+
+class LeakageError(MLError):
+    """特征工程或切分上的未来函数：fit 窗口看到了不该看到的样本。"""

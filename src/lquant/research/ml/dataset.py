@@ -32,6 +32,10 @@ class DatasetConfig:
     label_rank: bool = False                # 用截面排名作标签，对异常值更稳健
     dropna: bool = True
     min_samples_per_day: int = 10
+    #: 可 fit 的特征处理器声明（见 research/ml/processor.py）。
+    #: 例：[{"kind": "clip", "lower": 0.01}, {"kind": "standardize"}]
+    #: **一律只在训练段 fit**，valid/test 只 transform —— 不填则不处理。
+    processors: list[dict] | None = None
 
     def label_col(self) -> str:
         return f"fwd_ret_{self.label_horizon}"
@@ -65,6 +69,38 @@ class Dataset:
         return (self.slice(end=train_end),
                 self.slice(start=_next_day(train_end), end=valid_end),
                 self.slice(start=_next_day(valid_end), end=test_end))
+
+    def build_processor(self):
+        """按 ``cfg.processors`` 构造（未拟合的）处理器；无声明返回 None。"""
+        if not self.cfg.processors:
+            return None
+        from lquant.research.ml.processor import Pipeline, make_processor
+
+        procs = [make_processor(s) for s in self.cfg.processors]
+        return procs[0] if len(procs) == 1 else Pipeline(procs)
+
+    def fit_processor(self, train: pl.DataFrame):
+        """**只在训练段** fit 处理器，返回 (processor, transformed_train)。
+
+        这是防泄漏的关键入口：调用方拿到 processor 后只能 ``transform``
+        valid/test，绝不能对它们再 fit。``processor is None`` 表示未声明。
+        """
+        proc = self.build_processor()
+        if proc is None:
+            return None, train
+        proc.fit(train, features=self.features)
+        return proc, proc.transform(train)
+
+    def split_processed(self, train_end, valid_end, test_end=None):
+        """切分 + 只在 train 上 fit 处理器 → (train, valid, test, processor)。
+
+        valid/test 只做 transform；``fwd_ret`` 标签列原样保留（处理器只动特征列）。
+        """
+        train, valid, test = self.split(train_end, valid_end, test_end)
+        proc, train_p = self.fit_processor(train)
+        if proc is None:
+            return train, valid, test, None
+        return train_p, proc.transform(valid), proc.transform(test), proc
 
     def xy(self, part: pl.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """返回 (X, y, 日期数组)。y 为前瞻收益或截面排名。"""
