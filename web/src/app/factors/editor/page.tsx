@@ -13,9 +13,11 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import Chart from '@/components/Chart';
 import PageHeader from '@/components/PageHeader';
 import { Panel, Stat } from '@/components/Panel';
+import ProgressBar from '@/components/ProgressBar';
 import { ErrorNote, Msg } from '@/components/States';
-import { ApiError, get, post } from '@/lib/api';
+import { post } from '@/lib/api';
 import { C, axes, legend, tooltip } from '@/lib/chart';
+import { useJobStream } from '@/lib/streaming';
 
 import BlockPalette from './BlockPalette';
 import Inspector from './Inspector';
@@ -26,15 +28,18 @@ import { useFactorEditor } from './useFactorEditor';
 const Canvas = dynamic(() => import('./Canvas'), { ssr: false });
 
 const NAME_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
-const POLL_MS = 3000;
-/** 轮询上限：3s × 100 ≈ 5 分钟，超时如实报错而不是无限"运行中" */
-const MAX_POLLS = 100;
 
+/** 评价指标：与后端 `_evaluate_full` 返回值同形（WS `/ws/jobs/{id}` 终态 result
+ *  就是这个扁平结构）。
+ *
+ *  注意：`GET /factors/evaluate/{id}` 返回的是信封 `{job_id,ts,kind,params,result}`，
+ *  扁平字段在 `result` 下面 —— 早先这里按扁平读信封，导致 IC/ICIR 恒显示 `—`、
+ *  累计 IC 图恒为空。本页改用 WS 后不存在该歧义。 */
 type EvalMetrics = {
-  ic_mean?: number | null;
+  ic?: { mean?: number | null; ir?: number | null } | null;
   rank_ic_mean?: number | null;
-  icir?: number | null;
-  series?: { ic?: { dates: string[]; cum_ic: number[] } };
+  report_url?: string | null;
+  series?: { ic?: { dates: string[]; cum_ic: number[] } } | null;
 };
 
 /** 内置 / 配置来源的因子是种子数据，不能原地覆盖 —— 保存时强制换名 */
@@ -63,40 +68,29 @@ export default function FactorEditorPage() {
   const clobbersSeed = seedName !== null && name === seedName;
   const canSave = api.canSave && nameValid && !clobbersSeed && !busy;
 
-  // 评价任务轮询：404 = 还没跑完，继续等；拿到结果就停。
-  // 必须有次数上限：任务若在服务端抛错，结果接口会永远 404（只有成功路径落结果），
-  // 没有上限就会一直显示"运行中"骗人。
+  // 评价任务流：与因子库 / 因子详情页同一机制（WS /ws/jobs/{id}）——进度、终态
+  // result、失败 error 一次拿全。取代此前 3s × 100 的 REST 轮询：轮询既读错了
+  // 信封契约（结果恒为 —），任务失败时又只能空转到 5 分钟超时。
+  const evalStream = useJobStream<EvalMetrics>(evalJob?.id ?? null);
+
   useEffect(() => {
-    if (!evalJob || evalResult) return;
-    let alive = true;
-    let attempts = 0;
-    const stop = (error: string) => {
-      if (!alive) return;
+    if (!evalJob) return;
+    if (evalStream.error) {
+      setEvalError(evalStream.error);
       setEvalJob(null);
-      setEvalError(error);
-    };
-    const tick = async () => {
-      attempts += 1;
-      if (attempts > MAX_POLLS) {
-        stop(`评价任务 ${evalJob.id} 超时未出结果，请到「任务管理」查看`);
-        return;
-      }
-      try {
-        const result = await get<EvalMetrics>(`/factors/evaluate/${evalJob.id}`);
-        if (alive) setEvalResult(result);
-      } catch (e: unknown) {
-        // 只有 404 代表"任务还没跑完"；其他错误直接如实报出来
-        if (e instanceof ApiError && e.status === 404) return;
-        stop(`评价结果读取失败：${e instanceof Error ? e.message : String(e)}`);
-      }
-    };
-    const handle = setInterval(tick, POLL_MS);
-    void tick();
-    return () => {
-      alive = false;
-      clearInterval(handle);
-    };
-  }, [evalJob, evalResult]);
+      return;
+    }
+    if (evalStream.result) {
+      setEvalResult(evalStream.result);
+      setEvalJob(null);
+      return;
+    }
+    if (evalStream.done) {
+      // not_found / canceled 等无 result 的终态：如实报错，不无限显示"运行中"
+      setEvalError(`评价任务异常结束（${evalStream.status ?? 'unknown'}）`);
+      setEvalJob(null);
+    }
+  }, [evalJob, evalStream.error, evalStream.result, evalStream.done, evalStream.status]);
 
   const handleOpen = useCallback(
     async (factor: FactorListItem) => {
@@ -340,19 +334,43 @@ export default function FactorEditorPage() {
         ) : null}
 
         {evalJob && !evalResult ? (
-          <p className="mt-3 text-xs text-ink-faint">
-            评价任务 {evalJob.id} 运行中…（结果出来后自动显示）
-          </p>
+          <div className="mt-3 w-72 space-y-1">
+            {evalStream.progress && evalStream.progress.total > 0 ? (
+              <ProgressBar
+                pct={(evalStream.progress.done / evalStream.progress.total) * 100}
+                phase={evalStream.progress.phase}
+              />
+            ) : null}
+            <p className="text-xs text-ink-faint">
+              评价任务 {evalJob.id} 运行中…（结果出来后自动显示）
+            </p>
+          </div>
         ) : null}
 
         {evalResult ? (
           <div className="mt-3 space-y-3">
-            <div className="flex gap-8 border-t border-line pt-3">
-              <Stat label="IC 均值" value={fmt(evalResult.ic_mean)} />
+            <div className="flex flex-wrap items-center gap-8 border-t border-line pt-3">
+              <Stat label="IC 均值" value={fmt(evalResult.ic?.mean)} />
               <Stat label="RankIC 均值" value={fmt(evalResult.rank_ic_mean)} />
-              <Stat label="ICIR" value={fmt(evalResult.icir)} />
+              <Stat label="ICIR" value={fmt(evalResult.ic?.ir)} />
+              {evalResult.report_url ? (
+                <a
+                  className="text-xs text-indigo underline"
+                  href={evalResult.report_url}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  查看完整报告 ↗
+                </a>
+              ) : null}
+              <a className="text-xs text-ink-faint underline" href="/tasks">
+                任务管理
+              </a>
             </div>
             {icChart ? <Chart option={icChart} height={220} /> : null}
+            <p className="text-xs text-ink-faint">
+              更完整的指标与图表见「因子」页的快速评价，「任务管理」可取消或查看历史任务。
+            </p>
           </div>
         ) : null}
       </Panel>

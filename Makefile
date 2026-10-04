@@ -99,7 +99,7 @@ api:
 	.venv/bin/uvicorn lquant.server.main:app --reload --port 8000
 
 worker:
-	.venv/bin/rq worker lquant-default lquant-ingest --url redis://localhost:6379/0
+	.venv/bin/rq worker lquant-default lquant-ingest lquant-mining --url redis://localhost:6379/0
 
 web:
 	cd web && npm run dev

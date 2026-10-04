@@ -202,10 +202,10 @@ monitor/worker.py:65-66  可选：GENERAL_QUEUES 增加 lquant-mining，或新�
 
 **B2. 统一结果读取契约（P0）**
 
-两个选项，建议 A：
+两个选项：
 
-- **A（最小、推荐）**：`GET /factors/evaluate/{job_id}` 直接返回扁平 metrics（即现在的 `result`），另留 `GET /factors/evaluate/{job_id}/meta` 给需要 `params` 的调用方。同步把 `FactorPanel.openResult` 从 `r.result.report_url` 改为 `r.report_url`。前端各处读法随即一致，编辑器顺带修好。
-- B：保留信封，前端全部走 `useJobStream`，REST 只当兜底并统一解包。
+- A：`GET /factors/evaluate/{job_id}` 直接返回扁平 metrics（即现在的 `result`），另留 meta 端点给需要 `params` 的调用方。会改后端契约，`test_factor_eval_task.py:98` 已断言信封 `body["result"]`，属破坏性变更。
+- **B（P0 实际采用）**：保留信封不动，前端统一「评价结果走 WS」——编辑器改用与因子库/详情页相同的 `useJobStream`，彻底不再读 REST 信封；`FactorPanel.openResult` 保持读 `r.result.report_url` 的既有正确写法。零后端破坏，且顺带拿到进度、失败态与刷新重连。
 
 无论选哪个，**字段名 `ic_mean/icir` → `ic.mean/ic.ir` 必须改**（§3.1）。
 
@@ -325,3 +325,28 @@ curl -s "http://127.0.0.1:8000/api/tasks?kind=factor&limit=20"
 # 编辑器实际拿到的结果形状（信封，顶层没有 ic_mean）
 curl -s "http://127.0.0.1:8000/api/factors/evaluate/factor-eval-BETA10_copy"
 ```
+
+---
+
+## 6. P0 实施记录（本分支已落地）
+
+P0 只做「让评价真的能跑 + 编辑器结果能显示」，未动任务中心的可管理性（B3/B4 仍属 P1）。
+
+| # | 改动 | 文件 | 说明 |
+|---|---|---|---|
+| 1 | worker 订阅 `lquant-mining` | `scripts/dev.sh:17-21`、`Makefile:101-102`、`lquant.sh:523-527` | 原注释写着 factor 队列却漏订阅；补上后 Redis 模式下评价/挖掘才真正被执行 |
+| 2 | 评价结果改走 WS（与因子库/详情页同一机制） | `web/src/app/factors/editor/page.tsx` | 删除 3s×100 的 REST 轮询；`EvalMetrics` 改为后端真实扁平结构；字段名 `ic_mean→ic.mean`、`icir→ic.ir`；补 `ProgressBar`、报告外链、任务管理入口；失败/`not_found` 立即如实报错 |
+| 3 | 挖掘 `job_id = run_id` | `src/lquant/server/api/factors.py:1312-1317` | 响应 `task_id` 从此就是队列 job id，前端 `useJobStream(task_id)` 不再收到 `not_found` |
+| 4 | 回归测试 | `web/src/app/factors/editor/__tests__/page.test.tsx`（新增，5 例）、`tests/unit/test_api_cov_factors.py::test_mine_run_async_placeholder`（补 job id 断言） | 编辑器评价路径此前**零测试覆盖**；新测试用真实 WS 帧形状锁住字段读取，旧实现下必然失败 |
+
+验证：
+
+- `web`: `npx vitest run` → 89 files / 562 tests 全绿；`npx tsc --noEmit` 通过。
+- `backend`: `test_api_cov_factors.py`、`test_factor_eval_task.py`、`test_api_factor_crud.py`、`test_factor_edit_api.py`、`test_monitor_cli.py`、`test_monitor_queries_gap.py` 全绿。
+
+已知局限（留给 P1）：
+
+- `lq worker` supervisor（`monitor/worker.py:65-66`）仍不含 mining 组；`lquant.sh` 靠并行的普通 `rq worker` 覆盖。挖掘 worker 与 ingest 同进程，长挖掘可能阻塞数据任务，建议 P1 拆独立 mining worker 组。
+- 编辑器仍不显示历史评价、无取消按钮（P1 的 F1/F2/F4）。
+- 任务中心依旧显示不出因子名（P1 的 B3）。
+

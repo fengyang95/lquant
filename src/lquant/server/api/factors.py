@@ -1311,8 +1311,11 @@ def mine_run(req: MineIn) -> dict:
         return _run_mine_job(req.agent, req.generator, req.n, run_id=_new_run_id())
     run_id = _new_run_id()
     _mine_placeholder(run_id, req.agent, req.generator)
+    # job_id=run_id：响应里的 task_id 必须就是队列 job id，否则前端拿 task_id 订阅
+    # /ws/jobs/{id} 只会收到 not_found，幸存因子永远回不来（此前 job_id 留空，
+    # enqueue 另生成随机 id，与 run_id 不一致）。
     enqueue("lquant-mining", _run_mine_job, req.agent, req.generator, req.n,
-            run_id=run_id)
+            run_id=run_id, job_id=run_id)
     return JSONResponse(status_code=202, content={
         "status": "queued", "task_id": run_id, "agent": req.agent,
         "generator": req.generator, "n": req.n})
