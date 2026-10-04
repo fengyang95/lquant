@@ -3,6 +3,8 @@
 全部离线：行情/日线均 monkeypatch，不打真实接口。
 """
 
+import datetime
+
 import polars as pl
 import pytest
 
@@ -13,6 +15,19 @@ from lquant.paper.quotes import _parse_item, limit_prices
 @pytest.fixture(autouse=True)
 def _paper_db(tmp_path, monkeypatch):
     monkeypatch.setenv("LQ_PAPER_DB", str(tmp_path / "paper.db"))
+
+
+# 盘中 tick 只在**交易日**落 intraday 净值（非交易日不落，见 paper/service.py 的
+# _is_trading_day 门禁），而 today_cn() 取真实日期 —— 于是周末/节假日跑这几个
+# 用例必然失败（本次就是周日，且撞上国庆假期）。把「今天」和交易日判定一起
+# 钉死，用例就不再依赖运行日期。
+_FROZEN_DAY = datetime.date(2026, 9, 30)
+
+
+@pytest.fixture(autouse=True)
+def _freeze_trading_day(monkeypatch):
+    monkeypatch.setattr(service, "today_cn", lambda: _FROZEN_DAY)
+    monkeypatch.setattr(service, "_is_trading_day", lambda d: True)
 
 
 # ---------- 行情快照 ----------
