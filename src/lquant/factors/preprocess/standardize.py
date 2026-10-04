@@ -85,8 +85,9 @@ def minmax(df: pl.DataFrame, col: str, *, by: str = "trade_date",
         notes="截面排名归一化。to=uniform → [0,1]（已 clip 到 0.5/n ~ 1-0.5/n）；"
               "to=normal → 近似标准正态（逆正态变换，Acklam 近似，不用 scipy）。"
               "Rank 同时完成标准化与非线性压缩，是 A 股最常用口径。",
-        zero_variance="排名对「全值相同」仍给出 1..n 的确定序（依赖行序），不产生 null 或 0；"
-                      "此时结果**不含信息**，是真·无信号，而非数值退化。")
+        zero_variance="全值相同时 rank('average') 给所有样本**同一个**平均秩 → "
+                      "pct 恒为 (n+1)/(2n)，输出是一个常数（n=4 时 0.625 → 0.3186），"
+                      "不产生 null。结果是常量、**不含信息**，是真·无信号，而非数值退化。")
 def rank(df: pl.DataFrame, col: str, *, by: str = "trade_date",
          to: str = "uniform") -> pl.DataFrame:
     """截面排名归一化。to=uniform → [0,1]；to=normal → 近似标准正态。

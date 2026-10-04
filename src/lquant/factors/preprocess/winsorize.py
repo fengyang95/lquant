@@ -11,6 +11,7 @@ from __future__ import annotations
 import polars as pl
 
 from lquant.factors.preprocess.registry import method
+from lquant.factors.preprocess.standardize import _inv_norm
 
 _MAD_K = 1.4826  # MAD → 标准差的一致性修正（正态分布下）
 MAD_K = _MAD_K   # 公开名：供 API/前端/交叉验证脚本引用，避免各处重复硬编码
@@ -102,6 +103,73 @@ def clip(df: pl.DataFrame, col: str, *, by: str = "trade_date",
          lo: float = -10.0, hi: float = 10.0) -> pl.DataFrame:
     """固定上下界。适合已经标准化过、只需兜底的场景。"""
     return df.with_columns(pl.col(col).clip(lo, hi))
+
+
+@method("huber", stage="winsorize", label="Huber 截断", params={"c": 2.0, "scale": "std"},
+        formula="mean ± c × scale，其中 scale=std（默认）或 1.4826×MAD",
+        notes=(
+            "在 z 空间按 sign(z)·min(|z|, c) 截断再映射回原量纲。"
+            "**默认 scale='std' 与 AlphaPurify huber_winsorize(c=2.0) 完全对齐**"
+            "（它用截面 mean/std，见 APr_utils.huber_winsorize）。"
+            "但要注意：用 std 时这个方法**并不稳健** —— 极值会把 std 撑大，"
+            "截断点随之被拉远（masking 效应），与它的名字/文档宣称的『robust』不符。"
+            "要真正稳健请显式传 scale='mad'（用 1.4826×MAD 估尺度）。"
+            "c 的常用区间 1.5~3；越小压缩越强。"
+        ),
+        zero_variance="scale≈0（全截面同值）时用 1.0 兜底 → 输出恒等于截面均值（z=0 被截断到 0 后映射回均值）。")
+def huber(df: pl.DataFrame, col: str, *, by: str = "trade_date", c: float = 2.0,
+          scale: str = "std") -> pl.DataFrame:
+    """Huber 型截断：z 空间裁到 ±c 再映射回原量纲。
+
+    ``scale="std"``（默认）与 AlphaPurify 口径一致；
+    ``scale="mad"`` 用 1.4826×MAD 估尺度，才是真正抗极值的版本
+    （std 会被极值撑大，导致该截的没截住）。
+    """
+    if c <= 0:
+        raise ValueError(f"c 必须为正，收到 {c}")
+    if scale not in ("std", "mad"):
+        raise ValueError(f"未知 scale {scale!r}（可选 std/mad）")
+    mean = pl.col(col).mean().over(by)
+    if scale == "mad":
+        med = pl.col(col).median().over(by)
+        dev = (pl.col(col) - med).abs().median().over(by) * MAD_K
+        raw = _safe_scale(dev, pl.col(col).std().over(by))
+    else:
+        raw = pl.col(col).std().over(by)
+    sd = _safe_scale(raw, pl.lit(1.0))
+    z = (pl.col(col) - mean) / sd
+    clipped = pl.when(z.abs() > c).then(z.sign() * c).otherwise(z)
+    return df.with_columns((clipped * sd + mean).alias(col))
+
+
+@method("rankgauss", stage="winsorize", label="RankGauss（分位正态化）",
+        params={"clip": 1e-6},
+        formula="q = clip((rank_avg − 0.5) / n, clip, 1−clip); x' = Φ⁻¹(q)",
+        notes=(
+            "即分位正态化（quantile normalization）。分位点用 **Hazen 绘图位置**"
+            "``(rank−0.5)/n``，与 AlphaPurify rankgauss_winsorize 完全一致。"
+            "逆正态用本仓既有的 Acklam 近似（``standardize._inv_norm``，精度 ~1e-9），"
+            "**不引 scipy**。"
+            "与 ``standardize.rank(to='normal')`` 的区别：后者用 ``rank/n`` 并 clip 到"
+            "``[0.5/n, 1−0.5/n]``（Blom 风格），同一个 rank 会得到不同的分位点"
+            "（n=10、rank=1 时 Hazen 0.05 vs Blom 0.10）。两者都是合法约定，"
+            "但**不可混用**；要复现 AlphaPurify 请用本方法。"
+        ),
+        zero_variance="全截面同值时 rank('average') 给所有样本**同一个**平均秩 → "
+                      "分位点相同 → 输出恒为该分位对应的常数（n=6 时 (3.5−0.5)/6=0.5 → 0.0）。"
+                      "结果是常量、**不含信息**，是真·无信号，而非数值退化。")
+def rankgauss(df: pl.DataFrame, col: str, *, by: str = "trade_date",
+              clip: float = 1e-6) -> pl.DataFrame:
+    """RankGauss：截面排名 → Hazen 分位 → 逆正态。
+
+    同时完成标准化与非线性压缩，对重尾分布比 z-score 稳健得多。
+    """
+    if not (0.0 < clip < 0.5):
+        raise ValueError(f"clip 必须在 (0, 0.5)，收到 {clip}")
+    n = pl.col(col).count().over(by)
+    q = ((pl.col(col).rank("average").over(by) - 0.5) / n).clip(clip, 1 - clip)
+    return df.with_columns(
+        q.map_elements(_inv_norm, return_dtype=pl.Float64).alias(col))
 
 
 @method("none", stage="winsorize", label="不去极值",
