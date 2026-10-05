@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { useEffect, useState } from 'react';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -186,6 +186,16 @@ describe('回测工作台 page', () => {
 // 而已处于新建态时再点，若每个 setState 都是原值，React 会 bail out，
 // DOM 零变化，按钮看起来完全失灵。
 describe('回测工作台「新建」复位', () => {
+  // 这些用例先把编辑器改脏再点「新建」。加了丢弃保护后，dirty 时会先弹
+  // 确认框（jsdom 的 window.confirm 默认返回 false → 新建会被拦下）。
+  // 这里显式同意丢弃，聚焦「复位是否彻底」这个断言目标。
+  beforeEach(() => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   async function editFieldsThenNew() {
     render(<Page />);
     const name = await screen.findByLabelText('策略名称');
@@ -223,6 +233,8 @@ describe('回测工作台「新建」复位', () => {
 // 当前编辑器的旧 params，切到另一个策略会一载入就误报「●未保存」。
 describe('回测工作台载入策略的 dirty 基准', () => {
   it('载入 config 带 start/end 的策略 → 回填该日期且不误报未保存', async () => {
+    // 载入前编辑器已被改脏，载入保护会先确认；这里同意丢弃以聚焦基准断言
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
     setUserStrategies([{ id: 's1', name: '甲策略', source: 'user' }]);
     getMock.mockImplementation((path: string) => {
       if (path === '/strategies/s1') {

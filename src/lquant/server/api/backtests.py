@@ -408,6 +408,10 @@ def _run_code_job(payload: dict, cancel_check=None, progress=None) -> dict:
                       benchmark=payload.get("benchmark") or "000300.SH",
                       factor_formulas=payload.get("factor_formulas") or None,
                       timeout_s=JQ_CODE_TIMEOUT_S)
+    # 回测是耗时最长的一段，必须单独报一个阶段：否则进度会长时间停在
+    # "读取日线"，前端看起来和卡死没有区别。
+    if progress is not None:
+        progress(phase="运行策略")
     res = runner.run(df)
     if res.error:
         raise ValueError(res.error)
@@ -469,7 +473,12 @@ def run_jq_code(req: JQCodeIn) -> dict:
 
 @router.get("/run-code/{job_id}")
 def get_run_code_status(job_id: str) -> dict:
-    """轮询 run-code 任务：queued → running → done(带 run_id/摘要) / failed(带 error)。"""
+    """轮询 run-code 任务：queued → running → done(带 run_id/摘要) / failed(带 error)。
+
+    progress 一并返回（阶段名 + done/total）：回测要跑几十秒，前端此前只能显示
+    "执行中…"，用户无法区分"在正常跑"和"卡死了"。进度由 enqueue 按签名注入的
+    progress 回调写入，读取失败按无进度处理，不影响状态轮询本身。
+    """
     job = get_job(job_id)
     if job is None:
         raise HTTPException(404, f"未找到回测任务 {job_id}")
@@ -484,9 +493,34 @@ def get_run_code_status(job_id: str) -> dict:
         exc = getattr(job, "exc_info", None)
         error = exc if isinstance(exc, str) and exc.strip() else (str(exc) if exc else None)
     out: dict = {"job_id": job_id, "status": status, "error": error}
+    try:
+        from lquant.server.progress import get_progress
+
+        out["progress"] = get_progress(job_id)
+    except Exception:  # noqa: BLE001 - 进度是附加信息，取不到不该拖垮状态轮询
+        out["progress"] = None
     if status == "done" and isinstance(result, dict):
         out.update(result)
     return out
+
+
+@router.post("/run-code/{job_id}/cancel")
+def cancel_run_code(job_id: str) -> dict:
+    """请求取消 run-code 任务（协作式：执行体在阶段边界轮询探针收尾）。
+
+    本地降级线程无法强杀，cancel 只置标记 + 结果丢弃；任务体不配合时线程会
+    跑到自然结束。已终态（done/failed）返回 409，与 ml/qlib 的取消语义一致。
+    """
+    from lquant.server.jobs import request_cancel
+
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(404, f"未找到回测任务 {job_id}")
+    if job.get_status() in ("finished", "failed", "canceled"):
+        raise HTTPException(409, f"任务已结束（{job.get_status()}），不可取消")
+    if not request_cancel(job_id):
+        raise HTTPException(409, f"任务不可取消: {job_id}")
+    return {"job_id": job_id, "canceled": True}
 
 
 @router.get("/{run_id}/code")
