@@ -150,10 +150,22 @@ def test_factor_report_outlier_stats_only() -> None:
 def test_factor_report_optional_sections() -> None:
     df = _panel(n_days=80, n_sym=10)
     html = rep.factor_report(
-        df, "f", cat_col="symbol", group_col="grp", bps_list=[5.0, 10.0])
+        df, "f", cat_col="grp", group_col="grp", bps_list=[5.0, 10.0])
     assert "归因分解" in html
     assert "分组 IC" in html
     assert "成本敏感性" in html
+
+
+def test_factor_report_refuses_symbol_attribution() -> None:
+    """不变量：归因维度必须是分类维度。
+
+    按个股算「行业暴露」是上一轮的静默错误（写着「越接近 0 说明中性化越干净」，
+    算的却是个股维度）。调用方传错也不能默默产出无意义输出 —— 本节跳过并留痕。
+    """
+    html = rep.factor_report(_panel(n_days=80), "f", cat_col="symbol")
+    assert "<h2>归因分解" not in html
+    assert "归因维度 &#x27;symbol&#x27; 是个股维度" in html
+    assert "本节生成失败" in html
 
 
 def test_factor_report_turnover_section() -> None:
@@ -196,8 +208,8 @@ def test_factor_report_optional_sections_failure_is_disclosed(
     monkeypatch.setattr(rep, "ic_by_group", boom)
     monkeypatch.setattr(rep, "factor_turnover", boom)
     monkeypatch.setattr(rep, "cost_matrix", boom)
-    html = rep.factor_report(_panel(), "f", cat_col="symbol",
-                             group_col="symbol", bps_list=[5.0])
+    html = rep.factor_report(_panel(), "f", cat_col="grp",
+                             group_col="grp", bps_list=[5.0])
     assert "归因分解" not in html
     assert "分组 IC" not in html
     assert "换手率" not in html

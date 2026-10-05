@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import html
 import math
 from datetime import datetime
@@ -28,6 +29,12 @@ import polars as pl
 from lquant.factors.evaluate.attribution import attribution_summary
 from lquant.factors.evaluate.costs import cost_matrix, factor_turnover
 from lquant.factors.evaluate.decay import decay_profile, half_life, suggest_rebalance
+from lquant.factors.evaluate.defaults import (
+    DEFAULT_EVENT_WINDOW,
+    DEFAULT_N_GROUPS,
+    DEFAULT_WINDOW,
+)
+from lquant.factors.evaluate.defaults import decay_horizons as _decay_horizons
 from lquant.factors.evaluate.event_study import event_study_summary
 from lquant.factors.evaluate.group_ic import ic_by_group
 from lquant.factors.evaluate.ic import ic_by_year, ic_series, ic_summary
@@ -69,6 +76,36 @@ _STEP_LABELS = {
     "winsorize": "去极值", "standardize": "标准化",
     "neutralize": "中性化", "orthogonalize": "正交化",
 }
+# 内部列名 → 用户面文案（R14）。报告是给人看的，`cov_industry_sw1`
+# 这种 DataFrame 内部列名不该出现在正文里。
+_CAT_LABELS = {
+    "cov_industry_sw1": "申万一级行业",
+    "industry_sw1": "申万一级行业",
+    "cov_industry_sw2": "申万二级行业",
+    "industry_sw2": "申万二级行业",
+    "symbol": "个股",
+    "market_cap": "市值分组",
+    "cov_market_cap": "市值分组",
+    "turnover_1m": "换手率分组",
+    "cov_turnover_1m": "换手率分组",
+    "momentum_1m": "动量分组",
+    "cov_momentum_1m": "动量分组",
+}
+
+
+def _cat_label(col: str | None) -> str:
+    """归因/分组维度的用户面名称。"""
+    return _CAT_LABELS.get(str(col or ""), str(col or ""))
+
+
+def _ret_label(ret_col: str) -> str:
+    """``fwd_ret_5`` → ``5 日前瞻收益``（未知列名原样返回）。"""
+    s = str(ret_col)
+    if s.startswith("fwd_ret_"):
+        h = s[len("fwd_ret_"):]
+        if h.isdigit():
+            return f"{h} 日前瞻收益"
+    return s
 
 
 # --------------------------------------------------------------------------- #
@@ -418,15 +455,23 @@ def _conclusion_html(rating: dict | None, robustness: dict | None,
             })
         if rows:
             parts.append(_rows_table(rows))
+    elif rating:
+        # L3 稳健性没跑 ≠ 稳健性通过。不写清楚，读者会默认「没提就是没问题」。
+        parts.append(_hint(
+            "L3 稳健性（参数扰动 / 分段稳定 / 起点敏感 / 月度剔除 / OOS 衰减）"
+            "本次<b>未运行</b> —— 上面的评级只基于 L2 判据（IC / 分层单调性 / 多空）。"
+            "需要 L3 证据请在请求里打开 with_robustness。"))
     return "\n".join(parts)
 
 
 def _provenance_html(*, display_name: str, expr: str, universe: str,
                      data_start, data_end, n_samples, ret_col: str,
                      steps, covariates, sample_filters, window: int,
-                     n_groups: int, generator_version: str) -> str:
+                     n_groups: int, generator_version: str,
+                     decay_horizons: list[int] | None = None,
+                     description: str = "") -> str:
     """样本与口径：报告的身份与前提条件。"""
-    uni = universe_label(universe) if universe else "全部"
+    uni = universe_label(universe) if universe else "全市场"
     if data_start is not None and data_end is not None:
         rng = f"{data_start} ~ {data_end}"
     elif data_start is not None:
@@ -457,11 +502,14 @@ def _provenance_html(*, display_name: str, expr: str, universe: str,
 
     kv = [
         ("因子表达式", expr or display_name),
+        ("经济含义", description or "未提供（因子未注册或未填写描述）"),
         ("股票池", uni),
         ("数据区间", rng),
         ("样本量", _fmt_int(n_samples) if n_samples is not None else "未提供"),
-        ("前瞻收益列", ret_col),
+        ("前瞻收益列", _ret_label(ret_col)),
         ("分层组数", f"{n_groups} 组"),
+        ("衰减阶梯", "、".join(f"{h} 日" for h in decay_horizons)
+         if decay_horizons else "未提供"),
         ("滚动窗口", f"{window} 交易日"),
         ("预处理配方", recipe),
         ("协变量覆盖率", cov),
@@ -470,6 +518,10 @@ def _provenance_html(*, display_name: str, expr: str, universe: str,
     rows = "".join(f'<dt>{_esc(k)}</dt><dd>{_esc(v)}</dd>' for k, v in kv)
     html_parts = ["<h2>样本与口径</h2>", f'<dl class="kv">{rows}</dl>']
     if filter_rows:
+        html_parts.append("<h3>样本过滤</h3>")
+        html_parts.append(_hint(
+            "ST / 停牌剔除的开关状态与依据列 —— 打开会改变 IC 与分层口径，"
+            "因此默认关闭，且必须在此披露到底剔没剔。"))
         html_parts.append(_rows_table(filter_rows))
     else:
         html_parts.append(_hint("样本过滤：未做 ST / 停牌剔除。"))
@@ -493,7 +545,7 @@ def _errors_html(errors: dict) -> str:
 # 主入口
 # --------------------------------------------------------------------------- #
 def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
-                  price_col: str = "close", n_groups: int = 10,
+                  price_col: str = "close", n_groups: int = DEFAULT_N_GROUPS,
                   date_col: str = "trade_date", symbol_col: str = "symbol",
                   horizons: list[int] | None = None,
                   cat_col: str | None = None,
@@ -502,7 +554,7 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
                   universe: str = "",
                   filter_zscore: float | None = None,
                   outlier_stats: dict | None = None,
-                  event_window: tuple[int, int] | None = (10, 15),
+                  event_window: tuple[int, int] | None = DEFAULT_EVENT_WINDOW,
                   # ---- 身份与口径 ----
                   display_name: str | None = None,
                   expr: str = "",
@@ -510,13 +562,15 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
                   steps: list[dict] | None = None,
                   covariates: dict | None = None,
                   sample_filters: list[dict] | None = None,
-                  window: int = 60,
+                  window: int = DEFAULT_WINDOW,
+                  description: str = "",
                   # ---- 结论 ----
                   rating: dict | None = None,
                   robustness: dict | None = None,
                   # ---- 调用方已算好的内容块 ----
                   extras: dict | None = None,
-                  generator_version: str = REPORT_GENERATOR_VERSION) -> str:
+                  generator_version: str = REPORT_GENERATOR_VERSION,
+                  generated_at: str | None = None) -> str:
     """生成因子研究报告 HTML。
 
     ``factor`` 是 DataFrame 里的列名；``display_name`` / ``expr`` 是**用户面**
@@ -527,12 +581,20 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
     ``filter_zscore`` 提供时先做截面异常收益过滤（口径同 alphalens）；
     ``event_window=(before, after)`` 输出事件式分层收益图，None 则跳过。
 
-    ``steps`` / ``covariates`` / ``sample_filters`` 用于「样本与口径」披露；
-    ``rating`` / ``robustness`` 用于「结论」节。
+    ``steps`` / ``covariates`` / ``sample_filters`` / ``description`` 用于
+    「样本与口径」披露；``rating`` / ``robustness`` 用于「结论」节 ——
+    ``robustness=None`` 时报告会写明「L3 未运行」（没跑 ≠ 通过）。
 
     ``extras`` 承载调用方已经算好的内容块（避免报告重算）：
     ``excess`` / ``top_n`` / ``style_corr`` / ``neutral_ladder`` /
     ``neutral_views`` / ``group_ic_size`` / ``capacity``。
+
+    ``horizons`` 是 IC 衰减的**持有期阶梯**（``None`` → 平台默认，见
+    ``defaults.DEFAULT_DECAY_HORIZONS``）。``generated_at`` 可注入以便测试
+    与「陈旧报告」判定；缺省取当前时间。
+
+    不变量：``cat_col`` 不得等于 ``symbol_col`` —— 按个股做「行业暴露」没有
+    可解释含义，报告会跳过该节并留痕，而不是产出无意义表格。
 
     任何可选小节抛错都会被记录并在报告顶部渲染「本节生成失败」横幅。
     """
@@ -542,6 +604,8 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
     errors: dict[str, str] = {}
     extras = dict(extras or {})
     display_name = display_name or factor
+    # 生成时间可控（便于测试与「陈旧报告」判定）：默认取当前本地时间到分钟。
+    generated_at = generated_at or datetime.now().strftime("%Y-%m-%d %H:%M")
     steps = list(steps) if steps else []
     cov = dict(covariates) if covariates else {}
     # sample_filters 既接受「开关 spec」（dict，由报告自己描述），
@@ -572,21 +636,39 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
         )
 
     # ---- 核心计算（失败即抛：这些算不出来报告没有意义） ----
+    ladder = _decay_horizons(horizons)
+    # 数据区间：调用方没给就用帧里实际的起止日 —— 「2026-01-01 起」
+    # 不如「2026-01-01 ~ 2026-10-04」能自证样本范围（A3）。
+    if date_col in df.columns and len(df):
+        with contextlib.suppress(Exception):
+            if data_end is None:
+                data_end = str(df[date_col].max())
+            if data_start is None:
+                data_start = str(df[date_col].min())
     ic = ic_summary(df, factor, ret_col, date_col=date_col)
     qs = quantile_summary(df, factor, ret_col, n_groups, date_col=date_col)
-    prof = decay_profile(df, factor, horizons, price_col=price_col,
+    prof = decay_profile(df, factor, ladder, price_col=price_col,
                          date_col=date_col, symbol_col=symbol_col)
     hl = half_life(prof)
     yearly = ic_by_year(df, factor, ret_col, date_col=date_col)
     rw = rolling_ic(df, factor, ret_col, window, date_col=date_col)
 
     # ---- 可选小节：算炸了要留痕 ----
+    # 不变量：归因维度必须是**分类**维度。按个股做「行业暴露」是上一轮
+    # A1 的静默错误（写着「越接近 0 说明中性化越干净」，算的却是个股维度），
+    # 这里由报告自己守住，而不是靠调用方自觉。
     attr = None
     cc = cat_col or next(
         (c for c in ("industry_sw1", "cov_industry_sw1") if c in df.columns), None)
     if cc is not None:
-        attr = _safe(errors, "attribution", attribution_summary,
-                     df, factor, ret_col, date_col=date_col, cat_col=cc)
+        if str(cc) == symbol_col:
+            errors["attribution"] = (
+                f"归因维度 {cc!r} 是个股维度，不是分类维度 —— 已跳过归因分解"
+                "（按个股算「行业暴露」没有可解释含义；请传行业/市值等分类列）")
+            cc = None
+        else:
+            attr = _safe(errors, "attribution", attribution_summary,
+                         df, factor, ret_col, date_col=date_col, cat_col=cc)
 
     gi = None
     if group_col and group_col in df.columns:
@@ -683,7 +765,7 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
     exp = attr.get("industry_exposure") if isinstance(attr, dict) else None
     if exp is not None and len(exp):
         attr_html = (
-            f'<h2>归因分解 · {_esc(cc)}</h2>'
+            f'<h2>归因分解 · {_esc(_cat_label(cc))}</h2>'
             f'<p class="hint">多空行业暴露总和 {_fmt(attr["gross_exposure"])}'
             f'（越接近 0 说明中性化越干净）。按 |暴露| 降序，全量展示不截断。</p>'
             + _table(exp, limit=None,
@@ -705,7 +787,7 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
     # ---- 分组 IC（行业） ----
     gi_html = ""
     if gi is not None and len(gi):
-        gi_html = (f'<h2>分组 IC · {_esc(group_col)}</h2>'
+        gi_html = (f'<h2>分组 IC · {_esc(_cat_label(group_col))}</h2>'
                    f'<p class="hint">按组分别算 IC：若某组（如小市值）独占全部信号，'
                    f'因子收益其实是该组暴露 —— 全样本 IC 会掩盖这一点。'
                    f'按 |IC| 降序，全量展示不截断。</p>'
@@ -768,7 +850,8 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
             data_start=data_start, data_end=data_end, n_samples=n_samples,
             ret_col=ret_col, steps=steps, covariates=cov,
             sample_filters=filters, window=window, n_groups=n_groups,
-            generator_version=generator_version),
+            generator_version=generator_version, decay_horizons=ladder,
+            description=description),
         _errors_html(errors),
         outlier_html,
         _core_html(icv, ric, hl, qs, ls),
@@ -804,6 +887,8 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="lquant-report-generator" content="{_esc(generator_version)}">
+<meta name="lquant-report-generated-at" content="{_esc(generated_at)}">
 <title>因子研究报告 · {_esc(display_name)}</title>
 <style>
 *{{box-sizing:border-box}}
@@ -857,8 +942,8 @@ footer{{margin-top:40px;color:#999;font-size:12px}}
 }}
 </style></head><body><div class="wrap">
 <h1>因子研究报告 · {_esc(display_name)}</h1>
-<div class="sub">股票池 {_esc(universe_label(universe) if universe else "全部")} ·
-前瞻收益 {_esc(ret_col)} · 生成于 {datetime.now().strftime("%Y-%m-%d %H:%M")} ·
+<div class="sub">股票池 {_esc(universe_label(universe) if universe else "全市场")} ·
+{_esc(_ret_label(ret_col))} · 生成于 {_esc(generated_at)} ·
 报告版本 {_esc(generator_version)}</div>
 
 {sections}

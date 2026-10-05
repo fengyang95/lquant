@@ -23,6 +23,12 @@ from lquant.core.errors import FactorError
 from lquant.data.store.catalog import IndexConsRepo, upsert
 from lquant.data.store.parquet import read_daily
 from lquant.factors.evaluate import evaluate, forward_return
+from lquant.factors.evaluate.defaults import (
+    DEFAULT_BPS,
+    DEFAULT_DECAY_HORIZONS,
+    DEFAULT_N_GROUPS,
+    DEFAULT_WINDOW,
+)
 from lquant.factors.preprocess.pipeline import drop_nonfinite
 
 router = APIRouter(prefix="/factors", tags=["factors"])
@@ -90,10 +96,13 @@ class EvaluateIn(BaseModel):
     factor: str = Field(default="mom20", max_length=64,
                         pattern=r"^[A-Za-z0-9_-]+")  # 报告名（防路径穿越）
     formula: str = "pct_change_20"       # 支持 pct_change_{n} / rolling_std_{n}
-    n_groups: int = Field(default=5, ge=2, le=20)
-    horizons: list[int] = Field(default=[1, 5, 10, 20], min_length=1, max_length=20)
+    n_groups: int = Field(default=DEFAULT_N_GROUPS, ge=2, le=20)
+    horizons: list[int] = Field(default=list(DEFAULT_DECAY_HORIZONS),
+                                min_length=1, max_length=20,
+                                description="衰减阶梯（交易日）：报告与序列共用同一条曲线，"
+                                            "默认与 CLI/引擎一致（1,2,3,5,10,20,40,60）")
     start: str = "2026-01-01"
-    window: int = Field(default=60, ge=20, le=250)  # 滚动窗口（交易日）
+    window: int = Field(default=DEFAULT_WINDOW, ge=20, le=250)  # 滚动窗口（交易日）
     top_ns: list[int] = Field(default=[50, 100], min_length=1, max_length=5,
                               description="Top-N 持仓收缩测试的 N 列表")
     style_threshold: float = Field(default=0.14, ge=0.0, le=1.0,
@@ -657,7 +666,7 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
     res = evaluate(d, "_factor", ret_col=ret_col, n_groups=req.n_groups,
                    horizons=req.horizons, outlier_stats=outlier_stats,
                    cat_col=cat_col, group_col=cat_col,
-                   bps_list=[0.0, 5.0, 10.0, 15.0, 30.0],
+                   bps_list=list(DEFAULT_BPS),
                    universe=req.universe, expr=req.formula, covs=cov_cols_present,
                    with_robustness=req.with_robustness,
                    with_report=False,
@@ -899,31 +908,43 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
 
     sample_filter_rows = describe_sample_filters(
         d, exclude_st=req.exclude_st, exclude_suspended=req.exclude_suspended)
-    report_html = factor_report(
-        d, "_factor", ret_col, n_groups=req.n_groups, horizons=req.horizons,
-        cat_col=cat_col, group_col=cat_col,
-        bps_list=[0.0, 5.0, 10.0, 15.0, 30.0],
-        universe=req.universe, outlier_stats=outlier_stats,
-        event_window=(req.event_window[0], req.event_window[1]),
-        display_name=req.factor, expr=req.formula,
-        data_start=req.start, data_end=req.end, n_samples=len(d),
-        steps=applied_steps, covariates=cov_map,
-        sample_filters=sample_filter_rows, window=req.window,
-        rating=res.get("rating"), robustness=res.get("robustness"),
-        extras={
-            "excess": {"dates": ex_dates, "curves": ex_curves,
-                       "benchmark": "股票池等权", "metrics": excess_metrics},
-            "top_n": top_n_rows,
-            "style_corr": style_corr,
-            "neutral_ladder": ladder,
-            "neutral_views": views,
-            "group_ic_size": {"size_col": group_ic.get("size_col"),
-                              "rows": group_ic.get("size") or []},
-            "capacity": capacity,
-        })
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = _save_report_atomic(report_html, REPORT_DIR / f"{req.factor}.html")
-    metrics["report_url"] = f"/api/factors/reports/{report_path.stem}"
+    # 经济含义（A2）：按注册名查 factor_def.description。查不到就是空串，
+    # 报告里写「未提供」—— 元信息缺失不该阻断评价。
+    from lquant.factors.meta import factor_description
+
+    desc = factor_description(req.factor) or factor_description(req.formula)
+    try:
+        report_html = factor_report(
+            d, "_factor", ret_col, n_groups=req.n_groups, horizons=req.horizons,
+            cat_col=cat_col, group_col=cat_col,
+            bps_list=list(DEFAULT_BPS),
+            universe=req.universe, outlier_stats=outlier_stats,
+            event_window=(req.event_window[0], req.event_window[1]),
+            display_name=req.factor, expr=req.formula,
+            data_start=req.start, data_end=req.end, n_samples=len(d),
+            steps=applied_steps, covariates=cov_map,
+            sample_filters=sample_filter_rows, window=req.window,
+            description=desc,
+            rating=res.get("rating"), robustness=res.get("robustness"),
+            extras={
+                "excess": {"dates": ex_dates, "curves": ex_curves,
+                           "benchmark": "股票池等权", "metrics": excess_metrics},
+                "top_n": top_n_rows,
+                "style_corr": style_corr,
+                "neutral_ladder": ladder,
+                "neutral_views": views,
+                "group_ic_size": {"size_col": group_ic.get("size_col"),
+                                  "rows": group_ic.get("size") or []},
+                "capacity": capacity,
+            })
+    except Exception as e:  # noqa: BLE001 - 报告不是评价的前置：报告炸了也要给出指标，
+        # 但必须在 errors 里留痕（UI 会渲染成故障横幅），不许静默返回一个没有报告的 200
+        report_html = None
+        errors["report"] = f"{type(e).__name__}: {e}"
+    if report_html is not None:
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        report_path = _save_report_atomic(report_html, REPORT_DIR / f"{req.factor}.html")
+        metrics["report_url"] = f"/api/factors/reports/{report_path.stem}"
     metrics["capacity"] = capacity
 
     series = {
@@ -1401,12 +1422,52 @@ def mine_run(req: MineIn) -> dict:
         "generator": req.generator, "n": req.n})
 
 
+_REPORT_VERSION_RE = re.compile(r'name="lquant-report-generator" content="([^"]*)"')
+_REPORT_AT_RE = re.compile(r'name="lquant-report-generated-at" content="([^"]*)"')
+_REPORT_HEAD_BYTES = 4096
+
+
+def _report_meta(p: Path) -> tuple[str | None, str | None]:
+    """从报告头部读「生成器版本 / 生成时间」。
+
+    只读前 4KB —— 报告中心要列几百份报告，全读会白烧 IO。
+    两个 meta 是 R15 的落地：没有它，读者无法分辨一份报告是修复前还是
+    修复后生成的（242/244 份旧产物曾是错误口径，却和新报告长得一样）。
+    """
+    try:
+        with p.open("r", encoding="utf-8", errors="replace") as f:
+            head = f.read(_REPORT_HEAD_BYTES)
+    except OSError:
+        return None, None
+    mv = _REPORT_VERSION_RE.search(head)
+    ma = _REPORT_AT_RE.search(head)
+    return (mv.group(1) if mv else None), (ma.group(1) if ma else None)
+
+
+def _report_row(p: Path) -> dict:
+    """报告中心的一行：身份 + 版本 + 生成时间 + 是否陈旧。"""
+    from lquant.factors.evaluate.report import REPORT_GENERATOR_VERSION
+
+    st = p.stat()
+    ver, gen_at = _report_meta(p)
+    return {
+        "name": p.stem,
+        "url": f"/api/factors/reports/{p.stem}",
+        "size_kb": st.st_size // 1024,
+        "generator_version": ver,
+        "generated_at": gen_at or datetime.fromtimestamp(
+            st.st_mtime).strftime("%Y-%m-%d %H:%M"),
+        "current_version": REPORT_GENERATOR_VERSION,
+        # 版本号缺失（修复前的产物）或对不上当前生成器 → 陈旧，口径可能已变
+        "stale": ver != REPORT_GENERATOR_VERSION,
+    }
+
+
 def list_reports() -> list[dict]:
     if not REPORT_DIR.exists():
         return []
-    return [{"name": p.stem, "url": f"/api/factors/reports/{p.stem}",
-             "size_kb": p.stat().st_size // 1024}
-            for p in sorted(REPORT_DIR.glob("*.html"), key=lambda x: -x.stat().st_mtime)]
+    return [_report_row(p) for p in
+            sorted(REPORT_DIR.glob("*.html"), key=lambda x: -x.stat().st_mtime)]
 
 
 @router.get("/reports")
@@ -1446,8 +1507,11 @@ def get_factor(name: str) -> dict:
         # 「历史报告」里会挂着 BETA10_copy（另一个因子）的报告。
         p = REPORT_DIR / f"{name}.html"
         if p.exists():
-            reports.append({"name": p.stem,
-                            "url": f"/api/factors/reports/{p.stem}"})
+            row = _report_row(p)
+            reports.append({"name": row["name"], "url": row["url"],
+                            "generator_version": row["generator_version"],
+                            "generated_at": row["generated_at"],
+                            "stale": row["stale"]})
     return {"name": r[0], "expression": normalize_soft(r[1]), "description": r[2],
             "created_at": str(r[3]), "source": r[4] or "manual",
             "category": r[5] or "", "reports": reports}
@@ -1494,7 +1558,7 @@ class SynthesizeIn(BaseModel):
     formulas: list[str] = Field(min_length=2, max_length=8)
     method: str = Field(default="equal", pattern="^(equal|ic_weighted)$")
     ic_horizon: int = Field(default=5, ge=1, le=20)
-    n_groups: int = Field(default=5, ge=2, le=20)
+    n_groups: int = Field(default=DEFAULT_N_GROUPS, ge=2, le=20)
     start: str = "2026-01-01"
     end: str | None = Field(default=None, description="区间终点 YYYY-MM-DD；None = 数据末端")
     universe: str = Field(default="all",
@@ -1524,21 +1588,61 @@ def synthesize(req: SynthesizeIn) -> dict:
     if not len(d):
         raise HTTPException(422, "合成因子为空 —— 公式与数据不匹配")
 
-    horizons = [1, 5, 10, 20]
+    horizons = list(DEFAULT_DECAY_HORIZONS)
     d = forward_return(d, "close", periods=horizons)
     tag = "icw" if req.method == "ic_weighted" else "eq"
     name = f"syn_{len(req.formulas)}f_{tag}"
-    cat_col = next((c for c in ("industry_sw1", "cov_industry_sw1") if c in d.columns), None)
+
+    # 协变量必须在 evaluate() 之前建：日线面板里没有行业列，不建的话
+    # cat_col 恒为 None → 归因分解与分组 IC 静默缺席（合成报告因此一直比
+    # 单因子报告薄一截）。覆盖率照旧上报到报告的「样本与口径」。
+    cov_map: dict = {}
+    try:
+        with reader() as con:
+            ind = con.execute(
+                "SELECT symbol, std, code, std_date FROM industry_classify").pl()
+    except Exception:  # noqa: BLE001 - 分类数据缺失只降级，不阻断合成
+        ind = None
+    try:
+        from lquant.factors.covariates import build_covariates
+
+        d, cov_report = build_covariates(d, ["market_cap", "industry_sw1"],
+                                         industry_df=ind)
+        cov_map = {r["covariate"]: r["coverage"] for r in cov_report}
+    except Exception:  # noqa: BLE001 - 同上
+        cov_map = {}
+
+    cat_col = next(
+        (c for c in ("cov_industry_sw1", "industry_sw1")
+         if c in d.columns and (c == "industry_sw1" or cov_map.get("industry_sw1", 0) > 0)),
+        None)
+
+    from lquant.factors.evaluate.capacity import capacity_summary
+    from lquant.factors.evaluate.sample import describe_sample_filters
+
+    capacity = None
+    try:
+        capacity = capacity_summary(d, "_syn", f"fwd_ret_{min(horizons)}",
+                                    n_groups=req.n_groups)
+    except Exception:  # noqa: BLE001 - 无成交额列时容量不可算，报告里标注即可
+        capacity = None
+
     # 合成报告此前是「最薄的一份」：不写是哪几个公式合成的、没有分组 IC /
-    # 成本 / 容量。这里补齐到与单因子报告同一套内容。
+    # 成本 / 容量 / 样本过滤披露。这里补齐到与单因子报告同一套内容。
     res = evaluate(d, "_syn", ret_col=f"fwd_ret_{min(horizons)}",
                    n_groups=req.n_groups, horizons=horizons,
                    display_name=f"合成因子 {name}",
                    expr=" + ".join(req.formulas),
+                   description=f"{req.method} 合成的合成因子，成分："
+                               + " + ".join(req.formulas),
                    data_start=req.start, data_end=req.end, n_samples=len(d),
                    cat_col=cat_col, group_col=cat_col,
-                   bps_list=[0.0, 5.0, 10.0, 15.0, 30.0],
-                   universe=req.universe)
+                   bps_list=list(DEFAULT_BPS),
+                   covariates=cov_map,
+                   sample_filters=describe_sample_filters(d),
+                   window=DEFAULT_WINDOW,
+                   universe=req.universe,
+                   extras={"capacity": capacity})
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     _save_report_atomic(res["report"], REPORT_DIR / f"{name}.html")
     ic = res["ic"]["ic"]

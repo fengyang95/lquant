@@ -8,6 +8,14 @@ import math
 
 import click
 
+# 平台级默认口径的唯一来源（见 lquant.factors.evaluate.defaults 与
+# docs/因子报告内容契约.md）：CLI / API / 报告三处默认值必须同源，
+# 否则「同一个生成器产出三种报告」。
+from lquant.factors.evaluate.defaults import DEFAULT_BPS, DEFAULT_N_GROUPS, horizons_csv
+
+DECAY_HORIZONS_CSV = horizons_csv()
+BPS_CSV = ",".join(str(int(b)) if float(b).is_integer() else str(b) for b in DEFAULT_BPS)
+
 
 @click.group()
 def factor() -> None:
@@ -55,7 +63,7 @@ def check_expr(expr: str) -> None:
 @click.argument("expr")
 @click.option("--start", default=None, help="数据窗口起点 YYYY-MM-DD")
 @click.option("--neutral/--raw", default=True, help="是否中性化（默认中性化）")
-@click.option("--n-groups", default=10, help="分层组数")
+@click.option("--n-groups", default=DEFAULT_N_GROUPS, help="分层组数")
 @click.option("--agent", default=None, help="Agent 名（配额记账 + 校正门槛）")
 def eval_(expr: str, start: str | None, neutral: bool, n_groups: int,
           agent: str | None) -> None:
@@ -204,8 +212,8 @@ def submit(spec_path: str) -> None:
 @factor.command()
 @click.option("--name", required=True, help="已注册因子名（factor_def.name）")
 @click.option("--start", default=None, help="数据窗口起点 YYYY-MM-DD")
-@click.option("--n-groups", default=10, help="分层组数")
-@click.option("--horizons", default="1,2,3,5,10,20", help="衰减曲线持有期（逗号分隔）")
+@click.option("--n-groups", default=DEFAULT_N_GROUPS, help="分层组数")
+@click.option("--horizons", default=DECAY_HORIZONS_CSV, help="衰减曲线持有期（逗号分隔）")
 @click.option("--agent", default=None, help="Agent 名（配额记账 + 校正门槛）")
 def run(name: str, start: str | None, n_groups: int, horizons: str,
         agent: str | None) -> None:
@@ -483,8 +491,8 @@ def _quota(agent: str | None, expr: str, t_stat: float) -> dict:
 @factor.command()
 @click.argument("expr")
 @click.option("--start", default=None, help="数据窗口起点 YYYY-MM-DD")
-@click.option("--n-groups", default=10, help="分层组数")
-@click.option("--horizons", default="1,2,3,5,10,20", help="衰减曲线持有期（逗号分隔）")
+@click.option("--n-groups", default=DEFAULT_N_GROUPS, help="分层组数")
+@click.option("--horizons", default=DECAY_HORIZONS_CSV, help="衰减曲线持有期（逗号分隔）")
 @click.option("--agent", default=None, help="Agent 名（配额记账 + 校正门槛）")
 def audit(expr: str, start: str | None, n_groups: int, horizons: str, agent: str | None) -> None:
     """L2 深度校验：IC/ICIR + 分层 + 衰减 + 归因 + 评级 + 样本外衰减（平台算）。
@@ -580,7 +588,7 @@ def _audit_payload(expr: str, start: str | None, n_groups: int, horizons: str,
 @factor.command()
 @click.argument("expr")
 @click.option("--start", default=None, help="数据窗口起点 YYYY-MM-DD")
-@click.option("--n-groups", default=10, help="分层组数（剔除最佳月份用）")
+@click.option("--n-groups", default=DEFAULT_N_GROUPS, help="分层组数（剔除最佳月份用）")
 @click.option("--top-months", default=5, help="剔除收益最好的前 N 个月")
 @click.option("--deltas", default="0.1,0.2,0.3", help="窗口扰动幅度（逗号分隔）")
 @click.option("--agent", default=None, help="Agent 名（配额记账 + 校正门槛）")
@@ -619,8 +627,8 @@ def robust(expr: str, start: str | None, n_groups: int, top_months: int,
 @click.argument("expr")
 @click.option("--out", default=None, help="输出 HTML 路径（默认 <仓库根>/data/reports/factor_<id>.html）")
 @click.option("--start", default=None, help="数据窗口起点 YYYY-MM-DD")
-@click.option("--n-groups", default=10, help="分层组数")
-@click.option("--bps", default="0,5,10,15,30", help="成本敏感性 bps 列表（逗号分隔）")
+@click.option("--n-groups", default=DEFAULT_N_GROUPS, help="分层组数")
+@click.option("--bps", default=BPS_CSV, help="成本敏感性 bps 列表（逗号分隔）")
 @click.option("--filter-zscore", default=None, type=float,
               help="截面异常收益过滤阈值（|z| 上限，口径同 alphalens；默认不过滤）")
 @click.option("--exclude-st", is_flag=True, default=False,
@@ -661,6 +669,18 @@ def report(expr: str, out: str | None, start: str | None, n_groups: int, bps: st
 
     cat = next((c for c in ("cov_industry_sw1", "industry_sw1") if c in train.columns), None)
 
+    # 口头诚实：`prepare_segment` 在有协变量时**确实**跑了默认配方
+    # （mad 去极值 → zscore → 市值/行业/换手 OLS 中性化）。报告必须披露真实配方，
+    # 否则「预处理配方」一栏会写着「原始因子直接评价」—— 那是假的。
+    recipe = ([
+        {"op": "winsorize", "method": "mad", "n": 5},
+        {"op": "standardize", "method": "zscore"},
+        {"op": "neutralize", "method": "ols", "factors": list(cov_cols)},
+    ] if cov_cols else None)
+    cov_map = {c.removeprefix("cov_"): round(
+        1 - train[c].null_count() / max(len(train), 1), 4)
+        for c in cov_cols if c in train.columns}
+
     # 结论层：CLI 只跑 L2 评级（不跑 L3 稳健性 —— 要重算因子多遍，太贵）
     rating = None
     try:
@@ -685,6 +705,8 @@ def report(expr: str, out: str | None, start: str | None, n_groups: int, bps: st
         filter_zscore=filter_zscore,
         display_name=expr, expr=expr,
         data_start=start, n_samples=len(train),
+        steps=recipe, covariates=cov_map,
+        universe="all",
         sample_filters=describe_sample_filters(
             train, exclude_st=exclude_st, exclude_suspended=exclude_suspended),
         rating=rating,
@@ -701,9 +723,10 @@ def report(expr: str, out: str | None, start: str | None, n_groups: int, bps: st
     click.echo(json.dumps(_clean({
         "report": str(p.resolve()), "bytes": p.stat().st_size,
         "factor": expr, "factor_id": canonical_id(expr), "n_days": days,
-        "neutralized": bool(cov_cols), "covariates": cov_cols,
+        "neutralized": bool(cov_cols), "cov_names": cov_cols,
         "rating": (rating or {}).get("rating"),
         "capacity_aum": (capacity or {}).get("capacity_aum"),
+        "recipe": recipe, "covariates": cov_map,
         "exclude_st": exclude_st, "exclude_suspended": exclude_suspended,
         "filter_zscore": filter_zscore,
     }), ensure_ascii=False))

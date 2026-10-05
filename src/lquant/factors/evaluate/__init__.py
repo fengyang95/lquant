@@ -16,6 +16,7 @@ import polars as pl
 
 from lquant.factors.evaluate.attribution import attribution_summary, exposure
 from lquant.factors.evaluate.decay import decay_profile, decay_summary, half_life, suggest_rebalance
+from lquant.factors.evaluate.defaults import DEFAULT_N_GROUPS
 from lquant.factors.evaluate.event_study import event_study, event_study_summary
 from lquant.factors.evaluate.ic import (
     ic_autocorr,
@@ -74,7 +75,7 @@ __all__ = [
 
 
 def evaluate(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
-             n_groups: int = 10, horizons: list[int] | None = None,
+             n_groups: int = DEFAULT_N_GROUPS, horizons: list[int] | None = None,
              with_report: bool = True, with_robustness: bool = False,
              **kw) -> dict:
     """一次性跑完 IC / 分层 / 衰减 / 归因 / 评级，并可选生成 HTML 报告。
@@ -115,7 +116,7 @@ def evaluate(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
                     "outlier_stats", "event_window",
                     "display_name", "expr", "data_start", "data_end",
                     "n_samples", "steps", "covariates", "sample_filters",
-                    "window", "extras"))
+                    "window", "extras", "description"))
     return out
 
 

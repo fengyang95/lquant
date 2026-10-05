@@ -31,7 +31,13 @@ type FactorDetail = {
   created_at: string;
   source?: string;
   category?: string;
-  reports: { name: string; url: string }[];
+  reports: {
+    name: string;
+    url: string;
+    generator_version?: string | null;
+    generated_at?: string;
+    stale?: boolean;
+  }[];
 };
 
 type EvalResult = {
@@ -492,21 +498,37 @@ export default function FactorDetailPage() {
         </Panel>
       )}
 
-      {/* 历史报告 */}
-      <Panel title="历史报告" meta={`${data.reports.length} 份`}>
+      {/* 报告（同名因子覆盖写 —— 不是「历史」） */}
+      <Panel title="报告" meta={`${data.reports.length} 份 · 同名覆盖`}>
         {!data.reports.length ? (
           <Empty>暂无 —— 跑一次评价即生成</Empty>
         ) : (
           <ul className="divide-y divide-line text-sm">
             {data.reports.map((r) => (
-              <li key={r.name} className="py-2">
+              <li key={r.name} className="flex items-center justify-between py-2">
                 <a href={r.url} target="_blank" className="text-indigo hover:underline" rel="noreferrer">
                   {r.name} ↗
                 </a>
+                <span className="flex items-center gap-2 text-xs text-ink-faint">
+                  {r.stale ? (
+                    <span
+                      className="rounded bg-amber-100 px-2 py-0.5 text-amber-800"
+                      title="该报告的生成器版本与当前代码不一致（或缺失版本号），口径可能已变 —— 建议重算"
+                    >
+                      旧口径
+                    </span>
+                  ) : null}
+                  <span>{r.generated_at}</span>
+                  {r.generator_version ? <span>v{r.generator_version}</span> : null}
+                </span>
               </li>
             ))}
           </ul>
         )}
+        <p className="mt-3 text-xs text-ink-faint">
+          同名因子每次评价都会覆盖这份报告，只保留最新一份；
+          报告头部写明了生成器版本与生成时间，旧版本会标「旧口径」。
+        </p>
       </Panel>
     </div>
   );

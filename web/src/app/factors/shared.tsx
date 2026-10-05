@@ -174,6 +174,12 @@ const ERROR_LABEL: Record<string, string> = {
   style_corr: '风格相关性',
   turnover: '换手率',
   event_study: '事件式分层',
+  capacity: '容量与流动性',
+  // 报告生成失败不影响指标返回，但用户必须知道「这份评价没有 HTML 报告」
+  report: 'HTML 报告生成',
+  attribution: '归因分解',
+  cost_matrix: '成本敏感性',
+  outlier_filter: '截面异常收益过滤',
 };
 
 function errorLabel(key: string): string {

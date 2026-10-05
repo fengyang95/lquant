@@ -87,9 +87,13 @@ def test_report_attribution_never_uses_symbol_fallback() -> None:
 
 
 def test_report_attribution_prefers_cov_industry_column() -> None:
-    """API 路径：行业以 cov_industry_sw1 出现时应当被用上。"""
+    """API 路径：行业以 cov_industry_sw1 出现时应当被用上。
+
+    标题印的是**用户面文案**（申万一级行业），不是内部列名（R14）。
+    """
     html = factor_report(_panel_with_cov_industry(), "f", "fwd_ret_1")
-    assert "归因分解 · cov_industry_sw1" in html
+    assert "归因分解 · 申万一级行业" in html
+    assert "归因分解 · cov_industry_sw1" not in html
 
 
 # ───────────────────────── A2 synthesize 口径 ─────────────────────────
