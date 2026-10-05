@@ -30,8 +30,14 @@ def resolve_index_code(universe: str) -> str:
 
 
 def universe_label(universe: str) -> str:
-    """池名 → 中文展示名；未知代码原样返回。"""
+    """池名 → 中文展示名；未知代码原样返回。
+
+    ``all``（全市场）不在 ``UNIVERSE_OPTIONS`` 里，但它是 API/CLI 的默认值，
+    必须能映射成中文 —— 否则报告里会印出裸的 ``all``。
+    """
     key = universe.strip().lower()
+    if key == "all":
+        return "全市场"
     if key in _UNIVERSE_BY_KEY:
         return _UNIVERSE_BY_KEY[key][1]
     return universe.strip()

@@ -174,17 +174,21 @@ def test_factor_report_event_study(monkeypatch) -> None:
     assert "事前/事后发散度比" in html
 
 
-def test_factor_report_event_study_exception_swallowed(monkeypatch) -> None:
+def test_factor_report_event_study_failure_is_disclosed(monkeypatch) -> None:
+    """事件式算炸了 → 小节不出现，但必须留下失败横幅（不再静默吞掉）。"""
     def boom(*a, **k):
         raise ValueError("bad window")
 
     monkeypatch.setattr(rep, "event_study_summary", boom)
     html = rep.factor_report(_panel(), "f")
     assert "事件式分层收益" not in html
+    assert "本节生成失败" in html
+    assert "event_study" in html
 
 
-def test_factor_report_optional_sections_exception_swallowed(
+def test_factor_report_optional_sections_failure_is_disclosed(
         monkeypatch) -> None:
+    """可选小节算炸了 → 内容缺失，但故障必须可见（这是上一轮的静默缺陷）。"""
     def boom(*a, **k):
         raise RuntimeError("源数据异常")
 
@@ -198,3 +202,7 @@ def test_factor_report_optional_sections_exception_swallowed(
     assert "分组 IC" not in html
     assert "换手率" not in html
     assert "成本敏感性" not in html
+    # 关键：不能无声消失
+    assert "本节生成失败" in html
+    for key in ("attribution", "group_ic", "turnover", "cost_matrix"):
+        assert key in html

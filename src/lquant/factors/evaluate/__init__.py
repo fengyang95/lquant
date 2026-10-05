@@ -105,12 +105,17 @@ def evaluate(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
             icir_is=kw.get("icir_is"), icir_oos=kw.get("icir_oos"),
             **_pick(kw, "deltas", "n_splits", "n_starts", "top_n", "n_groups", "date_col"))
     if with_report:
-        out["report"] = factor_report(df, factor, ret_col, n_groups=n_groups,
-                                      horizons=horizons, **_pick(kw, "price_col", "date_col",
-                                                                 "symbol_col", "cat_col",
-                                                                 "group_col", "bps_list",
-                                                                 "universe", "filter_zscore",
-                                                                 "outlier_stats", "event_window"))
+        # 评级/稳健性在同一个函数体里已经算好 —— 直接喂给报告，
+        # 不再出现「算出来了但交付物里看不到」。
+        out["report"] = factor_report(
+            df, factor, ret_col, n_groups=n_groups, horizons=horizons,
+            rating=out.get("rating"), robustness=out.get("robustness"),
+            **_pick(kw, "price_col", "date_col", "symbol_col", "cat_col",
+                    "group_col", "bps_list", "universe", "filter_zscore",
+                    "outlier_stats", "event_window",
+                    "display_name", "expr", "data_start", "data_end",
+                    "n_samples", "steps", "covariates", "sample_filters",
+                    "window", "extras"))
     return out
 
 
