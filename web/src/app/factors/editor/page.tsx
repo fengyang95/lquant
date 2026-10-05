@@ -8,21 +8,21 @@
  * 不引入第二套执行语义。
  */
 import dynamic from 'next/dynamic';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 
 import Chart from '@/components/Chart';
 import PageHeader from '@/components/PageHeader';
 import { Panel, Stat } from '@/components/Panel';
-import ProgressBar from '@/components/ProgressBar';
 import { ErrorNote, Msg } from '@/components/States';
 import { post } from '@/lib/api';
 import { C, axes, legend, tooltip } from '@/lib/chart';
-import { useJobStream } from '@/lib/streaming';
 
 import BlockPalette from './BlockPalette';
 import Inspector from './Inspector';
 import OpenFactorDialog, { type FactorListItem } from './OpenFactorDialog';
 import { useFactorEditor } from './useFactorEditor';
+import FactorEvalProgress from '../FactorEvalProgress';
+import { useFactorEval } from '../useFactorEval';
 
 // React Flow 要量 DOM 尺寸，必须关掉 SSR（与 backtests 的 CodeMirror 同处理）
 const Canvas = dynamic(() => import('./Canvas'), { ssr: false });
@@ -59,38 +59,15 @@ export default function FactorEditorPage() {
   const [loadTranslated, setLoadTranslated] = useState(false);
   const [openError, setOpenError] = useState('');
 
-  const [evalJob, setEvalJob] = useState<{ id: string; factor: string } | null>(null);
-  const [evalResult, setEvalResult] = useState<EvalMetrics | null>(null);
-  const [evalError, setEvalError] = useState('');
+  // 评价：与因子库 / 因子详情页共用同一条链路（POST /factors/evaluate + WS 进度），
+  // 进度、结果、失败、取消都由 hook 提供 —— 本页不再自己维护轮询与三份 state。
+  const evalRun = useFactorEval<EvalMetrics>();
+  const evalResult = evalRun.result;
 
   const expression = api.compiled.expression;
   const nameValid = NAME_PATTERN.test(name);
   const clobbersSeed = seedName !== null && name === seedName;
   const canSave = api.canSave && nameValid && !clobbersSeed && !busy;
-
-  // 评价任务流：与因子库 / 因子详情页同一机制（WS /ws/jobs/{id}）——进度、终态
-  // result、失败 error 一次拿全。取代此前 3s × 100 的 REST 轮询：轮询既读错了
-  // 信封契约（结果恒为 —），任务失败时又只能空转到 5 分钟超时。
-  const evalStream = useJobStream<EvalMetrics>(evalJob?.id ?? null);
-
-  useEffect(() => {
-    if (!evalJob) return;
-    if (evalStream.error) {
-      setEvalError(evalStream.error);
-      setEvalJob(null);
-      return;
-    }
-    if (evalStream.result) {
-      setEvalResult(evalStream.result);
-      setEvalJob(null);
-      return;
-    }
-    if (evalStream.done) {
-      // not_found / canceled 等无 result 的终态：如实报错，不无限显示"运行中"
-      setEvalError(`评价任务异常结束（${evalStream.status ?? 'unknown'}）`);
-      setEvalJob(null);
-    }
-  }, [evalJob, evalStream.error, evalStream.result, evalStream.done, evalStream.status]);
 
   const handleOpen = useCallback(
     async (factor: FactorListItem) => {
@@ -106,8 +83,7 @@ export default function FactorEditorPage() {
         setSeedName(isSeed ? factor.name : null);
         setName(isSeed ? `${factor.name}_copy` : factor.name);
         setDescription(factor.description ?? '');
-        setEvalJob(null);
-        setEvalResult(null);
+        evalRun.reset();
       } catch (e: unknown) {
         // 到这一步说明连统一引擎的兼容翻译都救不回来（真语法错 / 未知字段 / 未注册算子）。
         // 如实说明原因，不要假装画布能打开。
@@ -118,7 +94,7 @@ export default function FactorEditorPage() {
         );
       }
     },
-    [api],
+    [api, evalRun.reset],
   );
 
   const handleSave = useCallback(async (): Promise<boolean> => {
@@ -140,21 +116,12 @@ export default function FactorEditorPage() {
   }, [api, canSave, description, expression, name]);
 
   const handleEvaluate = useCallback(async () => {
-    setEvalError('');
     const saved = await handleSave();
     if (!saved) return;
-    setEvalResult(null);
-    try {
-      const r = await post<{ job_id: string }>('/factors/evaluate', {
-        factor: name,
-        formula: expression,
-      });
-      setEvalJob({ id: r.job_id, factor: name });
-      setMessage(`✓ 已入队评价任务 ${r.job_id}，完成后自动刷新`);
-    } catch (e: unknown) {
-      setEvalError(e instanceof Error ? e.message : String(e));
-    }
-  }, [expression, handleSave, name]);
+    setMessage('');
+    const jid = await evalRun.start({ factor: name, formula: expression });
+    if (jid) setMessage(`✓ 已入队评价任务 ${jid}，完成后自动刷新`);
+  }, [evalRun.start, expression, handleSave, name]);
 
   const icChart = useMemo(() => {
     const ic = evalResult?.series?.ic;
@@ -200,8 +167,7 @@ export default function FactorEditorPage() {
                 setLoadWarnings([]);
                 setLoadTranslated(false);
                 setOpenError('');
-                setEvalJob(null);
-                setEvalResult(null);
+                evalRun.reset();
                 setMessage('');
               }}
             >
@@ -327,24 +293,18 @@ export default function FactorEditorPage() {
           </div>
         ) : null}
 
-        {evalError ? (
+        {evalRun.failure ? (
           <div className="mt-3">
-            <ErrorNote>评价失败：{evalError}</ErrorNote>
+            <ErrorNote>评价失败：{evalRun.failure}</ErrorNote>
           </div>
         ) : null}
 
-        {evalJob && !evalResult ? (
-          <div className="mt-3 w-72 space-y-1">
-            {evalStream.progress && evalStream.progress.total > 0 ? (
-              <ProgressBar
-                pct={(evalStream.progress.done / evalStream.progress.total) * 100}
-                phase={evalStream.progress.phase}
-              />
-            ) : null}
-            <p className="text-xs text-ink-faint">
-              评价任务 {evalJob.id} 运行中…（结果出来后自动显示）
-            </p>
-          </div>
+        {evalRun.running && evalRun.jobId ? (
+          <FactorEvalProgress
+            jobId={evalRun.jobId}
+            progress={evalRun.progress}
+            onCancel={evalRun.cancel}
+          />
         ) : null}
 
         {evalResult ? (

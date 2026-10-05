@@ -1166,6 +1166,33 @@ def list_mining_runs(limit: int = Query(default=50, ge=1, le=500)) -> list[dict]
              "created_at": str(r[9])} for r in rows]
 
 
+def mining_meta_by_ids(run_ids: list[str]) -> dict[str, dict]:
+    """批量取挖掘台账元信息 {run_id: {agent, generator, n_survivors}}。
+
+    任务中心的队列任务本身不带参数（jobs.py 只记 id/name/queue/status），
+    列表页要显示「谁在挖、什么生成器」只能回台账查。单次批量查询避免逐条开连接；
+    台账读不到就降级为空（任务列表照常出，不能因为台账故障整页失败）。
+    """
+    ids = [r for r in run_ids if r]
+    if not ids:
+        return {}
+    placeholders = ",".join("?" * len(ids))
+    # 整个取数（含拿连接）都在 try 内：duckdb 写锁冲突时 reader() 本身就会抛，
+    # 任务列表不能因为台账读不到而整页失败。独立端点 /mine/runs 仍保持 503 语义。
+    try:
+        with reader() as con:
+            rows = con.execute(
+                f"SELECT run_id, agent, generator, n_survivors FROM factor_mining_run "
+                f"WHERE run_id IN ({placeholders})", ids).fetchall()
+    except Exception as e:  # noqa: BLE001 - 台账故障不影响任务列表
+        import loguru
+
+        loguru.logger.warning(f"任务中心回填挖掘台账失败（参数列降级为空）: {e}")
+        return {}
+    return {r[0]: {"agent": r[1], "generator": r[2], "n_survivors": r[3]}
+            for r in rows}
+
+
 @router.get("/mine/runs/{run_id}")
 def get_mining_run(run_id: str) -> dict:
     """单次挖掘会话详情：漏斗计数 + 表达式修正日志（corrections）。"""
@@ -1247,8 +1274,14 @@ def _mine_placeholder(run_id: str, agent: str, generator: str) -> None:
         loguru.logger.warning(f"挖掘占位行写入失败（任务仍入队）: {e}")
 
 
-def _run_mine_job(agent_name: str, generator: str, n: int, run_id: str) -> dict:
-    """挖掘会话执行体：跑会话 → 覆盖 factor_mining_run → 返回结果体。"""
+def _run_mine_job(agent_name: str, generator: str, n: int, run_id: str,
+                  progress=None, cancel_check=None) -> dict:
+    """挖掘会话执行体：跑会话 → 覆盖 factor_mining_run → 返回结果体。
+
+    progress / cancel_check 由 enqueue 按签名自动注入。此前挖掘执行体不声明这两个
+    形参，于是同一个任务中心里「因子评价」有进度条、能取消，「因子挖掘」两者皆无
+    —— 任务体不配合时，取消只能是状态标记而拦不住结果落库。
+    """
     import datetime as dt
     import json
 
@@ -1256,7 +1289,22 @@ def _run_mine_job(agent_name: str, generator: str, n: int, run_id: str) -> dict:
     from lquant.factors.engine import FactorEngine
     from lquant.factors.mining.runner import run_session
     from lquant.factors.mining.submit import _panel_with_covs
+    from lquant.server.jobs import JobCanceled
 
+    _p = progress or (lambda **kw: None)  # noqa: E731
+    _is_canceled = cancel_check or (lambda: False)  # noqa: E731
+
+    def _checkpoint(pct: int, phase: str) -> None:
+        """阶段边界：写进度 + 轮询取消探针。
+
+        run_session 是单个阻塞调用，取消只能在它前后生效 —— 这与本地降级模式
+        「线程无法强杀」的限制一致：取消保证不落结果，不保证立刻停算。
+        """
+        _p(done=pct, total=100, phase=phase)
+        if _is_canceled():
+            raise JobCanceled(f"因子挖掘已取消: {run_id}")
+
+    _checkpoint(5, "准备面板")
     df, cov_cols = _panel_with_covs()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
@@ -1271,8 +1319,11 @@ def _run_mine_job(agent_name: str, generator: str, n: int, run_id: str) -> dict:
         gen = make_generator()
     else:
         raise HTTPException(422, f"未知生成器: {generator}（可选 gp/random）")
+    _checkpoint(20, "生成与评估候选")
     res, survivors = run_session(eng, df, gen, agent=agent_name, n_candidates=n,
                                  covs=cov_cols)
+    # 取消在会话跑完后、落账前收尾：取消的挖掘不应把结果写进台账（占位行保留）
+    _checkpoint(80, "记账落库")
     # 记账：与 CLI 共用同一账本，把实际评估数计入配额（此前 API 路径完全不记账）
     from lquant.factors.agents import record_eval
 
@@ -1291,6 +1342,7 @@ def _run_mine_job(agent_name: str, generator: str, n: int, run_id: str) -> dict:
 
         loguru.logger.warning(f"挖掘记账落库失败（结果仍有效）: {e}")
         ledger_warning = str(e)
+    _checkpoint(95, "汇总")
     return {"run_id": run_id, "agent": agent_name, "generator": generator,
             "n_evaluated": res.n_evaluated, "n_static_fail": res.n_static_fail,
             "n_low_ic": res.n_low_ic, "n_redundant": res.n_redundant,

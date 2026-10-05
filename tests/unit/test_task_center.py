@@ -422,3 +422,160 @@ def test_factor_mine_run_sync_mode(client, monkeypatch):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["n_evaluated"] == 3 and body["survivors"] == ["F1"]
+
+
+def _job_status(job_id: str) -> str:
+    from lquant.server.jobs import get_job
+
+    job = get_job(job_id)
+    return job.get_status() if job is not None else "missing"
+
+
+def test_factor_list_backfills_params_and_subtype(client, monkeypatch):
+    """factor 类目：队列任务回填 params 与 subtype。
+
+    队列任务本身不带参数（jobs.py 只记 id/name/queue/status）；不回填的话 UI 只能
+    看到一个 `factor-e…` 短 id —— 既分不清评价还是挖掘，也不知道在评哪个因子。
+    subtype 由落库位置判定（job_results ⇒ 评价，factor_mining_run ⇒ 挖掘），
+    不依赖可自由改写的显示名。
+    """
+    import types
+
+    import lquant.factors.mining.runner as runner_mod
+    from lquant.factors import agents as agents_mod
+    from lquant.server import jobs as jobs_mod
+    from lquant.server.api import factors as fmod
+    from lquant.server.eval_results import save_result
+
+    # 强制本地降级：本用例要断言任务体真的跑过（评价需落 job_results）。
+    # _redis_probe_at=inf 让 TTL 缓存判定永远命中，monkeypatch 结束时自动还原。
+    monkeypatch.setattr(jobs_mod, "_probe_redis", lambda *a, **k: False)
+    monkeypatch.setattr(jobs_mod, "_redis_probe_ok", False, raising=False)
+    monkeypatch.setattr(jobs_mod, "_redis_probe_at", float("inf"), raising=False)
+
+    # 评价：任务体 stub 成「落一条结果」，避免在任务中心测试里真跑重计算
+    def _fake_eval(req_d, cancel_check=None, progress=None):
+        save_result(fmod._job_result_id(req_d["factor"]), "factor_eval", req_d,
+                    {"factor": req_d["factor"], "report_url": "/api/x"})
+        return {"factor": req_d["factor"]}
+
+    monkeypatch.setattr(fmod, "_run_evaluate_job", _fake_eval)
+    r = client.post("/api/factors/evaluate",
+                    json={"factor": "tcbprobe", "formula": "pct_change_5"})
+    assert r.status_code == 202, r.text
+    eval_id = r.json()["job_id"]
+
+    # 挖掘：stub agent 加载 + 会话执行体
+    fake = types.SimpleNamespace(n_evaluated=1, n_static_fail=0, n_low_ic=0,
+                                 n_redundant=0, n_size_proxy=0, n_survivors=1,
+                                 corrections={})
+    monkeypatch.setattr(agents_mod, "load_agents",
+                        lambda *a, **k: [agents_mod.AgentProfile(name="gp-internal",
+                                                                 kind="builtin",
+                                                                 driver="platform")])
+    monkeypatch.setattr(runner_mod, "run_session", lambda *a, **k: (fake, ["F1"]))
+    rr = client.post("/api/factors/mine/run",
+                     json={"agent": "gp-internal", "generator": "gp", "n": 5})
+    assert rr.status_code == 202, rr.text
+    mine_id = rr.json()["task_id"]
+    _wait_status(lambda: _job_status(eval_id), lambda s: s in ("finished", "failed"))
+    _wait_status(lambda: _job_status(mine_id), lambda s: s in ("finished", "failed"))
+
+    items = client.get("/api/tasks", params={"kind": "factor", "limit": 500}).json()
+    by_id = {x["id"]: x for x in items}
+
+    ev = by_id.get(eval_id)
+    assert ev is not None, f"任务中心缺评价任务 {eval_id}"
+    assert ev["subtype"] == "factor_eval"
+    assert ev["params"].get("factor") == "tcbprobe"
+    assert ev["params"].get("formula") == "pct_change_5"
+
+    mi = by_id.get(mine_id)
+    assert mi is not None, f"任务中心缺挖掘任务 {mine_id}"
+    assert mi["subtype"] == "factor_mine"
+    assert mi["params"].get("agent") == "gp-internal"
+    assert mi["params"].get("generator") == "gp"
+
+    # 挖掘执行体声明了 progress 形参：enqueue 自动注入，最后一步「汇总」= 95
+    from lquant.server.progress import get_progress
+
+    p = get_progress(mine_id)
+    assert p is not None and p["total"] == 100 and p["done"] >= 95, p
+
+
+def test_factor_list_enrichment_degrades_when_stores_unreadable(client, monkeypatch):
+    """结果表/台账读不到时：任务列表照常返回，params 降级为空而不是整页 500。"""
+    from lquant.server import eval_results
+    from lquant.server.api import factors as fmod
+
+    def _boom(*a, **k):
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(eval_results, "meta_by_ids", _boom)
+    monkeypatch.setattr(fmod, "mining_meta_by_ids", _boom)
+    r = client.get("/api/tasks", params={"kind": "factor"})
+    assert r.status_code == 200, r.text
+    assert isinstance(r.json(), list)
+
+
+# --- 回填辅助函数的边界：空入参 / 存储不可读 一律降级为空 ----------------------
+
+
+def test_eval_meta_by_ids_empty_and_failure(monkeypatch):
+    """meta_by_ids：空入参短路；结果表读取异常降级为空（不能把列表打挂）。"""
+    from contextlib import contextmanager
+
+    from lquant.server import eval_results
+
+    assert eval_results.meta_by_ids([]) == {}
+    assert eval_results.meta_by_ids(["", None]) == {}  # type: ignore[list-item]
+
+    @contextmanager
+    def _boom():
+        raise RuntimeError("db locked")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(eval_results, "reader", _boom)
+    assert eval_results.meta_by_ids(["some-job"]) == {}
+
+
+def test_mining_meta_by_ids_empty_and_failure(monkeypatch):
+    """mining_meta_by_ids：空入参短路；台账读取异常降级为空。"""
+    from contextlib import contextmanager
+
+    from lquant.server.api import factors as fmod
+
+    assert fmod.mining_meta_by_ids([]) == {}
+
+    @contextmanager
+    def _boom():
+        raise RuntimeError("db locked")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(fmod, "reader", _boom)
+    assert fmod.mining_meta_by_ids(["some-run"]) == {}
+
+
+def test_factor_items_empty_short_circuits(monkeypatch):
+    """无队列任务时不查落库（省一次查询），直接返回空列表。"""
+    from lquant.server.api import task_center as tc
+
+    monkeypatch.setattr(tc, "_job_items", lambda *a, **k: [])
+    assert tc._factor_items(5) == []
+
+
+def test_mine_job_cancel_probe_stops_before_ledger():
+    """挖掘执行体声明了 cancel_check：探针置位时在落账前抛 JobCanceled。
+
+    取消保证不把结果写进台账（占位行保留），与评价任务的取消语义对齐。
+    """
+    from lquant.server.api.factors import _run_mine_job
+    from lquant.server.jobs import JobCanceled
+
+    phases: list[str] = []
+    with pytest.raises(JobCanceled):
+        _run_mine_job("gp-internal", "random", 5, "cancelrun",
+                      progress=lambda **kw: phases.append(kw.get("phase")),
+                      cancel_check=lambda: True)
+    # 第一个阶段边界就收尾：进度已写「准备面板」，但没走到面板/会话
+    assert phases == ["准备面板"]

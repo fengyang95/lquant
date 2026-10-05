@@ -346,7 +346,52 @@ P0 只做「让评价真的能跑 + 编辑器结果能显示」，未动任务�
 
 已知局限（留给 P1）：
 
-- `lq worker` supervisor（`monitor/worker.py:65-66`）仍不含 mining 组；`lquant.sh` 靠并行的普通 `rq worker` 覆盖。挖掘 worker 与 ingest 同进程，长挖掘可能阻塞数据任务，建议 P1 拆独立 mining worker 组。
+- `lq worker` supervisor（`monitor/worker.py:65-66`）仍不含 mining 组；`lquant.sh` 靠并行的普通 `rq worker` 覆盖。挖掘 worker 与 ingest 同进程，长挖掘可能阻塞数据任务，建议拆独立 mining worker 组。
 - 编辑器仍不显示历史评价、无取消按钮（P1 的 F1/F2/F4）。
 - 任务中心依旧显示不出因子名（P1 的 B3）。
+
+---
+
+## 7. P1 实施记录（本分支已落地）
+
+P1 解决原始问题里的另一半：「任务中心看不见在评哪个因子」+「四处评价入口各写一套」。
+
+### 后端
+
+| # | 改动 | 位置 | 说明 |
+|---|---|---|---|
+| B3 | 任务中心 factor 类目回填 `params` + `subtype` | `task_center._factor_items`；`eval_results.meta_by_ids`；`factors.mining_meta_by_ids` | 队列任务本身只记 id/name/queue/status，params 一律为空 → UI 只能看到 `factor-e…` 短 id。现在按落库位置判定类型：`job_results` ⇒ `factor_eval`（回填 `{factor, formula, …}`），`factor_mining_run` ⇒ `factor_mine`（回填 `{agent, generator, n_survivors}`）。批量单查 + 整体 try/except：回填失败只降级为空，绝不拖垮任务列表 |
+| B5 | `_run_mine_job` 声明 `progress` / `cancel_check` | `server/api/factors.py:_run_mine_job` | 此前评价有进度条、能取消，挖掘两者皆无。现在阶段边界（准备面板/生成与评估/记账/汇总）写进度并轮询取消探针；取消在记账前收尾，不把结果写进台账 |
+
+`subtype` 取代了前端 `t.name === '因子评价'` 的中文字符串判定 —— 显示名是自由文本，不可靠。
+
+### 前端
+
+| # | 改动 | 位置 | 说明 |
+|---|---|---|---|
+| F1 | 抽 `useFactorEval` hook | `web/src/app/factors/useFactorEval.ts`（新） | 把 `POST /factors/evaluate` + WS 进度 + 取消 + 失败归并收成一条；`failure` 统一了「入队失败 / 任务失败 / 无 result 的异常终态」三种情况 |
+| F2 | 抽 `<FactorEvalProgress>` | `web/src/app/factors/FactorEvalProgress.tsx`（新） | 进度条 + 任务号 + 取消按钮 + 任务管理入口，四处入口共用 |
+| — | 编辑器迁移到 hook | `editor/page.tsx` | 删掉自维护的三份 eval state；净减约 40 行 |
+| — | 任务中心面板改造 | `tasks/panels/FactorPanel.tsx`、`tasks/types.ts` | 详情列显示评价因子（可点进因子详情）或挖掘 Agent/生成器；queued 也可取消（后端本就支持，此前 UI 挡掉了）；`subtype` 判定 |
+| 基础设施 | `useJobStream(jobId, reconnectKey?)` | `web/src/lib/streaming.ts` | 评价 job id 是确定性的，同因子重跑 id 不变 → 只比较 jobId 不会重订阅，界面会停在上一轮结果。新增可选重连序号并**在新订阅时清空上一轮终态**；旧调用方行为不变 |
+
+> 这里踩到一个真实陷阱：最初用「start 里先 `setJobId(null)` 再设回同一个 id」来触发重连，
+> 测试直接证明它在 React 批处理下不成立（中间渲染不保证发生）。最终改成显式 `reconnectKey`，
+> 不依赖渲染时序。
+
+### 测试
+
+- 新增 `web/src/app/factors/__tests__/useFactorEval.test.tsx`（6 例）：入队、重连序号前移、入队失败、`not_found` 终态、终态 result、取消/reset。
+- 新增 `web/src/app/factors/editor/__tests__/page.test.tsx`（5 例，P0 已加）。
+- 扩展 `web/src/app/tasks/panels/__tests__/FactorPanel.test.tsx`（+3 例）：评价任务显示因子名并可跳详情、queued 可取消、查看结果取 `report_url`；fixture 从伪造的 `name` 改为真实 `subtype`/`params`。
+- 新增后端 `tests/unit/test_task_center.py::test_factor_list_backfills_params_and_subtype` 与 `test_factor_list_enrichment_degrades_when_stores_unreadable`。
+- 验证：`web` 全量 vitest 全绿 + `tsc` 通过；后端 task_center / factor / job 相关 8 个测试文件全绿（97 例）。
+
+### 仍未做（P2）
+
+- 因子库页 / 因子详情页仍在各自写 WS 回填 effect，可继续迁到 `useFactorEval`（纯重构，无 bug）。
+- 编辑器仍无「本因子的历史评价」列表（F4）；`evalJob` 未持久化到 URL（F5）。
+- 评价 job id 仍是确定性的：同因子重跑覆盖旧结果、无历史（B4）；并发同因子仍 409（合理，但是 running 的 RQ 任务不可取消时仍会卡住该因子）。
+- `lq worker` supervisor 未含 mining 组，挖掘与 ingest 共用 worker 进程，长挖掘可能阻塞数据任务。
+
 
