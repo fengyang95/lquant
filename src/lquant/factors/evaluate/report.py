@@ -86,6 +86,9 @@ _CAT_LABELS = {
     "symbol": "个股",
     "market_cap": "市值分组",
     "cov_market_cap": "市值分组",
+    "float_mv": "流通市值",
+    "total_mv": "总市值",
+    "amount": "成交额",
     "turnover_1m": "换手率分组",
     "cov_turnover_1m": "换手率分组",
     "momentum_1m": "动量分组",
@@ -1101,8 +1104,10 @@ def _size_ic_html(block) -> str:
     rows = block.get("rows") or []
     if not rows:
         return ""
-    col = block.get("size_col") or "市值"
-    return (f'<h2>分组 IC · 市值分组（{_esc(col)}）</h2>'
+    col = block.get("size_col") or ""
+    # 已知列给用户面文案（市值分组 / 成交额…），未知列原样保留以便追溯。
+    label = _cat_label(col) if col else "市值分组"
+    return (f'<h2>分组 IC · {_esc(label)}</h2>'
             f'<p class="hint">按市值分组算 IC：若信号只来自小市值组，'
             f'说明这个因子其实是市值暴露。</p>'
             + _rows_table(rows, limit=None, int_cols=("n_days",)))
