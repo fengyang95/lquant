@@ -18,6 +18,7 @@ import { ApiError, get, post } from '@/lib/api';
 import { C, axes, legend, tooltip } from '@/lib/chart';
 
 import BlockPalette from './BlockPalette';
+import ExpressionPane from './ExpressionPane';
 import Inspector from './Inspector';
 import OpenFactorDialog, { type FactorListItem } from './OpenFactorDialog';
 import { useFactorEditor } from './useFactorEditor';
@@ -50,15 +51,17 @@ export default function FactorEditorPage() {
   const [openDialog, setOpenDialog] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
-  const [loadWarnings, setLoadWarnings] = useState<string[]>([]);
-  const [loadTranslated, setLoadTranslated] = useState(false);
   const [openError, setOpenError] = useState('');
+  /** 表达式直编框折叠：画布需要高度时把它收起来 */
+  const [paneCollapsed, setPaneCollapsed] = useState(false);
 
   const [evalJob, setEvalJob] = useState<{ id: string; factor: string } | null>(null);
   const [evalResult, setEvalResult] = useState<EvalMetrics | null>(null);
   const [evalError, setEvalError] = useState('');
 
-  const expression = api.compiled.expression;
+  // 保存 / 评价用的表达式：**服务端归一后**的 DSL（文本是唯一真相源）。
+  // 不再取画布编译结果 —— 直编时画布只是这段文本的一个视图。
+  const expression = api.saveExpression;
   const nameValid = NAME_PATTERN.test(name);
   const clobbersSeed = seedName !== null && name === seedName;
   const canSave = api.canSave && nameValid && !clobbersSeed && !busy;
@@ -104,9 +107,9 @@ export default function FactorEditorPage() {
       setMessage('');
       setOpenError('');
       try {
-        const { warnings, translated } = await api.loadExpression(factor.expression);
-        setLoadWarnings(warnings);
-        setLoadTranslated(translated);
+        // 打开告警（画布只能近似表示的部分）由 loadExpression 写进 sync，
+        // 交给表达式直编框统一展示 —— 这里不再另存一份，免得两处各说各话。
+        await api.loadExpression(factor.expression);
         // 种子因子换个名字，避免把 qlib/yaml 的批量种子覆盖掉
         const isSeed = SEEDED_SOURCES.has(factor.source);
         setSeedName(isSeed ? factor.name : null);
@@ -116,9 +119,8 @@ export default function FactorEditorPage() {
         setEvalResult(null);
       } catch (e: unknown) {
         // 到这一步说明连统一引擎的兼容翻译都救不回来（真语法错 / 未知字段 / 未注册算子）。
-        // 如实说明原因，不要假装画布能打开。
-        setLoadWarnings([]);
-        setLoadTranslated(false);
+        // 如实说明原因，不要假装画布能打开。画布此刻仍停在原来的因子上，
+        // 它对应的告警也依然成立，所以这里不清空 sync。
         setOpenError(
           `打开 ${factor.name} 失败：${e instanceof Error ? e.message : String(e)}`,
         );
@@ -203,8 +205,6 @@ export default function FactorEditorPage() {
                 setName('');
                 setDescription('');
                 setSeedName(null);
-                setLoadWarnings([]);
-                setLoadTranslated(false);
                 setOpenError('');
                 setEvalJob(null);
                 setEvalResult(null);
@@ -228,73 +228,55 @@ export default function FactorEditorPage() {
 
       {openError ? <ErrorNote>{openError}</ErrorNote> : null}
 
-      {/* 表达式与校验状态 */}
-      <Panel bodyClass="px-4 py-3">
-        <div className="flex flex-wrap items-center gap-3">
-          <span className="shrink-0 text-xs text-ink-faint">DSL 表达式</span>
-          <code className="min-w-0 flex-1 truncate font-mono text-[13px] text-ink">
-            {expression || '（画布还没连到因子输出）'}
-          </code>
-          {api.checking ? (
-            <span className="shrink-0 text-xs text-ink-faint">校验中…</span>
-          ) : api.validation ? (
-            <span className={`shrink-0 text-xs ${api.validation.ok ? 'text-down' : 'text-up'}`}>
-              {api.validation.ok ? '✓ 引擎可解析' : `✗ ${api.validation.error}`}
-            </span>
-          ) : null}
-        </div>
-        {api.blockingWarnings.length > 0 ? (
-          <ul className="mt-2 space-y-0.5 border-l-2 border-up pl-2 text-xs text-up">
-            {api.blockingWarnings.map((w) => (
-              <li key={w}>{w}</li>
-            ))}
-          </ul>
-        ) : null}
-        {loadWarnings.length > 0 ? (
-          <ul className="mt-2 space-y-0.5 border-l-2 border-gold pl-2 text-xs text-gold">
-            {loadWarnings.map((w) => (
-              <li key={w}>打开时的近似：{w}</li>
-            ))}
-          </ul>
-        ) : null}
-        {loadTranslated ? (
-          <p className="mt-2 border-l-2 border-gold pl-2 text-xs text-gold">
-            该因子库里存的是历史 qlib 写法，已按统一引擎翻译成 lquant DSL 打开；
-            保存后以 DSL 存储。
-          </p>
-        ) : null}
-      </Panel>
-
-      {/* 画布三栏 */}
-      <div className="flex h-[calc(100vh-330px)] min-h-[520px] border border-line bg-panel">
-        <BlockPalette
-          catalog={api.catalog}
-          onAdd={(kind, op, arity) => api.addBlock(kind, op, undefined, arity)}
+      {/* 表达式直编 + 画布三栏：文本与画布共用一块高度，直编框可折叠 */}
+      <div className="flex h-[calc(100vh-300px)] min-h-[600px] flex-col border border-line bg-panel">
+        <ExpressionPane
+          value={api.text}
+          onChange={api.setText}
+          sync={api.sync}
+          onFormat={api.formatText}
+          onRevert={api.revertToCanvas}
+          onSave={() => void handleSave()}
+          collapsed={paneCollapsed}
+          onToggle={() => setPaneCollapsed((v) => !v)}
         />
-        <div className="min-w-0 flex-1">
-          <Canvas
+        <div className="flex min-h-0 flex-1">
+          <BlockPalette
             catalog={api.catalog}
+            onAdd={(kind, op, arity) => api.addBlock(kind, op, undefined, arity)}
+          />
+          <div className="min-w-0 flex-1">
+            <Canvas
+              catalog={api.catalog}
+              nodes={api.state.nodes}
+              edges={api.state.edges}
+              selectedId={api.state.selectedId}
+              onMove={api.move}
+              onSelect={api.select}
+              onRemoveNode={api.removeBlock}
+              onRemoveEdge={api.disconnect}
+              onConnect={api.connect}
+              onPatch={api.patchNode}
+              onAddBlock={api.addBlock}
+            />
+          </div>
+          <Inspector
+            catalog={api.catalog}
+            node={api.selected}
             nodes={api.state.nodes}
             edges={api.state.edges}
-            selectedId={api.state.selectedId}
-            onMove={api.move}
-            onSelect={api.select}
-            onRemoveNode={api.removeBlock}
-            onRemoveEdge={api.disconnect}
-            onConnect={api.connect}
             onPatch={api.patchNode}
-            onAddBlock={api.addBlock}
+            onSetParam={api.setParam}
+            onRemove={api.removeBlock}
           />
         </div>
-        <Inspector
-          catalog={api.catalog}
-          node={api.selected}
-          nodes={api.state.nodes}
-          edges={api.state.edges}
-          onPatch={api.patchNode}
-          onSetParam={api.setParam}
-          onRemove={api.removeBlock}
-        />
+        {/* 画布自身的结构问题：**不拦保存**（文本才是真相源），但必须如实说出来，
+            否则用户只会看到保存按钮莫名变灰。 */}
+        {api.canvasProblems.length > 0 ? (
+          <div className="border-t border-line px-3 py-1.5 text-[11px] text-up">
+            画布未接通：{api.canvasProblems.join('；')}
+          </div>
+        ) : null}
       </div>
 
       {/* 保存与评价 */}
