@@ -180,3 +180,76 @@ describe('回测工作台 page', () => {
     expect(await screen.findByLabelText('策略名称')).toBeInTheDocument();
   });
 });
+
+// 「新建」必须回到真正的白纸 —— 只清 name/description/code 会让上一个策略的
+// 回测区间与因子留在编辑器里，用户随后「编译运行」跑的是别人的参数；
+// 而已处于新建态时再点，若每个 setState 都是原值，React 会 bail out，
+// DOM 零变化，按钮看起来完全失灵。
+describe('回测工作台「新建」复位', () => {
+  async function editFieldsThenNew() {
+    render(<Page />);
+    const name = await screen.findByLabelText('策略名称');
+    await userEvent.type(name, '待丢弃策略');
+    await userEvent.clear(screen.getByLabelText('开始日期'));
+    await userEvent.type(screen.getByLabelText('开始日期'), '2019-09-09');
+    await userEvent.clear(screen.getByLabelText('因子公式'));
+    await userEvent.type(screen.getByLabelText('因子公式'), 'pct_change_5');
+    // 顶部 RunBar 的「新建」（精确匹配，避开「+ 新建策略」）
+    await userEvent.click(screen.getByRole('button', { name: '新建' }));
+  }
+
+  it('点击「新建」清空名称', async () => {
+    await editFieldsThenNew();
+    expect(screen.getByLabelText('策略名称')).toHaveValue('');
+  });
+
+  it('点击「新建」把开始日期复位为默认值，而非沿用上一个策略', async () => {
+    await editFieldsThenNew();
+    expect(screen.getByLabelText('开始日期')).toHaveValue('2024-01-01');
+  });
+
+  it('点击「新建」把因子公式复位为默认值，而非沿用上一个策略', async () => {
+    await editFieldsThenNew();
+    expect(screen.getByLabelText('因子公式')).toHaveValue('pct_change_20');
+  });
+
+  it('点击「新建」清空右栏结果区（回到空态引导）', async () => {
+    await editFieldsThenNew();
+    expect(screen.getByText(/开始第一次回测/)).toBeInTheDocument();
+  });
+});
+
+// 载入策略时 base 快照必须完全来自策略自身数据：此前 start/end 取自组件闭包里
+// 当前编辑器的旧 params，切到另一个策略会一载入就误报「●未保存」。
+describe('回测工作台载入策略的 dirty 基准', () => {
+  it('载入 config 带 start/end 的策略 → 回填该日期且不误报未保存', async () => {
+    setUserStrategies([{ id: 's1', name: '甲策略', source: 'user' }]);
+    getMock.mockImplementation((path: string) => {
+      if (path === '/strategies/s1') {
+        return Promise.resolve({
+          id: 's1',
+          name: '甲策略',
+          source: 'print(1)',
+          config: { start: '2023-01-03', end: '2023-06-30', factor_formulas: ['momentum_20'] },
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+    render(<Page />);
+
+    // 先把编辑器里的日期/因子改成与目标策略不同的值，制造"旧 params 污染"条件
+    await userEvent.clear(await screen.findByLabelText('开始日期'));
+    await userEvent.type(screen.getByLabelText('开始日期'), '2019-09-09');
+    await userEvent.clear(screen.getByLabelText('因子公式'));
+    await userEvent.type(screen.getByLabelText('因子公式'), 'pct_change_5');
+
+    await userEvent.click(screen.getByRole('button', { name: /甲策略/ }));
+
+    // 日期与因子来自策略 config
+    expect(await screen.findByLabelText('开始日期')).toHaveValue('2023-01-03');
+    expect(screen.getByLabelText('结束日期')).toHaveValue('2023-06-30');
+    expect(screen.getByLabelText('因子公式')).toHaveValue('momentum_20');
+    // 刚载入 = 与 base 一致，不该显示未保存
+    expect(screen.queryByText('●未保存')).not.toBeInTheDocument();
+  });
+});
