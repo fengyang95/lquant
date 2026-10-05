@@ -125,7 +125,13 @@ function BacktestWorkspace() {
     params: { ...params },
   });
 
-  /** 载入策略：填充全部字段 + 基准快照 + 原 config（保存时合并 factor_formulas） */
+  /** 载入策略：填充全部字段 + 基准快照 + 原 config（保存时合并 factor_formulas）。
+   *
+   * base 快照必须**完全由策略自身数据**构建。此前 start/end 取的是组件闭包里
+   * 当前编辑器的旧 params，导致「切到另一个策略」时 base 与 cur 天然不等，
+   * 一载入就误报「●未保存」。config 里没有日期时回落到默认值（与保存时的
+   * 行为对称：loadStrategy 载入什么，handleSave 就写回什么）。
+   */
   async function loadStrategy(id: string) {
     setErrors([]);
     setNotice('');
@@ -137,15 +143,18 @@ function BacktestWorkspace() {
       setCode(s?.source || '');
       const cfg = s?.config ?? {};
       setLoadedConfig(cfg);
-      // dirty 基准的 params 必须来自策略自身的 config（factor_formulas），
-      // 用当前编辑器里的旧 params 当基准会让"还原到刚加载状态"语义错位。
       const formulasRaw = (cfg as { factor_formulas?: unknown }).factor_formulas;
       const formulas = Array.isArray(formulasRaw) ? formulasRaw.join(',') : '';
+      const startRaw = (cfg as { start?: unknown }).start;
+      const endRaw = (cfg as { end?: unknown }).end;
+      const start = typeof startRaw === 'string' && startRaw ? startRaw : START_DEFAULT;
+      const end = typeof endRaw === 'string' && endRaw ? endRaw : END_DEFAULT;
+      setParams({ start, end, formulas });
       setBase({
         name: s?.name ?? '',
         description: s?.description ?? '',
         code: s?.source || '',
-        params: { start: params.start, end: params.end, formulas },
+        params: { start, end, formulas },
       });
     } catch (e) {
       setErrors([e instanceof Error ? e.message : String(e)]);
@@ -174,13 +183,23 @@ function BacktestWorkspace() {
     }
   }
 
+  /** 新建：回到一张真正的白纸。
+   *
+   * 必须连 params 一起重置 —— 只清 name/description/code 会让上一个策略的
+   * 回测区间与因子公式留在编辑器里。用户点「新建」后直接「编译运行」，
+   * 跑的就是上一个策略的参数；而已处于新建态时再点，「全部 setState 成原值」
+   * 会被 React bail out，DOM 零变化，按钮看起来完全是坏的。
+   */
   function resetToNew() {
     setSelectedId(null);
     setName('');
     setDescription('');
     setCode(DQ_TEMPLATE);
+    setParams({ ...PARAMS_DEFAULT });
     setLoadedConfig({});
     setBase(null);
+    // 右栏结果属于上一个策略/运行，新建后必须清掉，否则用户以为跑出了新结果
+    setRunId(null);
     setErrors([]);
     setNotice('');
   }
@@ -193,7 +212,14 @@ function BacktestWorkspace() {
     setBusy('save');
     setErrors([]);
     try {
-      const config = { ...loadedConfig, factor_formulas: parseFormulas(params.formulas) };
+      // start/end 一并入 config：loadStrategy 依赖它们还原回测区间，
+      // 否则重新载入策略会拿到默认日期、并误判为「未保存」。
+      const config = {
+        ...loadedConfig,
+        factor_formulas: parseFormulas(params.formulas),
+        start: params.start,
+        end: params.end,
+      };
       if (selectedId) {
         // PUT 契约：StrategySourceIn 只有 source/description/config，不可改名
         await putData(`/strategies/${selectedId}`, { source: code, description, config });
