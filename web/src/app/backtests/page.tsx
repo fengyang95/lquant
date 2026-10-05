@@ -21,9 +21,15 @@ import ValidationPanel from './workspace/ValidationPanel';
 import QlibRunsSection from './QlibRunsSection';
 import {
   buildRunPayload,
+  confirmDiscard,
+  describeRun,
   isDirty,
   parseFormulas,
+  pollDelayMs,
+  RUN_TIMEOUT_MS,
   type EditorParams,
+  type JobProgress,
+  type RunStatus,
   type Snapshot,
   type StrategyMeta,
 } from './workspace/state';
@@ -39,9 +45,10 @@ type StrategyDetail = {
 type RunCodeResult = { job_id: string };
 
 type RunCodeStatus = {
-  status: 'queued' | 'running' | 'done' | 'failed' | 'canceled';
+  status: RunStatus;
   run_id?: string;
   error?: string | null;
+  progress?: JobProgress;
 };
 
 const DQ_TEMPLATE = `# 双均线择时示例 —— lquant 用户策略
@@ -89,6 +96,20 @@ const PARAMS_DEFAULT: EditorParams = {
   formulas: FACTOR_DEFAULT,
 };
 
+/**
+ * 空白新建态的基准快照。
+ *
+ * 页面一打开编辑器里就有模板代码，若用 base=null 判定，isDirty 恒为 true
+ * （isDirty 把 null 基准下的"非全空"视为已修改）—— 用户还没动手就会被
+ * 「未保存修改」拦住。模板 + 默认参数就是新建态的"已保存"状态，用它当基准。
+ */
+const NEW_BASE: Snapshot = {
+  name: '',
+  description: '',
+  code: DQ_TEMPLATE,
+  params: PARAMS_DEFAULT,
+};
+
 type TabId = 'workspace' | 'quick' | 'history' | 'validation';
 
 const TABS: { id: TabId; label: string }[] = [
@@ -110,7 +131,7 @@ function BacktestWorkspace() {
   const [code, setCode] = useState(DQ_TEMPLATE);
   const [params, setParams] = useState<EditorParams>(PARAMS_DEFAULT);
   const [loadedConfig, setLoadedConfig] = useState<Record<string, unknown>>({});
-  const [base, setBase] = useState<Snapshot | null>(null);
+  const [base, setBase] = useState<Snapshot | null>(NEW_BASE);
   const [busy, setBusy] = useState<'' | 'save' | 'validate' | 'run'>('');
   const [notice, setNotice] = useState('');
   const [errors, setErrors] = useState<string[]>([]);
@@ -197,7 +218,8 @@ function BacktestWorkspace() {
     setCode(DQ_TEMPLATE);
     setParams({ ...PARAMS_DEFAULT });
     setLoadedConfig({});
-    setBase(null);
+    // 回到"全新白纸"基准：否则点完新建立刻就被判定为未保存
+    setBase(NEW_BASE);
     // 右栏结果属于上一个策略/运行，新建后必须清掉，否则用户以为跑出了新结果
     setRunId(null);
     setErrors([]);
@@ -272,6 +294,23 @@ function BacktestWorkspace() {
     };
   }, []);
 
+  /** 运行中任务 id：非空即代表可以取消（右栏「取消」按钮据此显隐）。 */
+  const [runningJobId, setRunningJobId] = useState<string | null>(null);
+
+  /** 取消运行中的回测。协作式取消：后端置标记，任务体在阶段边界收尾。 */
+  async function handleCancelRun() {
+    const jobId = runningJobId;
+    if (!jobId) return;
+    try {
+      await post(`/backtests/run-code/${jobId}/cancel`, {});
+      setNotice('已请求取消，等待任务收尾…');
+    } catch (e) {
+      // 409 = 任务刚好已结束，不算错误，让轮询去收敛状态
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!/409/.test(msg)) setErrors([msg]);
+    }
+  }
+
   async function handleRun() {
     setBusy('run');
     setErrors([]);
@@ -280,11 +319,17 @@ function BacktestWorkspace() {
       const payload = buildRunPayload(code, params, selectedId);
       const r = await post<RunCodeResult>('/backtests/run-code', payload);
       // run-code 已异步入队：POST 返回 job_id（轮询键），真正的 run_id
-      // 在终态响应里 —— 轮询直到终态（超时 10 分钟兜底），卸载即停。
+      // 在终态响应里 —— 轮询直到终态（超时兜底），卸载即停。
       const jobId = r.job_id;
-      const deadline = Date.now() + 10 * 60 * 1000;
+      setRunningJobId(jobId);
+      const startedAt = Date.now();
+      const deadline = startedAt + RUN_TIMEOUT_MS;
+      let attempt = 0;
       for (;;) {
-        await new Promise((res) => setTimeout(res, 2000));
+        // 退避轮询：刚提交时密一点拿首个进度，随后拉长，避免几十秒
+        // 的任务打出上百次请求。
+        await new Promise((res) => setTimeout(res, pollDelayMs(attempt)));
+        attempt += 1;
         if (!mountedRef.current) return;
         if (Date.now() > deadline) {
           throw new Error(`回测任务 ${jobId} 超过 10 分钟未完成，请稍后在历史列表查看`);
@@ -300,14 +345,18 @@ function BacktestWorkspace() {
         if (st.status === 'failed' || st.status === 'canceled') {
           throw new Error(st.error || `回测任务 ${st.status}`);
         }
-        setNotice(`回测运行中…（${st.status === 'queued' ? '排队中' : '执行中'}）`);
+        // 显式展示阶段与已用时长：没有它，26~39s 的等待与"卡死"无法区分
+        setNotice(describeRun(st.status, st.progress ?? null, Date.now() - startedAt));
       }
     } catch (e) {
       if (!mountedRef.current) return;
       setErrors([e instanceof Error ? e.message : String(e)]);
       setNotice('');
     } finally {
-      if (mountedRef.current) setBusy('');
+      if (mountedRef.current) {
+        setBusy('');
+        setRunningJobId(null);
+      }
     }
   }
 
@@ -340,6 +389,18 @@ function BacktestWorkspace() {
   const snapshot: Snapshot = { name, description, code, params };
   const dirty = isDirty(snapshot, base);
 
+  // --- 丢弃保护：载入 / 新建 / 切 Tab 都会直接丢掉编辑器内容，dirty 时先问一句 ---
+  const guardNew = () => {
+    if (confirmDiscard(dirty, '新建策略', window.confirm)) resetToNew();
+  };
+  const guardLoad = (id: string) => {
+    if (confirmDiscard(dirty, '载入其他策略', window.confirm)) void loadStrategy(id);
+  };
+  const guardTab = (next: TabId) => {
+    if (next === tab) return;
+    if (confirmDiscard(dirty, '切换页签', window.confirm)) setTab(next);
+  };
+
   return (
     <div className="space-y-5">
       <PageHeader
@@ -349,7 +410,7 @@ function BacktestWorkspace() {
           <RunBar
             dirty={dirty}
             busy={busy}
-            onNew={resetToNew}
+            onNew={guardNew}
             onSave={() => void handleSave()}
             onValidate={() => void handleValidate()}
             onRun={() => void handleRun()}
@@ -363,7 +424,7 @@ function BacktestWorkspace() {
           <button
             key={t.id}
             type="button"
-            onClick={() => setTab(t.id)}
+            onClick={() => guardTab(t.id)}
             className={`btn btn-sm ${tab === t.id ? 'btn-primary' : ''}`}
           >
             {t.label}
@@ -387,7 +448,7 @@ function BacktestWorkspace() {
             <StrategyPane
               strategies={(allStrategies ?? []).filter((s) => s.source === 'user')}
               selectedId={selectedId}
-              onLoad={(id) => void loadStrategy(id)}
+              onLoad={guardLoad}
               onDelete={(id, n) => void handleDeleteStrategy(id, n)}
               onNew={resetToNew}
             />
@@ -410,7 +471,11 @@ function BacktestWorkspace() {
           </div>
           {/* 右栏：结果 */}
           <div className="w-[380px] shrink-0">
-            <ResultPane runId={runId} />
+            <ResultPane
+              runId={runId}
+              runningJobId={runningJobId}
+              onCancel={() => void handleCancelRun()}
+            />
           </div>
         </div>
       )}
@@ -418,11 +483,12 @@ function BacktestWorkspace() {
       {tab === 'quick' && <QuickRunPanel />}
       {tab === 'history' && (
         <HistoryPanel
-          onLoadRun={(row) =>
+          onLoadRun={(row) => {
+            if (!confirmDiscard(dirty, '载入这次运行', window.confirm)) return;
             void (row.params?.strategy_id
               ? loadStrategy(row.params.strategy_id)
-              : loadRunCode(row.run_id))
-          }
+              : loadRunCode(row.run_id));
+          }}
         />
       )}
       {tab === 'validation' && (

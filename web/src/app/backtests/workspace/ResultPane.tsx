@@ -119,7 +119,14 @@ function useNavOption(d: Detail | undefined) {
   }, [d]);
 }
 
-export default function ResultPane({ runId }: { runId: string | null }) {
+type ResultPaneProps = {
+  runId: string | null;
+  /** 运行中的 job id：非空时右栏显示「取消」入口（协作式取消）。 */
+  runningJobId?: string | null;
+  onCancel?: () => void;
+};
+
+export default function ResultPane({ runId, runningJobId = null, onCancel }: ResultPaneProps) {
   const { data: d, isLoading, error } = useSWR<Detail>(
     runId ? `/backtests/${runId}` : null,
     get,
@@ -128,6 +135,24 @@ export default function ResultPane({ runId }: { runId: string | null }) {
         latest?.status && latest.status !== 'done' && latest.status !== 'failed' ? 3000 : 0 },
   );
   const navOption = useNavOption(d);
+
+  // 运行中优先于空态：此前这里一直显示「点编译运行开始第一次回测」，
+  // 用户点了运行后右栏毫无变化，只能靠顶部一行小字判断"到底跑没跑"。
+  if (runningJobId) {
+    return (
+      <div className="space-y-3 border border-line bg-panel px-4 py-3">
+        <div className="text-sm text-ink-dim">回测运行中…</div>
+        <p className="text-xs text-ink-faint">
+          进度见上方提示。任务在后台异步执行，可取消或切走，完成后结果会出现在这里。
+        </p>
+        {onCancel && (
+          <button type="button" className="btn btn-sm" onClick={onCancel}>
+            取消运行
+          </button>
+        )}
+      </div>
+    );
+  }
 
   if (!runId) {
     return <Empty>点「编译运行 ▶」开始第一次回测</Empty>;

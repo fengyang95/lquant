@@ -155,6 +155,124 @@ def test_run_jq_code_lifecycle(client):
     assert client.get("/api/backtests/run-code/zzzz").status_code == 404
 
 
+def test_run_code_status_exposes_progress_field(client):
+    """状态端点必须带 progress 字段（可空）。
+
+    回测要跑几十秒：前端此前只能显示"执行中…"，无法区分正常推进与卡死。
+    字段缺失会让前端永远拿不到阶段名，所以即使无进度也必须显式返回该键。
+    """
+    code = "def initialize(context):\n    pass\n\ndef handle_data(context, data):\n    pass\n"
+    r = client.post("/api/backtests/run-code",
+                    json={"code": code, "start": "2026-01-01"})
+    assert r.status_code == 200, r.text
+    job_id = r.json()["job_id"]
+
+    s = client.get(f"/api/backtests/run-code/{job_id}")
+    assert s.status_code == 200
+    assert "progress" in s.json(), "状态响应必须包含 progress 键"
+
+    body = _wait_run_code(client, job_id)
+    assert body["status"] == "done", body.get("error")
+
+
+def test_run_code_cancel_endpoint_rejects_finished_job(client):
+    """已终态的任务再取消 → 409（与 ml/qlib 取消语义一致）。"""
+    code = "def initialize(context):\n    pass\n\ndef handle_data(context, data):\n    pass\n"
+    r = client.post("/api/backtests/run-code",
+                    json={"code": code, "start": "2026-01-01"})
+    job_id = r.json()["job_id"]
+    body = _wait_run_code(client, job_id)
+    assert body["status"] == "done"
+
+    c = client.post(f"/api/backtests/run-code/{job_id}/cancel")
+    assert c.status_code == 409, c.text
+
+
+def test_run_code_cancel_unknown_job_404(client):
+    assert client.post("/api/backtests/run-code/zzzz/cancel").status_code == 404
+
+
+def test_run_code_status_progress_read_failure_is_swallowed(client, monkeypatch):
+    """进度读取抛异常时按无进度处理（progress=None），状态轮询本身不受影响。
+
+    进度是附加信息：进度表/连接出问题不该让整个状态端点 500 —— 否则前端
+    连"任务是否结束"都拿不到，会一直转圈。
+    """
+    import lquant.server.progress as progress_mod
+
+    code = "def initialize(context):\n    pass\n\ndef handle_data(context, data):\n    pass\n"
+    r = client.post("/api/backtests/run-code",
+                    json={"code": code, "start": "2026-01-01"})
+    job_id = r.json()["job_id"]
+
+    def boom(_jid):
+        raise RuntimeError("进度源炸了")
+
+    monkeypatch.setattr(progress_mod, "get_progress", boom)
+    s = client.get(f"/api/backtests/run-code/{job_id}")
+    assert s.status_code == 200, s.text
+    assert s.json()["progress"] is None
+
+    monkeypatch.undo()
+    _wait_run_code(client, job_id)
+
+
+def test_run_code_cancel_unregistered_job_409(client, monkeypatch):
+    """任务存在但取消登记表里没有它（如进程重启后遗留）→ 409，而不是 500。
+
+    request_cancel 在端点函数体内 import，patch 必须打到 jobs 模块本体，
+    打到 backtests 模块属性上不会生效。
+    """
+    import lquant.server.jobs as jobs_mod
+
+    code = "def initialize(context):\n    pass\n\ndef handle_data(context, data):\n    pass\n"
+    r = client.post("/api/backtests/run-code",
+                    json={"code": code, "start": "2025-01-01", "end": "2026-06-30"})
+    job_id = r.json()["job_id"]
+
+    monkeypatch.setattr(jobs_mod, "request_cancel", lambda _jid: False)
+    c = client.post(f"/api/backtests/run-code/{job_id}/cancel")
+    assert c.status_code == 409, c.text
+    assert "不可取消" in c.text
+
+    # 收尾：正常取消一次，避免线程挂着影响后续用例
+    monkeypatch.undo()
+    client.post(f"/api/backtests/run-code/{job_id}/cancel")
+    _wait_run_code(client, job_id)
+
+
+def test_run_code_cancel_running_job(client):
+    """运行中任务可取消 → 200 {canceled: true}，状态收敛到 canceled。
+
+    本地降级线程无法强杀：cancel 置协作标记，任务体在阶段边界收尾。
+    因此这里允许两种终态（canceled / done）—— 关键是不能 500、
+    且不能"取消成功了却还显示 running"。
+    """
+    import time as _t
+
+    # 用较长区间拉长执行时间，制造可取消的窗口
+    code = "def initialize(context):\n    pass\n\ndef handle_data(context, data):\n    pass\n"
+    r = client.post("/api/backtests/run-code",
+                    json={"code": code, "start": "2025-01-01", "end": "2026-06-30"})
+    assert r.status_code == 200, r.text
+    job_id = r.json()["job_id"]
+
+    c = client.post(f"/api/backtests/run-code/{job_id}/cancel")
+    # 任务可能已跑完（快机器）→ 409；否则受理 200
+    assert c.status_code in (200, 409), c.text
+    if c.status_code == 200:
+        assert c.json()["canceled"] is True
+
+    deadline = _t.time() + 30
+    while _t.time() < deadline:
+        body = client.get(f"/api/backtests/run-code/{job_id}").json()
+        if body["status"] in ("done", "failed", "canceled"):
+            break
+        _t.sleep(0.05)
+    assert body["status"] in ("done", "canceled"), body
+
+
+
 def test_run_jq_code_rejects_bad_source(client):
     r = client.post("/api/backtests/run-code",
                     json={"code": "import os\nos.system('ls')", "start": "2026-01-01"})

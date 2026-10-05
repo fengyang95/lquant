@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 
 const mockUseSWR = vi.fn();
 
@@ -76,5 +76,39 @@ describe('ResultPane', () => {
     render(<ResultPane runId="r2" />);
     expect(screen.getByText(/加载中/)).toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /查看完整详情/ })).not.toBeInTheDocument();
+  });
+
+  // 运行中：此前右栏始终显示「点编译运行开始第一次回测」空态，用户点了运行后
+  // 这一栏毫无变化，无法判断跑没跑起来，也没有取消入口。
+  it('运行中显示进度态与「取消运行」，且不再显示空态引导', () => {
+    mockUseSWR.mockReturnValue({ data: undefined });
+    const onCancel = vi.fn();
+    render(<ResultPane runId={null} runningJobId="j1" onCancel={onCancel} />);
+
+    expect(screen.getByText('回测运行中…')).toBeInTheDocument();
+    expect(screen.queryByText('点「编译运行 ▶」开始第一次回测')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '取消运行' }));
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('运行中未传 onCancel 时不渲染取消按钮（避免死按钮）', () => {
+    mockUseSWR.mockReturnValue({ data: undefined });
+    render(<ResultPane runId={null} runningJobId="j1" />);
+    expect(screen.queryByRole('button', { name: '取消运行' })).not.toBeInTheDocument();
+  });
+
+  it('运行中优先于已有结果展示（不被上一次的 runId 盖住）', () => {
+    mockUseSWR.mockReturnValue({ data: DETAIL, isLoading: false });
+    render(<ResultPane runId="r1" runningJobId="j2" onCancel={vi.fn()} />);
+    expect(screen.getByText('回测运行中…')).toBeInTheDocument();
+    expect(screen.queryByText('收益')).not.toBeInTheDocument();
+  });
+
+  it('运行结束后（runningJobId 清空）回到既有结果展示', () => {
+    mockUseSWR.mockReturnValue({ data: DETAIL, isLoading: false });
+    render(<ResultPane runId="r1" runningJobId={null} />);
+    expect(screen.queryByText('回测运行中…')).not.toBeInTheDocument();
+    expect(screen.getByText('收益')).toBeInTheDocument();
   });
 });
