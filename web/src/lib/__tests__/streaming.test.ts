@@ -63,6 +63,21 @@ describe('useJobStream', () => {
     expect(result.current.error).toContain('已中断');
   });
 
+  it('终态帧后服务端关连 → 正常收尾，不再发起重连', () => {
+    // 回归：服务端发完 done 帧即 close，客户端若仍重连会重复拉同一终态帧
+    const { Ctor, instances } = makeWsMock();
+    vi.stubGlobal('WebSocket', Ctor);
+    renderHook(() => useJobStream('job-7'));
+    act(() => {
+      instances[0].onmessage?.({ data: JSON.stringify({ status: 'done', done: true }) });
+      instances[0].onclose?.();
+    });
+    act(() => {
+      vi.advanceTimersByTime(5000);
+    });
+    expect(Ctor).toHaveBeenCalledTimes(1);
+  });
+
   it('非终态断连 → 有限重连（new 新 WebSocket）而非立即报错', () => {
     const { Ctor, instances } = makeWsMock();
     vi.stubGlobal('WebSocket', Ctor);

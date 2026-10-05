@@ -76,12 +76,15 @@ def event_study(
     if miss:
         raise KeyError(f"缺少列 {miss}")
 
+    # 价格路径分析必须拿「行完整面板」（与 decay_profile 的行过滤陷阱同源）：
+    # 若先 drop_nulls([price, factor]) 再 shift，`shift(-k).over(symbol)` 会
+    # 跨过被剔掉的行 —— 「k 个交易日后的收益」被静默算成跨越更长区间的收益。
+    # 因此先只剔 price 缺失的行算收益路径，再剔 factor 缺失的行做事件归属。
     d = (
         df.select(need)
-        .drop_nulls([price_col, factor])
+        .drop_nulls([price_col])
         .sort([symbol_col, date_col])
     )
-    d = add_quantile(d, factor, n_groups, date_col=date_col)
 
     rel = _rel_cols(before, after)
     # 第一趟：算各相对日的累计收益。k ≥ 0 → 事件日到 t+k 的收益（拿住能赚多少）；
@@ -97,11 +100,15 @@ def event_study(
         ).sub(1.0).alias(f"r{k}")
         for k in range(-before, after + 1)
     ])
+    # 事件归属：只有 factor 有效的行才参与分位分组与截面 demean
+    d = d.drop_nulls([factor])
     if demeaned:
         d = d.with_columns([
             (pl.col(f"r{k}") - pl.col(f"r{k}").mean().over(date_col)).alias(f"r{k}")
             for k in range(-before, after + 1)
         ])
+
+    d = add_quantile(d, factor, n_groups, date_col=date_col)
 
     # 各 (q, rel_period) 的均值可以按列独立聚合：直接 group_by(q).mean，
     # 不必把全面板 unpivot 成 26 倍行数的长表（全市场多年 ≈ 上亿行中间帧，

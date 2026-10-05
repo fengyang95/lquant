@@ -149,7 +149,8 @@ def test_retrain_enqueues_and_validates_months(client, monkeypatch):
 
 def test_job_endpoints(client, ml_env):
     assert client.get("/api/ml/jobs/nope").status_code == 404
-    assert client.post("/api/ml/jobs/nope/cancel").json()["canceled"] is False
+    # 取消契约与 backtests/任务中心对齐：不存在的任务 404，不是 200 {"canceled": false}
+    assert client.post("/api/ml/jobs/nope/cancel").status_code == 404
 
 
 # ---------------------------------------------------------------- 训练记录

@@ -49,6 +49,7 @@ export function useJobStream<T = unknown>(
     const url = `${proto}//${window.location.host}/ws/jobs/${encodeURIComponent(jobId)}`;
     let alive = true;
     let closed = false;
+    let finished = false; // 已收到终态帧：服务端主动关连属正常收尾，不再重连
     let retry = 0;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     let ws: WebSocket | null = null;
@@ -63,6 +64,7 @@ export function useJobStream<T = unknown>(
           done?: boolean;
         };
         if (!alive) return;
+        if (m.done) finished = true;
         // 帧合并而非整体替换：终态帧不带 progress，整体替换会让进度条瞬间清空
         setState((prev) => ({
           status: m.status ?? prev.status,
@@ -84,6 +86,8 @@ export function useJobStream<T = unknown>(
       ws.onmessage = (ev: MessageEvent<string>) => handleMsg(ev.data);
       ws.onclose = () => {
         if (closed || !alive) return;
+        // 服务端发完终态帧主动关连属正常收尾，重连只会重复拉同一终态帧
+        if (finished) return;
         // 服务端未发终态就断连：有限重连（网络抖动/代理超时下任务仍在跑），
         // 重试 2 次仍失败才置错误终态，防 busy 悬挂
         if (retry < 2) {
