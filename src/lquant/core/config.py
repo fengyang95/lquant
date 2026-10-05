@@ -139,6 +139,7 @@ class Settings(BaseModel):
     duckdb_path: str = "./data/duckdb/lquant.duckdb"
     parquet_dir: str = "./data/parquet"
     cache_dir: str = "./data/cache"
+    reports_dir: str = "./data/reports"
     ingest_concurrency: int = 4
     ingest_watchdog_sec: int = 120
     redis_url: str = "redis://localhost:6379/0"
@@ -174,6 +175,7 @@ def get_settings() -> Settings:
         duckdb_path=str(paths.get("duckdb", "./data/duckdb/lquant.duckdb")),
         parquet_dir=str(paths.get("parquet", "./data/parquet")),
         cache_dir=str(paths.get("cache", "./data/cache")),
+        reports_dir=str(paths.get("reports", "./data/reports")),
         ingest_concurrency=int(ingest.get("concurrency", 4)),
         ingest_watchdog_sec=int(ingest.get("watchdog_sec", 120)),
         redis_url=os.getenv("LQ_REDIS_URL", "redis://localhost:6379/0"),

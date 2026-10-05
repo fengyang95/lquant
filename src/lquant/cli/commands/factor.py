@@ -617,37 +617,93 @@ def robust(expr: str, start: str | None, n_groups: int, top_months: int,
 
 @factor.command()
 @click.argument("expr")
-@click.option("--out", default=None, help="输出 HTML 路径（默认 data/reports/factor_<id>.html）")
+@click.option("--out", default=None, help="输出 HTML 路径（默认 <仓库根>/data/reports/factor_<id>.html）")
 @click.option("--start", default=None, help="数据窗口起点 YYYY-MM-DD")
 @click.option("--n-groups", default=10, help="分层组数")
 @click.option("--bps", default="0,5,10,15,30", help="成本敏感性 bps 列表（逗号分隔）")
-def report(expr: str, out: str | None, start: str | None, n_groups: int, bps: str) -> None:
+@click.option("--filter-zscore", default=None, type=float,
+              help="截面异常收益过滤阈值（|z| 上限，口径同 alphalens；默认不过滤）")
+@click.option("--exclude-st", is_flag=True, default=False,
+              help="剔除 ST/*ST（默认否 —— 打开会改变 IC/分层口径）")
+@click.option("--exclude-suspended", is_flag=True, default=False,
+              help="剔除停牌（默认否）")
+def report(expr: str, out: str | None, start: str | None, n_groups: int, bps: str,
+           filter_zscore: float | None, exclude_st: bool,
+           exclude_suspended: bool) -> None:
     """生成自包含 HTML 因子研究报告（离线可看，涨红跌绿）。
 
-    报告含 IC/滚动/分层/衰减/分年度/归因/换手/成本敏感性 ——
-    单文件、无外部依赖，可直接归档或发出。
+    报告含「结论（评级）」+「样本与口径」+ IC/滚动/分层/超额/衰减/分年度/
+    归因/分组 IC/换手/成本/容量 —— 单文件、无外部依赖，可直接归档或发出。
     """
     import json
     from pathlib import Path
 
+    from lquant.core.config import get_settings
     from lquant.factors.dsl.printer import canonical_id
     from lquant.factors.evaluate import factor_report, save_report
+    from lquant.factors.evaluate.capacity import capacity_summary
+    from lquant.factors.evaluate.ic import ic_summary
+    from lquant.factors.evaluate.quantile import quantile_summary
+    from lquant.factors.evaluate.rating import factor_rating
+    from lquant.factors.evaluate.sample import apply_sample_filters, describe_sample_filters
 
     seg, cov_cols, days = _load_segments(start, expr, horizons=[1, 5, 10, 20])
     train = seg["train"]
     if not len(train):
         raise click.ClickException("train 段为空 —— 数据或表达式问题")
 
+    # 样本过滤（默认关）：与 API 同口径，报告里会写明到底剔没剔
+    if exclude_st or exclude_suspended:
+        train = apply_sample_filters(train, exclude_st=exclude_st,
+                                     exclude_suspended=exclude_suspended)
+        if not len(train):
+            raise click.ClickException("样本过滤后没有剩余数据 —— 检查 ST/停牌标记")
+
     cat = next((c for c in ("cov_industry_sw1", "industry_sw1") if c in train.columns), None)
+
+    # 结论层：CLI 只跑 L2 评级（不跑 L3 稳健性 —— 要重算因子多遍，太贵）
+    rating = None
+    try:
+        rating = factor_rating(
+            ic_summary(train, "f", "fwd_ret_1"),
+            quantile_summary(train, "f", "fwd_ret_1", n_groups))
+    except Exception:  # noqa: BLE001 - 评级失败不该让整份报告生成不了
+        rating = None
+
+    capacity = None
+    try:
+        capacity = capacity_summary(train, "f", "fwd_ret_1", n_groups=n_groups)
+    except Exception:  # noqa: BLE001 - 无成交额列时容量不可算，报告里标注即可
+        capacity = None
+
     # 分组 IC：按行业分组（有行业列时）。此前硬编码 None，导致报告里
     # 「分组 IC」这一节永远不出现 —— 引擎有能力，接线处丢了参数。
-    html = factor_report(train, "f", "fwd_ret_1", n_groups=n_groups,
-                         cat_col=cat, group_col=cat,
-                         bps_list=list(_parse_floats(bps)))
-    path = Path(out) if out else Path("data/reports") / f"factor_{canonical_id(expr)}.html"
+    html = factor_report(
+        train, "f", "fwd_ret_1", n_groups=n_groups,
+        cat_col=cat, group_col=cat,
+        bps_list=list(_parse_floats(bps)),
+        filter_zscore=filter_zscore,
+        display_name=expr, expr=expr,
+        data_start=start, n_samples=len(train),
+        sample_filters=describe_sample_filters(
+            train, exclude_st=exclude_st, exclude_suspended=exclude_suspended),
+        rating=rating,
+        extras={"capacity": capacity},
+    )
+    if out:
+        path = Path(out)
+    else:
+        s = get_settings()
+        base = Path(getattr(s, "reports_dir", "./data/reports"))
+        base = base if base.is_absolute() else (s.root / base)
+        path = base / f"factor_{canonical_id(expr)}.html"
     p = save_report(html, path)
     click.echo(json.dumps(_clean({
         "report": str(p.resolve()), "bytes": p.stat().st_size,
         "factor": expr, "factor_id": canonical_id(expr), "n_days": days,
         "neutralized": bool(cov_cols), "covariates": cov_cols,
+        "rating": (rating or {}).get("rating"),
+        "capacity_aum": (capacity or {}).get("capacity_aum"),
+        "exclude_st": exclude_st, "exclude_suspended": exclude_suspended,
+        "filter_zscore": filter_zscore,
     }), ensure_ascii=False))

@@ -44,7 +44,20 @@ def _jf(v, nd=4) -> float | None:
     return round(float(v), nd) if v is not None and math.isfinite(float(v)) else None
 
 
-REPORT_DIR = Path("data/reports")
+def _report_dir() -> Path:
+    """因子报告目录。
+
+    相对路径**锚定到仓库根**（``Settings.root``），不跟随进程 CWD ——
+    否则换个目录启动服务，报告会写到别处、``/factors/reports`` 也变空。
+    """
+    from lquant.core.config import get_settings
+
+    s = get_settings()
+    p = Path(getattr(s, "reports_dir", "./data/reports"))
+    return p if p.is_absolute() else (s.root / p)
+
+
+REPORT_DIR = _report_dir()
 
 
 class FactorIn(BaseModel):
@@ -100,6 +113,15 @@ class EvaluateIn(BaseModel):
     with_robustness: bool = Field(
         default=False,
         description="是否跑 L3 稳健性（窗口扰动/分段稳定/起点敏感/月度剔除）—— 需重算因子多遍，默认关")
+    exclude_st: bool = Field(
+        default=False,
+        description="是否剔除 ST/*ST（默认否 —— 打开会改变 IC/分层口径，报告会写明）")
+    exclude_suspended: bool = Field(
+        default=False,
+        description="是否剔除停牌（默认否 —— 打开会改变 IC/分层口径，报告会写明）")
+    aum_list: list[float] | None = Field(
+        default=None, max_length=12,
+        description="容量分析的资金规模档位；None = 用内置默认档")
 
     @field_validator("steps")
     @classmethod
@@ -559,6 +581,19 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
     if ret_col not in d.columns:
         raise HTTPException(500, f"前瞻收益列缺失: {ret_col}")
 
+    # 样本过滤（ST/停牌，默认关）：必须在所有计算之前，且报告里要写明到底剔没剔。
+    # 打开会改变 IC/分层口径，所以是显式开关而不是默认行为。
+    from lquant.factors.evaluate.sample import (
+        apply_sample_filters,
+        describe_sample_filters,
+    )
+
+    if req.exclude_st or req.exclude_suspended:
+        d = apply_sample_filters(d, exclude_st=req.exclude_st,
+                                 exclude_suspended=req.exclude_suspended)
+        if not len(d):
+            raise HTTPException(422, "样本过滤后没有剩余数据 —— 检查 ST/停牌标记")
+
     # 截面异常收益过滤（可选）：过滤一次，指标 / 序列 / 报告三处口径保持一致
     outlier_stats = None
     if req.filter_zscore is not None:
@@ -616,15 +651,17 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
 
     # ---- metrics（原 run_evaluate 计算体） ----
     _step(35, "评价计算")
+    # 报告延后到 extras（超额 / Top-N / 风格 / 归因阶梯 / 容量）全部算完再生成一次，
+    # 这样报告能一次带齐内容 —— 此前是先生成报告、再算 extras，导致
+    # 「研报三件套」永远进不了报告。
     res = evaluate(d, "_factor", ret_col=ret_col, n_groups=req.n_groups,
                    horizons=req.horizons, outlier_stats=outlier_stats,
                    cat_col=cat_col, group_col=cat_col,
                    bps_list=[0.0, 5.0, 10.0, 15.0, 30.0],
                    universe=req.universe, expr=req.formula, covs=cov_cols_present,
                    with_robustness=req.with_robustness,
+                   with_report=False,
                    event_window=(req.event_window[0], req.event_window[1]))
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = _save_report_atomic(res["report"], REPORT_DIR / f"{req.factor}.html")
     ic = res["ic"]["ic"]
     ric = res["ic"]["rank_ic"]
     ls = res["quantile"]["long_short"]
@@ -657,7 +694,7 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
         "annual_turnover": None,
         "top_n": [],
         "style_corr": {"max_abs": None, "passed": None},
-        "report_url": f"/api/factors/reports/{report_path.stem}",
+        "report_url": None,              # 报告在 extras 齐备后统一生成并回填
     }
 
     # ---- series（原 evaluate_series 计算体） ----
@@ -845,6 +882,50 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
         if outlier_stats else None
     )
 
+    # ---- 容量 / 流动性（基础版：闭式容量上限 + 平方根冲击成本） ----
+    from lquant.factors.evaluate.capacity import capacity_summary
+
+    capacity = None
+    try:
+        capacity = capacity_summary(
+            d, "_factor", ret_col, n_groups=req.n_groups,
+            aum_list=list(req.aum_list) if req.aum_list else None)
+    except Exception as e:  # noqa: BLE001
+        errors["capacity"] = f"{type(e).__name__}: {e}"
+
+    # ---- HTML 报告：所有内容块齐备后生成一次 ----
+    _step(90, "生成报告")
+    from lquant.factors.evaluate.report import factor_report
+
+    sample_filter_rows = describe_sample_filters(
+        d, exclude_st=req.exclude_st, exclude_suspended=req.exclude_suspended)
+    report_html = factor_report(
+        d, "_factor", ret_col, n_groups=req.n_groups, horizons=req.horizons,
+        cat_col=cat_col, group_col=cat_col,
+        bps_list=[0.0, 5.0, 10.0, 15.0, 30.0],
+        universe=req.universe, outlier_stats=outlier_stats,
+        event_window=(req.event_window[0], req.event_window[1]),
+        display_name=req.factor, expr=req.formula,
+        data_start=req.start, data_end=req.end, n_samples=len(d),
+        steps=applied_steps, covariates=cov_map,
+        sample_filters=sample_filter_rows, window=req.window,
+        rating=res.get("rating"), robustness=res.get("robustness"),
+        extras={
+            "excess": {"dates": ex_dates, "curves": ex_curves,
+                       "benchmark": "股票池等权", "metrics": excess_metrics},
+            "top_n": top_n_rows,
+            "style_corr": style_corr,
+            "neutral_ladder": ladder,
+            "neutral_views": views,
+            "group_ic_size": {"size_col": group_ic.get("size_col"),
+                              "rows": group_ic.get("size") or []},
+            "capacity": capacity,
+        })
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    report_path = _save_report_atomic(report_html, REPORT_DIR / f"{req.factor}.html")
+    metrics["report_url"] = f"/api/factors/reports/{report_path.stem}"
+    metrics["capacity"] = capacity
+
     series = {
         "factor": req.factor, "formula": req.formula,
         "n_groups": req.n_groups, "n_samples": len(d),
@@ -858,6 +939,8 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
         "excess": {"dates": ex_dates, "curves": ex_curves, "benchmark": "股票池等权"},
         "top_n": top_n_rows,
         "style_corr": style_corr,
+        "capacity": capacity,
+        "sample_filters": sample_filter_rows,
         "event_study": event_study,
         # 故障可见：UI 必须能区分「没数据」与「算炸了」
         "errors": errors,
@@ -1359,8 +1442,12 @@ def get_factor(name: str) -> dict:
         raise HTTPException(404, f"因子不存在: {name}")
     reports = []
     if REPORT_DIR.exists():
-        for p in sorted(REPORT_DIR.glob(f"{name}*.html"), key=lambda x: -x.stat().st_mtime):
-            reports.append({"name": p.stem, "url": f"/api/factors/reports/{p.stem}"})
+        # 精确匹配，不用 `{name}*.html` 前缀 glob —— 否则因子 BETA10 的
+        # 「历史报告」里会挂着 BETA10_copy（另一个因子）的报告。
+        p = REPORT_DIR / f"{name}.html"
+        if p.exists():
+            reports.append({"name": p.stem,
+                            "url": f"/api/factors/reports/{p.stem}"})
     return {"name": r[0], "expression": normalize_soft(r[1]), "description": r[2],
             "created_at": str(r[3]), "source": r[4] or "manual",
             "category": r[5] or "", "reports": reports}
@@ -1439,10 +1526,19 @@ def synthesize(req: SynthesizeIn) -> dict:
 
     horizons = [1, 5, 10, 20]
     d = forward_return(d, "close", periods=horizons)
-    res = evaluate(d, "_syn", ret_col=f"fwd_ret_{min(horizons)}",
-                   n_groups=req.n_groups, horizons=horizons)
     tag = "icw" if req.method == "ic_weighted" else "eq"
     name = f"syn_{len(req.formulas)}f_{tag}"
+    cat_col = next((c for c in ("industry_sw1", "cov_industry_sw1") if c in d.columns), None)
+    # 合成报告此前是「最薄的一份」：不写是哪几个公式合成的、没有分组 IC /
+    # 成本 / 容量。这里补齐到与单因子报告同一套内容。
+    res = evaluate(d, "_syn", ret_col=f"fwd_ret_{min(horizons)}",
+                   n_groups=req.n_groups, horizons=horizons,
+                   display_name=f"合成因子 {name}",
+                   expr=" + ".join(req.formulas),
+                   data_start=req.start, data_end=req.end, n_samples=len(d),
+                   cat_col=cat_col, group_col=cat_col,
+                   bps_list=[0.0, 5.0, 10.0, 15.0, 30.0],
+                   universe=req.universe)
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     _save_report_atomic(res["report"], REPORT_DIR / f"{name}.html")
     ic = res["ic"]["ic"]

@@ -5,6 +5,9 @@ paths:
   parquet: ${LQ_DATA_DIR:./data}/parquet
   duckdb: ${LQ_DUCKDB_PATH:./data/duckdb/lquant.duckdb}
   cache: ${LQ_DATA_DIR:./data}/cache
+  # 因子报告目录。相对路径一律锚定到仓库根（见 core/config.py 的 reports_dir），
+  # 不跟随进程 CWD —— 否则换个目录启动服务，报告就写到别处、报告列表也空了。
+  reports: ${LQ_DATA_DIR:./data}/reports
 
 timezone: Asia/Shanghai
 
