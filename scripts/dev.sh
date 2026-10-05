@@ -14,8 +14,11 @@ fi
 
 # 2) API
 .venv/bin/uvicorn lquant.server.main:app --reload --port 8000 &
-# 3) Worker（ingest / backtest / factor 三队列）
-.venv/bin/rq worker lquant-default lquant-ingest lquant-backtest \
+# 3) Worker（default / ingest / backtest / mining 四队列）
+# lquant-mining 承载因子评价与因子挖掘：此前注释写了 factor 却漏订阅该队列，
+# Redis 模式下这两个任务会永远停在 queued（并因评价的确定性 job_id 把该因子
+# 永久 409 锁死）。
+.venv/bin/rq worker lquant-default lquant-ingest lquant-backtest lquant-mining \
   --url "${LQ_REDIS_URL:-redis://localhost:6379/0}" &
 
 # 4) Web

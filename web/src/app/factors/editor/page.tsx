@@ -8,13 +8,13 @@
  * 不引入第二套执行语义。
  */
 import dynamic from 'next/dynamic';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 
 import Chart from '@/components/Chart';
 import PageHeader from '@/components/PageHeader';
 import { Panel, Stat } from '@/components/Panel';
 import { ErrorNote, Msg } from '@/components/States';
-import { ApiError, get, post } from '@/lib/api';
+import { post } from '@/lib/api';
 import { C, axes, legend, tooltip } from '@/lib/chart';
 
 import BlockPalette from './BlockPalette';
@@ -22,20 +22,25 @@ import ExpressionPane from './ExpressionPane';
 import Inspector from './Inspector';
 import OpenFactorDialog, { type FactorListItem } from './OpenFactorDialog';
 import { useFactorEditor } from './useFactorEditor';
+import FactorEvalProgress from '../FactorEvalProgress';
+import { useFactorEval } from '../useFactorEval';
 
 // React Flow 要量 DOM 尺寸，必须关掉 SSR（与 backtests 的 CodeMirror 同处理）
 const Canvas = dynamic(() => import('./Canvas'), { ssr: false });
 
 const NAME_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
-const POLL_MS = 3000;
-/** 轮询上限：3s × 100 ≈ 5 分钟，超时如实报错而不是无限"运行中" */
-const MAX_POLLS = 100;
 
+/** 评价指标：与后端 `_evaluate_full` 返回值同形（WS `/ws/jobs/{id}` 终态 result
+ *  就是这个扁平结构）。
+ *
+ *  注意：`GET /factors/evaluate/{id}` 返回的是信封 `{job_id,ts,kind,params,result}`，
+ *  扁平字段在 `result` 下面 —— 早先这里按扁平读信封，导致 IC/ICIR 恒显示 `—`、
+ *  累计 IC 图恒为空。本页改用 WS 后不存在该歧义。 */
 type EvalMetrics = {
-  ic_mean?: number | null;
+  ic?: { mean?: number | null; ir?: number | null } | null;
   rank_ic_mean?: number | null;
-  icir?: number | null;
-  series?: { ic?: { dates: string[]; cum_ic: number[] } };
+  report_url?: string | null;
+  series?: { ic?: { dates: string[]; cum_ic: number[] } } | null;
 };
 
 /** 内置 / 配置来源的因子是种子数据，不能原地覆盖 —— 保存时强制换名 */
@@ -55,9 +60,10 @@ export default function FactorEditorPage() {
   /** 表达式直编框折叠：画布需要高度时把它收起来 */
   const [paneCollapsed, setPaneCollapsed] = useState(false);
 
-  const [evalJob, setEvalJob] = useState<{ id: string; factor: string } | null>(null);
-  const [evalResult, setEvalResult] = useState<EvalMetrics | null>(null);
-  const [evalError, setEvalError] = useState('');
+  // 评价：与因子库 / 因子详情页共用同一条链路（POST /factors/evaluate + WS 进度），
+  // 进度、结果、失败、取消都由 hook 提供 —— 本页不再自己维护轮询与三份 state。
+  const evalRun = useFactorEval<EvalMetrics>();
+  const evalResult = evalRun.result;
 
   // 保存 / 评价用的表达式：**服务端归一后**的 DSL（文本是唯一真相源）。
   // 不再取画布编译结果 —— 直编时画布只是这段文本的一个视图。
@@ -65,41 +71,6 @@ export default function FactorEditorPage() {
   const nameValid = NAME_PATTERN.test(name);
   const clobbersSeed = seedName !== null && name === seedName;
   const canSave = api.canSave && nameValid && !clobbersSeed && !busy;
-
-  // 评价任务轮询：404 = 还没跑完，继续等；拿到结果就停。
-  // 必须有次数上限：任务若在服务端抛错，结果接口会永远 404（只有成功路径落结果），
-  // 没有上限就会一直显示"运行中"骗人。
-  useEffect(() => {
-    if (!evalJob || evalResult) return;
-    let alive = true;
-    let attempts = 0;
-    const stop = (error: string) => {
-      if (!alive) return;
-      setEvalJob(null);
-      setEvalError(error);
-    };
-    const tick = async () => {
-      attempts += 1;
-      if (attempts > MAX_POLLS) {
-        stop(`评价任务 ${evalJob.id} 超时未出结果，请到「任务管理」查看`);
-        return;
-      }
-      try {
-        const result = await get<EvalMetrics>(`/factors/evaluate/${evalJob.id}`);
-        if (alive) setEvalResult(result);
-      } catch (e: unknown) {
-        // 只有 404 代表"任务还没跑完"；其他错误直接如实报出来
-        if (e instanceof ApiError && e.status === 404) return;
-        stop(`评价结果读取失败：${e instanceof Error ? e.message : String(e)}`);
-      }
-    };
-    const handle = setInterval(tick, POLL_MS);
-    void tick();
-    return () => {
-      alive = false;
-      clearInterval(handle);
-    };
-  }, [evalJob, evalResult]);
 
   const handleOpen = useCallback(
     async (factor: FactorListItem) => {
@@ -115,8 +86,7 @@ export default function FactorEditorPage() {
         setSeedName(isSeed ? factor.name : null);
         setName(isSeed ? `${factor.name}_copy` : factor.name);
         setDescription(factor.description ?? '');
-        setEvalJob(null);
-        setEvalResult(null);
+        evalRun.reset();
       } catch (e: unknown) {
         // 到这一步说明连统一引擎的兼容翻译都救不回来（真语法错 / 未知字段 / 未注册算子）。
         // 如实说明原因，不要假装画布能打开。画布此刻仍停在原来的因子上，
@@ -126,7 +96,7 @@ export default function FactorEditorPage() {
         );
       }
     },
-    [api],
+    [api, evalRun.reset],
   );
 
   const handleSave = useCallback(async (): Promise<boolean> => {
@@ -148,21 +118,12 @@ export default function FactorEditorPage() {
   }, [api, canSave, description, expression, name]);
 
   const handleEvaluate = useCallback(async () => {
-    setEvalError('');
     const saved = await handleSave();
     if (!saved) return;
-    setEvalResult(null);
-    try {
-      const r = await post<{ job_id: string }>('/factors/evaluate', {
-        factor: name,
-        formula: expression,
-      });
-      setEvalJob({ id: r.job_id, factor: name });
-      setMessage(`✓ 已入队评价任务 ${r.job_id}，完成后自动刷新`);
-    } catch (e: unknown) {
-      setEvalError(e instanceof Error ? e.message : String(e));
-    }
-  }, [expression, handleSave, name]);
+    setMessage('');
+    const jid = await evalRun.start({ factor: name, formula: expression });
+    if (jid) setMessage(`✓ 已入队评价任务 ${jid}，完成后自动刷新`);
+  }, [evalRun.start, expression, handleSave, name]);
 
   const icChart = useMemo(() => {
     const ic = evalResult?.series?.ic;
@@ -206,8 +167,7 @@ export default function FactorEditorPage() {
                 setDescription('');
                 setSeedName(null);
                 setOpenError('');
-                setEvalJob(null);
-                setEvalResult(null);
+                evalRun.reset();
                 setMessage('');
               }}
             >
@@ -315,26 +275,44 @@ export default function FactorEditorPage() {
           </div>
         ) : null}
 
-        {evalError ? (
+        {evalRun.failure ? (
           <div className="mt-3">
-            <ErrorNote>评价失败：{evalError}</ErrorNote>
+            <ErrorNote>评价失败：{evalRun.failure}</ErrorNote>
           </div>
         ) : null}
 
-        {evalJob && !evalResult ? (
-          <p className="mt-3 text-xs text-ink-faint">
-            评价任务 {evalJob.id} 运行中…（结果出来后自动显示）
-          </p>
+        {evalRun.running && evalRun.jobId ? (
+          <FactorEvalProgress
+            jobId={evalRun.jobId}
+            progress={evalRun.progress}
+            onCancel={evalRun.cancel}
+          />
         ) : null}
 
         {evalResult ? (
           <div className="mt-3 space-y-3">
-            <div className="flex gap-8 border-t border-line pt-3">
-              <Stat label="IC 均值" value={fmt(evalResult.ic_mean)} />
+            <div className="flex flex-wrap items-center gap-8 border-t border-line pt-3">
+              <Stat label="IC 均值" value={fmt(evalResult.ic?.mean)} />
               <Stat label="RankIC 均值" value={fmt(evalResult.rank_ic_mean)} />
-              <Stat label="ICIR" value={fmt(evalResult.icir)} />
+              <Stat label="ICIR" value={fmt(evalResult.ic?.ir)} />
+              {evalResult.report_url ? (
+                <a
+                  className="text-xs text-indigo underline"
+                  href={evalResult.report_url}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  查看完整报告 ↗
+                </a>
+              ) : null}
+              <a className="text-xs text-ink-faint underline" href="/tasks">
+                任务管理
+              </a>
             </div>
             {icChart ? <Chart option={icChart} height={220} /> : null}
+            <p className="text-xs text-ink-faint">
+              更完整的指标与图表见「因子」页的快速评价，「任务管理」可取消或查看历史任务。
+            </p>
           </div>
         ) : null}
       </Panel>

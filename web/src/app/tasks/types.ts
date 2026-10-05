@@ -13,6 +13,8 @@ export type TaskItem = {
   id: string;
   kind: 'data' | 'sync' | 'backtest' | 'factor' | 'qlib' | 'ml';
   name: string;
+  /** factor 类目的子类型（后端按落库位置判定：job_results / factor_mining_run） */
+  subtype?: 'factor_eval' | 'factor_mine';
   status: string;
   state: 'queued' | 'running' | 'finished' | 'failed' | 'canceled';
   created_at: string | number | null;

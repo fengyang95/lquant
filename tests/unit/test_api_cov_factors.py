@@ -445,7 +445,7 @@ def test_mine_run_disabled_agent_423(client):
 
 
 def test_mine_run_async_placeholder(client):
-    """async 挖掘：预落 ledger 占位 + 入队。"""
+    """async 挖掘：预落 ledger 占位 + 入队，且队列 job id 必须等于 task_id。"""
     r = client.post("/api/factors/mine/run",
                     json={"agent": "gp-internal", "generator": "random",
                           "n": 2, "sync": False})
@@ -455,6 +455,11 @@ def test_mine_run_async_placeholder(client):
     # 台账占位行存在
     runs = client.get("/api/factors/mine/runs").json()
     assert any(x["run_id"] == body["task_id"] for x in runs)
+    # 队列 job id == task_id：否则前端 useJobStream(task_id) 订阅 /ws/jobs/{id}
+    # 只会收到 not_found，挖掘进度与幸存因子永远回不来
+    from lquant.server.jobs import get_job
+
+    assert get_job(body["task_id"]) is not None
 
 
 def test_mine_run_gp_sync(client):

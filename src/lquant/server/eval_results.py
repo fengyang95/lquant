@@ -82,3 +82,32 @@ def list_results(kind: str, limit: int = 50) -> list[dict]:
              "params": json.loads(p) if p else {},
              "result": json.loads(r) if r else None}
             for jid, ts, _k, p, r in rows]
+
+
+def meta_by_ids(job_ids: list[str]) -> dict[str, dict]:
+    """批量取结果元信息 {job_id: {"kind", "params"}}（任务中心列表回填用）。
+
+    逐条 `get_result` 会为每个任务开一次 reader 连接；列表一次要归一 200 条，
+    必须走单次批量查询。查不到/表未建/库被占用一律返回空 —— 列表页的
+    「参数」列降级为空，绝不能因为结果表读不到就把整个任务列表打挂。
+    """
+    ids = [j for j in job_ids if j]
+    if not ids:
+        return {}
+    placeholders = ",".join("?" * len(ids))
+    try:
+        with reader() as con:
+            rows = con.execute(
+                f"SELECT job_id, kind, params FROM job_results "
+                f"WHERE job_id IN ({placeholders})", ids).fetchall()
+    except Exception as e:  # noqa: BLE001 - 结果表读取失败不影响任务列表
+        from loguru import logger
+
+        logger.warning(f"任务中心回填 job_results 失败（参数列降级为空）: {e}")
+        return {}
+    out: dict[str, dict] = {}
+    for jid, kind, params in rows:
+        # params 是 DuckDB JSON 列，落库时必为合法 JSON —— 与 get_result 同口径，
+        # 不额外套 try（真出现脏值由调用方 _factor_items 整体兜底）
+        out[jid] = {"kind": kind, "params": json.loads(params) if params else {}}
+    return out

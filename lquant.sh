@@ -521,8 +521,9 @@ sys.path.insert(0, 'src')
 from lquant.server.jobs import _redis_available
 sys.exit(0 if _redis_available() else 1)" 2>/dev/null; then
       info "启动 RQ Worker"
+      # lquant-mining：因子评价 / 因子挖掘的唯一消费者，漏订阅会让任务永远 queued
       spawn worker "$LOG_DIR/worker.log" .venv/bin/rq worker \
-        lquant-default lquant-ingest lquant-backtest \
+        lquant-default lquant-ingest lquant-backtest lquant-mining \
         --url "${LQ_REDIS_URL:-redis://localhost:6379/0}"
     else
       warn "无 Redis，跳过独立 Worker（任务在 API 进程内本地执行）"

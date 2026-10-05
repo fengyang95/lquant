@@ -27,8 +27,15 @@ const IDLE: JobStream<never> = {
 };
 
 /** WS /ws/jobs/{id} 流式订阅：进度随流下发，终态带 result / error 后服务端关连。
- *  jobId 为 null 时不连接（IDLE 态）。页面刷新后重连可拿到终态（job 仍在注册表）。 */
-export function useJobStream<T = unknown>(jobId: string | null): JobStream<T> {
+ *  jobId 为 null 时不连接（IDLE 态）。页面刷新后重连可拿到终态（job 仍在注册表）。
+ *
+ *  `reconnectKey` 变化会强制重新订阅并清空上一轮状态：任务 id 可能是确定性的
+ *  （因子评价同一因子重跑 → 同一个 `factor-eval-{factor}`），只比较 jobId 会把
+ *  界面停在上一轮结果上。调用方每次重跑自增该值即可，不必依赖中间渲染。 */
+export function useJobStream<T = unknown>(
+  jobId: string | null,
+  reconnectKey: number = 0,
+): JobStream<T> {
   const [state, setState] = useState<JobStream<T>>(IDLE as JobStream<T>);
 
   useEffect(() => {
@@ -36,6 +43,8 @@ export function useJobStream<T = unknown>(jobId: string | null): JobStream<T> {
       setState(IDLE as JobStream<T>);
       return;
     }
+    // 新订阅先清空上一轮终态（IDLE 是模块常量，同引用时 React 会跳过重渲染）
+    setState(IDLE as JobStream<T>);
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${proto}//${window.location.host}/ws/jobs/${encodeURIComponent(jobId)}`;
     let alive = true;
@@ -97,7 +106,7 @@ export function useJobStream<T = unknown>(jobId: string | null): JobStream<T> {
       if (retryTimer !== null) clearTimeout(retryTimer);
       ws?.close();
     };
-  }, [jobId]);
+  }, [jobId, reconnectKey]);
 
   return state;
 }

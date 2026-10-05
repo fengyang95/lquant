@@ -1,4 +1,5 @@
-// FactorPanel 测试 —— 发起校验（预算 n）、POST /factors/mine/run 请求体、挖掘台账渲染
+// FactorPanel 测试 —— 发起校验（预算 n）、POST /factors/mine/run 请求体、
+// 任务列表（评价 / 挖掘的区分与操作）、挖掘台账渲染
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -11,24 +12,40 @@ vi.mock('swr', () => ({
 }));
 
 const postMock = vi.fn();
+const getMock = vi.fn();
 
 vi.mock('@/lib/api', () => ({
   fetcher: vi.fn(),
-  get: vi.fn(),
+  get: (...args: unknown[]) => getMock(...args),
   post: (...args: unknown[]) => postMock(...args),
 }));
 
 import FactorPanel from '../FactorPanel';
 import type { TaskItem } from '../../types';
 
-const task: TaskItem = {
+/** 挖掘任务：REST 归一后由后端回填 agent/generator（task_center._factor_items） */
+const mineTask: TaskItem = {
   id: 'aaaaaaaa-0000-0000-0000-000000000000',
   kind: 'factor',
-  name: 'gp-internal / random',
+  name: '因子挖掘',
+  subtype: 'factor_mine',
   status: 'running',
   state: 'running',
   created_at: '2024-06-01T10:30:45',
   params: { agent: 'gp-internal', generator: 'random', n: 100 },
+  error: null,
+};
+
+/** 评价任务：params.factor 决定「在评哪个因子」，此前恒为空 → 只能看到 factor-e… 短 id */
+const evalTask: TaskItem = {
+  id: 'factor-eval-mom20',
+  kind: 'factor',
+  name: '因子评价',
+  subtype: 'factor_eval',
+  status: 'finished',
+  state: 'finished',
+  created_at: '2024-06-01T10:30:45',
+  params: { factor: 'mom20', formula: 'pct_change_20' },
   error: null,
 };
 
@@ -60,6 +77,7 @@ describe('FactorPanel', () => {
     useSWRMock.mockImplementation(() => ({ data: undefined, mutate: vi.fn() }));
     postMock.mockReset();
     postMock.mockResolvedValue({ task_id: '12345678-abcd-abcd-abcd-abcdefabcdef', status: 'queued' });
+    getMock.mockReset();
   });
 
   it('取两个 SWR key：任务列表与挖掘台账', () => {
@@ -70,7 +88,9 @@ describe('FactorPanel', () => {
   });
 
   it('渲染任务与台账行（漏斗各列）', () => {
-    setup([task], [run]);
+    setup([mineTask], [run]);
+    expect(screen.getByText('因子挖掘')).toBeInTheDocument();
+    // 详情列：挖掘任务显示 Agent / 生成器（此前 params 恒空 → 恒为 —）
     expect(screen.getByText('gp-internal / random')).toBeInTheDocument();
     expect(screen.getByText('run-1')).toBeInTheDocument();
     expect(screen.getByText('60')).toBeInTheDocument();
@@ -80,6 +100,39 @@ describe('FactorPanel', () => {
   it('台账为空 → 空态文案', () => {
     setup([], []);
     expect(screen.getByText('还没有挖掘会话 —— 上方发起一次')).toBeInTheDocument();
+  });
+
+  it('评价任务：详情列显示因子名并可跳因子详情，完成态给「查看结果」', () => {
+    setup([evalTask], []);
+    // 结构化 subtype 判定，不依赖 name === '因子评价' 字符串
+    expect(screen.getByText('因子评价')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'mom20' })).toHaveAttribute(
+      'href',
+      '/factors/mom20',
+    );
+    expect(screen.getByRole('button', { name: '查看结果' })).toBeInTheDocument();
+    // 完成态不再提供取消
+    expect(screen.queryByRole('button', { name: '取消' })).toBeNull();
+  });
+
+  it('queued 评价任务也可取消（此前 UI 只在 running 显示）', async () => {
+    setup([{ ...evalTask, status: 'queued', state: 'queued' }], []);
+    const btn = screen.getByRole('button', { name: '取消' });
+    await userEvent.setup().click(btn);
+    await waitFor(() => {
+      expect(postMock).toHaveBeenCalledWith('/tasks/factor/factor-eval-mom20/cancel', {});
+    });
+  });
+
+  it('「查看结果」取落库 report_url 并打开', async () => {
+    getMock.mockResolvedValue({ result: { report_url: '/api/factors/reports/mom20' } });
+    const openSpy = vi.spyOn(window, 'open').mockImplementation(() => null);
+    setup([evalTask], []);
+    await userEvent.setup().click(screen.getByRole('button', { name: '查看结果' }));
+    await waitFor(() => {
+      expect(openSpy).toHaveBeenCalledWith('/api/factors/reports/mom20', '_blank');
+    });
+    openSpy.mockRestore();
   });
 
   it('预算 n 非法（0/负数）→ 校验报错且不发请求', async () => {

@@ -23,7 +23,13 @@ type MineRun = {
 
 const GENERATORS = ['random', 'gp'];
 
-/** 因子挖掘面板：发起表单 + 任务列表 + 挖掘台账 */
+/** 是否因子评价任务。优先结构化 subtype（后端按 job_results 判定），
+ *  回退显示名 —— 名称是自由文本，只作老数据/老后端的兜底。 */
+function isEvalTask(t: TaskItem): boolean {
+  return t.subtype === 'factor_eval' || t.name === '因子评价';
+}
+
+/** 因子挖掘面板：发起表单 + 任务列表（评价 + 挖掘）+ 挖掘台账 */
 export default function FactorPanel() {
   const { data: tasks, isLoading, mutate } = useSWR<TaskItem[]>('/tasks?kind=factor', fetcher, {
     refreshInterval: (latest?: TaskItem[]) =>
@@ -66,6 +72,24 @@ export default function FactorPanel() {
     } finally {
       setBusy('');
     }
+  }
+
+  /** 详情列：评价显示「在评哪个因子」（可跳因子详情），挖掘显示 Agent / 生成器。
+   *  后端已把 params 回填（task_center._factor_items），此前恒为 `—`。 */
+  function detailOf(t: TaskItem) {
+    if (isEvalTask(t)) {
+      const factor = typeof t.params?.factor === 'string' ? t.params.factor : '';
+      if (!factor) return '—';
+      return (
+        <a className="underline" href={`/factors/${encodeURIComponent(factor)}`}>
+          {factor}
+        </a>
+      );
+    }
+    const agent = t.params?.agent;
+    const gen = t.params?.generator;
+    if (!agent && !gen) return '—';
+    return `${agent ?? '—'} / ${gen ?? '—'}`;
   }
 
   async function launch() {
@@ -136,15 +160,15 @@ export default function FactorPanel() {
         <Msg text={msg} />
       </Panel>
 
-      <Panel title="挖掘任务" meta="队列任务 + 落账挖掘会话">
+      <Panel title="挖掘 / 评价任务" meta="同一条 lquant-mining 队列 · 详情列显示评价因子或挖掘 Agent">
         <TaskTable
           tasks={tasks}
           loading={isLoading}
           msg=""
-          extraOf={(t) => String(t.params?.generator ?? '—')}
+          extraOf={detailOf}
           actionsOf={(t) => (
             <>
-              {t.name === '因子评价' && t.state === 'finished' && (
+              {isEvalTask(t) && t.state === 'finished' && (
                 <button
                   className="btn btn-sm"
                   disabled={busy === `res-${t.id}`}
@@ -153,7 +177,9 @@ export default function FactorPanel() {
                   查看结果
                 </button>
                 )}
-              {t.state === 'running' && (
+              {/* queued 也要能取消：后端 request_cancel 支持排队取消（RQ job.cancel），
+                  此前 UI 只在 running 显示，把最该取消的排队任务挡在外面 */}
+              {(t.state === 'running' || t.state === 'queued') && (
                 <button
                   className="btn btn-sm"
                   disabled={busy === 'cancel'}
@@ -164,7 +190,7 @@ export default function FactorPanel() {
               )}
             </>
           )}
-          emptyHint="暂无挖掘任务 —— 上方发起一次"
+          emptyHint="暂无挖掘 / 评价任务 —— 上方发起一次，或去「因子」页运行评价"
         />
       </Panel>
 

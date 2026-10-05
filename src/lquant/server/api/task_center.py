@@ -99,6 +99,48 @@ def _job_items(queue: str, kind: str, limit: int) -> list[dict]:
     return out
 
 
+def _factor_items(limit: int) -> list[dict]:
+    """factor 类目：队列任务 + 回填落库元信息。
+
+    队列任务本身不带参数（jobs.py 只记 id/name/queue/status），不回填的话 UI 只能
+    看到一个 `factor-e…` 短 id —— 既分不清是评价还是挖掘，也不知道在评哪个因子。
+    subtype 由落库位置判定（job_results ⇒ 评价，factor_mining_run ⇒ 挖掘），
+    比依赖可自由改写的显示名可靠（原先靠 `name === '因子评价'` 字符串比对）。
+    """
+    items = _job_items("lquant-mining", "factor", limit)
+    ids = [it["id"] for it in items]
+    if not ids:
+        return items
+
+    from lquant.server.eval_results import meta_by_ids
+
+    try:
+        eval_meta = meta_by_ids(ids)
+        mine_meta: dict[str, dict] = {}
+        rest = [i for i in ids if i not in eval_meta]
+        if rest:
+            from lquant.server.api.factors import mining_meta_by_ids
+
+            mine_meta = mining_meta_by_ids(rest)
+    except Exception as e:  # noqa: BLE001 - 回填是尽力而为，不能拖垮整个任务列表
+        from loguru import logger
+
+        logger.warning(f"任务中心回填 factor 参数失败（列表降级为无参数）: {e}")
+        return items
+
+    for it in items:
+        em = eval_meta.get(it["id"])
+        if em is not None and em.get("kind") == "factor_eval":
+            it["subtype"] = "factor_eval"
+            it["params"] = em.get("params") or {}
+            continue
+        mm = mine_meta.get(it["id"])
+        if mm is not None:
+            it["subtype"] = "factor_mine"
+            it["params"] = mm
+    return items
+
+
 def _summary_of(items: list[dict]) -> dict:
     def _c(state: str) -> int:
         return sum(1 for x in items if x["state"] == state)
@@ -116,7 +158,7 @@ def _items(kind: str, limit: int) -> list[dict]:
     if kind == "backtest":
         return _job_items("lquant-backtest", "backtest", limit)
     if kind == "factor":
-        return _job_items("lquant-mining", "factor", limit)
+        return _factor_items(limit)
     if kind == "qlib":
         return _job_items("lquant-qlib", "qlib", limit)
     if kind == "ml":
