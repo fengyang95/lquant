@@ -59,6 +59,9 @@ export default function FactorReportsPage() {
           有 {staleCount} 份报告是<b>旧口径</b>
           （生成器版本与当前代码不一致，或生成于版本号引入之前）。
           旧报告不会自动失效 —— 结论可能已被修复，请重跑评价后再引用。
+          <div className="mt-1 font-mono text-xs">
+            lq factor reports --stale-only ｜ --rebuild-stale ｜ --prune-stale --yes
+          </div>
         </div>
       ) : null}
       <Panel title="报告列表" meta={`共 ${shown.length} 份`}>

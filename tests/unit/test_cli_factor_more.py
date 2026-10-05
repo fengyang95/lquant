@@ -429,8 +429,12 @@ def _seg_returns_empty(monkeypatch):
     dates = [dt.date(2026, 1, d) for d in (5, 6, 7)]
     monkeypatch.setattr(submit_mod, "_panel_with_covs",
                         lambda start=None: (pl.DataFrame({"trade_date": dates}), []))
-    monkeypatch.setattr(submit_mod, "prepare_segment",
-                        lambda df, covs, expr, dates, *, horizons=(1, 5): pl.DataFrame())
+    def _empty(df, covs, expr, dates, *, horizons=(1, 5), with_pre=False):
+        # report 用 with_pre=True 取「中性化之前的帧」；空帧同样要能返回
+        empty = pl.DataFrame()
+        return (empty, empty) if with_pre else empty
+
+    monkeypatch.setattr(submit_mod, "prepare_segment", _empty)
 
 
 def test_audit_train_segment_empty(monkeypatch):
@@ -462,9 +466,10 @@ def test_audit_attribution_with_industry(monkeypatch):
 
     orig = submit_mod.prepare_segment
 
-    def seg_with_industry(df, cov_cols, expr, dates, *, horizons=(1, 5)):
+    def seg_with_industry(df, cov_cols, expr, dates, *, horizons=(1, 5), with_pre=False):
         d = orig(df, cov_cols, expr, dates, horizons=list(horizons))
-        return d.with_columns(pl.lit("银行", dtype=pl.String).alias("cov_industry_sw1"))
+        d = d.with_columns(pl.lit("银行", dtype=pl.String).alias("cov_industry_sw1"))
+        return (d, d) if with_pre else d
 
     monkeypatch.setattr(submit_mod, "prepare_segment", seg_with_industry)
     r = _invoke("audit", "Ts_Mean($close,5)")
@@ -483,9 +488,10 @@ def test_audit_attribution_error_visible(monkeypatch):
 
     orig = submit_mod.prepare_segment
 
-    def seg_with_industry(df, cov_cols, expr, dates, *, horizons=(1, 5)):
+    def seg_with_industry(df, cov_cols, expr, dates, *, horizons=(1, 5), with_pre=False):
         d = orig(df, cov_cols, expr, dates, horizons=list(horizons))
-        return d.with_columns(pl.lit("银行", dtype=pl.String).alias("cov_industry_sw1"))
+        d = d.with_columns(pl.lit("银行", dtype=pl.String).alias("cov_industry_sw1"))
+        return (d, d) if with_pre else d
 
     monkeypatch.setattr(submit_mod, "prepare_segment", seg_with_industry)
     monkeypatch.setattr(ev_mod, "attribution_summary",

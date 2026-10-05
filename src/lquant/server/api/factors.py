@@ -454,26 +454,6 @@ def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
     raise HTTPException(422, f"暂不支持的因子公式: {formula}（内置因子见 GET /api/factors/builtin）")
 
 
-def _neutral_views_for(d: pl.DataFrame, ret_col: str, n_groups: int = 5) -> dict:
-    """收益中性化对照 + 行业内分组分层（§5.1 三视图）。
-
-    n_groups 必须透传用户选择 —— 此前恒用默认 5，与页面上的分层组数不一致。
-    """
-    from lquant.factors.evaluate.neutral_views import neutral_views as _nv
-
-    try:
-        cov_cols = [c for c in d.columns if c.startswith("cov_")]
-        if not cov_cols:
-            return {"view": "raw（未中性化 —— 协变量数据不可用）"}
-        return _nv(d, "_factor", ret_col, covariates=cov_cols,
-                   group_col="cov_industry_sw1" if "cov_industry_sw1" in d.columns else None,
-                   n_groups=n_groups)
-    except Exception as e:  # noqa: BLE001
-        # 不能静默成 {}：页面会把「算炸了」显示成「协变量数据不足」，
-        # 两种情况的处置完全不同（一个是修数据，一个是修代码）
-        return {"view": "error", "error": f"{type(e).__name__}: {e}"}
-
-
 def _persist_ic(name: str, ladder: list[dict]) -> None:
     """评价成功后把 IC(原始)/IC(中性化) 落 factor_ic 表 —— 列表页排序用。"""
     if not ladder:
@@ -495,69 +475,6 @@ def _persist_ic(name: str, ladder: list[dict]) -> None:
         import loguru
 
         loguru.logger.warning(f"factor_ic 写入失败: {e}")
-
-
-def _neutral_ladder(d: pl.DataFrame, col: str, ret_col: str,
-                    dd: pl.DataFrame | None = None,
-                    cov_report: dict | None = None,
-                    errors: dict | None = None) -> list[dict]:
-    """逐段叠加协变量看 IC 怎么掉：原始 → +市值 → +行业 → +换手率。
-
-    dd/cov_report 可由调用方传入（协变量只构建一次，ladder 与 views 复用）。
-    errors 传入时记录失败原因 —— 「阶梯缺一段」和「这一段算不出来」必须能区分。
-    """
-    from lquant.factors.evaluate.ic import ic_series
-    from lquant.factors.preprocess.pipeline import drop_nonfinite
-    from lquant.factors.preprocess.pipeline import run as pipeline_run
-
-    def _fail(key: str, e: Exception) -> None:
-        if errors is not None:
-            errors[key] = f"{type(e).__name__}: {e}"
-
-    levels = [
-        ("raw", []),
-        ("+market_cap", ["market_cap"]),
-        ("+industry", ["market_cap", "industry_sw1"]),
-        ("+turnover", ["market_cap", "industry_sw1", "turnover_1m"]),
-    ]
-    out = []
-    if dd is None:
-        from lquant.factors.covariates import build_covariates
-
-        cov_names = sorted({c for _, covs in levels for c in covs})
-        try:
-            dd, report = build_covariates(d, cov_names)
-        except Exception as e:  # noqa: BLE001
-            _fail("neutral_ladder:covariates", e)
-            return []
-        cov_report = {r["covariate"]: r["coverage"] for r in report}
-    cov_report = cov_report or {}
-    for label, covs in levels:
-        steps = [{"op": "winsorize", "method": "mad", "n": 5},
-                 {"op": "standardize", "method": "zscore"}]
-        if covs:
-            cols = [f"cov_{c}" for c in covs if f"cov_{c}" in dd.columns]
-            if covs and not cols:
-                _fail(f"neutral_ladder:{label}", RuntimeError("协变量列全缺失"))
-                continue
-            steps.append({"op": "neutralize", "method": "ols", "factors": cols})
-        try:
-            r = pipeline_run(dd, col, steps)
-        except Exception as e:  # noqa: BLE001
-            _fail(f"neutral_ladder:{label}", e)
-            continue
-        r = drop_nonfinite(r, col)
-        s = ic_series(r, col, ret_col)
-        if not len(s):
-            continue
-        out.append({
-            "label": label, "covs": covs,
-            "ic_mean": _jf(s["ic"].mean()),
-            "rank_ic_mean": _jf(s["rank_ic"].mean()),
-            "n_days": len(s),
-            "coverage": round(min((cov_report.get(c, 1.0) for c in covs), default=1.0), 4),
-        })
-    return out
 
 
 def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[dict, dict]:
@@ -738,105 +655,28 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
                 "ir": _jf(r["ir"], 3), "positive_rate": _jf(r["positive_rate"], 4)}
                for r in icy.to_dicts()] if len(icy) else []
 
-    # ---- IC 归因阶梯（方案 5.3）+ 三种中性化视图（方案 5.1） ----
+    # ---- 归因阶梯 / 中性化视图 / 分组 IC / 研报三件套 ----
+    # 编排收口在 evaluate/extras.py：CLI 与合成入口共用同一份实现，
+    # 否则「同一个生成器产出三种报告」（评审 R12）。阶梯的基线是**未套配方**的帧。
     _step(55, "归因与中性化")
-    ladder = _neutral_ladder(d_pre_recipe, "_factor", ret_col,
-                             dd=d_pre_recipe, cov_report=cov_map, errors=errors)
-    if not ladder:
-        errors.setdefault("neutral_ladder", "归因阶梯为空（协变量不可用或 IC 序列不足）")
+    from lquant.factors.evaluate.extras import build_report_extras
+
+    extras = build_report_extras(
+        d, "_factor", ret_col, n_groups=req.n_groups, top_ns=req.top_ns,
+        style_threshold=req.style_threshold, group_col=cat_col,
+        pre_recipe_df=d_pre_recipe, cov_report=cov_map, errors=errors)
+    ladder = extras["neutral_ladder"]
     _persist_ic(req.factor, ladder)
-    views = _neutral_views_for(d, ret_col, req.n_groups)
-    if views.get("view") == "error":
-        errors["neutral_views"] = views["error"]
+    views = extras["neutral_views"]
+    group_ic = extras["group_ic"]
+    excess_block = extras["excess"]
+    ex_dates = excess_block["dates"]
+    ex_curves = excess_block["curves"]
+    excess_metrics = excess_block["metrics"]
+    top_n_rows = extras["top_n"]
+    style_corr = extras["style_corr"]
 
-    # ---- 分组 IC：行业组 + 市值组（识破「信号只来自小市值/某一行业」） ----
-    # 此前 ic_by_group / size_group 在生产代码里不可达（report 的 group_col 被丢弃）。
-    group_ic: dict = {"by": cat_col, "industry": [], "size": [], "size_col": None,
-                      "error": None}
-    try:
-        from lquant.factors.evaluate.group_ic import ic_by_group, size_group
-
-        if cat_col:
-            gi = ic_by_group(d, "_factor", ret_col, cat_col)
-            group_ic["industry"] = [
-                {"group": str(r["group"]), "ic_mean": _jf(r["ic_mean"]),
-                 "rank_ic_mean": _jf(r["rank_ic_mean"]), "ir": _jf(r["ir"], 3),
-                 "n_days": int(r["n_days"])} for r in gi.to_dicts()
-            ] if len(gi) else []
-        mcap_col = next((c for c in ("cov_market_cap", "float_mv", "amount")
-                         if c in d.columns), None)
-        if mcap_col:
-            ds = size_group(d, mcap_col=mcap_col, n_groups=3)
-            gs = ic_by_group(ds, "_factor", ret_col, "size_q")
-            group_ic["size_col"] = mcap_col
-            group_ic["size"] = [
-                {"group": f"size_q{int(r['group'])}", "ic_mean": _jf(r["ic_mean"]),
-                 "rank_ic_mean": _jf(r["rank_ic_mean"]), "ir": _jf(r["ir"], 3),
-                 "n_days": int(r["n_days"])} for r in gs.to_dicts()
-            ] if len(gs) else []
-    except Exception as e:  # noqa: BLE001
-        group_ic["error"] = f"{type(e).__name__}: {e}"
-        errors["group_ic"] = group_ic["error"]
-
-    # ---- 超额收益体系 / Top-N 收缩测试 / 中性化后风格相关性（研报标准三件套） ----
     _step(70, "超额与Top-N")
-    from lquant.factors.evaluate.excess import (
-        benchmark_series,
-        group_excess_summary,
-        quantile_excess_nav,
-    )
-
-    bench = benchmark_series(d, ret_col)
-    exnav = quantile_excess_nav(d, "_factor", ret_col, req.n_groups, bench)
-    ex_dates = [str(x) for x in exnav["trade_date"].to_list()] if len(exnav) else []
-    ex_curves = {c: [_jf(v, 4) for v in exnav[c].to_list()]
-                 for c in exnav.columns if c != "trade_date"} if len(exnav) else {}
-    gex = group_excess_summary(d, "_factor", ret_col, req.n_groups, bench)
-    # 最高组（q=N）相对基准的绩效 —— 研报 G0 组口径
-    excess_metrics = {}
-    if len(gex):
-        r0 = gex.filter(pl.col("q") == req.n_groups)
-        if len(r0):
-            row = r0.to_dicts()[0]
-            excess_metrics = {"annual_excess": _jf(row["annual_excess"]),
-                              "excess_sharpe": _jf(row["excess_sharpe"], 2),
-                              "excess_mdd": _jf(row["excess_mdd"])}
-
-    try:
-        from lquant.factors.evaluate.top_n import top_n_summary
-
-        tn = top_n_summary(d, "_factor", ret_col, n_list=req.top_ns, bench=bench)
-        top_n_rows = [{"n": int(r["n"]), "annual_return": _jf(r["annual_return"]),
-                       "annual_excess": _jf(r["annual_excess"]),
-                       "excess_sharpe": _jf(r["excess_sharpe"], 2),
-                       "max_drawdown": _jf(r["max_drawdown"]),
-                       "annual_turnover": _jf(r["annual_turnover"], 2)}
-                      for r in tn.to_dicts()] if len(tn) else []
-    except Exception as e:  # noqa: BLE001
-        top_n_rows = []
-        errors["top_n"] = f"{type(e).__name__}: {e}"
-
-    try:
-        from lquant.factors.evaluate.style_corr import style_correlation
-        from lquant.factors.preprocess.pipeline import run as pipeline_run
-
-        steps = [{"op": "winsorize", "method": "mad", "n": 5},
-                 {"op": "standardize", "method": "zscore"}]
-        cap_ind = [c for c in ("cov_market_cap", "cov_industry_sw1") if c in d.columns]
-        if cap_ind:
-            steps.append({"op": "neutralize", "method": "ols", "factors": cap_ind})
-        rn = pipeline_run(d, "_factor", steps)
-        rn = drop_nonfinite(rn, "_factor")
-        style_cols = [c for c in ("cov_market_cap", "cov_turnover_1m", "cov_momentum_1m")
-                      if c in rn.columns]
-        style_corr = style_correlation(
-            rn, "_factor", style_cols,
-            group_col="cov_industry_sw1" if "cov_industry_sw1" in rn.columns else None,
-            threshold=req.style_threshold)
-    except Exception as e:  # noqa: BLE001
-        style_corr = {}
-        errors["style_corr"] = f"{type(e).__name__}: {e}"
-
     try:
         from lquant.factors.evaluate.costs import factor_turnover
 
@@ -926,17 +766,10 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
             sample_filters=sample_filter_rows, window=req.window,
             description=desc,
             rating=res.get("rating"), robustness=res.get("robustness"),
-            extras={
-                "excess": {"dates": ex_dates, "curves": ex_curves,
-                           "benchmark": "股票池等权", "metrics": excess_metrics},
-                "top_n": top_n_rows,
-                "style_corr": style_corr,
-                "neutral_ladder": ladder,
-                "neutral_views": views,
-                "group_ic_size": {"size_col": group_ic.get("size_col"),
-                                  "rows": group_ic.get("size") or []},
-                "capacity": capacity,
-            })
+            # errors 一并交给报告：调用方算炸的小节也要在报告里留痕，
+            # 否则那一节在报告里无声消失，读者分不清「没数据」和「算炸了」。
+            errors=errors,
+            extras={**extras, "capacity": capacity})
     except Exception as e:  # noqa: BLE001 - 报告不是评价的前置：报告炸了也要给出指标，
         # 但必须在 errors 里留痕（UI 会渲染成故障横幅），不许静默返回一个没有报告的 200
         report_html = None
@@ -1422,52 +1255,11 @@ def mine_run(req: MineIn) -> dict:
         "generator": req.generator, "n": req.n})
 
 
-_REPORT_VERSION_RE = re.compile(r'name="lquant-report-generator" content="([^"]*)"')
-_REPORT_AT_RE = re.compile(r'name="lquant-report-generated-at" content="([^"]*)"')
-_REPORT_HEAD_BYTES = 4096
-
-
-def _report_meta(p: Path) -> tuple[str | None, str | None]:
-    """从报告头部读「生成器版本 / 生成时间」。
-
-    只读前 4KB —— 报告中心要列几百份报告，全读会白烧 IO。
-    两个 meta 是 R15 的落地：没有它，读者无法分辨一份报告是修复前还是
-    修复后生成的（242/244 份旧产物曾是错误口径，却和新报告长得一样）。
-    """
-    try:
-        with p.open("r", encoding="utf-8", errors="replace") as f:
-            head = f.read(_REPORT_HEAD_BYTES)
-    except OSError:
-        return None, None
-    mv = _REPORT_VERSION_RE.search(head)
-    ma = _REPORT_AT_RE.search(head)
-    return (mv.group(1) if mv else None), (ma.group(1) if ma else None)
-
-
-def _report_row(p: Path) -> dict:
-    """报告中心的一行：身份 + 版本 + 生成时间 + 是否陈旧。"""
-    from lquant.factors.evaluate.report import REPORT_GENERATOR_VERSION
-
-    st = p.stat()
-    ver, gen_at = _report_meta(p)
-    return {
-        "name": p.stem,
-        "url": f"/api/factors/reports/{p.stem}",
-        "size_kb": st.st_size // 1024,
-        "generator_version": ver,
-        "generated_at": gen_at or datetime.fromtimestamp(
-            st.st_mtime).strftime("%Y-%m-%d %H:%M"),
-        "current_version": REPORT_GENERATOR_VERSION,
-        # 版本号缺失（修复前的产物）或对不上当前生成器 → 陈旧，口径可能已变
-        "stale": ver != REPORT_GENERATOR_VERSION,
-    }
-
-
 def list_reports() -> list[dict]:
-    if not REPORT_DIR.exists():
-        return []
-    return [_report_row(p) for p in
-            sorted(REPORT_DIR.glob("*.html"), key=lambda x: -x.stat().st_mtime)]
+    """报告中心列表（索引实现见 evaluate/reports_index.py，CLI 共用同一份）。"""
+    from lquant.factors.evaluate.reports_index import list_reports as _list
+
+    return _list(REPORT_DIR)
 
 
 @router.get("/reports")
@@ -1507,7 +1299,9 @@ def get_factor(name: str) -> dict:
         # 「历史报告」里会挂着 BETA10_copy（另一个因子）的报告。
         p = REPORT_DIR / f"{name}.html"
         if p.exists():
-            row = _report_row(p)
+            from lquant.factors.evaluate.reports_index import report_row
+
+            row = report_row(p)
             reports.append({"name": row["name"], "url": row["url"],
                             "generator_version": row["generator_version"],
                             "generated_at": row["generated_at"],
@@ -1618,14 +1412,24 @@ def synthesize(req: SynthesizeIn) -> dict:
         None)
 
     from lquant.factors.evaluate.capacity import capacity_summary
+    from lquant.factors.evaluate.extras import build_report_extras
     from lquant.factors.evaluate.sample import describe_sample_filters
+
+    errors: dict[str, str] = {}
+    # 归因阶梯 / 中性化视图 / 分组 IC / 研报三件套：与 /factors/evaluate、
+    # CLI 共用同一份编排。合成因子的帧没有「配方前」概念（合成后直接评价），
+    # 所以阶梯基线就是它自己。
+    extras = build_report_extras(
+        d, "_syn", f"fwd_ret_{min(horizons)}", n_groups=req.n_groups,
+        group_col=cat_col, pre_recipe_df=d, cov_report=cov_map, errors=errors)
 
     capacity = None
     try:
         capacity = capacity_summary(d, "_syn", f"fwd_ret_{min(horizons)}",
                                     n_groups=req.n_groups)
-    except Exception:  # noqa: BLE001 - 无成交额列时容量不可算，报告里标注即可
+    except Exception as e:  # noqa: BLE001 - 无成交额列时容量不可算，报告里标注即可
         capacity = None
+        errors["capacity"] = f"{type(e).__name__}: {e}"
 
     # 合成报告此前是「最薄的一份」：不写是哪几个公式合成的、没有分组 IC /
     # 成本 / 容量 / 样本过滤披露。这里补齐到与单因子报告同一套内容。
@@ -1642,7 +1446,8 @@ def synthesize(req: SynthesizeIn) -> dict:
                    sample_filters=describe_sample_filters(d),
                    window=DEFAULT_WINDOW,
                    universe=req.universe,
-                   extras={"capacity": capacity})
+                   errors=errors,
+                   extras={**extras, "capacity": capacity})
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     _save_report_atomic(res["report"], REPORT_DIR / f"{name}.html")
     ic = res["ic"]["ic"]

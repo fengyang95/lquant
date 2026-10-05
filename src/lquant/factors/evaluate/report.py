@@ -572,6 +572,7 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
                   robustness: dict | None = None,
                   # ---- 调用方已算好的内容块 ----
                   extras: dict | None = None,
+                  errors: dict | None = None,
                   generator_version: str = REPORT_GENERATOR_VERSION,
                   generated_at: str | None = None) -> str:
     """生成因子研究报告 HTML。
@@ -596,6 +597,10 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
     ``defaults.DEFAULT_DECAY_HORIZONS``）。``generated_at`` 可注入以便测试
     与「陈旧报告」判定；缺省取当前时间。
 
+    ``errors`` 接收**调用方**的失败记录（协变量/容量/归因阶梯/风格/分组 IC/Top-N…），
+    与报告自身的失败合并后一起渲染成「本节生成失败」横幅 —— 否则调用方算炸一段、
+    报告里那一节就无声消失，读者无法区分「没数据」和「算炸了」。
+
     不变量：``cat_col`` 不得等于 ``symbol_col`` —— 按个股做「行业暴露」没有
     可解释含义，报告会跳过该节并留痕，而不是产出无意义表格。
 
@@ -604,7 +609,12 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
     if factor not in df.columns:
         raise KeyError(f"因子列不存在: {factor}")
 
+    # 调用方（API / CLI / 合成入口）的失败记录先并入：报告里的「本节生成失败」
+    # 必须是「整条链路」的失败集合，而不是只有报告自己那几次 try。
+    errors_in = errors
     errors: dict[str, str] = {}
+    for k, v in (errors_in or {}).items():
+        errors.setdefault(str(k), str(v))
     extras = dict(extras or {})
     display_name = display_name or factor
     # 生成时间可控（便于测试与「陈旧报告」判定）：默认取当前本地时间到分钟。

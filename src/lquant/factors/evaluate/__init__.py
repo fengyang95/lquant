@@ -116,7 +116,7 @@ def evaluate(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
                     "outlier_stats", "event_window",
                     "display_name", "expr", "data_start", "data_end",
                     "n_samples", "steps", "covariates", "sample_filters",
-                    "window", "extras", "description"))
+                    "window", "extras", "description", "errors"))
     return out
 
 

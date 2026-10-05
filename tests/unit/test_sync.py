@@ -365,6 +365,11 @@ def test_tick_runs_due_jobs_only():
     # 其它作业（backfill/reference 等会触网）一律禁用：测试必须离线
     for sid in ("preopen", "backfill", "reference", "daily_basic", "financial"):
         manager.set_enabled(sid, False)
+    # 用例自净：sync_job 在共享库里，upsert_job 会**刻意保留** last_run_at
+    # （生产语义：编辑开关不该触发补跑）。不清掉，上一次运行留下的
+    # 「close 已跑过注入日」会让这里的第一次 tick 空转。
+    for sid in ("close", "daily", "adj"):
+        manager.delete_job(sid)
     # 把 close 作业的时刻改到很早 → 必然到期；daily/adj 改到很晚 → 不到期。
     # weekdays 不能沿用 seed_defaults 的「1,2,3,4,5」/「6」：那是生产节奏，
     # 用例必须与运行日无关（close 显式全周——注意 _is_due 对空串回落
@@ -390,8 +395,10 @@ def test_tick_runs_due_jobs_only():
     ids = {r["sync_id"] for r in res}
     assert "close" in ids
     assert "daily" not in ids and "adj" not in ids
-    # 再 tick 一次：close 今天已跑 → 不再执行
-    res2 = manager.tick()
+    # 再 tick 一次（**同一个注入日**的稍晚时刻）：close 今天已跑 → 不再执行。
+    # 这里必须继续注入时钟：用真实时钟的话，注入日一过就变成「今天还没跑」，
+    # 用例会在某个日期之后必然失败（时间炸弹）。
+    res2 = manager.tick(now=_dt(2026, 9, 21, 10, 0))
     assert all(r["sync_id"] != "close" for r in res2)
 
 
@@ -608,6 +615,10 @@ def test_partial_from_check_is_retryable(monkeypatch):
     monkeypatch.setattr(db_mod, "backfill_daily_basic",
                         lambda *a, **kw: {"rows": 0})
 
+    # 用例必须自净：sync_job 落在共享库里，upsert_job 又刻意保留 last_run/retry
+    # 轨迹（生产语义：编辑开关不该触发补跑）。不清掉上一次运行留下的
+    # retry_count，第二次跑同一用例就会看到 2 而不是 1。
+    manager.delete_job("rt5")
     manager.upsert_job("rt5", "检查重试探针", "daily_basic", "03:45", enabled=False)
     job = next(j for j in manager.list_jobs() if j["sync_id"] == "rt5")
     res = manager.run_job({**job, "params": {"days": 1, "merge": False}})
