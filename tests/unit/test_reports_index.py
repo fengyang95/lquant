@@ -197,6 +197,7 @@ def test_cli_reports_lists_and_marks_stale(report_dir) -> None:
     assert r.exit_code == 0, r.output
     body = json.loads(r.output)
     assert body["n_reports"] == 2
+    assert body["scope"] == "all"
     stale = {x["name"]: x["stale"] for x in body["reports"]}
     assert stale == {"cur": False, "old": True}
 
@@ -208,7 +209,8 @@ def test_cli_reports_stale_only_and_prune_dry_run(report_dir) -> None:
     _write(report_dir / "old.html", None)
     r = _invoke("reports", "--prune-stale")
     body = json.loads(r.output)
-    # 不加 --yes 只演练：不真删
+    # 不加 --yes 只演练：不真删；且只针对旧口径（当前口径的不许被卷进来）
+    assert body["scope"] == "stale"
     assert body["prune"]["dry_run"] is True
     assert body["prune"]["names"] == ["old"]
     assert (report_dir / "old.html").exists()
@@ -251,6 +253,7 @@ def test_cli_reports_rebuild_stale(report_dir, monkeypatch) -> None:
     r = _invoke("reports", "--rebuild-stale")
     assert r.exit_code == 0, r.output
     body = json.loads(r.output)
+    assert body["scope"] == "stale"
     assert [x["name"] for x in body["rebuilt"]] == ["resolvable"]
     assert calls and calls[0][0] == "pct_change_5"
     assert calls[0][1].endswith("resolvable.html")   # 覆盖同名文件，不改名
@@ -258,3 +261,32 @@ def test_cli_reports_rebuild_stale(report_dir, monkeypatch) -> None:
     assert "无法自动推断" in body["skipped"][0]["reason"]
     # 重算后不再是旧口径
     assert idx.report_row(report_dir / "resolvable.html")["stale"] is False
+
+
+def test_cli_reports_rebuild_does_not_touch_current_reports(report_dir, monkeypatch) -> None:
+    """回归：--rebuild-stale 只能碰旧口径报告。
+
+    首版实现遍历的是「全部报告」，于是会把已经是最新口径的报告也拿去重算 ——
+    既是纯浪费，还可能用不同的数据窗口把它改掉。
+    """
+    import json
+
+    from lquant.cli.commands import factor as cli_factor
+
+    _write(report_dir / "current.html", rep.REPORT_GENERATOR_VERSION)
+    _write(report_dir / "old.html", None)
+
+    calls = []
+
+    def _fake_build(expr, *, out=None, start=None, **kw):
+        calls.append(out)
+        return {"report": out, "bytes": 1}
+
+    monkeypatch.setattr(cli_factor, "_build_report", _fake_build)
+    monkeypatch.setattr("lquant.factors.evaluate.reports_index.resolve_report_expression",
+                        lambda stem, path=None: ("pct_change_5", "stub"))
+    r = _invoke("reports", "--rebuild-stale")
+    body = json.loads(r.output)
+    assert [x["name"] for x in body["rebuilt"]] == ["old"]
+    assert calls == [str(report_dir / "old.html")]
+    assert body["n_reports"] == 2 and body["n_selected"] == 1

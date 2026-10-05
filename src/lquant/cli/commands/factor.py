@@ -799,16 +799,19 @@ def reports(stale_only: bool, rebuild_stale: bool, prune_stale: bool, limit: int
     s = get_settings()
     base = Path(getattr(s, "reports_dir", "./data/reports"))
     base = base if base.is_absolute() else (s.root / base)
-    rows = _list(base)
-    if stale_only:
-        rows = [r for r in rows if r["stale"]]
+    all_rows = _list(base)
+    # 三个动作都只针对**旧口径**报告：--rebuild-stale 去重算一份当前口径的报告
+    # 是纯浪费（还可能用不同的数据窗口把它改掉）。只有纯列表请求才看得到全部。
+    scope_stale = stale_only or rebuild_stale or prune_stale
+    rows = [r for r in all_rows if r["stale"]] if scope_stale else all_rows
     if limit:
         rows = rows[:limit]
 
     out: dict = {
         "dir": str(base),
-        "n_reports": len(_list(base)),
-        "n_stale_selected": len(rows),
+        "n_reports": len(all_rows),
+        "scope": "stale" if scope_stale else "all",
+        "n_selected": len(rows),
         "reports": [{k: r[k] for k in ("name", "generator_version", "generated_at",
                                        "size_kb", "stale")} for r in rows],
     }
@@ -829,17 +832,16 @@ def reports(stale_only: bool, rebuild_stale: bool, prune_stale: bool, limit: int
         out["rebuilt"] = rebuilt
         out["skipped"] = skipped
     elif prune_stale:
-        targets = [r for r in rows if r["stale"]]
         out["prune"] = {
-            "n": len(targets),
-            "names": [r["name"] for r in targets],
+            "n": len(rows),
+            "names": [r["name"] for r in rows],
             "dry_run": not yes,
         }
         if yes:
-            for r in targets:
+            for r in rows:
                 with contextlib.suppress(OSError):
                     Path(r["path"]).unlink()
-            out["prune"]["deleted"] = len(targets)
+            out["prune"]["deleted"] = len(rows)
     elif stale_only:
         out["hint"] = ("旧口径报告不会自动失效：--rebuild-stale 重算（需能推断表达式），"
                        "--prune-stale --yes 删除")
