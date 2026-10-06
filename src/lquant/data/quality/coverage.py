@@ -56,13 +56,13 @@ def _expected_symbols(end: date, start: date) -> list[str]:
 def _lake_pairs(table: str) -> set[tuple[str, date]]:
     """湖内 (symbol, trade_date) 全集（只取两列，省内存）。
 
-    read_daily 返回 LazyFrame；read_daily_basic 返回 DataFrame（空湖时
-    是带 schema 的 LazyFrame）—— .lazy() 统一后 select + collect。
+    read_daily 返回 LazyFrame，read_daily_basic 返回 DataFrame ——
+    统一 ``.lazy()`` 后 select + collect，两条路径写法一致。
     """
     if table == "daily":
         df = read_daily().select("symbol", "trade_date").collect()
     else:
-        # read_daily_basic 返回 DataFrame（空湖才是 LazyFrame）→ 统一 lazy
+        # read_daily_basic 恒返回 DataFrame（空湖也是）→ 统一 lazy 后取数
         df = read_daily_basic().lazy().select("symbol", "trade_date").collect()
     return set(zip(df["symbol"].to_list(), df["trade_date"].to_list(),
                    strict=True))

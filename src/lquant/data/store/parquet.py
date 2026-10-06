@@ -197,29 +197,39 @@ def write_daily_basic(df: pl.DataFrame) -> list[Path]:
     return out
 
 
-def read_daily_basic(start=None, end=None) -> pl.DataFrame:
-    """读 daily_basic 湖（区间过滤，空湖返回带 schema 的空帧）。"""
+def read_daily_basic(start=None, end=None,
+                     symbols: list[str] | None = None) -> pl.DataFrame:
+    """读 daily_basic 湖（区间 / 标的过滤，空湖返回带 schema 的空帧）。
+
+    ``symbols`` 与 :func:`read_daily` 同语义：为 None 读全市场，给了就只读这些
+    标的。个股分析只要一只票的估值历史，全市场物化（数百万行）纯属浪费 ——
+    过滤下推到 scan，parquet 行组直接跳过。
+
+    **返回类型恒为 DataFrame**（空湖也不例外）。此前空湖分支返回 LazyFrame，
+    于是 ``len(df)`` / ``df.height`` 在「湖是空的」这条路径上直接 AttributeError，
+    调用方得先判类型再取值 —— 调用方漏判就是一个只在空库才炸的 bug。
+    """
     from datetime import date as _date
 
     root = _root() / "daily_basic"
     if not _has_parquet(root):
-        return _empty_frame("daily_basic")
+        return _empty_frame("daily_basic").collect()
     if isinstance(start, str):
         start = _date.fromisoformat(start)
     if isinstance(end, str):
         end = _date.fromisoformat(end)
-    df = (
-        pl.scan_parquet(
-            str(root / "**" / "*.parquet"),
-            missing_columns="insert",
-            extra_columns="ignore",
-        ).collect()
+    lf = pl.scan_parquet(
+        str(root / "**" / "*.parquet"),
+        missing_columns="insert",
+        extra_columns="ignore",
     )
+    if symbols:
+        lf = lf.filter(pl.col("symbol").is_in(symbols))
     if start is not None:
-        df = df.filter(pl.col("trade_date") >= start)
+        lf = lf.filter(pl.col("trade_date") >= start)
     if end is not None:
-        df = df.filter(pl.col("trade_date") <= end)
-    return df
+        lf = lf.filter(pl.col("trade_date") <= end)
+    return lf.collect()
 
 
 def _merge_quality_flags(old: pl.DataFrame, new: pl.DataFrame) -> pl.DataFrame:
@@ -406,13 +416,22 @@ def daily_range() -> tuple[date | None, date | None]:
 
     给「该拉哪一段」类逻辑用（跨源对拍窗口、覆盖度报告）。
     走 parquet 统计做 min/max 下推，不物化数据。
+
+    **schema 漂移必须容忍**：增量回填会改写单个年文件（例如某年补了 ``is_st``），
+    于是跨年文件的列集合天然不一致。不带 ``extra_columns="ignore"`` 的 scan 会在
+    这里抛 SchemaError，被下面的 ``except`` 吞掉，函数静默返回 ``(None, None)`` ——
+    看起来像「湖是空的」，实际是「读湖失败」。``read_daily`` 早就带了这两个选项，
+    本函数漏了，导致 ``latest_trade_date()`` / ``latest_top_by_amount()`` 在多年度
+    真实湖上长期失效（新闻热点池取不到标的）。
     """
     root = _root() / "daily"
     if not _has_parquet(root):
         return None, None
     try:
         row = (
-            pl.scan_parquet(str(root / "**" / "*.parquet"))
+            pl.scan_parquet(str(root / "**" / "*.parquet"),
+                            missing_columns="insert",
+                            extra_columns="ignore")
             .select(pl.col("trade_date").min().alias("lo"),
                     pl.col("trade_date").max().alias("hi"))
             .collect()

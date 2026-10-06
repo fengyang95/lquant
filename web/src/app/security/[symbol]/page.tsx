@@ -16,6 +16,7 @@ import IndicatorPicker, {
   type IndicatorMeta,
 } from '@/components/IndicatorPicker';
 import FundamentalCard from '@/components/FundamentalCard';
+import SecurityAnalysisView from '@/components/SecurityAnalysis';
 import { Pct, fmtNum, fmtYi } from '@/components/QuoteTable';
 import { SERIES_COLORS } from '@/lib/chart';
 import { fetcher } from '@/lib/api';
@@ -95,6 +96,10 @@ export default function SecurityPage() {
     `/data/indicators?symbol=${symbol}&limit=250&names=${names}`, fetcher,
   );
   const { data: flows } = useSWR<FlowRow[]>(`/market/money-flow?symbol=${symbol}`, fetcher);
+  // 多角度分析报告（技术/基本面/估值/资金/相对强度/消息面 + 风险）
+  const { data: analysis, isLoading: analysisLoading } = useSWR(
+    `/security/${encodeURIComponent(symbol)}/analysis`, fetcher,
+  );
 
   // bars/overlays 仅随 rows（日线）变化；行情 5s 轮询不改 rows 引用，
   // useMemo 保证 KChart 的 effect 不因 quote 更新而重建图表、重置视口
@@ -167,6 +172,21 @@ export default function SecurityPage() {
             <Stat label="数据截至" value={last?.trade_date ?? '—'} />
           </div>
         </div>
+      </Panel>
+
+      {/* 多角度分析：一个代码进，六个角度 + 风险出（本页的核心能力） */}
+      <Panel
+        title="多角度分析"
+        meta="技术 · 基本面 · 估值 · 资金 · 相对强度 · 消息面"
+        actions={
+          <button className="btn text-xs" onClick={() => router.push('/security')}>
+            换一个代码
+          </button>
+        }
+      >
+        {analysisLoading
+          ? <Loading>分析计算中…</Loading>
+          : <SecurityAnalysisView report={analysis} />}
       </Panel>
 
       {/* 基本面：行业相对分位评分（PIT） */}
