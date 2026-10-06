@@ -273,7 +273,16 @@ def job_ep(job_id: str) -> dict:
 
 @router.post("/jobs/{job_id}/cancel")
 def cancel_ep(job_id: str) -> dict:
-    return {"canceled": request_cancel(job_id)}
+    """请求取消 ML 任务。契约与 backtests/任务中心对齐：任务不存在 404，
+    已终态 409，取消受理 200 —— 不存在的任务不能静默伪装成「已取消」。"""
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(404, f"未找到 ML 任务 {job_id}")
+    if job.get_status() in ("finished", "failed", "canceled"):
+        raise HTTPException(409, f"任务已结束（{job.get_status()}），不可取消")
+    if not request_cancel(job_id):
+        raise HTTPException(409, f"任务不可取消: {job_id}")
+    return {"job_id": job_id, "canceled": True}
 
 
 # ---------------------------------------------------------------- 训练记录

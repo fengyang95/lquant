@@ -95,3 +95,24 @@ def test_missing_column_raises():
     df = _panel("momentum").drop("close")
     with pytest.raises(KeyError):
         event_study(df, "factor", "close")
+
+
+def test_null_factor_rows_do_not_corrupt_price_path():
+    """回归：factor 为空的行被剔除后，shift 收益不得跨过被剔的行。
+
+    3 天价格 100→110→121（日收益 10%），中间日 factor 置 null。
+    旧实现先 drop_nulls([price, factor]) 再 shift，`shift(-1)` 会把
+    「次 1 个交易日」错算成「次 1 个剩余行」（100→121 = +21%）；
+    行完整面板上算则恒为 +10%。
+    """
+    df = pl.DataFrame({
+        "trade_date": [0, 1, 2],
+        "symbol": ["S0", "S0", "S0"],
+        "close": [100.0, 110.0, 121.0],
+        "factor": [1.0, None, 2.0],
+    })
+    curve = event_study(df, "factor", "close", n_groups=1, before=0, after=2,
+                        demeaned=False)
+    r1 = curve.filter(pl.col("rel_period") == 1)["q1"].drop_nulls().to_list()
+    # 事件日 0 的 r1 = +10%；事件日 1 无次日价格，不入聚合
+    assert r1 == pytest.approx([0.10]), f"r1 应为 +10%，实得 {r1}"

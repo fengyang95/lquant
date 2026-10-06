@@ -139,7 +139,7 @@ EOF
   local _ver
   _ver="$("$GL" version 2>/dev/null | head -1 | tr -d 'v')"
   if ! version_ge "$_ver" "$MIN_VERSION"; then
-    bad "gitleaks 版本过旧：$_ver（需要 >= $MIN_VERSION，本脚本用的是 git/dir 子命令）"
+    bad "gitleaks 版本过旧：${_ver}（需要 >= ${MIN_VERSION}，本脚本用的是 git/dir 子命令）"
     exit 2
   fi
   if [ ! -f "$CONFIG" ]; then
@@ -185,9 +185,9 @@ run_scan() {
   local _rc=0
   gl "$@" || _rc=$?
   case "$_rc" in
-    0) ok "$_label：未发现密钥" ;;
-    1) bad "$_label：发现疑似密钥" ;;
-    *) bad "$_label：扫描器异常退出（rc=$_rc）" ;;
+    0) ok "${_label}：未发现密钥" ;;
+    1) bad "${_label}：发现疑似密钥" ;;
+    *) bad "${_label}：扫描器异常退出（rc=${_rc}）" ;;
   esac
   return "$_rc"
 }
@@ -309,7 +309,7 @@ scan_push() {
       [ "$_rsha" = "$_lsha" ] && continue
       _range="$_rsha..$_lsha"
     fi
-    info "扫描 $_lref → $_rref（$_range）"
+    info "扫描 ${_lref} → ${_rref}（${_range}）"
     run_scan "推送范围 $_rref" git --log-opts="$_range" || _rc=$?
     _scanned=1
   done < "$_reflog"
@@ -407,9 +407,9 @@ main() {
   esac
 
   if [ "$_rc" -eq 0 ]; then
-    echo "==> secret-scan 通过（$_mode）"
+    echo "==> secret-scan 通过（${_mode}）"
   else
-    echo "==> secret-scan 未通过（$_mode，rc=$_rc）" >&2
+    echo "==> secret-scan 未通过（${_mode}，rc=${_rc}）" >&2
     if [ -n "${LQ_SECRET_REPORT:-}" ]; then
       print_findings "$LQ_SECRET_REPORT" >&2
     fi

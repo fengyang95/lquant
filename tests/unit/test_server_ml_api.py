@@ -149,7 +149,53 @@ def test_retrain_enqueues_and_validates_months(client, monkeypatch):
 
 def test_job_endpoints(client, ml_env):
     assert client.get("/api/ml/jobs/nope").status_code == 404
-    assert client.post("/api/ml/jobs/nope/cancel").json()["canceled"] is False
+    # 取消契约与 backtests/任务中心对齐：不存在的任务 404，不是 200 {"canceled": false}
+    assert client.post("/api/ml/jobs/nope/cancel").status_code == 404
+
+
+class _StubJob:
+    def __init__(self, status):
+        self._status = status
+
+    def get_status(self):
+        return self._status
+
+
+@pytest.fixture()
+def fake_job(monkeypatch):
+    """往任务注册表塞打桩 job，用完清理（不真起线程）。"""
+    from lquant.server import jobs
+
+    added = []
+
+    def add(job_id, status, cancelable=True, local=True):
+        job = _StubJob(status)
+        jobs._LOCAL_JOBS[job_id] = job
+        if cancelable:
+            jobs._CANCELABLE[job_id] = jobs._CancelTarget(
+                queue="lquant-ml", local_job=job if local else None)
+        added.append(job_id)
+        return job
+
+    yield add
+    for jid in added:
+        jobs._LOCAL_JOBS.pop(jid, None)
+        jobs._CANCELABLE.pop(jid, None)
+
+
+def test_cancel_contract_paths(client, fake_job):
+    # 已终态（finished/canceled）→ 409
+    fake_job("fin1", "finished")
+    fake_job("fin2", "canceled")
+    assert client.post("/api/ml/jobs/fin1/cancel").status_code == 409
+    assert client.post("/api/ml/jobs/fin2/cancel").status_code == 409
+    # 运行中且登记了可取消目标 → 200 canceled:true
+    fake_job("run1", "running")
+    r = client.post("/api/ml/jobs/run1/cancel")
+    assert r.status_code == 200 and r.json()["canceled"] is True
+    # 运行中但无取消目标（Redis 也不可用）→ 409，不能假装取消成功
+    fake_job("nc1", "running", cancelable=False)
+    assert client.post("/api/ml/jobs/nc1/cancel").status_code == 409
 
 
 # ---------------------------------------------------------------- 训练记录

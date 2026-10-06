@@ -18,8 +18,20 @@ def clean_lq_ops(monkeypatch):
     monkeypatch.delitem(sys.modules, "lq_ops", raising=False)
 
 
+def _lq_ops_built() -> bool:
+    """环境里是否真的编译并安装了 lq_ops（与 test_rust_alignment 的 skipif 同口径）。"""
+    try:
+        import lq_ops  # noqa: F401, PLC0415
+
+        return True
+    except ImportError:
+        return False
+
+
+@pytest.mark.skipif(not _lq_ops_built(), reason="未编译 Rust：先 make rust-build")
 def test_rust_available_real():
-    # 当前环境 lq_ops 可导入
+    # 当前环境 lq_ops 可导入。未编译 Rust 的 worktree / CI 环境没有 lq_ops，
+    # 这条环境探针不能不加防护地断 True——否则 pre-push 全量测试必挂
     assert rust_bridge.rust_available() is True
 
 
