@@ -15,16 +15,18 @@ os.environ.setdefault("LQ_SYNC_WORKER", "0")
 
 pytestmark = pytest.mark.usefixtures("api_env")
 
+from lquant.fundamental import pit_items, raw_items  # noqa: E402
+
 PUB = date(2026, 3, 20)
 STAT = date(2025, 12, 31)
+#: 估值观察日（日线湖里的一根 bar）
+VAL_DAY = date(2026, 3, 31)
 
-# 覆盖 metrics 目录里的全部 item（让覆盖率断言有意义）
-ITEMS = ("profit.roeAvg", "profit.npMargin", "profit.gpMargin", "dupont.dupontNitogr",
-         "cashflow.CFOToNP", "cashflow.CFOToOR", "cashflow.CFOToGr",
-         "operation.NRTurnDays", "operation.INVTurnDays", "operation.AssetTurnRatio",
-         "balance.currentRatio", "balance.quickRatio", "balance.liabilityToAsset",
-         "cashflow.ebitToInterest",
-         "valuation.pe_ttm", "valuation.pb", "valuation.dividend_yield")
+# 覆盖 metrics 目录里的**全部** item（让覆盖率断言有意义）。
+# 从真实注册表推导，而不是手抄一份键名清单 —— 手抄的那份曾经整体是
+# BaoStock 遗留键（profit.roeAvg …），与生产库（Tushare indicator.*）
+# 完全对不上，测试却一直是绿的。
+ITEMS = tuple(dict.fromkeys([*pit_items(), *raw_items()]))
 
 
 @pytest.fixture(scope="module")
@@ -43,13 +45,24 @@ def api_env(tmp_path_factory):
         for stmt in DDL_STATEMENTS:
             con.execute(stmt)
         _seed_financial(con)
+    _seed_valuation_lake(base)
     yield base
     os.chdir(prev_cwd)
     get_settings.cache_clear()
 
 
 def _seed_financial(con) -> None:
-    """两个行业 × 6 只票 × 17 个指标，公告日 2026-03-20。"""
+    """两个行业 × 6 只票 × 全部物理键，公告日 2026-03-20。
+
+    值按 ``base + k`` 造，保证同一 (行业, 指标) 内 6 只票的取值互不相同 ——
+    分位（P25/P50/P75）才有意义，否则区间退化、档位全落同一档。
+    """
+    from lquant.fundamental.metrics import METRICS
+
+    lower_better = {m.item for m in METRICS if not m.higher_better} | {
+        "indicator.ar_turn", "income.oper_cost", "income.fin_exp_int_exp",
+        "cashflow.n_cashflow_act", "indicator.ebit",
+    }
     rows = []
     industries = []
     for i in range(12):
@@ -57,11 +70,8 @@ def _seed_financial(con) -> None:
         ind = "白酒" if i < 6 else "银行"
         industries.append((sym, ind))
         for k, item in enumerate(ITEMS):
-            lower_better = item in ("operation.NRTurnDays", "operation.INVTurnDays",
-                                    "balance.liabilityToAsset", "valuation.pe_ttm",
-                                    "valuation.pb")
-            base = 40.0 - i * 2 if lower_better else 10.0 + i * 2
-            rows.append((sym, STAT, PUB, "2025Q4", item, base + k, "baostock"))
+            base = 40.0 - i * 2 if item in lower_better else 10.0 + i * 2
+            rows.append((sym, STAT, PUB, "2025Q4", item, base + k, "tushare"))
     con.executemany(
         "INSERT INTO financial_pit (symbol, stat_date, pub_date, report_type, item,"
         " value, source) VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
@@ -69,6 +79,34 @@ def _seed_financial(con) -> None:
         "INSERT INTO industry_classify (symbol, std, code, name, std_date, source)"
         " VALUES (?, ?, ?, ?, ?, ?)",
         [(sym, "sw", ind, ind, date(2024, 1, 1), "test") for sym, ind in industries])
+
+
+def _seed_valuation_lake(base) -> None:
+    """写一小份日线湖 + daily_basic 湖。
+
+    估值指标（pe_ttm / pb_mrq / dv_ttm）**不在** financial_pit 里，
+    只从日线湖读 —— 不铺这个湖，集成测试就永远只覆盖 14/17 个指标，
+    「估值模块是否真的接上了」这件事没人守。
+    """
+    symbols = [f"6000{i:02d}.SH" for i in range(12)]
+    daily = pl.DataFrame({
+        "symbol": symbols,
+        "trade_date": [VAL_DAY] * len(symbols),
+        "close": [10.0 + i for i in range(len(symbols))],
+        "pe_ttm": [8.0 + i for i in range(len(symbols))],
+        "pb_mrq": [1.0 + i * 0.1 for i in range(len(symbols))],
+    })
+    basic = pl.DataFrame({
+        "symbol": symbols,
+        "trade_date": [VAL_DAY] * len(symbols),
+        "close": [10.0 + i for i in range(len(symbols))],
+        "dv_ttm": [1.0 + i * 0.5 for i in range(len(symbols))],
+    })
+    root = base / "data" / "parquet"
+    for kind, frame in (("daily", daily), ("daily_basic", basic)):
+        d = root / kind / "year=2026"
+        d.mkdir(parents=True, exist_ok=True)
+        frame.write_parquet(d / "part-0.parquet")
 
 
 @pytest.fixture(scope="module")

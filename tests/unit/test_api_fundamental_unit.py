@@ -22,7 +22,7 @@ class _BrokenCon:
 
 
 def test_load_financial_degrades_on_missing_table():
-    out = fd._load_financial(_BrokenCon(), date(2026, 4, 1), ("profit.roeAvg",))
+    out = fd._load_financial(_BrokenCon(), date(2026, 4, 1), ("indicator.roe",))
     assert isinstance(out, pl.DataFrame) and out.is_empty()
 
 
@@ -42,6 +42,19 @@ def test_json_safe_handles_nan_and_nesting():
     assert fd._json_safe(float("inf")) is None
     assert fd._json_safe({"a": [float("nan"), 1.0]}) == {"a": [None, 1.0]}
     assert fd._json_safe((True, None, "x")) == [True, None, "x"]
+
+
+@pytest.fixture(autouse=True)
+def _clear_fundamental_cache():
+    """每个用例前后清空面板缓存。
+
+    评分面板是按 ``(asof, min_samples)`` 缓存的重对象，用例之间共享同一组
+    参数，不隔离就会读到上一个用例写入的 monkeypatch 结果 —— 表现为
+    「单独跑绿、整文件跑红」。
+    """
+    fd.clear_fundamental_cache()
+    yield
+    fd.clear_fundamental_cache()
 
 
 @pytest.fixture(scope="module")
@@ -76,19 +89,19 @@ def test_score_one_when_percentiles_unavailable(env, monkeypatch):
     """面板非空但分位样本不足 → 走 detail 为空的分支。"""
     panel = pl.DataFrame({
         "symbol": ["600519.SH"], "stat_date": [date(2025, 12, 31)],
-        "pub_date": [date(2026, 3, 20)], "item": ["profit.roeAvg"], "value": [20.0]})
+        "pub_date": [date(2026, 3, 20)], "item": ["indicator.roe"], "value": [20.0]})
     ind = pl.DataFrame({"symbol": ["600519.SH"], "std": ["sw"], "code": ["白酒"],
                         "name": ["白酒"], "std_date": [date(2024, 1, 1)]})
     monkeypatch.setattr(fd, "_load_financial", lambda *a, **k: panel)
     monkeypatch.setattr(fd, "_load_industry", lambda *a, **k: ind)
     out = fd.score_one(symbol="600519.SH", asof="2026-04-01", min_samples=100)
-    assert out["available"] is False and "行业分位样本不足" in out["hint"]
+    assert out["available"] is False and "分位样本不足" in out["hint"]
 
 
 def test_score_many_when_percentiles_unavailable(env, monkeypatch):
     panel = pl.DataFrame({
         "symbol": ["600519.SH"], "stat_date": [date(2025, 12, 31)],
-        "pub_date": [date(2026, 3, 20)], "item": ["profit.roeAvg"], "value": [20.0]})
+        "pub_date": [date(2026, 3, 20)], "item": ["indicator.roe"], "value": [20.0]})
     ind = pl.DataFrame({"symbol": ["600519.SH"], "std": ["sw"], "code": ["白酒"],
                         "name": ["白酒"], "std_date": [date(2024, 1, 1)]})
     monkeypatch.setattr(fd, "_load_financial", lambda *a, **k: panel)

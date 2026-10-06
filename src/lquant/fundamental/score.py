@@ -18,7 +18,12 @@ from datetime import date
 
 import polars as pl
 
-from lquant.fundamental.metrics import METRICS, MODULE_WEIGHTS, RatioMetric
+from lquant.fundamental.metrics import (
+    METRICS,
+    MODULE_WEIGHTS,
+    RatioMetric,
+    metrics_by_module_of,
+)
 from lquant.fundamental.percentile import (
     DEFAULT_MIN_SAMPLES,
     score_universe,
@@ -27,6 +32,7 @@ from lquant.fundamental.percentile import (
 __all__ = [
     "DEFAULT_RATING_THRESHOLDS",
     "aggregate",
+    "module_coverage",
     "rating",
     "score_history",
     "score_snapshot",
@@ -71,34 +77,76 @@ def aggregate(detail: pl.DataFrame,
         return pl.DataFrame(schema={"symbol": pl.String, "rating": pl.String})
 
     n_metrics = len(metrics)
-    rows: list[dict] = []
-    for (symbol, industry), grp in detail.group_by(["symbol", "industry"],
-                                                   maintain_order=True):
-        scored_modules = (grp.group_by("module")
-                             .agg(pl.col("points").sum().alias("pts"),
-                                  pl.col("max_score").sum().alias("mx")))
-        points_by_mod = dict(zip(scored_modules["module"].to_list(),
-                                 scored_modules["pts"].to_list(), strict=True))
-        max_by_mod = dict(zip(scored_modules["module"].to_list(),
-                              scored_modules["mx"].to_list(), strict=True))
-        raw = float(sum(points_by_mod.values()))
-        avail = float(sum(max_by_mod.values()))
-        n_scored = grp.height
-        row: dict = {
-            "symbol": symbol,
-            "industry": industry,
-            "n_scored": n_scored,
-            "n_metrics": n_metrics,
-            "coverage": n_scored / n_metrics if n_metrics else 0.0,
-            "raw_score": raw,
-            "available_max": avail,
-            "normalized_score": (raw / avail * 100.0) if avail > 0 else 0.0,
+    # 全向量化：原实现按 symbol 做 Python 循环、循环内再 group_by，
+    # 5000+ 只票时是请求耗时的主要来源（且随标的数线性放大）。
+    # 语义与逐票循环完全一致：模块分 = 该模块**已评分**行的 points 之和。
+    mod_aggs: list[pl.Expr] = []
+    for mod in MODULE_WEIGHTS:
+        in_mod = pl.col("module") == mod
+        mod_aggs.append(pl.col("points").filter(in_mod).sum().alias(f"score_{mod}"))
+        mod_aggs.append(pl.col("max_score").filter(in_mod).sum().alias(f"avail_{mod}"))
+
+    good, fair, poor = thresholds
+    out = (
+        detail.group_by(["symbol", "industry"])
+        .agg(pl.len().alias("n_scored"),
+             pl.col("points").sum().alias("raw_score"),
+             pl.col("max_score").sum().alias("available_max"),
+             *mod_aggs)
+        .with_columns(
+            pl.lit(n_metrics, dtype=pl.Int64).alias("n_metrics"),
+            (pl.col("raw_score") / pl.col("available_max") * 100.0)
+            .fill_nan(0.0).fill_null(0.0).alias("normalized_score"),
+        )
+        .with_columns(
+            (pl.col("n_scored") / n_metrics if n_metrics else pl.lit(0.0)).alias("coverage"),
+        )
+        .with_columns(
+            pl.when(pl.col("normalized_score") >= good).then(pl.lit(_RATING_LABELS[0]))
+            .when(pl.col("normalized_score") >= fair).then(pl.lit(_RATING_LABELS[1]))
+            .when(pl.col("normalized_score") >= poor).then(pl.lit(_RATING_LABELS[2]))
+            .otherwise(pl.lit(_RATING_LABELS[3])).alias("rating"),
+        )
+        .with_columns(
+            *[pl.col(f"score_{m}").fill_null(0.0).cast(pl.Float64) for m in MODULE_WEIGHTS],
+        )
+        .select(cols)
+        .sort("symbol")
+    )
+    return out
+
+
+def module_coverage(detail: pl.DataFrame,
+                    metrics: Sequence[RatioMetric] = METRICS) -> dict[str, dict]:
+    """各模块在**本次评分结果**里的可得性 —— 给前端解释「为什么某模块是 0 分」。
+
+    区分两种情况，UI 上必须能分辨：
+
+    - 模块**没有数据源**（如估值列未回填）：整列恒 0，属于配置问题；
+    - 模块**有数据源但本票没匹配上**：属于个股覆盖问题。
+
+    Returns:
+        ``{module: {"n_metrics": 该模块指标数, "max_score": 模块满分,
+        "hit_rate": 命中该模块至少一个指标的标的占比,
+        "n_scored_rows": 该模块已评分明细行数}}``
+    """
+    per_mod = metrics_by_module_of(metrics)
+    if not detail.is_empty():
+        # 明细里出现、但目录未声明的模块也要计入 —— 静默漏掉等于给出错的可得性
+        for mod in detail["module"].unique().to_list():
+            per_mod.setdefault(mod, ())
+    n_symbols = detail.select("symbol").n_unique() if not detail.is_empty() else 0
+    out: dict[str, dict] = {}
+    for mod, items in per_mod.items():
+        sub = detail.filter(pl.col("module") == mod) if not detail.is_empty() else detail
+        scored_symbols = sub.select("symbol").n_unique() if sub.height else 0
+        out[mod] = {
+            "n_metrics": len(items),
+            "max_score": float(sum(m.max_score for m in items)),
+            "n_scored_rows": int(sub.height) if sub.height else 0,
+            "hit_rate": (scored_symbols / n_symbols) if n_symbols else 0.0,
         }
-        row["rating"] = rating(row["normalized_score"], thresholds)
-        for mod in MODULE_WEIGHTS:
-            row[f"score_{mod}"] = float(points_by_mod.get(mod, 0.0))
-        rows.append(row)
-    return pl.DataFrame(rows).select(cols).sort("symbol")
+    return out
 
 
 def score_snapshot(panel: pl.DataFrame, industry: pl.DataFrame, asof: date,
