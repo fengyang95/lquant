@@ -62,12 +62,15 @@ def _panel_with_covs(start=None):
     return df, present
 
 
-def prepare_segment(df, cov_cols, expr, dates, *, horizons=(1, 5)):
+def prepare_segment(df, cov_cols, expr, dates, *, horizons=(1, 5), with_pre: bool = False):
     """在给定交易日子集上算因子 → 前瞻收益 → 中性化，返回分析就绪的 df。
 
     train/val 切分、submit 重验、``lq factor audit`` 深度校验、``lq factor robust``
     鲁棒性检验共用这一条实现 —— 口径一旦分叉，「JSON 里的 ic_mean」和
     「报告里的 ic_mean」就对不上，这种不一致最难查。
+
+    ``with_pre=True`` 时返回 ``(分析就绪帧, 中性化之前的帧)``。后者是「IC 归因阶梯」
+    的基线：阶梯要回答「中性化吃掉了多少 IC」，拿已中性化的帧当 raw 段等于没问。
     """
     from lquant.factors.analysis import compute_factor_col
     from lquant.factors.evaluate import forward_return
@@ -79,6 +82,7 @@ def prepare_segment(df, cov_cols, expr, dates, *, horizons=(1, 5)):
     d = drop_nonfinite(compute_factor_col(sub, expr, "f"), "f")
     if "fwd_ret_1" in d.columns:
         d = drop_nonfinite(d, "fwd_ret_1")
+    pre = d
     if cov_cols:
         d = pipeline_run(d, "f", [
             {"op": "winsorize", "method": "mad", "n": 5},
@@ -86,7 +90,7 @@ def prepare_segment(df, cov_cols, expr, dates, *, horizons=(1, 5)):
             {"op": "neutralize", "method": "ols", "factors": cov_cols},
         ])
     d = drop_nonfinite(d, "f")
-    return d
+    return (d, pre) if with_pre else d
 
 
 def _split_eval(df, cov_cols, expr):

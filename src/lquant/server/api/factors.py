@@ -23,6 +23,12 @@ from lquant.core.errors import FactorError
 from lquant.data.store.catalog import IndexConsRepo, upsert
 from lquant.data.store.parquet import read_daily
 from lquant.factors.evaluate import evaluate, forward_return
+from lquant.factors.evaluate.defaults import (
+    DEFAULT_BPS,
+    DEFAULT_DECAY_HORIZONS,
+    DEFAULT_N_GROUPS,
+    DEFAULT_WINDOW,
+)
 from lquant.factors.preprocess.pipeline import drop_nonfinite
 
 router = APIRouter(prefix="/factors", tags=["factors"])
@@ -44,7 +50,20 @@ def _jf(v, nd=4) -> float | None:
     return round(float(v), nd) if v is not None and math.isfinite(float(v)) else None
 
 
-REPORT_DIR = Path("data/reports")
+def _report_dir() -> Path:
+    """因子报告目录。
+
+    相对路径**锚定到仓库根**（``Settings.root``），不跟随进程 CWD ——
+    否则换个目录启动服务，报告会写到别处、``/factors/reports`` 也变空。
+    """
+    from lquant.core.config import get_settings
+
+    s = get_settings()
+    p = Path(getattr(s, "reports_dir", "./data/reports"))
+    return p if p.is_absolute() else (s.root / p)
+
+
+REPORT_DIR = _report_dir()
 
 
 class FactorIn(BaseModel):
@@ -77,10 +96,13 @@ class EvaluateIn(BaseModel):
     factor: str = Field(default="mom20", max_length=64,
                         pattern=r"^[A-Za-z0-9_-]+")  # 报告名（防路径穿越）
     formula: str = "pct_change_20"       # 支持 pct_change_{n} / rolling_std_{n}
-    n_groups: int = Field(default=5, ge=2, le=20)
-    horizons: list[int] = Field(default=[1, 5, 10, 20], min_length=1, max_length=20)
+    n_groups: int = Field(default=DEFAULT_N_GROUPS, ge=2, le=20)
+    horizons: list[int] = Field(default=list(DEFAULT_DECAY_HORIZONS),
+                                min_length=1, max_length=20,
+                                description="衰减阶梯（交易日）：报告与序列共用同一条曲线，"
+                                            "默认与 CLI/引擎一致（1,2,3,5,10,20,40,60）")
     start: str = "2026-01-01"
-    window: int = Field(default=60, ge=20, le=250)  # 滚动窗口（交易日）
+    window: int = Field(default=DEFAULT_WINDOW, ge=20, le=250)  # 滚动窗口（交易日）
     top_ns: list[int] = Field(default=[50, 100], min_length=1, max_length=5,
                               description="Top-N 持仓收缩测试的 N 列表")
     style_threshold: float = Field(default=0.14, ge=0.0, le=1.0,
@@ -100,6 +122,15 @@ class EvaluateIn(BaseModel):
     with_robustness: bool = Field(
         default=False,
         description="是否跑 L3 稳健性（窗口扰动/分段稳定/起点敏感/月度剔除）—— 需重算因子多遍，默认关")
+    exclude_st: bool = Field(
+        default=False,
+        description="是否剔除 ST/*ST（默认否 —— 打开会改变 IC/分层口径，报告会写明）")
+    exclude_suspended: bool = Field(
+        default=False,
+        description="是否剔除停牌（默认否 —— 打开会改变 IC/分层口径，报告会写明）")
+    aum_list: list[float] | None = Field(
+        default=None, max_length=12,
+        description="容量分析的资金规模档位；None = 用内置默认档")
 
     @field_validator("steps")
     @classmethod
@@ -423,26 +454,6 @@ def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
     raise HTTPException(422, f"暂不支持的因子公式: {formula}（内置因子见 GET /api/factors/builtin）")
 
 
-def _neutral_views_for(d: pl.DataFrame, ret_col: str, n_groups: int = 5) -> dict:
-    """收益中性化对照 + 行业内分组分层（§5.1 三视图）。
-
-    n_groups 必须透传用户选择 —— 此前恒用默认 5，与页面上的分层组数不一致。
-    """
-    from lquant.factors.evaluate.neutral_views import neutral_views as _nv
-
-    try:
-        cov_cols = [c for c in d.columns if c.startswith("cov_")]
-        if not cov_cols:
-            return {"view": "raw（未中性化 —— 协变量数据不可用）"}
-        return _nv(d, "_factor", ret_col, covariates=cov_cols,
-                   group_col="cov_industry_sw1" if "cov_industry_sw1" in d.columns else None,
-                   n_groups=n_groups)
-    except Exception as e:  # noqa: BLE001
-        # 不能静默成 {}：页面会把「算炸了」显示成「协变量数据不足」，
-        # 两种情况的处置完全不同（一个是修数据，一个是修代码）
-        return {"view": "error", "error": f"{type(e).__name__}: {e}"}
-
-
 def _persist_ic(name: str, ladder: list[dict]) -> None:
     """评价成功后把 IC(原始)/IC(中性化) 落 factor_ic 表 —— 列表页排序用。"""
     if not ladder:
@@ -464,69 +475,6 @@ def _persist_ic(name: str, ladder: list[dict]) -> None:
         import loguru
 
         loguru.logger.warning(f"factor_ic 写入失败: {e}")
-
-
-def _neutral_ladder(d: pl.DataFrame, col: str, ret_col: str,
-                    dd: pl.DataFrame | None = None,
-                    cov_report: dict | None = None,
-                    errors: dict | None = None) -> list[dict]:
-    """逐段叠加协变量看 IC 怎么掉：原始 → +市值 → +行业 → +换手率。
-
-    dd/cov_report 可由调用方传入（协变量只构建一次，ladder 与 views 复用）。
-    errors 传入时记录失败原因 —— 「阶梯缺一段」和「这一段算不出来」必须能区分。
-    """
-    from lquant.factors.evaluate.ic import ic_series
-    from lquant.factors.preprocess.pipeline import drop_nonfinite
-    from lquant.factors.preprocess.pipeline import run as pipeline_run
-
-    def _fail(key: str, e: Exception) -> None:
-        if errors is not None:
-            errors[key] = f"{type(e).__name__}: {e}"
-
-    levels = [
-        ("raw", []),
-        ("+market_cap", ["market_cap"]),
-        ("+industry", ["market_cap", "industry_sw1"]),
-        ("+turnover", ["market_cap", "industry_sw1", "turnover_1m"]),
-    ]
-    out = []
-    if dd is None:
-        from lquant.factors.covariates import build_covariates
-
-        cov_names = sorted({c for _, covs in levels for c in covs})
-        try:
-            dd, report = build_covariates(d, cov_names)
-        except Exception as e:  # noqa: BLE001
-            _fail("neutral_ladder:covariates", e)
-            return []
-        cov_report = {r["covariate"]: r["coverage"] for r in report}
-    cov_report = cov_report or {}
-    for label, covs in levels:
-        steps = [{"op": "winsorize", "method": "mad", "n": 5},
-                 {"op": "standardize", "method": "zscore"}]
-        if covs:
-            cols = [f"cov_{c}" for c in covs if f"cov_{c}" in dd.columns]
-            if covs and not cols:
-                _fail(f"neutral_ladder:{label}", RuntimeError("协变量列全缺失"))
-                continue
-            steps.append({"op": "neutralize", "method": "ols", "factors": cols})
-        try:
-            r = pipeline_run(dd, col, steps)
-        except Exception as e:  # noqa: BLE001
-            _fail(f"neutral_ladder:{label}", e)
-            continue
-        r = drop_nonfinite(r, col)
-        s = ic_series(r, col, ret_col)
-        if not len(s):
-            continue
-        out.append({
-            "label": label, "covs": covs,
-            "ic_mean": _jf(s["ic"].mean()),
-            "rank_ic_mean": _jf(s["rank_ic"].mean()),
-            "n_days": len(s),
-            "coverage": round(min((cov_report.get(c, 1.0) for c in covs), default=1.0), 4),
-        })
-    return out
 
 
 def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[dict, dict]:
@@ -558,6 +506,19 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
     ret_col = f"fwd_ret_{min(req.horizons)}"
     if ret_col not in d.columns:
         raise HTTPException(500, f"前瞻收益列缺失: {ret_col}")
+
+    # 样本过滤（ST/停牌，默认关）：必须在所有计算之前，且报告里要写明到底剔没剔。
+    # 打开会改变 IC/分层口径，所以是显式开关而不是默认行为。
+    from lquant.factors.evaluate.sample import (
+        apply_sample_filters,
+        describe_sample_filters,
+    )
+
+    if req.exclude_st or req.exclude_suspended:
+        d = apply_sample_filters(d, exclude_st=req.exclude_st,
+                                 exclude_suspended=req.exclude_suspended)
+        if not len(d):
+            raise HTTPException(422, "样本过滤后没有剩余数据 —— 检查 ST/停牌标记")
 
     # 截面异常收益过滤（可选）：过滤一次，指标 / 序列 / 报告三处口径保持一致
     outlier_stats = None
@@ -616,15 +577,17 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
 
     # ---- metrics（原 run_evaluate 计算体） ----
     _step(35, "评价计算")
+    # 报告延后到 extras（超额 / Top-N / 风格 / 归因阶梯 / 容量）全部算完再生成一次，
+    # 这样报告能一次带齐内容 —— 此前是先生成报告、再算 extras，导致
+    # 「研报三件套」永远进不了报告。
     res = evaluate(d, "_factor", ret_col=ret_col, n_groups=req.n_groups,
                    horizons=req.horizons, outlier_stats=outlier_stats,
                    cat_col=cat_col, group_col=cat_col,
-                   bps_list=[0.0, 5.0, 10.0, 15.0, 30.0],
+                   bps_list=list(DEFAULT_BPS),
                    universe=req.universe, expr=req.formula, covs=cov_cols_present,
                    with_robustness=req.with_robustness,
+                   with_report=False,
                    event_window=(req.event_window[0], req.event_window[1]))
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = _save_report_atomic(res["report"], REPORT_DIR / f"{req.factor}.html")
     ic = res["ic"]["ic"]
     ric = res["ic"]["rank_ic"]
     ls = res["quantile"]["long_short"]
@@ -657,7 +620,7 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
         "annual_turnover": None,
         "top_n": [],
         "style_corr": {"max_abs": None, "passed": None},
-        "report_url": f"/api/factors/reports/{report_path.stem}",
+        "report_url": None,              # 报告在 extras 齐备后统一生成并回填
     }
 
     # ---- series（原 evaluate_series 计算体） ----
@@ -692,105 +655,28 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
                 "ir": _jf(r["ir"], 3), "positive_rate": _jf(r["positive_rate"], 4)}
                for r in icy.to_dicts()] if len(icy) else []
 
-    # ---- IC 归因阶梯（方案 5.3）+ 三种中性化视图（方案 5.1） ----
+    # ---- 归因阶梯 / 中性化视图 / 分组 IC / 研报三件套 ----
+    # 编排收口在 evaluate/extras.py：CLI 与合成入口共用同一份实现，
+    # 否则「同一个生成器产出三种报告」（评审 R12）。阶梯的基线是**未套配方**的帧。
     _step(55, "归因与中性化")
-    ladder = _neutral_ladder(d_pre_recipe, "_factor", ret_col,
-                             dd=d_pre_recipe, cov_report=cov_map, errors=errors)
-    if not ladder:
-        errors.setdefault("neutral_ladder", "归因阶梯为空（协变量不可用或 IC 序列不足）")
+    from lquant.factors.evaluate.extras import build_report_extras
+
+    extras = build_report_extras(
+        d, "_factor", ret_col, n_groups=req.n_groups, top_ns=req.top_ns,
+        style_threshold=req.style_threshold, group_col=cat_col,
+        pre_recipe_df=d_pre_recipe, cov_report=cov_map, errors=errors)
+    ladder = extras["neutral_ladder"]
     _persist_ic(req.factor, ladder)
-    views = _neutral_views_for(d, ret_col, req.n_groups)
-    if views.get("view") == "error":
-        errors["neutral_views"] = views["error"]
+    views = extras["neutral_views"]
+    group_ic = extras["group_ic"]
+    excess_block = extras["excess"]
+    ex_dates = excess_block["dates"]
+    ex_curves = excess_block["curves"]
+    excess_metrics = excess_block["metrics"]
+    top_n_rows = extras["top_n"]
+    style_corr = extras["style_corr"]
 
-    # ---- 分组 IC：行业组 + 市值组（识破「信号只来自小市值/某一行业」） ----
-    # 此前 ic_by_group / size_group 在生产代码里不可达（report 的 group_col 被丢弃）。
-    group_ic: dict = {"by": cat_col, "industry": [], "size": [], "size_col": None,
-                      "error": None}
-    try:
-        from lquant.factors.evaluate.group_ic import ic_by_group, size_group
-
-        if cat_col:
-            gi = ic_by_group(d, "_factor", ret_col, cat_col)
-            group_ic["industry"] = [
-                {"group": str(r["group"]), "ic_mean": _jf(r["ic_mean"]),
-                 "rank_ic_mean": _jf(r["rank_ic_mean"]), "ir": _jf(r["ir"], 3),
-                 "n_days": int(r["n_days"])} for r in gi.to_dicts()
-            ] if len(gi) else []
-        mcap_col = next((c for c in ("cov_market_cap", "float_mv", "amount")
-                         if c in d.columns), None)
-        if mcap_col:
-            ds = size_group(d, mcap_col=mcap_col, n_groups=3)
-            gs = ic_by_group(ds, "_factor", ret_col, "size_q")
-            group_ic["size_col"] = mcap_col
-            group_ic["size"] = [
-                {"group": f"size_q{int(r['group'])}", "ic_mean": _jf(r["ic_mean"]),
-                 "rank_ic_mean": _jf(r["rank_ic_mean"]), "ir": _jf(r["ir"], 3),
-                 "n_days": int(r["n_days"])} for r in gs.to_dicts()
-            ] if len(gs) else []
-    except Exception as e:  # noqa: BLE001
-        group_ic["error"] = f"{type(e).__name__}: {e}"
-        errors["group_ic"] = group_ic["error"]
-
-    # ---- 超额收益体系 / Top-N 收缩测试 / 中性化后风格相关性（研报标准三件套） ----
     _step(70, "超额与Top-N")
-    from lquant.factors.evaluate.excess import (
-        benchmark_series,
-        group_excess_summary,
-        quantile_excess_nav,
-    )
-
-    bench = benchmark_series(d, ret_col)
-    exnav = quantile_excess_nav(d, "_factor", ret_col, req.n_groups, bench)
-    ex_dates = [str(x) for x in exnav["trade_date"].to_list()] if len(exnav) else []
-    ex_curves = {c: [_jf(v, 4) for v in exnav[c].to_list()]
-                 for c in exnav.columns if c != "trade_date"} if len(exnav) else {}
-    gex = group_excess_summary(d, "_factor", ret_col, req.n_groups, bench)
-    # 最高组（q=N）相对基准的绩效 —— 研报 G0 组口径
-    excess_metrics = {}
-    if len(gex):
-        r0 = gex.filter(pl.col("q") == req.n_groups)
-        if len(r0):
-            row = r0.to_dicts()[0]
-            excess_metrics = {"annual_excess": _jf(row["annual_excess"]),
-                              "excess_sharpe": _jf(row["excess_sharpe"], 2),
-                              "excess_mdd": _jf(row["excess_mdd"])}
-
-    try:
-        from lquant.factors.evaluate.top_n import top_n_summary
-
-        tn = top_n_summary(d, "_factor", ret_col, n_list=req.top_ns, bench=bench)
-        top_n_rows = [{"n": int(r["n"]), "annual_return": _jf(r["annual_return"]),
-                       "annual_excess": _jf(r["annual_excess"]),
-                       "excess_sharpe": _jf(r["excess_sharpe"], 2),
-                       "max_drawdown": _jf(r["max_drawdown"]),
-                       "annual_turnover": _jf(r["annual_turnover"], 2)}
-                      for r in tn.to_dicts()] if len(tn) else []
-    except Exception as e:  # noqa: BLE001
-        top_n_rows = []
-        errors["top_n"] = f"{type(e).__name__}: {e}"
-
-    try:
-        from lquant.factors.evaluate.style_corr import style_correlation
-        from lquant.factors.preprocess.pipeline import run as pipeline_run
-
-        steps = [{"op": "winsorize", "method": "mad", "n": 5},
-                 {"op": "standardize", "method": "zscore"}]
-        cap_ind = [c for c in ("cov_market_cap", "cov_industry_sw1") if c in d.columns]
-        if cap_ind:
-            steps.append({"op": "neutralize", "method": "ols", "factors": cap_ind})
-        rn = pipeline_run(d, "_factor", steps)
-        rn = drop_nonfinite(rn, "_factor")
-        style_cols = [c for c in ("cov_market_cap", "cov_turnover_1m", "cov_momentum_1m")
-                      if c in rn.columns]
-        style_corr = style_correlation(
-            rn, "_factor", style_cols,
-            group_col="cov_industry_sw1" if "cov_industry_sw1" in rn.columns else None,
-            threshold=req.style_threshold)
-    except Exception as e:  # noqa: BLE001
-        style_corr = {}
-        errors["style_corr"] = f"{type(e).__name__}: {e}"
-
     try:
         from lquant.factors.evaluate.costs import factor_turnover
 
@@ -845,6 +731,55 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
         if outlier_stats else None
     )
 
+    # ---- 容量 / 流动性（基础版：闭式容量上限 + 平方根冲击成本） ----
+    from lquant.factors.evaluate.capacity import capacity_summary
+
+    capacity = None
+    try:
+        capacity = capacity_summary(
+            d, "_factor", ret_col, n_groups=req.n_groups,
+            aum_list=list(req.aum_list) if req.aum_list else None)
+    except Exception as e:  # noqa: BLE001
+        errors["capacity"] = f"{type(e).__name__}: {e}"
+
+    # ---- HTML 报告：所有内容块齐备后生成一次 ----
+    _step(90, "生成报告")
+    from lquant.factors.evaluate.report import factor_report
+
+    sample_filter_rows = describe_sample_filters(
+        d, exclude_st=req.exclude_st, exclude_suspended=req.exclude_suspended)
+    # 经济含义（A2）：按注册名查 factor_def.description。查不到就是空串，
+    # 报告里写「未提供」—— 元信息缺失不该阻断评价。
+    from lquant.factors.meta import factor_description
+
+    desc = factor_description(req.factor) or factor_description(req.formula)
+    try:
+        report_html = factor_report(
+            d, "_factor", ret_col, n_groups=req.n_groups, horizons=req.horizons,
+            cat_col=cat_col, group_col=cat_col,
+            bps_list=list(DEFAULT_BPS),
+            universe=req.universe, outlier_stats=outlier_stats,
+            event_window=(req.event_window[0], req.event_window[1]),
+            display_name=req.factor, expr=req.formula,
+            data_start=req.start, data_end=req.end, n_samples=len(d),
+            steps=applied_steps, covariates=cov_map,
+            sample_filters=sample_filter_rows, window=req.window,
+            description=desc,
+            rating=res.get("rating"), robustness=res.get("robustness"),
+            # errors 一并交给报告：调用方算炸的小节也要在报告里留痕，
+            # 否则那一节在报告里无声消失，读者分不清「没数据」和「算炸了」。
+            errors=errors,
+            extras={**extras, "capacity": capacity})
+    except Exception as e:  # noqa: BLE001 - 报告不是评价的前置：报告炸了也要给出指标，
+        # 但必须在 errors 里留痕（UI 会渲染成故障横幅），不许静默返回一个没有报告的 200
+        report_html = None
+        errors["report"] = f"{type(e).__name__}: {e}"
+    if report_html is not None:
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        report_path = _save_report_atomic(report_html, REPORT_DIR / f"{req.factor}.html")
+        metrics["report_url"] = f"/api/factors/reports/{report_path.stem}"
+    metrics["capacity"] = capacity
+
     series = {
         "factor": req.factor, "formula": req.formula,
         "n_groups": req.n_groups, "n_samples": len(d),
@@ -858,6 +793,8 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
         "excess": {"dates": ex_dates, "curves": ex_curves, "benchmark": "股票池等权"},
         "top_n": top_n_rows,
         "style_corr": style_corr,
+        "capacity": capacity,
+        "sample_filters": sample_filter_rows,
         "event_study": event_study,
         # 故障可见：UI 必须能区分「没数据」与「算炸了」
         "errors": errors,
@@ -1374,11 +1311,10 @@ def mine_run(req: MineIn) -> dict:
 
 
 def list_reports() -> list[dict]:
-    if not REPORT_DIR.exists():
-        return []
-    return [{"name": p.stem, "url": f"/api/factors/reports/{p.stem}",
-             "size_kb": p.stat().st_size // 1024}
-            for p in sorted(REPORT_DIR.glob("*.html"), key=lambda x: -x.stat().st_mtime)]
+    """报告中心列表（索引实现见 evaluate/reports_index.py，CLI 共用同一份）。"""
+    from lquant.factors.evaluate.reports_index import list_reports as _list
+
+    return _list(REPORT_DIR)
 
 
 @router.get("/reports")
@@ -1414,8 +1350,17 @@ def get_factor(name: str) -> dict:
         raise HTTPException(404, f"因子不存在: {name}")
     reports = []
     if REPORT_DIR.exists():
-        for p in sorted(REPORT_DIR.glob(f"{name}*.html"), key=lambda x: -x.stat().st_mtime):
-            reports.append({"name": p.stem, "url": f"/api/factors/reports/{p.stem}"})
+        # 精确匹配，不用 `{name}*.html` 前缀 glob —— 否则因子 BETA10 的
+        # 「历史报告」里会挂着 BETA10_copy（另一个因子）的报告。
+        p = REPORT_DIR / f"{name}.html"
+        if p.exists():
+            from lquant.factors.evaluate.reports_index import report_row
+
+            row = report_row(p)
+            reports.append({"name": row["name"], "url": row["url"],
+                            "generator_version": row["generator_version"],
+                            "generated_at": row["generated_at"],
+                            "stale": row["stale"]})
     return {"name": r[0], "expression": normalize_soft(r[1]), "description": r[2],
             "created_at": str(r[3]), "source": r[4] or "manual",
             "category": r[5] or "", "reports": reports}
@@ -1462,7 +1407,7 @@ class SynthesizeIn(BaseModel):
     formulas: list[str] = Field(min_length=2, max_length=8)
     method: str = Field(default="equal", pattern="^(equal|ic_weighted)$")
     ic_horizon: int = Field(default=5, ge=1, le=20)
-    n_groups: int = Field(default=5, ge=2, le=20)
+    n_groups: int = Field(default=DEFAULT_N_GROUPS, ge=2, le=20)
     start: str = "2026-01-01"
     end: str | None = Field(default=None, description="区间终点 YYYY-MM-DD；None = 数据末端")
     universe: str = Field(default="all",
@@ -1492,12 +1437,72 @@ def synthesize(req: SynthesizeIn) -> dict:
     if not len(d):
         raise HTTPException(422, "合成因子为空 —— 公式与数据不匹配")
 
-    horizons = [1, 5, 10, 20]
+    horizons = list(DEFAULT_DECAY_HORIZONS)
     d = forward_return(d, "close", periods=horizons)
-    res = evaluate(d, "_syn", ret_col=f"fwd_ret_{min(horizons)}",
-                   n_groups=req.n_groups, horizons=horizons)
     tag = "icw" if req.method == "ic_weighted" else "eq"
     name = f"syn_{len(req.formulas)}f_{tag}"
+
+    # 协变量必须在 evaluate() 之前建：日线面板里没有行业列，不建的话
+    # cat_col 恒为 None → 归因分解与分组 IC 静默缺席（合成报告因此一直比
+    # 单因子报告薄一截）。覆盖率照旧上报到报告的「样本与口径」。
+    cov_map: dict = {}
+    try:
+        with reader() as con:
+            ind = con.execute(
+                "SELECT symbol, std, code, std_date FROM industry_classify").pl()
+    except Exception:  # noqa: BLE001 - 分类数据缺失只降级，不阻断合成
+        ind = None
+    try:
+        from lquant.factors.covariates import build_covariates
+
+        d, cov_report = build_covariates(d, ["market_cap", "industry_sw1"],
+                                         industry_df=ind)
+        cov_map = {r["covariate"]: r["coverage"] for r in cov_report}
+    except Exception:  # noqa: BLE001 - 同上
+        cov_map = {}
+
+    cat_col = next(
+        (c for c in ("cov_industry_sw1", "industry_sw1")
+         if c in d.columns and (c == "industry_sw1" or cov_map.get("industry_sw1", 0) > 0)),
+        None)
+
+    from lquant.factors.evaluate.capacity import capacity_summary
+    from lquant.factors.evaluate.extras import build_report_extras
+    from lquant.factors.evaluate.sample import describe_sample_filters
+
+    errors: dict[str, str] = {}
+    # 归因阶梯 / 中性化视图 / 分组 IC / 研报三件套：与 /factors/evaluate、
+    # CLI 共用同一份编排。合成因子的帧没有「配方前」概念（合成后直接评价），
+    # 所以阶梯基线就是它自己。
+    extras = build_report_extras(
+        d, "_syn", f"fwd_ret_{min(horizons)}", n_groups=req.n_groups,
+        group_col=cat_col, pre_recipe_df=d, cov_report=cov_map, errors=errors)
+
+    capacity = None
+    try:
+        capacity = capacity_summary(d, "_syn", f"fwd_ret_{min(horizons)}",
+                                    n_groups=req.n_groups)
+    except Exception as e:  # noqa: BLE001 - 无成交额列时容量不可算，报告里标注即可
+        capacity = None
+        errors["capacity"] = f"{type(e).__name__}: {e}"
+
+    # 合成报告此前是「最薄的一份」：不写是哪几个公式合成的、没有分组 IC /
+    # 成本 / 容量 / 样本过滤披露。这里补齐到与单因子报告同一套内容。
+    res = evaluate(d, "_syn", ret_col=f"fwd_ret_{min(horizons)}",
+                   n_groups=req.n_groups, horizons=horizons,
+                   display_name=f"合成因子 {name}",
+                   expr=" + ".join(req.formulas),
+                   description=f"{req.method} 合成的合成因子，成分："
+                               + " + ".join(req.formulas),
+                   data_start=req.start, data_end=req.end, n_samples=len(d),
+                   cat_col=cat_col, group_col=cat_col,
+                   bps_list=list(DEFAULT_BPS),
+                   covariates=cov_map,
+                   sample_filters=describe_sample_filters(d),
+                   window=DEFAULT_WINDOW,
+                   universe=req.universe,
+                   errors=errors,
+                   extras={**extras, "capacity": capacity})
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     _save_report_atomic(res["report"], REPORT_DIR / f"{name}.html")
     ic = res["ic"]["ic"]

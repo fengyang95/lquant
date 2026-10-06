@@ -217,7 +217,10 @@ def test_evaluate_series_chart_payload(client):
     assert set(q["curves"]) >= {f"q{i}" for i in range(1, 6)} | {"long_short"}
     assert len(q["dates"]) == len(q["curves"]["q1"])
     assert len(q["groups"]) == 5
-    assert body["decay"]["horizons"] == [1, 5, 10, 20]
+    # 衰减阶梯 = 平台统一口径（与 CLI / 报告同一个常量），不再随入口漂移
+    from lquant.factors.evaluate.defaults import DEFAULT_DECAY_HORIZONS
+
+    assert body["decay"]["horizons"] == list(DEFAULT_DECAY_HORIZONS)
     assert all(v is None or isinstance(v, (int, float)) for v in body["decay"]["ic"])
     assert isinstance(body["ic_by_year"], list)
     # 滚动窗口序列：窗口数与序列长度一致，字段齐全

@@ -13,6 +13,7 @@ import math
 
 import polars as pl
 
+from lquant.factors.evaluate.defaults import decay_horizons as _resolve_horizons
 from lquant.factors.evaluate.ic import _summarize, ic_series
 from lquant.factors.evaluate.returns import forward_return
 
@@ -33,8 +34,12 @@ def decay_profile(df: pl.DataFrame, factor: str, horizons: list[int] | None = No
     「h 个交易日后的收益」被静默算成跨越更长区间的收益（实测删一行后
     前一日收益从 0.0714 变成 0.1429），半衰期与调仓建议随之失真。
     复用调用方在行完整帧上算好的列，等于把这一口径固定下来。
+
+    默认阶梯收口在 :mod:`lquant.factors.evaluate.defaults`（8 期，到 60 日）——
+    此前这里写死一份、API 请求默认另一份、报告又一份，同一份报告换个入口
+    就换一条曲线。
     """
-    horizons = horizons or [1, 2, 3, 5, 10, 20, 40, 60]
+    horizons = _resolve_horizons(horizons)
     missing = [h for h in horizons if f"fwd_ret_{h}" not in df.columns]
     d = (forward_return(df, price_col=price_col, periods=missing,
                         by=symbol_col, date_col=date_col) if missing else df)

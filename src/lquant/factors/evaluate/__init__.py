@@ -16,6 +16,7 @@ import polars as pl
 
 from lquant.factors.evaluate.attribution import attribution_summary, exposure
 from lquant.factors.evaluate.decay import decay_profile, decay_summary, half_life, suggest_rebalance
+from lquant.factors.evaluate.defaults import DEFAULT_N_GROUPS
 from lquant.factors.evaluate.event_study import event_study, event_study_summary
 from lquant.factors.evaluate.ic import (
     ic_autocorr,
@@ -74,7 +75,7 @@ __all__ = [
 
 
 def evaluate(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
-             n_groups: int = 10, horizons: list[int] | None = None,
+             n_groups: int = DEFAULT_N_GROUPS, horizons: list[int] | None = None,
              with_report: bool = True, with_robustness: bool = False,
              **kw) -> dict:
     """一次性跑完 IC / 分层 / 衰减 / 归因 / 评级，并可选生成 HTML 报告。
@@ -105,12 +106,17 @@ def evaluate(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
             icir_is=kw.get("icir_is"), icir_oos=kw.get("icir_oos"),
             **_pick(kw, "deltas", "n_splits", "n_starts", "top_n", "n_groups", "date_col"))
     if with_report:
-        out["report"] = factor_report(df, factor, ret_col, n_groups=n_groups,
-                                      horizons=horizons, **_pick(kw, "price_col", "date_col",
-                                                                 "symbol_col", "cat_col",
-                                                                 "group_col", "bps_list",
-                                                                 "universe", "filter_zscore",
-                                                                 "outlier_stats", "event_window"))
+        # 评级/稳健性在同一个函数体里已经算好 —— 直接喂给报告，
+        # 不再出现「算出来了但交付物里看不到」。
+        out["report"] = factor_report(
+            df, factor, ret_col, n_groups=n_groups, horizons=horizons,
+            rating=out.get("rating"), robustness=out.get("robustness"),
+            **_pick(kw, "price_col", "date_col", "symbol_col", "cat_col",
+                    "group_col", "bps_list", "universe", "filter_zscore",
+                    "outlier_stats", "event_window",
+                    "display_name", "expr", "data_start", "data_end",
+                    "n_samples", "steps", "covariates", "sample_filters",
+                    "window", "extras", "description", "errors"))
     return out
 
 

@@ -55,7 +55,7 @@ def test_report_rolling_section():
     """滚动窗口章节：默认窗口 60 会因样本不足而显示空态。"""
     html = factor_report(_df(), "mom", "fwd_ret_1")
     assert "滚动窗口" in html
-    assert "数据不足：滚动 RankIC" in html
+    assert "数据不足：滚动指标" in html
 
 
 def test_report_rolling_section_with_data():

@@ -10,6 +10,7 @@ import math
 
 import polars as pl
 
+from lquant.factors.evaluate.defaults import DEFAULT_N_GROUPS
 from lquant.factors.evaluate.ic import ic_series
 from lquant.factors.preprocess._regress import (
     residual_by_day,
@@ -96,7 +97,8 @@ def industry_group_quantile_summary(df: pl.DataFrame, factor: str, ret_col: str,
 
 def neutral_views(df: pl.DataFrame, factor: str, ret_col: str,
                   covariates: list[str] | None = None,
-                  group_col: str | None = None, n_groups: int = 5) -> dict:
+                  group_col: str | None = None,
+                  n_groups: int = DEFAULT_N_GROUPS) -> dict:
     """三种中性化视图汇总（页面上必须标明用的哪种，否则数字没法对话）。"""
     out = {"view": "factor_neutral (默认: 因子~协变量取残差再算 IC)"}
     if covariates:

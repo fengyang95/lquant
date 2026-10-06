@@ -150,10 +150,22 @@ def test_factor_report_outlier_stats_only() -> None:
 def test_factor_report_optional_sections() -> None:
     df = _panel(n_days=80, n_sym=10)
     html = rep.factor_report(
-        df, "f", cat_col="symbol", group_col="grp", bps_list=[5.0, 10.0])
+        df, "f", cat_col="grp", group_col="grp", bps_list=[5.0, 10.0])
     assert "归因分解" in html
     assert "分组 IC" in html
     assert "成本敏感性" in html
+
+
+def test_factor_report_refuses_symbol_attribution() -> None:
+    """不变量：归因维度必须是分类维度。
+
+    按个股算「行业暴露」是上一轮的静默错误（写着「越接近 0 说明中性化越干净」，
+    算的却是个股维度）。调用方传错也不能默默产出无意义输出 —— 本节跳过并留痕。
+    """
+    html = rep.factor_report(_panel(n_days=80), "f", cat_col="symbol")
+    assert "<h2>归因分解" not in html
+    assert "归因维度 &#x27;symbol&#x27; 是个股维度" in html
+    assert "本节生成失败" in html
 
 
 def test_factor_report_turnover_section() -> None:
@@ -174,17 +186,21 @@ def test_factor_report_event_study(monkeypatch) -> None:
     assert "事前/事后发散度比" in html
 
 
-def test_factor_report_event_study_exception_swallowed(monkeypatch) -> None:
+def test_factor_report_event_study_failure_is_disclosed(monkeypatch) -> None:
+    """事件式算炸了 → 小节不出现，但必须留下失败横幅（不再静默吞掉）。"""
     def boom(*a, **k):
         raise ValueError("bad window")
 
     monkeypatch.setattr(rep, "event_study_summary", boom)
     html = rep.factor_report(_panel(), "f")
     assert "事件式分层收益" not in html
+    assert "本节生成失败" in html
+    assert "event_study" in html
 
 
-def test_factor_report_optional_sections_exception_swallowed(
+def test_factor_report_optional_sections_failure_is_disclosed(
         monkeypatch) -> None:
+    """可选小节算炸了 → 内容缺失，但故障必须可见（这是上一轮的静默缺陷）。"""
     def boom(*a, **k):
         raise RuntimeError("源数据异常")
 
@@ -192,9 +208,81 @@ def test_factor_report_optional_sections_exception_swallowed(
     monkeypatch.setattr(rep, "ic_by_group", boom)
     monkeypatch.setattr(rep, "factor_turnover", boom)
     monkeypatch.setattr(rep, "cost_matrix", boom)
-    html = rep.factor_report(_panel(), "f", cat_col="symbol",
-                             group_col="symbol", bps_list=[5.0])
+    html = rep.factor_report(_panel(), "f", cat_col="grp",
+                             group_col="grp", bps_list=[5.0])
     assert "归因分解" not in html
     assert "分组 IC" not in html
     assert "换手率" not in html
     assert "成本敏感性" not in html
+    # 关键：不能无声消失
+    assert "本节生成失败" in html
+    for key in ("attribution", "group_ic", "turnover", "cost_matrix"):
+        assert key in html
+
+
+# --------------------------------------------------------------------------- #
+# 内部辅助的边界分支（平时跑不到，但决定「显示成什么」）
+# --------------------------------------------------------------------------- #
+def test_ret_label_branches() -> None:
+    assert rep._ret_label("fwd_ret_5") == "5 日前瞻收益"
+    assert rep._ret_label("fwd_ret_x") == "fwd_ret_x"   # 不认识的持有期原样返回
+    assert rep._ret_label("custom_ret") == "custom_ret"
+
+
+def test_fmt_int_branches() -> None:
+    assert rep._fmt_int(None) == "n/a"
+    assert rep._fmt_int(True) == "True"
+    assert rep._fmt_int(float("nan")) == "n/a"
+    assert rep._fmt_int(3.9) == "3"
+    assert rep._fmt_int("x") == "x"
+
+
+def test_rows_table_empty_returns_empty() -> None:
+    assert rep._rows_table([]) == ""
+    assert rep._rows_table(None or []) == ""
+
+
+def test_empty_blocks_are_skipped_not_rendered_as_blank() -> None:
+    assert rep._views_html(None) == ""
+    # 既没有可渲染的行、也没有口径说明 → 整节省略（不留一个空标题）
+    assert rep._views_html({}) == ""
+    assert rep._size_ic_html(None) == ""
+    assert rep._size_ic_html({"rows": []}) == ""
+    assert rep._style_html({}) == ""
+    assert rep._style_html({"max_abs": None}) == ""
+
+
+def test_table_survives_schema_introspection_failure() -> None:
+    """取不到 schema 时只放弃「整数列优化」，不许把整张表打挂。"""
+    class _BadSchema:
+        def __getitem__(self, _k):
+            raise RuntimeError("no schema")
+
+    class _FakeDF:
+        columns = ["a"]
+        schema = _BadSchema()
+
+        def __len__(self):
+            return 1
+
+        def iter_rows(self, named=False):
+            yield {"a": 1.5}
+
+    html = rep._table(_FakeDF(), limit=None)
+    assert "<table>" in html and "1.5000" in html
+
+
+def test_provenance_range_variants() -> None:
+    kw = dict(display_name="f", expr="x", universe="all", n_samples=10,
+              ret_col="fwd_ret_1", steps=None, covariates=None,
+              sample_filters=None, window=60, n_groups=10,
+              generator_version="2.0")
+    assert "2026-01-01 起" in rep._provenance_html(data_start="2026-01-01",
+                                                  data_end=None, **kw)
+    assert "至 2026-02-01" in rep._provenance_html(data_start=None,
+                                                   data_end="2026-02-01", **kw)
+    assert "未提供" in rep._provenance_html(data_start=None, data_end=None, **kw)
+
+
+def test_conclusion_section_absent_without_rating() -> None:
+    assert rep._conclusion_html(None, None, "随意的一句话") == ""

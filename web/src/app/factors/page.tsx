@@ -272,7 +272,10 @@ export default function FactorsPage() {
         // 必须显式传公式：后端 EvaluateIn.formula 默认 pct_change_20，
         // 漏发的话选什么因子实际都在评 pct_change_20
         formula,
-        n_groups: 5,
+        // 分层组数：与 CLI/报告默认值一致（10 分位）。此前这里写死 5，
+        // 于是「页面上看到 5 组、报告里也是 5 组、CLI 却是 10 组」——
+        // 同一平台两种口径。默认值收口在后端 defaults.py。
+        n_groups: 10,
         start: evalStart,
         end: evalEnd.trim() ? evalEnd : null,
         universe: evalUniverse,

@@ -8,6 +8,14 @@ import math
 
 import click
 
+# 平台级默认口径的唯一来源（见 lquant.factors.evaluate.defaults 与
+# docs/因子报告内容契约.md）：CLI / API / 报告三处默认值必须同源，
+# 否则「同一个生成器产出三种报告」。
+from lquant.factors.evaluate.defaults import DEFAULT_BPS, DEFAULT_N_GROUPS, horizons_csv
+
+DECAY_HORIZONS_CSV = horizons_csv()
+BPS_CSV = ",".join(str(int(b)) if float(b).is_integer() else str(b) for b in DEFAULT_BPS)
+
 
 @click.group()
 def factor() -> None:
@@ -55,7 +63,7 @@ def check_expr(expr: str) -> None:
 @click.argument("expr")
 @click.option("--start", default=None, help="数据窗口起点 YYYY-MM-DD")
 @click.option("--neutral/--raw", default=True, help="是否中性化（默认中性化）")
-@click.option("--n-groups", default=10, help="分层组数")
+@click.option("--n-groups", default=DEFAULT_N_GROUPS, help="分层组数")
 @click.option("--agent", default=None, help="Agent 名（配额记账 + 校正门槛）")
 def eval_(expr: str, start: str | None, neutral: bool, n_groups: int,
           agent: str | None) -> None:
@@ -204,8 +212,8 @@ def submit(spec_path: str) -> None:
 @factor.command()
 @click.option("--name", required=True, help="已注册因子名（factor_def.name）")
 @click.option("--start", default=None, help="数据窗口起点 YYYY-MM-DD")
-@click.option("--n-groups", default=10, help="分层组数")
-@click.option("--horizons", default="1,2,3,5,10,20", help="衰减曲线持有期（逗号分隔）")
+@click.option("--n-groups", default=DEFAULT_N_GROUPS, help="分层组数")
+@click.option("--horizons", default=DECAY_HORIZONS_CSV, help="衰减曲线持有期（逗号分隔）")
 @click.option("--agent", default=None, help="Agent 名（配额记账 + 校正门槛）")
 def run(name: str, start: str | None, n_groups: int, horizons: str,
         agent: str | None) -> None:
@@ -420,11 +428,15 @@ def _parse_floats(s: str) -> tuple[float, ...]:
     return tuple(float(x) for x in s.split(",") if x.strip())
 
 
-def _load_segments(start: str | None, expr: str, *, horizons=(1, 5)):
+def _load_segments(start: str | None, expr: str, *, horizons=(1, 5),
+                   with_pre: bool = False):
     """读日线 + 协变量 → 70/15/15 切分 → train/val 两段分析就绪面板。
 
     与 submit 重验共用 ``prepare_segment``，所以 audit 报的 IC 和入库时
     服务端重算的 IC 是同一个数 —— 口径不允许分叉。
+
+    ``with_pre=True`` 额外返回 train 段**中性化之前**的帧（IC 归因阶梯的基线），
+    返回 ``(seg, cov_cols, days, pre)``。
     """
     from lquant.factors.mining.runner import split_dates
     from lquant.factors.mining.submit import _panel_with_covs, prepare_segment
@@ -434,11 +446,18 @@ def _load_segments(start: str | None, expr: str, *, horizons=(1, 5)):
         raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")
     dates = sorted(df["trade_date"].unique().to_list())
     train_d, val_d, test_d = split_dates(dates)
+    train = prepare_segment(df, cov_cols, expr, train_d, horizons=list(horizons),
+                            with_pre=with_pre)
+    pre = None
+    if with_pre:
+        train, pre = train
     seg = {
-        "train": prepare_segment(df, cov_cols, expr, train_d, horizons=list(horizons)),
+        "train": train,
         "val": prepare_segment(df, cov_cols, expr, val_d, horizons=[1]),
     }
     days = {"train_days": len(train_d), "val_days": len(val_d), "test_days": len(test_d)}
+    if with_pre:
+        return seg, cov_cols, days, pre
     return seg, cov_cols, days
 
 
@@ -483,8 +502,8 @@ def _quota(agent: str | None, expr: str, t_stat: float) -> dict:
 @factor.command()
 @click.argument("expr")
 @click.option("--start", default=None, help="数据窗口起点 YYYY-MM-DD")
-@click.option("--n-groups", default=10, help="分层组数")
-@click.option("--horizons", default="1,2,3,5,10,20", help="衰减曲线持有期（逗号分隔）")
+@click.option("--n-groups", default=DEFAULT_N_GROUPS, help="分层组数")
+@click.option("--horizons", default=DECAY_HORIZONS_CSV, help="衰减曲线持有期（逗号分隔）")
 @click.option("--agent", default=None, help="Agent 名（配额记账 + 校正门槛）")
 def audit(expr: str, start: str | None, n_groups: int, horizons: str, agent: str | None) -> None:
     """L2 深度校验：IC/ICIR + 分层 + 衰减 + 归因 + 评级 + 样本外衰减（平台算）。
@@ -580,7 +599,7 @@ def _audit_payload(expr: str, start: str | None, n_groups: int, horizons: str,
 @factor.command()
 @click.argument("expr")
 @click.option("--start", default=None, help="数据窗口起点 YYYY-MM-DD")
-@click.option("--n-groups", default=10, help="分层组数（剔除最佳月份用）")
+@click.option("--n-groups", default=DEFAULT_N_GROUPS, help="分层组数（剔除最佳月份用）")
 @click.option("--top-months", default=5, help="剔除收益最好的前 N 个月")
 @click.option("--deltas", default="0.1,0.2,0.3", help="窗口扰动幅度（逗号分隔）")
 @click.option("--agent", default=None, help="Agent 名（配额记账 + 校正门槛）")
@@ -617,37 +636,213 @@ def robust(expr: str, start: str | None, n_groups: int, top_months: int,
 
 @factor.command()
 @click.argument("expr")
-@click.option("--out", default=None, help="输出 HTML 路径（默认 data/reports/factor_<id>.html）")
+@click.option("--out", default=None, help="输出 HTML 路径（默认 <仓库根>/data/reports/factor_<id>.html）")
 @click.option("--start", default=None, help="数据窗口起点 YYYY-MM-DD")
-@click.option("--n-groups", default=10, help="分层组数")
-@click.option("--bps", default="0,5,10,15,30", help="成本敏感性 bps 列表（逗号分隔）")
-def report(expr: str, out: str | None, start: str | None, n_groups: int, bps: str) -> None:
+@click.option("--n-groups", default=DEFAULT_N_GROUPS, help="分层组数")
+@click.option("--bps", default=BPS_CSV, help="成本敏感性 bps 列表（逗号分隔）")
+@click.option("--filter-zscore", default=None, type=float,
+              help="截面异常收益过滤阈值（|z| 上限，口径同 alphalens；默认不过滤）")
+@click.option("--exclude-st", is_flag=True, default=False,
+              help="剔除 ST/*ST（默认否 —— 打开会改变 IC/分层口径）")
+@click.option("--exclude-suspended", is_flag=True, default=False,
+              help="剔除停牌（默认否）")
+def report(expr: str, out: str | None, start: str | None, n_groups: int, bps: str,
+           filter_zscore: float | None, exclude_st: bool,
+           exclude_suspended: bool) -> None:
     """生成自包含 HTML 因子研究报告（离线可看，涨红跌绿）。
 
-    报告含 IC/滚动/分层/衰减/分年度/归因/换手/成本敏感性 ——
-    单文件、无外部依赖，可直接归档或发出。
+    报告含「结论（评级）」+「样本与口径」+ IC/滚动/分层/超额/衰减/分年度/
+    归因/分组 IC/换手/成本/容量 —— 单文件、无外部依赖，可直接归档或发出。
     """
     import json
+
+    payload = _build_report(expr, out=out, start=start, n_groups=n_groups, bps=bps,
+                            filter_zscore=filter_zscore, exclude_st=exclude_st,
+                            exclude_suspended=exclude_suspended)
+    click.echo(json.dumps(payload, ensure_ascii=False))
+
+
+def _build_report(expr: str, *, out: str | None = None, start: str | None = None,
+                  n_groups: int = DEFAULT_N_GROUPS, bps: str = BPS_CSV,
+                  filter_zscore: float | None = None, exclude_st: bool = False,
+                  exclude_suspended: bool = False) -> dict:
+    """生成一份报告并返回摘要 dict（``report`` 与 ``reports --rebuild-stale`` 共用）。"""
     from pathlib import Path
 
+    from lquant.core.config import get_settings
     from lquant.factors.dsl.printer import canonical_id
     from lquant.factors.evaluate import factor_report, save_report
+    from lquant.factors.evaluate.capacity import capacity_summary
+    from lquant.factors.evaluate.defaults import DEFAULT_DECAY_HORIZONS
+    from lquant.factors.evaluate.extras import build_report_extras
+    from lquant.factors.evaluate.ic import ic_summary
+    from lquant.factors.evaluate.quantile import quantile_summary
+    from lquant.factors.evaluate.rating import factor_rating
+    from lquant.factors.evaluate.sample import apply_sample_filters, describe_sample_filters
 
-    seg, cov_cols, days = _load_segments(start, expr, horizons=[1, 5, 10, 20])
+    # 衰减阶梯与 API/报告默认同源；with_pre 拿中性化之前的帧做 IC 归因阶梯的基线。
+    seg, cov_cols, days, pre_recipe = _load_segments(
+        start, expr, horizons=list(DEFAULT_DECAY_HORIZONS), with_pre=True)
     train = seg["train"]
     if not len(train):
         raise click.ClickException("train 段为空 —— 数据或表达式问题")
 
+    # 样本过滤（默认关）：与 API 同口径，报告里会写明到底剔没剔
+    if exclude_st or exclude_suspended:
+        train = apply_sample_filters(train, exclude_st=exclude_st,
+                                     exclude_suspended=exclude_suspended)
+        if not len(train):
+            raise click.ClickException("样本过滤后没有剩余数据 —— 检查 ST/停牌标记")
+
     cat = next((c for c in ("cov_industry_sw1", "industry_sw1") if c in train.columns), None)
+
+    # 口头诚实：`prepare_segment` 在有协变量时**确实**跑了默认配方
+    # （mad 去极值 → zscore → 市值/行业/换手 OLS 中性化）。报告必须披露真实配方，
+    # 否则「预处理配方」一栏会写着「原始因子直接评价」—— 那是假的。
+    recipe = ([
+        {"op": "winsorize", "method": "mad", "n": 5},
+        {"op": "standardize", "method": "zscore"},
+        {"op": "neutralize", "method": "ols", "factors": list(cov_cols)},
+    ] if cov_cols else None)
+    cov_map = {c.removeprefix("cov_"): round(
+        1 - train[c].null_count() / max(len(train), 1), 4)
+        for c in cov_cols if c in train.columns}
+
+    # 归因阶梯 / 中性化视图 / 分组 IC / 研报三件套 —— 与 API 共用同一份编排，
+    # 否则 CLI 生成的报告永远比 API 的薄一截（评审 R12）。
+    errors: dict[str, str] = {}
+    extras = build_report_extras(
+        train, "f", "fwd_ret_1", n_groups=n_groups, group_col=cat,
+        pre_recipe_df=pre_recipe, cov_report=cov_map, errors=errors)
+
+    # 结论层：CLI 只跑 L2 评级（不跑 L3 稳健性 —— 要重算因子多遍，太贵）
+    rating = None
+    try:
+        rating = factor_rating(
+            ic_summary(train, "f", "fwd_ret_1"),
+            quantile_summary(train, "f", "fwd_ret_1", n_groups))
+    except Exception as e:  # noqa: BLE001 - 评级失败不该让整份报告生成不了
+        rating = None
+        errors["rating"] = f"{type(e).__name__}: {e}"
+
+    capacity = None
+    try:
+        capacity = capacity_summary(train, "f", "fwd_ret_1", n_groups=n_groups)
+    except Exception as e:  # noqa: BLE001 - 无成交额列时容量不可算，报告里标注即可
+        capacity = None
+        errors["capacity"] = f"{type(e).__name__}: {e}"
+
     # 分组 IC：按行业分组（有行业列时）。此前硬编码 None，导致报告里
     # 「分组 IC」这一节永远不出现 —— 引擎有能力，接线处丢了参数。
-    html = factor_report(train, "f", "fwd_ret_1", n_groups=n_groups,
-                         cat_col=cat, group_col=cat,
-                         bps_list=list(_parse_floats(bps)))
-    path = Path(out) if out else Path("data/reports") / f"factor_{canonical_id(expr)}.html"
+    html = factor_report(
+        train, "f", "fwd_ret_1", n_groups=n_groups,
+        cat_col=cat, group_col=cat,
+        bps_list=list(_parse_floats(bps)),
+        filter_zscore=filter_zscore,
+        display_name=expr, expr=expr,
+        data_start=start, n_samples=len(train),
+        steps=recipe, covariates=cov_map,
+        universe="all",
+        sample_filters=describe_sample_filters(
+            train, exclude_st=exclude_st, exclude_suspended=exclude_suspended),
+        rating=rating,
+        errors=errors,
+        extras={**extras, "capacity": capacity},
+    )
+    if out:
+        path = Path(out)
+    else:
+        s = get_settings()
+        base = Path(getattr(s, "reports_dir", "./data/reports"))
+        base = base if base.is_absolute() else (s.root / base)
+        path = base / f"factor_{canonical_id(expr)}.html"
     p = save_report(html, path)
-    click.echo(json.dumps(_clean({
+    return _clean({
         "report": str(p.resolve()), "bytes": p.stat().st_size,
         "factor": expr, "factor_id": canonical_id(expr), "n_days": days,
-        "neutralized": bool(cov_cols), "covariates": cov_cols,
-    }), ensure_ascii=False))
+        "neutralized": bool(cov_cols), "cov_names": cov_cols,
+        "rating": (rating or {}).get("rating"),
+        "capacity_aum": (capacity or {}).get("capacity_aum"),
+        "recipe": recipe, "covariates": cov_map,
+        "sections": sorted(k for k in extras),
+        "errors": errors,
+        "exclude_st": exclude_st, "exclude_suspended": exclude_suspended,
+        "filter_zscore": filter_zscore,
+    })
+
+
+@factor.command("reports")
+@click.option("--stale-only", is_flag=True, default=False, help="只列旧口径报告")
+@click.option("--rebuild-stale", is_flag=True, default=False,
+              help="重算旧口径报告（能推断出表达式的才重算，其余跳过并给原因）")
+@click.option("--prune-stale", is_flag=True, default=False,
+              help="删除旧口径报告（不加 --yes 只演练，不真删）")
+@click.option("--limit", default=0, type=int, help="最多处理 N 份（0 = 不限）")
+@click.option("--yes", is_flag=True, default=False, help="确认删除（--prune-stale 需要）")
+@click.option("--start", default=None, help="重算时的数据窗口起点 YYYY-MM-DD")
+def reports(stale_only: bool, rebuild_stale: bool, prune_stale: bool, limit: int,
+            yes: bool, start: str | None) -> None:
+    """报告中心维护：列出 / 重算 / 清理旧口径报告。
+
+    报告文件名不含版本，正文也看不出口径 —— 只有 ``<head>`` 里的生成器版本能证明
+    「这份是修复前还是修复后的」。所以旧口径报告必须能被**识别 → 重算或清理**，
+    否则读者永远在拿旧结论当新结论（评审 R15 的第二半：失效标记 ≠ 重算）。
+    """
+    import contextlib
+    import json
+    from pathlib import Path
+
+    from lquant.core.config import get_settings
+    from lquant.factors.evaluate.reports_index import list_reports as _list
+    from lquant.factors.evaluate.reports_index import resolve_report_expression
+
+    s = get_settings()
+    base = Path(getattr(s, "reports_dir", "./data/reports"))
+    base = base if base.is_absolute() else (s.root / base)
+    all_rows = _list(base)
+    # 三个动作都只针对**旧口径**报告：--rebuild-stale 去重算一份当前口径的报告
+    # 是纯浪费（还可能用不同的数据窗口把它改掉）。只有纯列表请求才看得到全部。
+    scope_stale = stale_only or rebuild_stale or prune_stale
+    rows = [r for r in all_rows if r["stale"]] if scope_stale else all_rows
+    if limit:
+        rows = rows[:limit]
+
+    out: dict = {
+        "dir": str(base),
+        "n_reports": len(all_rows),
+        "scope": "stale" if scope_stale else "all",
+        "n_selected": len(rows),
+        "reports": [{k: r[k] for k in ("name", "generator_version", "generated_at",
+                                       "size_kb", "stale")} for r in rows],
+    }
+
+    if rebuild_stale:
+        rebuilt, skipped = [], []
+        for r in rows:
+            expr, why = resolve_report_expression(r["name"], Path(r["path"]))
+            if not expr:
+                skipped.append({"name": r["name"], "reason": why})
+                continue
+            try:
+                info = _build_report(expr, out=r["path"], start=start)
+                rebuilt.append({"name": r["name"], "expr": expr, "why": why,
+                                "version": "current", "bytes": info["bytes"]})
+            except Exception as e:  # noqa: BLE001 - 单份失败不阻断整批
+                skipped.append({"name": r["name"], "reason": f"{type(e).__name__}: {e}"})
+        out["rebuilt"] = rebuilt
+        out["skipped"] = skipped
+    elif prune_stale:
+        out["prune"] = {
+            "n": len(rows),
+            "names": [r["name"] for r in rows],
+            "dry_run": not yes,
+        }
+        if yes:
+            for r in rows:
+                with contextlib.suppress(OSError):
+                    Path(r["path"]).unlink()
+            out["prune"]["deleted"] = len(rows)
+    elif stale_only:
+        out["hint"] = ("旧口径报告不会自动失效：--rebuild-stale 重算（需能推断表达式），"
+                       "--prune-stale --yes 删除")
+    click.echo(json.dumps(_clean(out), ensure_ascii=False))

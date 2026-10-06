@@ -12,3 +12,18 @@ def _isolate_fundamentals_cache():
 
     clear_fundamentals_cache()
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_report_dir(tmp_path, monkeypatch):
+    """把报告目录指到 tmp —— 用例不许往真实的 ``data/reports`` 写文件。
+
+    之前 ``/factors/evaluate``、``/factors/synthesize`` 的用例会真的在
+    ``data/reports`` 里留下 ``covrate.html`` / ``covfail.html`` / ``ws*.html``
+    这类产物：既污染报告中心（读者会看到一堆测试垃圾），也让「陈旧报告」
+    的统计失真。需要真实目录的用例自行覆盖本夹具。
+    """
+    from lquant.server.api import factors as api
+
+    monkeypatch.setattr(api, "REPORT_DIR", tmp_path / "reports")
+    yield
