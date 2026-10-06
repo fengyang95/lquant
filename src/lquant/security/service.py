@@ -49,7 +49,7 @@ def analyze_security(symbol: str, asof: date | str | None = None) -> dict:
         A.fundamental_angle(md.financial, md.financial_peers, md.industry,
                             md.peer_count, CANONICAL_FINANCIAL),
         A.valuation_angle(md.valuation, md.valuation_cross),
-        A.capital_angle(md.money_flow),
+        A.capital_angle(md.money_flow, sym),
         A.relative_angle(md.bars, md.benchmark, md.benchmark_symbol, md.industry),
         A.news_angle(md.news, day),
     ]

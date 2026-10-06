@@ -81,7 +81,19 @@ def money_flow(
     symbol: str | None = Query(default=None, max_length=12,
                                description="传了则返回该票的历史资金流而非全市场 Top"),
 ) -> list[dict]:
-    df = _read("money_flow", 1000)
+    # 不走通用的 _read：money_flow 里混着 demo 采集写进去的合成行，
+    # 看板把它当真实资金流展示等于造假（「样例188」之类会出现在全市场 Top 里）。
+    # 过滤条件与个股分析的 loader、覆盖统计共用同一份 real_flow_predicate。
+    from lquant.market.backfill import real_flow_predicate
+
+    try:
+        with reader() as con:
+            real = real_flow_predicate(con)
+            df = con.execute(
+                f"SELECT * FROM money_flow WHERE {real} "
+                "ORDER BY trade_date DESC LIMIT 1000").pl()
+    except Exception:  # noqa: BLE001 - 表未建/结构迁移中 → 空态
+        return []
     if not len(df):
         return []
     if symbol:

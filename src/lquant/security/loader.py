@@ -290,12 +290,23 @@ def load_industry(con, symbol: str, asof: date
 
 def load_money_flow(con, symbol: str, asof: date,
                     days: int = FLOW_LOOKBACK_DAYS) -> pl.DataFrame:
-    """主力资金流（近 ``days`` 自然日，截至 asof）。"""
+    """主力资金流（近 ``days`` 自然日，截至 asof）。
+
+    只取真实来源的行：``money_flow`` 里混着 demo 采集写进去的合成数据，
+    而合成数据的代码有相当一部分能对上真实标的（200 个 demo 代码里 75 个
+    是真实上市公司），拿它评分等于用伪造的净流入下结论。
+    过滤条件与覆盖统计/清理共用 ``real_flow_predicate``，
+    避免「分析排除了、统计没排除」这类漂移。
+    """
+    from lquant.market.backfill import real_flow_predicate
+
     try:
+        real = real_flow_predicate(con)
         return con.execute(
             "SELECT trade_date, main_net_inflow, main_net_ratio, super_large_net, "
             "large_net, medium_net, small_net, change_pct FROM money_flow "
             "WHERE symbol = ? AND trade_date <= ? AND trade_date >= ? "
+            f"AND {real} "
             "ORDER BY trade_date",
             [symbol, asof, asof - timedelta(days=days)],
         ).pl()

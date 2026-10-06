@@ -286,3 +286,139 @@ def test_status_reports_empty_lake_hint(tmp_path, monkeypatch):
         assert "湖为空" in r.output
     finally:
         get_settings.cache_clear()
+
+
+# ---------------- lq data money-flow ----------------
+#
+# 下层一律打桩：只测 CLI 的参数流与输出（命令体里 import，
+# 所以打的是 lquant.market.backfill 的模块属性）。
+
+_FLOW_REPORT = {
+    "table": "money_flow", "symbols": 2, "days": 30, "qps": 1.5,
+    "fetched": 40, "persisted": 40, "failed": {},
+    "covered_before": 0, "covered_after": 2,
+}
+
+
+def _stub_flow(monkeypatch, report=None, symbols=("600519.SH", "000001.SZ")):
+    seen: dict = {}
+
+    def fake_backfill(targets, **kw):
+        seen["targets"] = list(targets)
+        seen.update(kw)
+        return dict(report or _FLOW_REPORT)
+
+    _patch_mod(monkeypatch, "lquant.market.backfill", "backfill_money_flow_history",
+               fake_backfill)
+    _patch_mod(monkeypatch, "lquant.market.backfill", "money_flow_symbols",
+               lambda **kw: list(symbols))
+    return seen
+
+
+def test_money_flow_cmd_without_targets(monkeypatch):
+    seen = _stub_flow(monkeypatch)
+    r = _invoke("money-flow")
+    assert r.exit_code == 0, r.output
+    assert "未指定标的" in r.output
+    assert "targets" not in seen          # 没指定就别去联网
+
+
+def test_money_flow_cmd_symbols_and_days(monkeypatch):
+    seen = _stub_flow(monkeypatch)
+    r = _invoke("money-flow", "--symbols", "600519,000001.SZ", "--days", "30",
+                "--qps", "0.5")
+    assert r.exit_code == 0, r.output
+    assert seen["targets"] == ["600519", "000001.SZ"]
+    assert seen["days"] == 30 and seen["qps"] == 0.5
+    assert "拉取: 40 行，入库: 40 行" in r.output
+    assert "0 → 2" in r.output and "money-flow done" in r.output
+
+
+def test_money_flow_cmd_all_uses_lake_symbols(monkeypatch):
+    seen = _stub_flow(monkeypatch, symbols=("600519.SH",))
+    r = _invoke("money-flow", "--all", "--limit", "7")
+    assert r.exit_code == 0, r.output
+    assert seen["targets"] == ["600519.SH"]
+    assert "标的池（日线湖）: 1 只" in r.output
+
+
+def test_money_flow_cmd_all_empty_lake(monkeypatch):
+    seen = _stub_flow(monkeypatch, symbols=())
+    r = _invoke("money-flow", "--all")
+    assert r.exit_code == 0, r.output
+    assert "日线湖为空" in r.output
+    assert "targets" not in seen
+
+
+def test_money_flow_cmd_reports_failures(monkeypatch):
+    rep = dict(_FLOW_REPORT, failed={"600519.SH": "RuntimeError: 单票接口 500"},
+               covered_after=1, persisted=20, fetched=20)
+    _stub_flow(monkeypatch, report=rep)
+    r = _invoke("money-flow", "--symbols", "600519.SH")
+    assert r.exit_code == 0, r.output
+    assert "失败 1 只" in r.output
+    assert "单票接口 500" in r.output
+
+
+def test_money_flow_cmd_purge_demo_needs_yes(monkeypatch):
+    calls: list = []
+    _patch_mod(monkeypatch, "lquant.market.backfill", "purge_demo_flow",
+               lambda **kw: (calls.append(kw),
+                             {"dry_run": True, "demo_rows": 599,
+                              "relabel_rows": 900, "deleted": 0})[1])
+    _patch_mod(monkeypatch, "lquant.market.backfill", "money_flow_symbols",
+               lambda **kw: [])
+    r = _invoke("money-flow", "--purge-demo")
+    assert r.exit_code == 0, r.output
+    assert "待清理合成数据: 599 行" in r.output
+    assert "确认后加 --yes" in r.output
+    assert calls == [{"dry_run": True}]      # 没 --yes 就不能真删
+
+
+def test_money_flow_cmd_purge_demo_with_yes(monkeypatch):
+    calls: list = []
+
+    def fake_purge(**kw):
+        calls.append(kw)
+        if kw.get("dry_run"):
+            return {"dry_run": True, "demo_rows": 599, "relabel_rows": 900,
+                    "deleted": 0}
+        return {"dry_run": False, "demo_rows": 599, "relabel_rows": 900,
+                "deleted": 599}
+
+    _patch_mod(monkeypatch, "lquant.market.backfill", "purge_demo_flow", fake_purge)
+    _patch_mod(monkeypatch, "lquant.market.backfill", "money_flow_symbols",
+               lambda **kw: [])
+    r = _invoke("money-flow", "--purge-demo", "--yes")
+    assert r.exit_code == 0, r.output
+    assert "已删除: 599 行" in r.output
+    assert calls == [{"dry_run": True}, {}]
+
+
+def test_money_flow_cmd_demo_targets(monkeypatch):
+    """--demo 不联网，只跑两个样板标的。"""
+    seen = _stub_flow(monkeypatch)
+    r = _invoke("money-flow", "--demo")
+    assert r.exit_code == 0, r.output
+    assert seen["targets"] == ["600519.SH", "000001.SZ"]
+    assert seen["demo"] is True
+
+
+def test_money_flow_cmd_progress_is_throttled(monkeypatch):
+    """几千只标的不能逐只刷屏：按步长报，且最后一条必须报出来。"""
+    def fake_backfill(targets, **kw):
+        p = kw["progress"]
+        p(1, 100, "600000.SH")      # 未到步长（100//50=2）→ 不打印
+        p(2, 100, "600001.SH")      # 到步长 → 打印
+        p(100, 100, "600099.SH")    # 收尾 → 必打印
+        return dict(_FLOW_REPORT)
+
+    _patch_mod(monkeypatch, "lquant.market.backfill", "backfill_money_flow_history",
+               fake_backfill)
+    _patch_mod(monkeypatch, "lquant.market.backfill", "money_flow_symbols",
+               lambda **kw: [])
+    r = _invoke("money-flow", "--symbols", "600519")
+    assert r.exit_code == 0, r.output
+    assert "[1/100]" not in r.output
+    assert "[2/100] 600001.SH" in r.output
+    assert "[100/100] 600099.SH" in r.output

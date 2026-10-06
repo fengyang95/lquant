@@ -312,6 +312,21 @@ def test_capital_empty_degrades():
     assert A.capital_angle(pl.DataFrame())["available"] is False
 
 
+def test_capital_empty_hint_is_actionable_when_symbol_known():
+    """缺口要给出可执行的补救命令，而不是笼统的「表为空」。
+
+    每日采集只装当天净流入榜前列，普通标的必须靠历史回填 ——
+    提示里直接写出命令，用户才知道下一步做什么。
+    """
+    out = A.capital_angle(pl.DataFrame(), "600519.SH")
+    assert out["available"] is False
+    assert "lq data money-flow --symbols 600519.SH" in out["hint"]
+    assert "600519.SH" in out["hint"]
+    # 没给 symbol 时保持原来的通用文案（调用方不总是知道标的）
+    generic = A.capital_angle(pl.DataFrame())
+    assert "lq data money-flow" not in generic["hint"]
+
+
 # ---------------------------------------------------------------- 相对强度
 
 
@@ -655,6 +670,35 @@ def test_load_money_flow_window_and_asof():
 
 def test_load_money_flow_missing_table_degrades():
     assert L.load_money_flow(duckdb.connect(), "600519.SH", date(2026, 9, 30)).is_empty()
+
+
+def test_load_money_flow_excludes_demo_rows():
+    """合成数据不能进资金面评分。
+
+    demo 采集写进 money_flow 的 200 个代码里，有 75 个能对上真实上市公司
+    （如 300408.SZ），主键同为 (trade_date, symbol) —— 不过滤就是拿伪造的
+    净流入给真实标的下结论。
+    """
+    con = duckdb.connect()
+    con.execute(
+        "CREATE TABLE money_flow (trade_date DATE, symbol VARCHAR, name VARCHAR, "
+        "main_net_inflow DOUBLE, main_net_ratio DOUBLE, super_large_net DOUBLE, "
+        "large_net DOUBLE, medium_net DOUBLE, small_net DOUBLE, change_pct DOUBLE, "
+        "source VARCHAR)")
+    con.executemany("INSERT INTO money_flow VALUES (?,?,?,?,?,?,?,?,?,?,?)", [
+        # 带 source 的合成行
+        (date(2026, 10, 6), "300408.SZ", "样例088", 9e7, 20.0, 0, 0, 0, 0, 1.0, "demo"),
+        # 老库没有 source 列那一代的合成行（只能靠 name 认）
+        (date(2026, 10, 2), "300408.SZ", "样例088", 8e7, 19.0, 0, 0, 0, 0, 1.0, None),
+        # 真实历史回填行
+        (date(2026, 9, 30), "300408.SZ", "三环集团", 1e7, 3.0, 0, 0, 0, 0, 1.0, "history"),
+        # 老库的真实行（source 为 NULL）
+        (date(2026, 9, 29), "300408.SZ", "三环集团", 2e7, 4.0, 0, 0, 0, 0, 1.0, None),
+    ])
+    df = L.load_money_flow(con, "300408.SZ", date(2026, 10, 6), days=60)
+    assert df.height == 2, "两代合成行都必须被排除"
+    assert df["trade_date"].to_list() == [date(2026, 9, 29), date(2026, 9, 30)]
+    assert df["main_net_inflow"].to_list() == [2e7, 1e7]
 
 
 def _news_con() -> duckdb.DuckDBPyConnection:

@@ -159,6 +159,123 @@ def index_cmd(start: str, end: str | None, symbols: str | None) -> None:
     click.echo("index done")
 
 
+@data.command("money-flow")
+@click.option("--symbols", default=None, help="逗号分隔标的（裸码或带后缀，如 600519,000001.SZ）")
+@click.option("--all", "all_syms", is_flag=True, help="回填日线湖里的全部真实标的")
+@click.option("--limit", default=None, type=int, help="配合 --all：只回填前 N 只")
+@click.option("--days", default=None, type=int, help="每只只保留最近 N 个交易日")
+@click.option("--qps", default=None, type=float,
+              help="请求速率上限（默认 1.5；被封 IP 时调小，网络好可调大）")
+@click.option("--purge-demo", is_flag=True, help="清理合成数据并补 source（不联网）")
+@click.option("--yes", is_flag=True, help="确认执行 --purge-demo 的删除")
+@click.option("--demo", is_flag=True, help="生成合成数据（不联网，仅测试）")
+def money_flow_cmd(symbols: str | None, all_syms: bool, limit: int | None,
+                   days: int | None, qps: float | None, purge_demo: bool,
+                   yes: bool, demo: bool) -> None:
+    """回填逐日主力资金流（个股分析「资金面」的数据来源）。
+
+    每日横截面采集只有当天，而且东财的榜单式接口只装得下净流入靠前的
+    少数标的 —— 普通股票在 money_flow 里一行都没有，分析的资金面永远是
+    「样本不足」。本命令走东财单票历史接口，把任意标的补到约 120 个交易日。
+
+    \b
+    lq data money-flow --symbols 600519,000001.SZ   # 指定标的
+    lq data money-flow --all                        # 全市场（约 7000 只，几十分钟）
+    lq data money-flow --purge-demo --yes           # 清掉库里的合成数据
+    """
+    from lquant.market.backfill import (
+        backfill_money_flow_history,
+        money_flow_symbols,
+        purge_demo_flow,
+    )
+
+    if purge_demo:
+        preview = purge_demo_flow(dry_run=True)
+        click.echo(f"  待清理合成数据: {preview['demo_rows']} 行"
+                   f"（另有 {preview['relabel_rows']} 行老数据补 source）")
+        if not yes:
+            click.echo("  这是删除操作，确认后加 --yes 重跑")
+            return
+        rep = purge_demo_flow()
+        click.echo(f"  已删除: {rep['deleted']} 行，补 source: {rep['relabel_rows']} 行")
+
+    targets: list[str] = []
+    if symbols:
+        targets = [s.strip() for s in symbols.split(",") if s.strip()]
+    elif all_syms:
+        targets = money_flow_symbols(limit=limit)
+        click.echo(f"  标的池（日线湖）: {len(targets)} 只")
+        if not targets:
+            click.echo("  日线湖为空，先跑 `lq data sync`")
+            return
+    elif demo:
+        targets = ["600519.SH", "000001.SZ"]
+    elif not purge_demo:
+        click.echo("  未指定标的。用法：--symbols / --all / --purge-demo")
+        return
+
+    if not targets:
+        return
+
+    last = {"i": 0}
+
+    def _progress(done: int, total: int, sym: str) -> None:
+        # 全市场几千只，逐只刷屏没有意义；每 50 只报一次
+        step = max(1, total // 50)
+        if done == total or done - last["i"] >= step:
+            last["i"] = done
+            click.echo(f"  [{done}/{total}] {sym}")
+
+    rep = backfill_money_flow_history(targets, days=days, demo=demo, qps=qps,
+                                      progress=_progress)
+    click.echo(f"  拉取: {rep['fetched']} 行，入库: {rep['persisted']} 行"
+               f"（{rep['qps']} qps）")
+    click.echo(f"  有资金流的标的: {rep['covered_before']} → {rep['covered_after']}"
+               f" / {rep['symbols']}")
+    if rep["failed"]:
+        click.echo(f"  ⚠ 失败 {len(rep['failed'])} 只，前几例:")
+        for sym, err in list(rep["failed"].items())[:5]:
+            click.echo(f"    {sym}: {err}")
+    _money_flow_coverage_line()
+    click.echo("money-flow done")
+
+
+def _money_flow_coverage_line() -> None:
+    """资金流覆盖一览（个股分析「资金面」的数据源出口）。
+
+    没有这行时「资金面恒为空」只能靠打开某只股票的分析报告才发现 ——
+    显式给出「覆盖多少标的 / 多少天 / 有多少是合成数据」。
+    """
+    from lquant.core.db import reader
+    from lquant.market.backfill import money_flow_symbols, real_flow_predicate
+
+    try:
+        with reader() as con:
+            real = real_flow_predicate(con)
+            row = con.execute(
+                "SELECT count(*), count(DISTINCT symbol), count(DISTINCT trade_date), "
+                f"min(trade_date), max(trade_date) FROM money_flow WHERE {real}"
+            ).fetchone()
+            demo_n = con.execute(
+                f"SELECT count(*) FROM money_flow WHERE NOT ({real})").fetchone()[0]
+        # 解包也放在 try 里：status() 的约定是「读库形态异常就降级显示」，
+        # 不能因为某行数不对就整个命令挂掉（与上面 _index_coverage_line 一致）。
+        n, syms, days, lo, hi = row
+    except Exception as e:  # noqa: BLE001  表可能未建 / 结果形态异常
+        click.echo(f"  money_flow: - ({type(e).__name__})")
+        return
+
+    click.echo(f"  money_flow: {n} 行 / {syms} 只 / {days} 个交易日 {lo} ~ {hi}")
+    if demo_n:
+        click.echo(f"    ⚠ 另有 {demo_n} 行合成数据（分析已排除，"
+                   "`lq data money-flow --purge-demo --yes` 清理）")
+    universe = money_flow_symbols()
+    if universe:
+        pct = syms / len(universe) * 100
+        tail = "" if syms >= len(universe) else "（跑 `lq data money-flow --all` 补齐）"
+        click.echo(f"    覆盖: {syms}/{len(universe)} 只真实标的 ({pct:.1f}%){tail}")
+
+
 @data.command()
 def status() -> None:
     """数据覆盖度一览。"""
@@ -193,6 +310,7 @@ def status() -> None:
                + ("（湖为空，先跑 lq data sync）" if lake_is_empty("daily") else ""))
 
     _index_coverage_line()
+    _money_flow_coverage_line()
 
 
 def _index_coverage_line() -> None:

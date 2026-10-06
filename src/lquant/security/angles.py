@@ -466,9 +466,19 @@ def valuation_angle(own: pl.DataFrame, cross: pl.DataFrame) -> dict:
 _MIN_FLOW_DAYS = 3
 
 
-def capital_angle(flow: pl.DataFrame) -> dict:
-    """资金面：主力净流入的强度与持续性。"""
+def capital_angle(flow: pl.DataFrame, symbol: str | None = None) -> dict:
+    """资金面：主力净流入的强度与持续性。
+
+    ``symbol`` 只用于把「没数据」写成可执行的补救命令 ——
+    money_flow 的每日采集只装得下当天净流入榜前列的标的，
+    普通标的要么靠历史回填，要么永远看不到资金面。
+    """
     if flow.is_empty():
+        if symbol:
+            hint = (f"资金流未覆盖 {symbol}：每日采集只装当天净流入榜前列的标的，"
+                    f"普通标的需回填历史 —— 跑 "
+                    f"`lq data money-flow --symbols {symbol} --days 120` 后重看")
+            return unavailable("capital", hint, summary="资金流数据为空")
         return unavailable("capital", "没有资金流数据（money_flow 表为空或未覆盖该标的）",
                            summary="资金流数据为空")
     flow = flow.sort("trade_date")

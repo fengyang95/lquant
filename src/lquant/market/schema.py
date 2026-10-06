@@ -1,14 +1,20 @@
 """看板表结构。
 
-这五张表有个共同特点：**源站不提供历史回溯**。
+这些表绝大多数有个共同特点：**源站不提供历史回溯**。
 涨停池、炸板池、盘口资金流当天不采就永久丢失，事后补不回来。
 所以它们的调度优先级高于任何批处理任务，且失败必须告警而不是静默跳过。
+
+例外是 money_flow：东财的 ``fflow/daykline`` 单票接口可以回溯
+约 120 个交易日，所以它是唯一能事后补齐的看板表
+（见 collectors/money_flow.fetch_money_flow_history 与
+market/backfill.backfill_money_flow_history）。
 """
 from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["MARKET_TABLES", "ddl_statements", "ensure_market_tables", "TABLE_DOCS"]
+__all__ = ["MARKET_TABLES", "ddl_statements", "ensure_market_tables", "TABLE_DOCS",
+           "TABLE_COLUMNS", "SOURCE_REAL", "SOURCE_DEMO", "SOURCE_HISTORY"]
 
 
 MARKET_TABLES: dict[str, str] = {
@@ -54,6 +60,7 @@ MARKET_TABLES: dict[str, str] = {
             large_net       DOUBLE,
             medium_net      DOUBLE,
             small_net       DOUBLE,
+            source          VARCHAR,
             collected_at    TIMESTAMP,
             PRIMARY KEY (trade_date, symbol)
         )""",
@@ -135,7 +142,8 @@ MARKET_TABLES: dict[str, str] = {
 TABLE_DOCS: dict[str, str] = {
     "limit_up_pool": "涨停池：连板数、首次封板时间、炸板次数。源站仅提供当日，必须当天采。",
     "limit_down_pool": "跌停池：与涨停池配对，衡量市场恐慌程度。",
-    "money_flow": "个股资金流：主力/超大单/大单/中单/小单净额，用于判断资金真伪。",
+    "money_flow": "个股资金流：主力/超大单/大单/中单/小单净额，用于判断资金真伪。"
+                  "source 标记来源（eastmoney 当日横截面 / history 历史回填 / demo 合成）。",
     "sector_daily": "板块日度：涨跌幅、资金流、龙头股。行业轮动策略的输入。",
     "sentiment_daily": "市场情绪：涨停数、炸板率、最高连板、昨日涨停今日表现。",
     "dragon_tiger": "龙虎榜：机构与游资席位买卖，T+1 盘后公布。",
@@ -152,7 +160,7 @@ TABLE_COLUMNS: dict[str, list[str]] = {
                         "industry", "collected_at"],
     "money_flow": ["trade_date", "symbol", "name", "close", "change_pct", "main_net_inflow",
                    "main_net_ratio", "super_large_net", "large_net", "medium_net",
-                   "small_net", "collected_at"],
+                   "small_net", "source", "collected_at"],
     "sector_daily": ["trade_date", "sector_code", "sector_name", "kind", "change_pct",
                      "turnover_rate",
                      "amount", "main_net_inflow", "leader_symbol", "leader_name",
@@ -170,6 +178,23 @@ TABLE_COLUMNS: dict[str, list[str]] = {
 }
 
 
+#: 后加列迁移表：{表名: [(列名, 列定义), ...]}。加列走 ALTER，保留既有行。
+#:
+#: money_flow.source 故意不给 DEFAULT：库里的历史行既有真实行也有
+#: `lq data demo` / demo 采集写进去的合成行，默认成 'eastmoney' 等于
+#: 把伪造数据洗成真实数据。NULL = 来源未知，由 `lq data money-flow --purge-demo`
+#: 显式清理后再回填 source。
+_ADD_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "sector_daily": (("kind", "VARCHAR DEFAULT 'industry'"),),
+    "money_flow": (("source", "VARCHAR"),),
+}
+
+#: money_flow.source 的取值：eastmoney=真实源，demo=合成数据，history=历史回填。
+SOURCE_REAL = "eastmoney"
+SOURCE_DEMO = "demo"
+SOURCE_HISTORY = "history"
+
+
 def ddl_statements() -> list[str]:
     return list(MARKET_TABLES.values())
 
@@ -185,16 +210,16 @@ def ensure_market_tables(con: Any) -> int:
     """
     n = 0
     for table, sql in MARKET_TABLES.items():
-        # 加列迁移：新增可空列时优先 ALTER（保留历史数据），不动 drop-rebuild 路径
-        if table == "sector_daily":
+        # 加列迁移：新增可空列时优先 ALTER（保留历史数据），不动 drop-rebuild 路径。
+        # 必须先 ALTER 再校验 required，否则新列会被判成「结构过旧」→ 整表重建。
+        for col, decl in _ADD_COLUMNS.get(table, ()):
             try:
                 existing_cols = {r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()}
-                if existing_cols and "kind" not in existing_cols:
-                    con.execute(
-                        "ALTER TABLE sector_daily ADD COLUMN kind VARCHAR DEFAULT 'industry'")
-                    print("[migrate] sector_daily 加列 kind（历史行默认 industry）")
+                if existing_cols and col not in existing_cols:
+                    con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+                    print(f"[migrate] {table} 加列 {col}（{decl}）")
             except Exception as e:  # noqa: BLE001  表可能不存在，走下面正常建表
-                print(f"[migrate] sector_daily kind 列检查跳过: {e}")
+                print(f"[migrate] {table} {col} 列检查跳过: {e}")
         required = [c for c in TABLE_COLUMNS.get(table, []) if c != "collected_at"]
         try:
             existing = {r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()}
