@@ -221,6 +221,44 @@ FinancialTool 声明「盈利与现金流」模块权重 30，但子项合计只
 - `normalized_score = raw / available_max × 100` —— **跨覆盖度可比**
 - `coverage` —— 已评分 / 全部指标
 
+#### 3.4.1 三个取数来源（`RatioMetric.source`）
+
+17 个指标的值来自**三个互相独立**的数据源，任一缺失都会让某些模块恒为 0 分。
+`source` 必须显式声明，前端据此把「模块没数据源」和「本票没匹配上」区分开：
+
+| `source` | 含义 | 物理位置 | 指标 |
+|---|---|---|---|
+| `pit` | 报表科目直接可读 | `financial_pit`，键形如 `indicator.*` | 盈利能力 4 项、总资产周转率、偿债 3 项 |
+| `derived` | 库里没有现成比率，由原始科目现算 | 见 `lquant/fundamental/derive.py` | 现金质量 3 项、周转天数 2 项、利息保障倍数 |
+| `valuation` | 日频估值量 | **日线湖** `pe_ttm` / `pb_mrq` / `dv_ttm` | 估值 3 项 |
+
+派生口径（每条都有单测固定，见 `tests/unit/test_fundamental_derive.py`）：
+
+| 逻辑键 | 公式 | 备注 |
+|---|---|---|
+| `derived.cfo_to_np` | `cashflow.n_cashflow_act / income.n_income_attr_p` | 分子分母必须**同一报告期** |
+| `derived.cfo_to_or` | `cashflow.n_cashflow_act / income.total_revenue` | |
+| `derived.cfo_to_op` | `cashflow.n_cashflow_act / income.operate_profit` | |
+| `derived.ar_turn_days` | `360 / indicator.ar_turn` | 用官方周转率折算 |
+| `derived.inv_turn_days` | `360 × balancesheet.inventories / income.oper_cost` | **近似**：期末存货而非平均存货 |
+| `derived.ebit_to_interest` | `indicator.ebit / income.fin_exp_int_exp` | 分母为负则不计分 |
+
+派生层的 PIT 约束：按 `(symbol, stat_date)` 分组（分子分母同报告期）→
+每个原始科目取 `pub_date` 最新的一次修订 → 派生 `pub_date = max(所用输入的 pub_date)`
+→ 任一输入缺失即整条缺失，**绝不用 0 兜底**。
+
+估值来源与符号守卫：`pe_ttm` / `pb_mrq` 为负表示亏损 / 净资产为负，
+**不是「便宜」**。反向打分下若不处理，亏损股会被排到全市场最前。
+处理方式是「先取最近一个有值的 bar，再把非正值就地置空」——
+只跳过「没有值」（日线湖尾部常缺估值列），不跳过「有值的不可用」。
+
+> **历史事故（本文件原先漏记）**：17 个 `item` 曾经整体沿用 FinancialTool 时代的
+> BaoStock 键名（`profit.roeAvg` / `balance.currentRatio` / `dupont.dupontNitogr`），
+> 而库里真实数据是 Tushare 的 `indicator.*` —— **17/17 全部取不到值**。
+> 后端把它们当成「财务数据为空」返回 `hint`，用户于是反复重跑数据回填，
+> 而库里当时有 7700 万行财务数据。契约现由
+> `tests/unit/test_fundamental_registry_contract.py` 对着真实库锁死。
+
 ### 3.5 三表勾稽 `reconcile.py`
 
 用报表之间的**内部一致性**发现数据源错误与财务异常：
@@ -238,13 +276,33 @@ FinancialTool 声明「盈利与现金流」模块权重 30，但子项合计只
 `checked_items` 为空时 `passed=False`（一项都没查到不能算通过，
 否则数据缺失会被当成质量优秀），有测试固定这个语义。
 
+**已知口径局限（必须对使用者可见）**：留存收益勾稽式**未扣除利润分配**
+（分红）与其它直接计入权益的变动，因此分红较多的公司这一项会天然报出
+较大差额，不代表数据错误。`cashflow.c_pay_dist_dpcp_int_exp`
+（分配股利、利润或偿付利息支付的现金）把利息混在一起，用它做修正会引入
+另一重误差，所以本实现选择**如实暴露局限**而不是用近似量掩盖。
+前端在勾稽面板上直接写明这一点。
+
+接口侧的自动取数（`POST /api/fundamental/reconcile` 的 `auto=true`）会把
+**累计口径**科目（利润表 / 现金流量表，Q2 = 上半年累计）先折算成单季值，
+再与资产负债表的时点变动比较 —— 否则会拿「上半年净利润」去比「二季度留存
+收益变动」，差额巨大但毫无意义。
+
 ### 3.6 数据接入
 
-直接消费 lquant 既有的两张 PIT 表，**不需要新建 schema**：
+消费三处既有数据，**不需要新建 schema**：
 
 - `financial_pit(symbol, stat_date, pub_date, report_type, item, value, unit, source)`
+  —— 报表科目与派生指标的输入
 - `industry_classify(symbol, std, code, name, std_date, source)` —— `std_date`（生效日）
-  是该列设计的初衷（「防止用今天的分类回测十年前」），本模块是它的强制消费点。
+  是该列设计的初衷（「防止用今天的分类回测十年前」），本模块是它的强制消费点
+- **日线湖**（`data/parquet/daily` 与 `daily_basic`）—— 估值列
+
+API 侧取数做了两处下推（`_load_financial`）：`stat_date` 限定近 5 年
+（既是扫描量闸门，也是陈旧性闸门），以及用 `arg_max(value, pub_date)`
+哈希聚合做「同报告期取最新修订」而不是窗口函数。
+实测 563 万行 → 168 万行，6.5s → 1.8s；窗口函数版本是 28s。
+估值取数从整块湖缩到 45 天回退窗口，14s → 0.4s。
 
 ---
 
@@ -261,19 +319,25 @@ FinancialTool 声明「盈利与现金流」模块权重 30，但子项合计只
 | GET | `/api/data/indicators?symbol=&limit=&names=` | 按名字计算指标；未注册名返回 **422**（不静默忽略） |
 | GET | `/api/backtests/exit-strategies` | 退出策略枚举 |
 | POST | `/api/backtests/run` | 新增 `exit_strategy` / `exit_params`，内部用 `ExitOverlay` 包裹 TopN 策略 |
-| GET | `/api/fundamental/metrics` | 指标目录 + 模块权重 |
-| GET | `/api/fundamental/score?symbol=&asof=` | 单票评分（含逐指标明细与行业分位） |
-| POST | `/api/fundamental/scores` | 全市场/指定池排名（`min_coverage` 过滤低覆盖） |
-| GET | `/api/fundamental/percentiles?asof=` | 各行业 × 各指标 P25/P50/P75 |
-| POST | `/api/fundamental/reconcile` | 三表勾稽校验 |
+| GET | `/api/fundamental/metrics` | 指标目录 + 模块权重 + 每项取数来源 |
+| GET | `/api/fundamental/score?symbol=&asof=&min_samples=` | 单票评分（逐指标明细 + 模块可得性 + 日线估值原值） |
+| POST | `/api/fundamental/scores` | 排名；支持 `symbols` / `industries` / `min_samples` / `min_coverage` / `limit` / `sort_by` / `sort_desc` |
+| GET | `/api/fundamental/percentiles?asof=&min_samples=&industry=` | 各行业 × 各指标 P25/P50/P75 |
+| GET | `/api/fundamental/industries?asof=` | 观察日**真正有标的**的行业清单（筛选器选项来源） |
+| POST | `/api/fundamental/reconcile` | 三表勾稽；`auto=true` 时自动从最近两期报表取数 |
 
 设计要点：
 
 - **`/data/indicators` 向后兼容**：默认 `names=ma,macd,rsi,boll`，与迁移前输出一致；
   旧前端不改也能跑。
 - **未注册的指标/策略一律 422**，且提示可选清单 —— 静默忽略会让用户拿到一列
-  不存在的字段却不知道哪里错了。
-- **财务表为空返回 `available:false` + `hint`**，不是 500：空表是常态不是错误。
+  不存在的字段却不知道哪里错了。`sort_by` 同样走白名单。
+- **空数据返回 `available:false` + `hint`**，不是 500：空表是常态不是错误。
+  但 hint 必须**指向真正缺失的那个来源**（报表 / 估值 / 行业样本），
+  并把 `availability` 结构化返回，否则用户会去修错的东西。
+- **面板结果按 `(asof, min_samples)` 缓存**（TTL 300s，最多 12 条）：
+  一次全市场评分冷启动约 15s，命中缓存 0.0s。前端改筛选不再重算。
+  数据同步完成后应调用 `clear_fundamental_cache()`。
 
 ### 4.2 指标新增 `pane` 元数据（一个被测试固定的设计决定）
 
@@ -290,9 +354,9 @@ FinancialTool 声明「盈利与现金流」模块权重 30，但子项合计只
 
 | 页面 | 变化 |
 |---|---|
-| `/security/[symbol]`（个股详情） | 顶部新增**基本面评分卡**（评级/归一化分/覆盖率/模块分解/逐指标行业位置条）；「技术指标」面板改为**注册表驱动的勾选框**，选中项同时决定指标条与 K 线叠加线 |
+| `/security/[symbol]`（个股详情） | 顶部**基本面评分卡**（评级/归一化分/覆盖率/模块分解/逐指标行业位置条/日线估值原值）；模块口径**从 `/fundamental/metrics` 取**，不再前端硬编码权重；「技术指标」面板改为**注册表驱动的勾选框** |
 | `/backtests`（快速回测） | 新增**退出策略下拉**，未选时不发 `exit_strategy` 字段（旧请求契约不破） |
-| `/fundamental`（新增页） | 全市场基本面排名表（归一化分 + 覆盖率 + 模块分列）+ 评分口径说明 |
+| `/fundamental`（新增页） | 三个页签：**排名**（行业多选 / 代码搜索（防抖）/ 最低覆盖率 / 最小行业样本 / 条数 / 列排序 / CSV 导出 / 分数分布图 / 模块可得性条 / 数据源可用性条 + 修复指引）、**行业分位**（P25/P50/P75 × 行业，解释分数怎么来的）、**三表勾稽**（默认自动取数，可手工覆盖，并把口径局限写在界面上） |
 | 侧边栏 | 研究分组新增「基本面」 |
 
 两个刻意的展示原则：
@@ -301,6 +365,11 @@ FinancialTool 声明「盈利与现金流」模块权重 30，但子项合计只
    拿 90 分，可信度完全不同；覆盖率低于 80% 时卡片会额外给出提示。
 2. **分位区间退化时不给位置条**。同行业取值全部相同时（P25 == P75），
    位置条会给出误导性的"居中"假象，此时显式显示「区间退化」。
+
+第三条是本次补的：**模块恒 0 分必须能区分「没数据源」与「本票没匹配上」**。
+后端在 `/scores` 与 `/score` 里返回每个模块的 `hit_rate` 与 `n_scored_rows`，
+页面据此把「估值模块无数据源」标红，而不是让它混在正常的 0 分里。
+原始事故里这正是最坑的一环：所有模块都是 0，而提示只说「财务数据为空」。
 
 ---
 
@@ -330,17 +399,24 @@ FinancialTool 声明「盈利与现金流」模块权重 30，但子项合计只
 - `tests/unit/test_exit_overlay.py` —— 与真实 `Engine` 的契约 + 端到端对比
 - `tests/unit/test_fundamental_percentile.py` —— PIT + 分位 + 聚合 + 滚动
 - `tests/unit/test_fundamental_reconcile.py` —— 勾稽口径 + 缺失值安全
-- `tests/unit/test_api_port_endpoints.py` —— 新增端点的 API 契约（19 用例）
+- `tests/unit/test_fundamental_percentile.py` —— PIT 解析 / 分位 / 聚合 / 覆盖率
+- `tests/unit/test_fundamental_derive.py` —— 派生口径：同报告期、公告日取 max、
+  缺项不兜底、分母守卫、非有限值剔除
+- `tests/unit/test_fundamental_valuation.py` —— 日线湖 PIT 选取、负 PE/PB 置空、
+  股息率保留 0、缺列降级
+- `tests/unit/test_fundamental_registry_contract.py` —— **键名契约**：固定期望集合，
+  并在本机有真实库时逐个校验 key 存在（这条是原始事故唯一可靠的防线）
+- `tests/unit/test_api_port_endpoints.py` —— 新增端点的 API 契约（含估值湖铺设）
 - `tests/unit/test_api_fundamental_unit.py` —— 表缺失降级 / JSON 安全 / 样本不足分支
-- `web/.../IndicatorPicker.test.tsx`、`FundamentalCard.test.tsx`、
-  `fundamental/__tests__/page.test.tsx`、`security/__tests__/page.test.tsx`
+- `web/src/components/__tests__/{FundamentalCard,PercentileMatrix,ReconcilePanel}.test.tsx`、
+  `web/src/app/fundamental/__tests__/page.test.tsx`
 
 ---
 
 ## 6. 明确没做的事（留给后续）
 
 1. **退出策略未接入 JQ 代码回测路径**：`/api/backtests/run-code`（聚宽方言）目前
-   不接收 `exit_strategy`。走那条路的用户可以改在策略源码里调 `ExitStrategy`。
+   不接收 `exit_strategy`。走那条路的用户可以在策略源码里调 `ExitStrategy`。
 2. **缠论 / 波浪**：FinancialTool 没有实现，无物可移；本层也没有实现。
 3. **筹码分布**：FinancialTool 的版本是**换手率近似**（非真 tick）。
    当前数据湖无 tick 数据，若要移植必须先解决数据源并**显式标注近似口径**。
@@ -349,3 +425,14 @@ FinancialTool 声明「盈利与现金流」模块权重 30，但子项合计只
 5. **RL 模块**：本次未做（P0-5）。接入方案见对比报告第 5 节。
 6. **指标子图**：`pane=sub/volume` 的指标（MACD/RSI/KDJ/量比）目前只在指标条里
    显示末值，尚未在 KChart 下方渲染独立子图 —— 需要先扩 `KChart` 的分 panel 能力。
+7. **基本面冷启动仍是秒级**：全市场评分需要读约 168 万行报表 + 派生 + 分位，
+   实测冷启动约 15s、命中缓存 0.0s。进一步压到秒级的路径是：
+   把 8 个 `pit` 指标在 SQL 里先聚合成「每股每指标一行」（约 4 万行），
+   只对 9 个派生输入保留逐报告期数据。本次未做，因为收益（约 2 倍）
+   与新增的查询复杂度不成比例。
+8. **留存收益勾稽未扣分红**：见 3.5 的「已知口径局限」。要真正修好需要
+   单独接入「分配股利、利润或偿付利息支付的现金」中**仅股利**的部分，
+   当前库里没有这个粒度的字段。
+9. **无行业中性化 / 市值分层**：行业分位只按申万一级行业分组，
+   未做市值分层。小市值公司的比率分布与大市值差异明显，
+   同行业内直接比仍会有系统性偏移。

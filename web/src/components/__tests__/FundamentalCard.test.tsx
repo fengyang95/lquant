@@ -6,8 +6,23 @@ const swrState: { data: unknown; isLoading: boolean; error: unknown } = {
   data: undefined, isLoading: false, error: undefined,
 };
 
+// 评分卡现在有**两个** SWR 请求（/fundamental/score 与 /fundamental/metrics）。
+// 按 key 分发，否则模块口径会取到评分的返回体，模块名与满分全部对不上。
+const CATALOGUE = {
+  modules: [
+    { name: 'profitability', label: '盈利能力', weight: 25 },
+    { name: 'cashflow', label: '现金质量', weight: 20 },
+    { name: 'efficiency', label: '营运效率', weight: 15 },
+    { name: 'solvency', label: '偿债能力', weight: 20 },
+    { name: 'valuation', label: '估值水平', weight: 20 },
+  ],
+  metrics: [],
+};
+
 vi.mock('swr', () => ({
-  default: () => swrState,
+  default: (key: unknown) => (key === '/fundamental/metrics'
+    ? { data: CATALOGUE, isLoading: false }
+    : swrState),
 }));
 
 import FundamentalCard, { type FundScore } from '../FundamentalCard';
@@ -28,7 +43,7 @@ function payload(overrides: Partial<FundScore['score']> = {},
       ...overrides,
     } as unknown as FundScore['score'] : null,
     items: available ? [{
-      item: 'profit.roeAvg', label: '净资产收益率', module: 'profitability',
+      item: 'indicator.roe', label: '净资产收益率', module: 'profitability',
       value: 22.5, p25: 10, p50: 15, p75: 20, n: 42,
       ratio: 1.0, points: 8, max_score: 8,
     }] : [],
@@ -76,7 +91,7 @@ describe('FundamentalCard', () => {
     expect(screen.getByText('盈利能力 / 25')).toBeInTheDocument();
     expect(screen.getByText('估值水平 / 20')).toBeInTheDocument();
     expect(screen.getByText('净资产收益率')).toBeInTheDocument();
-    expect(screen.getByText('profit.roeAvg')).toBeInTheDocument();
+    expect(screen.getByText('indicator.roe')).toBeInTheDocument();
     expect(screen.getByText(/n=42/)).toBeInTheDocument();
   });
 

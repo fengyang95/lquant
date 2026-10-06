@@ -35,10 +35,19 @@ PUB = date(2026, 3, 20)
 AFTER = date(2026, 4, 1)
 BEFORE = date(2026, 1, 10)
 
+#: 造数用的 item 必须取自**真实目录**。
+#: 这里原先是写死的 ``profit.roeAvg`` / ``operation.NRTurnDays`` 等
+#: BaoStock 遗留键 —— 恰好是当时 METRICS 的子集，于是测试全绿，
+#: 而生产库（Tushare ``indicator.*``）17 个指标一个都取不到。
+#: 契约由 tests/unit/test_fundamental_registry_contract.py 单独守。
+FIXTURE_ITEMS = ("indicator.roe", "indicator.netprofit_margin", "indicator.assets_turn")
+#: 一正一反，用于验证反向指标档位
+FIXTURE_MIXED = ("indicator.roe", "indicator.debt_to_assets")
+
 
 def make_panel(n_per_industry: int = 6, items: tuple[str, ...] | None = None
                ) -> tuple[pl.DataFrame, pl.DataFrame, list[str]]:
-    items = items or ("profit.roeAvg", "profit.npMargin", "operation.NRTurnDays")
+    items = items or FIXTURE_ITEMS
     symbols, industries = [], []
     rows = []
     for i in range(n_per_industry * 2):
@@ -69,29 +78,29 @@ def test_resolve_pit_hides_unpublished_reports():
 def test_resolve_pit_picks_latest_stat_date():
     panel = pl.DataFrame([
         {"symbol": "600000.SH", "stat_date": date(2025, 3, 31), "pub_date": date(2025, 4, 20),
-         "item": "profit.roeAvg", "value": 5.0},
+         "item": "indicator.roe", "value": 5.0},
         {"symbol": "600000.SH", "stat_date": date(2025, 12, 31), "pub_date": date(2026, 3, 20),
-         "item": "profit.roeAvg", "value": 9.0},
+         "item": "indicator.roe", "value": 9.0},
     ])
     got = resolve_pit(panel, AFTER)
-    assert got["profit.roeAvg"][0] == 9.0
+    assert got["indicator.roe"][0] == 9.0
     assert got["stat_date"][0] == date(2025, 12, 31)
 
 
 def test_resolve_pit_prefers_later_revision_same_period():
     panel = pl.DataFrame([
         {"symbol": "600000.SH", "stat_date": STAT, "pub_date": date(2026, 3, 20),
-         "item": "profit.roeAvg", "value": 9.0},
+         "item": "indicator.roe", "value": 9.0},
         {"symbol": "600000.SH", "stat_date": STAT, "pub_date": date(2026, 3, 28),
-         "item": "profit.roeAvg", "value": 11.0},
+         "item": "indicator.roe", "value": 11.0},
     ])
-    assert resolve_pit(panel, AFTER)["profit.roeAvg"][0] == 11.0
+    assert resolve_pit(panel, AFTER)["indicator.roe"][0] == 11.0
 
 
 def test_resolve_pit_item_filter_and_missing_columns():
     panel, _, _ = make_panel()
-    got = resolve_pit(panel, AFTER, items=["profit.roeAvg"])
-    assert "profit.roeAvg" in got.columns and "profit.npMargin" not in got.columns
+    got = resolve_pit(panel, AFTER, items=["indicator.roe"])
+    assert "indicator.roe" in got.columns and "indicator.netprofit_margin" not in got.columns
     with pytest.raises(KeyError, match="缺列"):
         resolve_pit(pl.DataFrame({"symbol": ["x"]}), AFTER)
 
@@ -199,10 +208,10 @@ def test_aggregate_normalized_and_coverage():
 
 def test_best_in_every_metric_reaches_full_normalized_score():
     """归一化分数的意义：覆盖度低也能拿满分，只要它在可比口径里最好。"""
-    panel, ic, _ = make_panel(items=("profit.roeAvg", "operation.NRTurnDays"))
+    panel, ic, _ = make_panel(items=FIXTURE_MIXED)
     panel = panel.with_columns(
         pl.when(pl.col("symbol") == "600000.SH")
-        .then(pl.when(pl.col("item") == "operation.NRTurnDays").then(-1e6).otherwise(1e6))
+        .then(pl.when(pl.col("item") == "indicator.debt_to_assets").then(-1e6).otherwise(1e6))
         .otherwise(pl.col("value")).alias("value"))
     snap = score_snapshot(panel, ic, AFTER)
     best = snap.filter(pl.col("symbol") == "600000.SH").row(0, named=True)
@@ -257,3 +266,78 @@ def test_metric_direction_label():
     up = RatioMetric("a", "A", "profitability", 1.0, higher_better=True)
     down = RatioMetric("b", "B", "profitability", 1.0, higher_better=False)
     assert up.direction == "越高越好" and down.direction == "越低越好"
+
+
+def test_score_universe_matches_scalar_banding():
+    """向量化打分必须与标量 :func:`score_by_percentile` 逐行一致。
+
+    ``score_universe`` 为了性能把档位判断内联成了 Polars 表达式，
+    而 ``score_by_percentile`` 仍是公开 API（也是档位口径的文档）。
+    两份实现各写一遍阈值迟早会漂移 —— 这条测试把它们钉在一起：
+    只要有人改了其中一边的阈值，就会在这里红。
+    """
+    from lquant.fundamental.percentile import score_by_percentile
+
+    panel, ic, _ = make_panel(items=FIXTURE_MIXED, n_per_industry=8)
+    detail = score_universe(panel, ic, AFTER)
+    assert detail.height > 0
+
+    by_item = {m.item: m for m in METRICS if m.item in set(FIXTURE_MIXED)}
+    assert by_item, "fixture 的指标必须真实存在于目录里"
+
+    for r in detail.iter_rows(named=True):
+        band = PercentileBand(r["p25"], r["p50"], r["p75"], r["n"])
+        expect = score_by_percentile(r["value"], band,
+                                     higher_better=by_item[r["item"]].higher_better)
+        assert r["ratio"] == pytest.approx(expect), (
+            f"{r['symbol']} {r['item']} value={r['value']} "
+            f"band=({r['p25']},{r['p50']},{r['p75']}) "
+            f"向量化={r['ratio']} 标量={expect}")
+
+
+def test_band_constants_are_shared_not_duplicated():
+    """档位阈值只应存在一份定义，且顺序单调。"""
+    from lquant.fundamental import percentile as p
+
+    assert p.BAND_RATIO_TOP > p.BAND_RATIO_MID > p.BAND_RATIO_LOW > p.BELOW_FLOOR
+    assert (p.BAND_RATIO_TOP, p.BAND_RATIO_MID, p.BAND_RATIO_LOW, p.BELOW_FLOOR) \
+        == (1.0, 0.8, 0.5, 0.2)
+
+
+def test_long_view_returns_none_when_no_metric_column_present():
+    """面板里一个目录指标都没有 → 走 resolve_pit 的空帧分支。"""
+    panel, ic, _ = make_panel(items=("unknown.a", "unknown.b"))
+    assert percentile_table(panel, ic, AFTER).is_empty()
+    assert score_universe(panel, ic, AFTER).is_empty()
+
+
+def test_long_view_returns_none_when_industry_join_yields_nothing():
+    """有财务数据、但行业分类一只都对不上 → 视为无可用数据。
+
+    注意这与上一条是**不同分支**：上一条在 ``resolve_pit`` 就空了，
+    这条是宽表非空、join 行业后为空。不区分就会写出「绿在错误分支上」的测试。
+    """
+    panel, _, _ = make_panel()                       # 指标都是真实目录键
+    other = pl.DataFrame({
+        "symbol": ["999999.SH"], "std": ["sw"], "code": ["银行"],
+        "name": ["银行"], "std_date": [date(2024, 1, 1)], "source": ["test"],
+    })
+    assert resolve_pit(panel, AFTER).height > 0       # 宽表确实非空
+    assert percentile_table(panel, other, AFTER).is_empty()
+    assert score_universe(panel, other, AFTER).is_empty()
+
+
+def test_bands_empty_when_all_values_null():
+    """全为 null 时降级为空分位表，而不是让 quantile 产出垃圾。"""
+    panel, ic, _ = make_panel()
+    panel = panel.with_columns(pl.lit(None, dtype=pl.Float64).alias("value"))
+    tbl = percentile_table(panel, ic, AFTER)
+    assert tbl.is_empty()
+    assert set(tbl.columns) >= {"industry", "item", "p25", "p50", "p75", "n"}
+
+
+def test_score_universe_empty_catalogue_and_unreachable_min_samples():
+    """两条提前返回：目录为空、以及分位样本阈值高到没有行业达标。"""
+    panel, ic, _ = make_panel()
+    assert score_universe(panel, ic, AFTER, ()).is_empty()          # 空目录
+    assert score_universe(panel, ic, AFTER, min_samples=100).is_empty()  # 无行业达标
