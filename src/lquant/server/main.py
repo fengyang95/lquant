@@ -28,6 +28,7 @@ from lquant.server.api import (
     news,
     paper,
     qlib,
+    security,
     settings,
     strategies,
     sync,
@@ -61,7 +62,7 @@ def create_app() -> FastAPI:
     )
     for r in (health, data, data_admin, factors, backtests, market, paper, watchlist,
               strategies, analyses, sync, etf, news, settings, ask, agent,
-              qlib, task_center, monitor, fundamental, ml):
+              qlib, task_center, monitor, fundamental, ml, security):
         app.include_router(r.router, prefix="/api")
     app.include_router(ws.router)  # /ws/jobs/{id}，无 /api 前缀（与前端代理一致）
     # A2A：Agent Card 按 RFC 8615 挂在 /.well-known/，POST 落在 /a2a —— 两者都

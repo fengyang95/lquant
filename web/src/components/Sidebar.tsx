@@ -9,6 +9,7 @@ const GROUPS: { label: string; items: { href: string; label: string }[] }[] = [
     label: '市场',
     items: [
       { href: '/dashboard', label: '大盘' },
+      { href: '/security', label: '个股分析' },
       { href: '/sectors', label: '板块' },
       { href: '/watchlist', label: '自选' },
       { href: '/news', label: '资讯' },
