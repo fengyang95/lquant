@@ -214,3 +214,113 @@ def test_cli_build_report_forwards_extras_and_errors(monkeypatch, tmp_path) -> N
     assert "errors" in captured["report_kw"]
     # 归因阶梯拿到了「中性化之前」的帧
     assert captured["extras_kw"]["pre_recipe_df"] is frame
+
+
+def _stub_cli_report(monkeypatch, frame, *, rating=None, capacity=None,
+                     rating_raises=False, capacity_raises=False,
+                     apply_filters=None, settings=None):
+    """把 `_build_report` 的依赖全部打桩，返回 (cli_factor, captured)。"""
+    import lquant.factors.evaluate as ev_pkg
+    import lquant.factors.evaluate.capacity as cap_mod
+    import lquant.factors.evaluate.extras as extras_mod
+    import lquant.factors.evaluate.rating as rating_mod
+    import lquant.factors.evaluate.report as report_mod
+    import lquant.factors.evaluate.sample as sample_mod
+    from lquant.cli.commands import factor as cli_factor
+
+    monkeypatch.setattr(cli_factor, "_load_segments",
+                        lambda start, expr, **kw: ({"train": frame}, ["cov_market_cap"],
+                                                   {}, frame))
+    monkeypatch.setattr(extras_mod, "build_report_extras",
+                        lambda df, factor, ret_col, **kw: {"excess": {"dates": []}})
+    if rating_raises:
+        def _rboom(*_a, **_k):
+            raise RuntimeError("rating down")
+        monkeypatch.setattr(rating_mod, "factor_rating", _rboom)
+    else:
+        monkeypatch.setattr(rating_mod, "factor_rating",
+                            lambda ic, qs: rating or {"rating": "weak"})
+    if capacity_raises:
+        def _cboom(*_a, **_k):
+            raise RuntimeError("capacity down")
+        monkeypatch.setattr(cap_mod, "capacity_summary", _cboom)
+    else:
+        monkeypatch.setattr(cap_mod, "capacity_summary",
+                            lambda *a, **k: capacity or {"capacity_aum": 1.0})
+    if apply_filters is not None:
+        monkeypatch.setattr(sample_mod, "apply_sample_filters", apply_filters)
+    if settings is not None:
+        monkeypatch.setattr("lquant.core.config.get_settings", lambda: settings)
+
+    captured: dict = {}
+
+    def _fake_report(df, factor, ret_col="fwd_ret_1", **kw):
+        captured["report_kw"] = kw
+        return "<html>stub</html>"
+
+    monkeypatch.setattr(report_mod, "factor_report", _fake_report)
+    monkeypatch.setattr(ev_pkg, "factor_report", _fake_report)
+    return cli_factor, captured
+
+
+def _frame(**extra):
+    base = {
+        "trade_date": [date(2026, 1, 5)] * 3,
+        "symbol": ["a", "b", "c"],
+        "f": [1.0, 2.0, 3.0],
+        "fwd_ret_1": [0.01, 0.02, 0.03],
+        "cov_market_cap": [1.0, 2.0, 3.0],
+    }
+    base.update(extra)
+    return pl.DataFrame(base)
+
+
+def test_cli_report_applies_sample_filter(monkeypatch, tmp_path) -> None:
+    """--exclude-st 走真正的过滤路径，并把开关状态写进报告披露。"""
+    calls = []
+
+    def _fake_filter(df, *, exclude_st=False, exclude_suspended=False):
+        calls.append((exclude_st, exclude_suspended))
+        return df
+
+    cli_factor, captured = _stub_cli_report(
+        monkeypatch, _frame(is_st=[False, True, False]),
+        apply_filters=_fake_filter)
+    info = cli_factor._build_report("Ts_Mean($close,5)", out=str(tmp_path / "r.html"),
+                                    exclude_st=True)
+    assert calls == [(True, False)]
+    assert info["exclude_st"] is True
+    assert captured["report_kw"]["sample_filters"]  # 披露行存在
+
+
+def test_cli_report_rejects_empty_sample(monkeypatch, tmp_path) -> None:
+    """过滤后一行不剩 → ClickException，而不是生成一份空报告。"""
+    import click
+
+    cli_factor, _ = _stub_cli_report(
+        monkeypatch, _frame(is_st=[True, True, True]),
+        apply_filters=lambda df, **_k: df.head(0))
+    with pytest.raises(click.ClickException) as ei:
+        cli_factor._build_report("Ts(M)", out=str(tmp_path / "r.html"), exclude_st=True)
+    assert "样本过滤后没有剩余数据" in str(ei.value)
+
+
+def test_cli_report_records_rating_and_capacity_failures(monkeypatch, tmp_path) -> None:
+    cli_factor, captured = _stub_cli_report(
+        monkeypatch, _frame(), rating_raises=True, capacity_raises=True)
+    info = cli_factor._build_report("Ts_Mean($close,5)", out=str(tmp_path / "r.html"))
+    assert info["rating"] is None and info["capacity_aum"] is None
+    errs = captured["report_kw"]["errors"]
+    assert "rating down" in errs["rating"] and "capacity down" in errs["capacity"]
+
+
+def test_cli_report_default_output_path(monkeypatch, tmp_path) -> None:
+    """不传 --out：落到 Settings.reports_dir（相对路径锚定仓库根）。"""
+    from types import SimpleNamespace
+
+    s = SimpleNamespace(root=tmp_path, reports_dir="./data/reports")
+    cli_factor, _ = _stub_cli_report(monkeypatch, _frame(), settings=s)
+    info = cli_factor._build_report("Ts_Mean($close,5)")
+    assert info["report"].startswith(str(tmp_path / "data" / "reports"))
+    assert info["report"].endswith(".html")
+    assert info["factor_id"] in info["report"]

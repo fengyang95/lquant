@@ -218,3 +218,71 @@ def test_factor_report_optional_sections_failure_is_disclosed(
     assert "本节生成失败" in html
     for key in ("attribution", "group_ic", "turnover", "cost_matrix"):
         assert key in html
+
+
+# --------------------------------------------------------------------------- #
+# 内部辅助的边界分支（平时跑不到，但决定「显示成什么」）
+# --------------------------------------------------------------------------- #
+def test_ret_label_branches() -> None:
+    assert rep._ret_label("fwd_ret_5") == "5 日前瞻收益"
+    assert rep._ret_label("fwd_ret_x") == "fwd_ret_x"   # 不认识的持有期原样返回
+    assert rep._ret_label("custom_ret") == "custom_ret"
+
+
+def test_fmt_int_branches() -> None:
+    assert rep._fmt_int(None) == "n/a"
+    assert rep._fmt_int(True) == "True"
+    assert rep._fmt_int(float("nan")) == "n/a"
+    assert rep._fmt_int(3.9) == "3"
+    assert rep._fmt_int("x") == "x"
+
+
+def test_rows_table_empty_returns_empty() -> None:
+    assert rep._rows_table([]) == ""
+    assert rep._rows_table(None or []) == ""
+
+
+def test_empty_blocks_are_skipped_not_rendered_as_blank() -> None:
+    assert rep._views_html(None) == ""
+    # 既没有可渲染的行、也没有口径说明 → 整节省略（不留一个空标题）
+    assert rep._views_html({}) == ""
+    assert rep._size_ic_html(None) == ""
+    assert rep._size_ic_html({"rows": []}) == ""
+    assert rep._style_html({}) == ""
+    assert rep._style_html({"max_abs": None}) == ""
+
+
+def test_table_survives_schema_introspection_failure() -> None:
+    """取不到 schema 时只放弃「整数列优化」，不许把整张表打挂。"""
+    class _BadSchema:
+        def __getitem__(self, _k):
+            raise RuntimeError("no schema")
+
+    class _FakeDF:
+        columns = ["a"]
+        schema = _BadSchema()
+
+        def __len__(self):
+            return 1
+
+        def iter_rows(self, named=False):
+            yield {"a": 1.5}
+
+    html = rep._table(_FakeDF(), limit=None)
+    assert "<table>" in html and "1.5000" in html
+
+
+def test_provenance_range_variants() -> None:
+    kw = dict(display_name="f", expr="x", universe="all", n_samples=10,
+              ret_col="fwd_ret_1", steps=None, covariates=None,
+              sample_filters=None, window=60, n_groups=10,
+              generator_version="2.0")
+    assert "2026-01-01 起" in rep._provenance_html(data_start="2026-01-01",
+                                                  data_end=None, **kw)
+    assert "至 2026-02-01" in rep._provenance_html(data_start=None,
+                                                   data_end="2026-02-01", **kw)
+    assert "未提供" in rep._provenance_html(data_start=None, data_end=None, **kw)
+
+
+def test_conclusion_section_absent_without_rating() -> None:
+    assert rep._conclusion_html(None, None, "随意的一句话") == ""

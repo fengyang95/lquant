@@ -73,6 +73,14 @@ def test_read_report_expr(tmp_path) -> None:
     assert idx.read_report_expr(p2) is None
 
 
+def test_read_meta_and_expr_tolerate_unreadable_path(tmp_path) -> None:
+    """目录（或任何读不开的路径）不能把报告中心整页拖挂。"""
+    d = tmp_path / "adir.html"
+    d.mkdir()
+    assert idx.read_report_meta(d) == (None, None)
+    assert idx.read_report_expr(d) is None
+
+
 # --------------------------------------------------------------------------- #
 # 表达式推断：只认精确来源，绝不猜
 # --------------------------------------------------------------------------- #
@@ -150,7 +158,8 @@ def test_resolve_canonical_id_reverse_lookup(tmp_path, monkeypatch) -> None:
             return None
 
         def fetchall(self):
-            return [("myfac", expr_text)]
+            # 第一条表达式解析不了 → 必须跳过它继续找，而不是整批放弃
+            return [("broken", ")(("), ("myfac", expr_text)]
 
     class _Ctx:
         def __enter__(self):
@@ -163,6 +172,45 @@ def test_resolve_canonical_id_reverse_lookup(tmp_path, monkeypatch) -> None:
     expr, why = idx.resolve_report_expression(f"factor_{cid}")
     assert expr == expr_text
     assert "canonical_id" in why
+
+
+def test_resolve_reports_registry_unreadable(monkeypatch) -> None:
+    import lquant.core.db as db_mod
+
+    def _boom():
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(db_mod, "reader", _boom)
+    expr, why = idx.resolve_report_expression("anything")
+    assert expr is None and "不可读" in why
+
+
+def test_resolve_reports_reverse_lookup_failure(monkeypatch) -> None:
+    """反查阶段读库失败也要给出原因，而不是静默返回 None。"""
+    import lquant.core.db as db_mod
+
+    class _Con:
+        def execute(self, sql, params=None):
+            if "LIKE" in sql or "expression IS NOT NULL" in sql:
+                return self
+            return self
+
+        def fetchone(self):
+            return None                     # 名字查不到 → 进入 canonical_id 反查
+
+        def fetchall(self):
+            raise RuntimeError("scan failed")
+
+    class _Ctx:
+        def __enter__(self):
+            return _Con()
+
+        def __exit__(self, *_a):
+            return False
+
+    monkeypatch.setattr(db_mod, "reader", lambda: _Ctx())
+    expr, why = idx.resolve_report_expression("factor_deadbeefdeadbeef")
+    assert expr is None and "反查失败" in why
 
 
 # --------------------------------------------------------------------------- #
@@ -290,3 +338,44 @@ def test_cli_reports_rebuild_does_not_touch_current_reports(report_dir, monkeypa
     assert [x["name"] for x in body["rebuilt"]] == ["old"]
     assert calls == [str(report_dir / "old.html")]
     assert body["n_reports"] == 2 and body["n_selected"] == 1
+
+
+def test_cli_reports_stale_only_hint_and_limit(report_dir) -> None:
+    """--stale-only 只列不删并给出后续动作；--limit 截断处理集合。"""
+    import json
+
+    for i in range(3):
+        _write(report_dir / f"old{i}.html", None)
+    r = _invoke("reports", "--stale-only")
+    body = json.loads(r.output)
+    assert body["scope"] == "stale" and body["n_selected"] == 3
+    assert "--rebuild-stale" in body["hint"]
+    assert "prune" not in body and "rebuilt" not in body
+
+    r2 = _invoke("reports", "--stale-only", "--limit", "1")
+    assert json.loads(r2.output)["n_selected"] == 1
+
+
+def test_cli_reports_rebuild_failure_is_reported_per_report(report_dir, monkeypatch) -> None:
+    """单份重算失败不能拖垮整批：进 skipped 并带异常类型。"""
+    import json
+
+    from lquant.cli.commands import factor as cli_factor
+
+    _write(report_dir / "bad.html", None)
+    _write(report_dir / "good.html", None)
+
+    def _fake_build(expr, *, out=None, start=None, **kw):
+        if str(out).endswith("bad.html"):
+            raise RuntimeError("build exploded")
+        return {"report": out, "bytes": 1}
+
+    monkeypatch.setattr(cli_factor, "_build_report", _fake_build)
+    monkeypatch.setattr("lquant.factors.evaluate.reports_index.resolve_report_expression",
+                        lambda stem, path=None: ("pct_change_5", "stub"))
+    r = _invoke("reports", "--rebuild-stale")
+    assert r.exit_code == 0, r.output
+    body = json.loads(r.output)
+    assert [x["name"] for x in body["rebuilt"]] == ["good"]
+    assert [x["name"] for x in body["skipped"]] == ["bad"]
+    assert "build exploded" in body["skipped"][0]["reason"]
