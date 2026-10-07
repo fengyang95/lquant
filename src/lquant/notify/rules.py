@@ -23,6 +23,7 @@ alert_type 首批五种（都是纯数值比较，不碰数据源）：
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -278,12 +279,18 @@ def evaluate(rule: AlertRule, ctx: dict) -> tuple[str, str]:
         return COOLDOWN, f"冷却至 {rule.cooldown_until}"
     try:
         threshold = float(rule.parameters.get("threshold"))
+        missing_ic = False
         if rule.alert_type in ("price_above", "price_below"):
             px = float(ctx["last_price"])
             hit = px >= threshold if rule.alert_type == "price_above" else px <= threshold
         elif rule.alert_type == "ic_below":
-            ic = float(ctx["ic"])
-            hit = ic <= threshold
+            raw = ctx["ic"]  # KeyError → EVAL_ERROR（缺字段不是「未触发」）
+            ic = None if raw is None else float(raw)
+            # IC 为 None/NaN/Inf：窗口内因子已无可用截面信息（如某日截面内
+            # 退化成常数时 pl.corr 返回 NaN）。这正是 ic_below 要抓的失效，
+            # 此前 `nan <= threshold` 恒为 False —— 退化的因子被静默放过。
+            missing_ic = ic is None or not math.isfinite(ic)
+            hit = missing_ic or ic <= threshold
         else:  # pct_change_up / pct_change_down
             px, pre = float(ctx["last_price"]), float(ctx["pre_close"])
             if pre <= 0:
@@ -295,6 +302,8 @@ def evaluate(rule: AlertRule, ctx: dict) -> tuple[str, str]:
     except (TypeError, ValueError) as e:
         return EVAL_ERROR, f"ctx 数值非法: {e}"
     if hit:
+        if missing_ic:
+            return TRIGGERED, f"ic_below 命中：IC 缺失/非有限（threshold={threshold}）"
         return TRIGGERED, f"{rule.alert_type} 命中 (threshold={threshold})"
     return NOT_TRIGGERED, "未命中"
 
@@ -323,11 +332,15 @@ def run_rules(ctxs: list[dict], store: RuleStore | None = None, notify_fn=None) 
             continue
         # 同一规则对多条行情逐一评估，任一命中即触发一次（合并 detail，不刷屏）
         results = [evaluate(rule, c) for c in matched]
-        hit = next((r for r in results if r[0] == TRIGGERED), None)
+        hit_idx = next((i for i, r in enumerate(results) if r[0] == TRIGGERED), None)
         err = next((r for r in results if r[0] == EVAL_ERROR), None)
-        if hit:
+        if hit_idx is not None:
+            hit = results[hit_idx]
             store.mark_triggered(rule.id, rule.cooldown_seconds)
-            sym = matched[results.index(hit)].get("symbol", "")
+            # 必须用命中的**那一行**下标取 symbol：此前 matched[results.index(hit)]
+            # 是元组相等查找，两个标的给出同样的 (status, detail) 时会指到先出现
+            # 的那个 —— 通知里的标的和证据不是同一只。
+            sym = matched[hit_idx].get("symbol", "")
             notify_fn(
                 f"[{rule.severity}] {rule.name}",
                 f"{sym} {hit[1]}",

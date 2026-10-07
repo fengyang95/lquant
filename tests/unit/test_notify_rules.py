@@ -120,6 +120,52 @@ def test_run_rules_triggers_and_notifies(tmp_path):
     assert results2[0]["status"] == COOLDOWN and len(fired) == 1
 
 
+def test_evaluate_ic_below_treats_non_finite_as_hit():
+    """ic_below 对 None/NaN 必须判命中（因子退化到无 IC 正是要抓的失效）。
+
+    修复前 ``float(ctx["ic"])`` 遇 None 直接 EVAL_ERROR，遇 NaN 则
+    ``nan <= threshold`` 恒 False → 退化因子静默漏报。
+    """
+    rule = AlertRule(name="因子失效", alert_type="ic_below", parameters={"threshold": 0.0})
+    for raw in (None, float("nan"), float("inf")):
+        status, detail = evaluate(rule, {"symbol": "f1", "ic": raw})
+        assert status == TRIGGERED, (raw, status, detail)
+        assert "缺失/非有限" in detail
+    # 正常数值照旧比阈值
+    assert evaluate(rule, {"symbol": "f1", "ic": -0.02})[0] == TRIGGERED
+    assert evaluate(rule, {"symbol": "f1", "ic": 0.05})[0] == NOT_TRIGGERED
+    # 缺字段仍是 EVAL_ERROR（不是「未触发」）
+    assert evaluate(rule, {"symbol": "f1"})[0] == EVAL_ERROR
+
+
+def test_run_rules_names_the_symbol_that_actually_hit(tmp_path):
+    """多标的命中同一条规则时，通知里的标的是**命中的那一只**。
+
+    修复前用 ``matched[results.index(hit)]`` 按元组相等查找：两只票给出同样的
+    (status, detail) 时会指回先出现的那只 —— 通知里印着 A，证据却是 B 的。
+    """
+    store = RuleStore(tmp_path / "r.db")
+    store.add(
+        AlertRule(
+            name="全市场跌破",
+            target_scope="market",
+            target="",
+            alert_type="price_below",
+            parameters={"threshold": 10.0},
+            cooldown_seconds=0,
+        )
+    )
+    fired: list[tuple] = []
+    ctxs = [
+        {"symbol": "600000.SH", "last_price": 12.0},   # 未命中（先出现）
+        {"symbol": "000001.SZ", "last_price": 9.5},    # 命中（后出现）
+    ]
+    results = run_rules(ctxs, store=store, notify_fn=lambda t, x, **k: fired.append((t, x, k)))
+    assert results[0]["status"] == TRIGGERED
+    assert "000001.SZ" in results[0]["detail"]
+    assert "000001.SZ" in fired[0][1] and "600000.SH" not in fired[0][1]
+
+
 def test_run_rules_market_scope_matches_all(tmp_path):
     store = RuleStore(tmp_path / "r.db")
     store.add(
