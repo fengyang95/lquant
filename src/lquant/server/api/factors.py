@@ -403,18 +403,43 @@ def delete_factor(name: str) -> dict:
     return {"deleted": name}
 
 
-def _universe_symbols(universe: str | None) -> list[str] | None:
+def _universe_symbols(universe: str | None, *, as_of=None) -> list[str] | None:
     """股票池 → 成分股清单；all/None → 不过滤。
 
-    研究态口径：取该指数最新一次成分快照（IndexConsRepo 的当下口径，
-    与 get_index_stocks 一致）；成分表未同步时 503 提示先同步。
+    口径分两档：
+
+    - ``as_of`` 给出（评价区间起点）：取该日**已生效**的成分
+      （``IndexConsRepo.symbols_as_of``，与 JQ 方言 get_index_stocks 防前视
+      同一口径）。用「今天的成分」回溯十年历史会引入幸存者偏差——中途调入
+      的大牛股被事后追溯进评价池、被调出的衰落股丢失，IC 系统性高估；
+      评价请求带区间时必须走这一档。
+    - ``as_of`` 缺省（或区间起点为 None）：最新一次快照，研究态当下口径。
+
+    成分表未同步 / 起点前无任何已生效快照时 503 提示先同步——历史区间
+    评价需要按期累积成分快照，不能拿当下快照假装历史。
     """
     if not universe or universe == "all":
         return None
+    from datetime import date as _date
+
     from lquant.factors.universe import resolve_index_code
 
     code = resolve_index_code(universe)
-    symbols = IndexConsRepo().latest_symbols(code)
+    repo = IndexConsRepo()
+    if as_of is not None:
+        if isinstance(as_of, str):
+            try:
+                as_of = _date.fromisoformat(as_of)
+            except ValueError as e:
+                raise HTTPException(422, f"as_of 日期非法: {as_of!r}") from e
+        symbols = repo.symbols_as_of(code, as_of)
+        if not symbols:
+            raise HTTPException(
+                503,
+                f"指数 {code} 在 {as_of} 当日无已生效成分快照，"
+                "先在数据页同步指数成分（index_cons）；历史区间评价需按期累积成分快照")
+        return symbols
+    symbols = repo.latest_symbols(code)
     if not symbols:
         raise HTTPException(
             503, f"指数 {code} 成分股为空，先在数据页同步指数成分（index_cons）")
@@ -497,7 +522,7 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
 
     _step(2, "读取日线")
     df = read_daily(start=req.start, end=req.end,
-                    symbols=_universe_symbols(req.universe)).collect()
+                    symbols=_universe_symbols(req.universe, as_of=req.start)).collect()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
     _step(10, "计算因子")
@@ -977,7 +1002,7 @@ def trace_ep(req: TraceIn) -> dict:
     from lquant.factors.evaluate.returns import forward_return
 
     df = read_daily(start=req.start, end=req.end,
-                    symbols=_universe_symbols(req.universe)).collect()
+                    symbols=_universe_symbols(req.universe, as_of=req.start)).collect()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
     d = _compute_factor(df, req.formula)
@@ -1392,7 +1417,7 @@ def analyze(req: AnalyzeIn) -> dict:
     from lquant.factors.analysis import correlation
 
     df = read_daily(start=req.start, end=req.end,
-                    symbols=_universe_symbols(req.universe)).collect()
+                    symbols=_universe_symbols(req.universe, as_of=req.start)).collect()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
     try:
@@ -1426,7 +1451,7 @@ def synthesize(req: SynthesizeIn) -> dict:
     from lquant.factors import analysis as fa
 
     df = read_daily(start=req.start, end=req.end,
-                    symbols=_universe_symbols(req.universe)).collect()
+                    symbols=_universe_symbols(req.universe, as_of=req.start)).collect()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
     try:
