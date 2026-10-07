@@ -35,11 +35,22 @@ __all__ = [
 
 
 def _watchlist_symbols() -> list[str]:
-    """自选清单（DuckDB 小表，按加入时间稳定排序）。"""
+    """自选清单（DuckDB 小表，按加入时间稳定排序）。
+
+    ``watchlist`` 的建表语句在 Web 端（``server/api/watchlist.py``），**首次访问
+    端点时才建** —— 而 ``lq notify digest`` 的典型用法恰恰是无人打开 UI 的
+    定时任务（README 的外部 cron 姿势）。缺表按「自选清单为空」处理：
+    日报退化成空清单，而不是让整个 cron 以 CatalogException 失败。
+    """
+    from duckdb import CatalogException
+
     from lquant.core.db import reader
 
     with reader() as con:
-        rows = con.execute("SELECT symbol FROM watchlist ORDER BY added_at").fetchall()
+        try:
+            rows = con.execute("SELECT symbol FROM watchlist ORDER BY added_at").fetchall()
+        except CatalogException:
+            return []
     return [r[0] for r in rows]
 
 

@@ -101,7 +101,33 @@ def test_digest_defaults_to_watchlist_table(monkeypatch):
     assert spy.calls[0]["category"] == "report"
 
 
-# ---------- 审阅修复回归：sent 按真实送达判定 ----------
+def test_watchlist_symbols_missing_table_is_empty_not_crash(tmp_path, monkeypatch):
+    """``watchlist`` 表不存在时按空清单处理（cron 姿势下 UI 从没被打开过）。
+
+    建表语句在 Web 端点里（首次访问才建），而 ``lq notify digest`` 的典型用法
+    恰恰是无人的定时任务 —— 这里不能让 CatalogException 冒出去炸掉整个 cron。
+    """
+    import duckdb
+
+    monkeypatch.setenv("LQ_ROOT", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    from lquant.core.config import get_settings
+
+    get_settings.cache_clear()
+    (tmp_path / "data" / "duckdb").mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(str(get_settings().duckdb_path))
+    con.execute("CREATE TABLE security (symbol VARCHAR)")  # 库在，但没 watchlist
+    con.close()
+
+    assert dg._watchlist_symbols() == []
+    # 端到端：默认读自选清单的日报退化成「清单为空」，而不是异常
+    spy = NotifySpy()
+    res = run_watchlist_digest(analyze_fn=lambda s, a: make_report(s), notify_fn=spy)
+    assert res == {"sent": False, "ok": [], "failed": [], "skipped": "清单为空"}
+    assert spy.calls == []
+    get_settings.cache_clear()
+
+
 
 
 class SuppressedNotify:
