@@ -403,8 +403,8 @@ def delete_factor(name: str) -> dict:
     return {"deleted": name}
 
 
-def _universe_symbols(universe: str | None, *, as_of=None) -> list[str] | None:
-    """股票池 → 成分股清单；all/None → 不过滤。
+def _resolve_universe(universe: str | None, *, as_of=None) -> tuple[list[str] | None, str | None]:
+    """股票池 → (成分股清单, 口径替换说明)；all/None → (None, None)。
 
     口径分两档：
 
@@ -415,11 +415,18 @@ def _universe_symbols(universe: str | None, *, as_of=None) -> list[str] | None:
       评价请求带区间时必须走这一档。
     - ``as_of`` 缺省（或区间起点为 None）：最新一次快照，研究态当下口径。
 
-    成分表未同步 / 起点前无任何已生效快照时 503 提示先同步——历史区间
-    评价需要按期累积成分快照，不能拿当下快照假装历史。
+    第二个返回值是**降级披露**（无降级时为 None）。之所以需要它：成分快照
+    目前只同步最新一批（``ingest/index_cons.py``），而评价请求的起点默认是
+    固定的 ``2026-01-01``（Web 表单同款默认值）——「起点早于首次同步」因此是
+    常态而非例外。此时若按严格口径返回 503，带指数池的评价/合成/快照接口在
+    真实库上会**永久**打不开（再同步也只会产生更晚的 eff_date），所以退回该
+    指数现存最早一批作为最接近的可得成分，并把这个替换**显式回传**给调用方
+    （响应字段 + 报告口径披露），绝不静默冒充严格 point-in-time。
+
+    只有「该指数一条快照都没有」才继续 503（那才是真需要先同步）。
     """
     if not universe or universe == "all":
-        return None
+        return None, None
     from datetime import date as _date
 
     from lquant.factors.universe import resolve_index_code
@@ -433,17 +440,37 @@ def _universe_symbols(universe: str | None, *, as_of=None) -> list[str] | None:
             except ValueError as e:
                 raise HTTPException(422, f"as_of 日期非法: {as_of!r}") from e
         symbols = repo.symbols_as_of(code, as_of)
-        if not symbols:
+        if symbols:
+            return symbols, None
+        eff, fallback = repo.earliest_batch(code)
+        if eff is None:
             raise HTTPException(
                 503,
-                f"指数 {code} 在 {as_of} 当日无已生效成分快照，"
-                "先在数据页同步指数成分（index_cons）；历史区间评价需按期累积成分快照")
-        return symbols
+                f"指数 {code} 无任何成分快照，先在数据页同步指数成分（index_cons）")
+        return fallback, (
+            f"成分口径替换：{as_of} 之前无已生效快照，改用现存最早一批 "
+            f"{eff} 的成分（该池非严格 point-in-time，幸存者偏差防护降级；"
+            "要精确口径需按期累积成分快照）"
+        )
     symbols = repo.latest_symbols(code)
     if not symbols:
         raise HTTPException(
             503, f"指数 {code} 成分股为空，先在数据页同步指数成分（index_cons）")
-    return symbols
+    return symbols, None
+
+
+def _universe_symbols(universe: str | None, *, as_of=None) -> list[str] | None:
+    """``_resolve_universe`` 的清单视图（兼容既有调用方/测试）。"""
+    return _resolve_universe(universe, as_of=as_of)[0]
+
+
+def _universe_label(universe: str, note: str | None) -> str:
+    """报告里的股票池展示串：有口径替换时把披露并进标签。"""
+    if not note:
+        return universe
+    from lquant.factors.universe import universe_label
+
+    return f"{universe_label(universe)}（{note}）"
 
 
 def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
@@ -521,8 +548,8 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
             progress(done=pct, total=100, phase=phase)
 
     _step(2, "读取日线")
-    df = read_daily(start=req.start, end=req.end,
-                    symbols=_universe_symbols(req.universe, as_of=req.start)).collect()
+    uni_symbols, uni_note = _resolve_universe(req.universe, as_of=req.start)
+    df = read_daily(start=req.start, end=req.end, symbols=uni_symbols).collect()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
     _step(10, "计算因子")
@@ -783,7 +810,8 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
             d, "_factor", ret_col, n_groups=req.n_groups, horizons=req.horizons,
             cat_col=cat_col, group_col=cat_col,
             bps_list=list(DEFAULT_BPS),
-            universe=req.universe, outlier_stats=outlier_stats,
+            universe=_universe_label(req.universe, uni_note),
+            outlier_stats=outlier_stats,
             event_window=(req.event_window[0], req.event_window[1]),
             display_name=req.factor, expr=req.formula,
             data_start=req.start, data_end=req.end, n_samples=len(d),
@@ -824,6 +852,10 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
         # 故障可见：UI 必须能区分「没数据」与「算炸了」
         "errors": errors,
     }
+    if uni_note:
+        # 股票池口径被降级时必须显式回传（见 _resolve_universe）：否则用户
+        # 以为拿到的是严格 as-of 成分，实际是最早一批可得快照。
+        series["universe_note"] = uni_note
     metrics["errors"] = errors
     _step(95, "汇总")
     return metrics, series
@@ -1001,8 +1033,8 @@ def trace_ep(req: TraceIn) -> dict:
     from lquant.factors.evaluate import trace_snapshot
     from lquant.factors.evaluate.returns import forward_return
 
-    df = read_daily(start=req.start, end=req.end,
-                    symbols=_universe_symbols(req.universe, as_of=req.start)).collect()
+    uni_symbols, uni_note = _resolve_universe(req.universe, as_of=req.start)
+    df = read_daily(start=req.start, end=req.end, symbols=uni_symbols).collect()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
     d = _compute_factor(df, req.formula)
@@ -1017,6 +1049,8 @@ def trace_ep(req: TraceIn) -> dict:
     except FactorError as e:
         raise HTTPException(422, str(e)) from e
     snap["factor"] = req.factor
+    if uni_note:
+        snap["universe_note"] = uni_note
     return snap
 
 
@@ -1416,12 +1450,15 @@ def analyze(req: AnalyzeIn) -> dict:
     from lquant.core.errors import FactorError
     from lquant.factors.analysis import correlation
 
-    df = read_daily(start=req.start, end=req.end,
-                    symbols=_universe_symbols(req.universe, as_of=req.start)).collect()
+    uni_symbols, uni_note = _resolve_universe(req.universe, as_of=req.start)
+    df = read_daily(start=req.start, end=req.end, symbols=uni_symbols).collect()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
     try:
-        return correlation(df, req.formulas, threshold=req.threshold)
+        out = correlation(df, req.formulas, threshold=req.threshold)
+        if uni_note:
+            out["universe_note"] = uni_note
+        return out
     except (ValueError, FactorError) as e:
         # FactorError 不是 ValueError：公式本身写错（DSL 未知字段/算子）也是
         # 客户端问题，不能放任它冒成 500
@@ -1450,8 +1487,8 @@ def synthesize(req: SynthesizeIn) -> dict:
     from lquant.core.errors import FactorError
     from lquant.factors import analysis as fa
 
-    df = read_daily(start=req.start, end=req.end,
-                    symbols=_universe_symbols(req.universe, as_of=req.start)).collect()
+    uni_symbols, uni_note = _resolve_universe(req.universe, as_of=req.start)
+    df = read_daily(start=req.start, end=req.end, symbols=uni_symbols).collect()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
     try:
@@ -1525,7 +1562,7 @@ def synthesize(req: SynthesizeIn) -> dict:
                    covariates=cov_map,
                    sample_filters=describe_sample_filters(d),
                    window=DEFAULT_WINDOW,
-                   universe=req.universe,
+                   universe=_universe_label(req.universe, uni_note),
                    errors=errors,
                    extras={**extras, "capacity": capacity})
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1543,4 +1580,5 @@ def synthesize(req: SynthesizeIn) -> dict:
         "monotonicity": _jf(res["quantile"]["monotonicity"], 3),
         "half_life": res["decay"]["half_life"],
         "report_url": f"/api/factors/reports/{name}",
+        **({"universe_note": uni_note} if uni_note else {}),
     }
