@@ -63,6 +63,17 @@ def _signal(cond: pl.Expr, name: str) -> pl.Expr:
     return pl.when(cond.fill_null(False)).then(1).otherwise(0).cast(pl.Int8).alias(name)
 
 
+def _check_trend_n(trend_n: int) -> None:
+    """趋势背景的窗口下限校验（fail-loudly）。
+
+    trend_n < 1 时 ``shift(0)`` 自比较恒 False（指标静默全 0）、负数
+    ``shift(-n)`` 会引用**未来根**（真实 lookahead —— 前缀不变性门禁只
+    测缺省参数，抓不到运行时传入），所以在入口直接拒绝。
+    """
+    if int(trend_n) < 1:
+        raise ValueError(f"trend_n 必须 >= 1，收到 {trend_n}（负数会引用未来数据）")
+
+
 @register_indicator(
     "pattern_doji",
     label="十字星",
@@ -79,10 +90,15 @@ def add_doji(
 
     ``min_range_pct`` 是绝对振幅下限（相对当根收盘价），防极窄幅 K 线的
     比例噪声：分母太小的时候 body/rng 的随机性没有意义。一字板
-    （高=低）振幅为 0 直接不成立。
+    （高=低）振幅为 0 直接不成立；close<=0 的脏价数据同样不成立。
     """
     rng = _rng()
-    cond = (rng > 0) & (rng >= pl.col("close") * min_range_pct) & (_body() <= body_ratio * rng)
+    cond = (
+        (rng > 0)
+        & (pl.col("close") > 0)
+        & (rng >= pl.col("close") * min_range_pct)
+        & (_body() <= body_ratio * rng)
+    )
     return df.with_columns(_signal(cond, "pattern_doji"))
 
 
@@ -108,7 +124,11 @@ def add_hammer(
     跌势判定：trend_n 根前收盘高于当根收盘（严格历史参照）。
     实体为 0 的蜻蜓十字（长下影 + 开收同价）同属锤头家族，会被判为 1
     —— 教科书口径即如此。
+
+    注意：注册表 ``min_window`` 按**缺省参数**（trend_n=5）静态声明；
+    运行时调大 trend_n 后真实预热为 trend_n+1，取数方需自行多备。
     """
+    _check_trend_n(trend_n)
     rng = _rng()
     cond = (
         (rng > 0)
@@ -138,6 +158,7 @@ def add_shooting_star(
     trend_n: int = 5,
 ) -> pl.DataFrame:
     """射击之星（流星）：上涨之后出现，长上影、小实体、短下影（锤头的镜像）。"""
+    _check_trend_n(trend_n)
     rng = _rng()
     cond = (
         (rng > 0)

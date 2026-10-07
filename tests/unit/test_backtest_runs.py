@@ -53,9 +53,37 @@ def test_git_hash_returns_short_hash_in_repo():
     from lquant.backtest import runs
 
     h = runs.git_hash()
-    # 测试运行于仓库内（editable 安装 + cwd 在 repo）→ 能拿到 hash
-    if h is not None:
-        assert 7 <= len(h) <= 40
+    # cwd 固定到仓库根：测试无论从哪个 cwd 跑，repo 内都能拿到 hash
+    assert h is not None
+    assert 7 <= len(h) <= 40
+
+
+def test_git_hash_ignores_foreign_git_repo(tmp_path, monkeypatch):
+    """cwd 落在别的 git 仓库时不误记异库 hash：cwd 固定到 lquant 仓库根。"""
+    import subprocess as sp
+
+    from lquant.backtest import runs
+
+    # 造一个独立的 git 仓库当「异库」
+    monkeypatch.chdir(tmp_path)
+    sp.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    sp.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "x"],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    h = runs.git_hash()
+    assert h is not None
+    # 与 lquant 仓库 HEAD 一致（不是 tmp 异库的 hash）
+    head = sp.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=runs._REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert h == head
 
 
 def test_git_hash_timeout_is_swallowed(monkeypatch):
@@ -145,6 +173,20 @@ def test_get_run_missing_raises(runs_env):
 
     with pytest.raises(KeyError):
         runs.get_run("nope")
+
+
+def test_record_duplicate_run_id_raises(runs_env, monkeypatch):
+    """撞键必须报错而非静默覆盖旧实验（OR REPLACE 的数据丢失风险已除）。"""
+    import uuid as uuid_mod
+
+    from lquant.backtest import runs
+
+    monkeypatch.setattr(runs.uuid, "uuid4", lambda: uuid_mod.UUID("ab" * 16))
+    runs.record_run("s", {"k": 1}, {})
+    with pytest.raises(Exception):  # noqa: B017 - duckdb.ConstraintException
+        runs.record_run("s", {"k": 2}, {})
+    # 旧记录原样保留
+    assert runs.list_runs()[0]["params"]["k"] == 1
 
 
 def test_list_runs_strategy_filter(runs_env):

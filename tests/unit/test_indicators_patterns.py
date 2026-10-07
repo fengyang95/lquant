@@ -195,6 +195,29 @@ def test_morning_star_positive_and_weak_recover():
 # ---------------- 输出形状与除零安全 ----------------
 
 
+def test_trend_n_validation():
+    """trend_n<1 fail-loudly：0 静默失效、负数引用未来根，都不允许。"""
+    df = random_ohlc(20)
+    for bad in (0, -1, -5):
+        with pytest.raises(ValueError, match="trend_n"):
+            add_hammer(df, trend_n=bad)
+        with pytest.raises(ValueError, match="trend_n"):
+            add_shooting_star(df, trend_n=bad)
+
+
+def test_doji_boundary_is_inclusive():
+    """body 恰等于 body_ratio×rng（<= 判据）→ 信号 1，锁住边界语义。"""
+    # rng=1.0, body=0.1 = 0.1×1.0
+    df = ohlc([(10.0, 11.0, 10.0, 10.1)])
+    assert add_doji(df)["pattern_doji"].to_list() == [1]
+
+
+def test_doji_dirty_price_is_zero():
+    """close<=0 的脏价数据：信号 0 不误报（close>0 前置条件）。"""
+    df = ohlc([(5.0, 6.0, 5.0, 0.0), (5.0, 6.0, 5.0, -5.0)])
+    assert add_doji(df)["pattern_doji"].to_list() == [0, 0]
+
+
 def test_output_dtype_int8_no_null():
     out = add_hammer(random_ohlc(30))
     col = out["pattern_hammer"]

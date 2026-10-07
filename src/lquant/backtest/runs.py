@@ -24,12 +24,22 @@ import math
 import subprocess
 import uuid
 from datetime import date, datetime
+from pathlib import Path
 
 __all__ = ["diff_runs", "get_run", "git_hash", "list_runs", "record_run"]
 
+# 本包上溯的仓库根（editable 安装 = src 上一级）。pip 装进 site-packages 时
+# 该目录不在 git 仓库内 → git_hash 返回 None，不会误记别处仓库的 hash。
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 def git_hash() -> str | None:
-    """当前仓库短 hash；非 git 环境（pip 安装、无 .git）返回 None。"""
+    """lquant 仓库当前短 hash；非 git 环境（pip 安装、无 .git）返回 None。
+
+    显式固定 cwd 到仓库根：常驻进程（server/agent）的 cwd 可能落在
+    **别的** git 仓库里，git 就近解析会把异库 hash 记进 params，
+    版本追溯失真。
+    """
     try:
         out = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -37,6 +47,7 @@ def git_hash() -> str | None:
             text=True,
             timeout=5,
             check=True,
+            cwd=_REPO_ROOT,
         )
         return out.stdout.strip() or None
     except Exception:  # noqa: BLE001 - 版本追溯尽力而为，不阻断记录
@@ -77,6 +88,13 @@ def _loads(text: str | None) -> dict:
         return {}
 
 
+def _now() -> datetime:
+    """仓库约定时区（Asia/Shanghai）的 naive 时间戳，不用裸本地时间。"""
+    from lquant.core.types import now_cn_naive
+
+    return now_cn_naive()
+
+
 def _as_date(v) -> date | None:
     """DuckDB start_date/end_date 是 DATE 列：字符串在此显式转 date，
     不依赖驱动的隐式 cast（转换失败在记账前就 fail-loudly）。"""
@@ -96,19 +114,23 @@ def record_run(
     end_date=None,
     status: str = "done",
 ) -> str:
-    """记一条实验（INSERT OR REPLACE），返回 run_id。
+    """记一条实验，返回 run_id。
 
-    params 里自动附 ``git_hash``（拿得到时）。数据库错误原样上抛。
+    params 里自动附 ``git_hash``（拿得到时）。数据库错误原样上抛
+    （含 run_id 撞键：12 hex 随机主键撞概率极低，但 OR REPLACE 的
+    「静默覆盖旧实验」后果不可接受 —— 宁可报错，由 CLI 转警告）。
     """
     run_id = uuid.uuid4().hex[:12]
     payload = dict(params or {})
     gh = git_hash()
     if gh:
         payload["git_hash"] = gh
-    now = datetime.now()
+    now = _now()
     with _writer() as con:
         con.execute(
-            "INSERT OR REPLACE INTO backtest_run VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO backtest_run (run_id, strategy, params, start_date, "
+            "end_date, status, metrics, created_at, finished_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 run_id,
                 strategy,

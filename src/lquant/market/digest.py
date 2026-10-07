@@ -97,7 +97,8 @@ def run_watchlist_digest(
             ok.append(sym)
         except Exception as e:  # noqa: BLE001 - 单只失败不影响其他
             failed.append({"symbol": sym, "error": f"{type(e).__name__}: {e}"})
-            log.warning("个股分析失败 symbol=%s err=%s", sym, e)
+            # loguru 不做 %s 惰性插值，必须用 f-string，否则失败原因不进日志
+            log.warning(f"个股分析失败 symbol={sym} err={e}")
 
     sent = False
     if ok:
@@ -172,17 +173,21 @@ def portfolio_snapshot(account: str) -> dict:
     positions.sort(key=lambda x: x["value"], reverse=True)
 
     # 权重分母：官方 nav 优先（收盘对账值 = 现金 + 持仓市值，最可信）；
-    # 无净值记录时用现金 + Σ市值 兜底；两者皆无则权重不可知（None）
+    # 无净值记录时用现金 + Σ市值 兜底；两者皆无则权重不可知（None）。
+    # last_price<=0（从未定价的新持仓）权重置 None 而非 0：市值 0 伪装成
+    # 「0% 集中度」会让 TOP1/TOP3 风控信号失真 —— 报文里显示「—」。
     total: float | None = nav
     if total is None:
         s = acct["cash"] + sum(p["value"] for p in positions)
         total = s if s > 0 else None
     for p in positions:
-        p["weight"] = (p["value"] / total) if total else None
+        p["weight"] = (p["value"] / total) if (total and p["last_price"] > 0) else None
     weights = [p["weight"] for p in positions if p["weight"] is not None]
 
     day_pnl = (nav - prev) if (nav is not None and prev is not None) else None
-    day_pct = (nav / prev - 1) if (nav and prev) else None
+    # nav<=0 是脏数据（对账事故）：原始值照传，但派生比例一律置 None，
+    # 「—」优于「+100% 盈亏 / -100% 回撤」这类荒谬数
+    day_pct = (nav / prev - 1) if (nav and prev and nav > 0 and prev > 0) else None
     return {
         "account": account,
         "asof": str(nav_df["trade_date"][-1]) if navs else None,
@@ -190,7 +195,7 @@ def portfolio_snapshot(account: str) -> dict:
         "prev_nav": prev,
         "day_pnl": day_pnl,
         "day_pct": day_pct,
-        "drawdown": (1 - nav / peak) if (nav and peak) else None,
+        "drawdown": (1 - nav / peak) if (nav and peak and nav > 0 and peak > 0) else None,
         "peak": peak,
         "cash": acct["cash"],
         "n_positions": len(positions),
@@ -209,7 +214,9 @@ def format_portfolio_report(snap: dict) -> str:
     dp = snap.get("day_pnl")
     if dp is not None:
         sign = "+" if dp >= 0 else ""
-        lines.append(f"当日盈亏 {sign}{_fmt_amt(dp)} 元（{sign}{_fmt_pct(snap.get('day_pct'))}）")
+        pct = snap.get("day_pct")
+        pct_txt = f"{sign}{pct * 100:.1f}%" if pct is not None else "—"
+        lines.append(f"当日盈亏 {sign}{_fmt_amt(dp)} 元（{pct_txt}）")
     if snap.get("drawdown") is not None:
         lines.append(f"当前回撤 {_fmt_pct(snap['drawdown'])}（峰值 {_fmt_amt(snap['peak'])} 元）")
     lines.append(
@@ -247,7 +254,7 @@ def run_portfolio_digest(*, account: str, notify_fn=None) -> dict:
         return {"sent": False, "skipped": f"账户不存在: {account}", "account": account}
     except Exception as e:  # noqa: BLE001 - 快照失败改走 error 通道，绝不静默
         detail = f"{type(e).__name__}: {e}"
-        log.warning("组合日报快照失败 account=%s err=%s", account, e)
+        log.warning(f"组合日报快照失败 account={account} err={e}")
         results = notify_fn(
             "组合日报失败",
             f"账户 {account} 快照构建失败，未发送正文：\n{detail}",

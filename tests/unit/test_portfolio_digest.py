@@ -99,6 +99,49 @@ def test_snapshot_missing_account_raises(paper_env):
         portfolio_snapshot("ghost")
 
 
+def test_snapshot_unpriced_position_weight_is_none(paper_env):
+    """last_price=0（未定价新持仓）：权重「—」而非伪装成 0% 集中度。"""
+    from lquant.paper import store as paper_store
+    from lquant.paper.engine import PaperPosition
+
+    _seed_account()
+    broker = paper_store.load_broker(ACCOUNT)
+    broker.positions["301999"] = PaperPosition(
+        symbol="301999", qty=500, available=500, avg_cost=20.0, last_price=0.0, name="未定价新股"
+    )
+    paper_store.save_broker(ACCOUNT, broker)
+
+    from lquant.market.digest import portfolio_snapshot
+
+    snap = portfolio_snapshot(ACCOUNT)
+    unpriced = next(p for p in snap["positions"] if p["symbol"] == "301999")
+    assert unpriced["weight"] is None
+    # TOP1 不被未定价持仓稀释：仍是 600519 的 0.75
+    assert snap["top1_weight"] == pytest.approx(0.75)
+    assert snap["n_positions"] == 3
+
+
+def test_snapshot_dirty_nav_derived_fields_none(paper_env):
+    """nav<=0 的对账事故：派生比例置 None（「—」优于荒谬数）。"""
+    _seed_account()
+    import sqlite3
+
+    from lquant.paper.store import db_path
+
+    con = sqlite3.connect(db_path())
+    con.execute("UPDATE paper_nav SET nav = -100.0 WHERE trade_date = '2024-01-05'")
+    con.commit()
+    con.close()
+
+    from lquant.market.digest import portfolio_snapshot
+
+    snap = portfolio_snapshot(ACCOUNT)
+    assert snap["nav"] == pytest.approx(-100.0)  # 原始值照传（不静默）
+    assert snap["day_pct"] is None  # 负/负 → 不再出 +100%
+    assert snap["drawdown"] is None
+    assert snap["day_pnl"] == pytest.approx(-100.0 - 205000.0)  # 差值仍如实
+
+
 # ---------------- 报文 ----------------
 
 
