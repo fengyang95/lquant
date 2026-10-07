@@ -147,9 +147,33 @@ def _p_lhb_net_buy_5d(panel, industry_df=None):
     return _shift1(d, "_v")
 
 
+def _limit_up_only(panel: pl.DataFrame) -> pl.DataFrame:
+    """只要**真涨停**的行：``limit_up_pool`` 同时装「涨停池」与「炸板池」两份采集。
+
+    ``market/collectors/__init__.py`` 把 ``broken_pool`` 也落到 ``limit_up_pool``
+    （同一个交易日、同一张表），而炸板池的行没有 ``limit_up_type``（``fetch_broken_pool``
+    不产出该列 → 入库为 NULL，``fetch_limit_up_pool`` 才有「一字板/T字板/换手板」）。
+    按「在池里」计数会把「盘中涨停但收盘没封住」算成涨停日，连板数因此虚高。
+
+    炸板行只能在写库时区分，所以这里按 ``limit_up_type`` 过滤；列整个缺失
+    （老库只跑过炸板池采集）就宁可报 CovariateUnavailable 也不假装知道 ——
+    与模块「缺失语义显式上报，绝不填 0 冒充」的约定一致。
+    """
+    raw = _board_table("limit_up_pool", panel)
+    if "limit_up_type" not in raw.columns:
+        raise CovariateUnavailable(
+            "limit_up_pool 缺 limit_up_type 列（老库或只采集过炸板池）——"
+            "无法区分涨停与炸板，连板数不可信；重跑涨停池采集补齐该列")
+    real = raw.filter(pl.col("limit_up_type").is_not_null())
+    if not len(real):
+        raise CovariateUnavailable(
+            "limit_up_pool 窗口内只有炸板池行（无 limit_up_type）——涨停池未采集")
+    return real
+
+
 @provider("zt_streak", label="T日连续涨停天数（T+1 可用）")
 def _p_zt_streak(panel, industry_df=None):
-    raw = _board_table("limit_up_pool", panel).with_columns(pl.lit(1).alias("_in_pool"))
+    raw = _limit_up_only(panel).with_columns(pl.lit(1).alias("_in_pool"))
     d = _grid(panel).join(
         raw.select("trade_date", "symbol", "_in_pool"), on=["trade_date", "symbol"], how="left"
     )

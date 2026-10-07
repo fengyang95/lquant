@@ -95,16 +95,25 @@ def _seed_board_tables(con) -> None:
             [d, s, nb, reason],
         )
     zt = [
-        (D2, "600000.SH", 1),
-        (D3, "600000.SH", 0),
-        (D4, "600000.SH", 2),
-        (D6, "000001.SZ", 3),
+        # (date, symbol, open_count, limit_up_type) —— 真涨停行才有 limit_up_type
+        (D2, "600000.SH", 1, "换手板"),
+        (D3, "600000.SH", 0, "换手板"),
+        (D4, "600000.SH", 2, "T字板"),
+        (D6, "000001.SZ", 3, "一字板"),
+        # 炸板池（曾涨停未封住）也落 limit_up_pool，且没有 limit_up_type：
+        # market/collectors/__init__.py 把 broken_pool 指到同一张表，
+        # fetch_broken_pool 不产出该列 → 入库 NULL。300750 连续三天在池里
+        # 但一次都没封住，连板数必须恒 0（不当成三连板）。
+        (D2, "300750.SZ", 1, None),
+        (D3, "300750.SZ", 1, None),
+        (D4, "300750.SZ", 1, None),
     ]
-    for d, s, oc in zt:
+    for d, s, oc, ltype in zt:
         con.execute(
-            "INSERT INTO limit_up_pool (trade_date, symbol, open_count, collected_at) "
-            "VALUES (?, ?, ?, now())",
-            [d, s, oc],
+            "INSERT INTO limit_up_pool "
+            "(trade_date, symbol, open_count, limit_up_type, collected_at) "
+            "VALUES (?, ?, ?, ?, now())",
+            [d, s, oc, ltype],
         )
 
 
@@ -216,6 +225,37 @@ def test_zt_streak_counts_consecutive_days(board_env):
     m = dict(zip(df2["trade_date"].to_list(), df2["cov_zt_streak"].to_list(), strict=True))
     assert m[D7] == 1  # D6 涨停 → D7 行为 1
     assert m[D6] == 0
+
+
+def test_zt_streak_excludes_broken_pool_rows(board_env):
+    """炸板池行（``limit_up_type IS NULL``）不算涨停日。
+
+    炸板池与涨停池共用 ``limit_up_pool`` 表；不区分的话「盘中涨停、收盘没封住」
+    会被计成涨停，连板数虚高（300750 连续三天在炸板池 → 会被算成三连板）。
+    """
+    df, _ = _cov_frame(board_env, ["zt_streak"])
+    sub = df.filter(pl.col("symbol") == "300750.SZ")
+    m = dict(zip(sub["trade_date"].to_list(), sub["cov_zt_streak"].to_list(), strict=True))
+    assert m[D5] == 0, "炸板被当成涨停：D2-D4 全在池里 → 伪三连板"
+    assert m[D4] == 0 and m[D3] == 0
+    # 主角（真涨停）不受影响
+    got = _sym_col(df, "cov_zt_streak")
+    assert got[D5] == 3
+
+
+def test_zt_streak_unavailable_without_limit_up_type_column(board_env):
+    """旧库缺 ``limit_up_type`` 列 → 显式不可用，不静默拿炸板行凑连板。"""
+    import duckdb
+
+    from lquant.core.config import get_settings
+
+    con = duckdb.connect(str(get_settings().duckdb_path))
+    con.execute("ALTER TABLE limit_up_pool DROP COLUMN limit_up_type")
+    con.close()
+    _, report = _cov_frame(board_env, ["zt_streak"])
+    r = {x["covariate"]: x for x in report}
+    assert r["zt_streak"]["coverage"] == 0.0
+    assert "limit_up_type" in r["zt_streak"]["note"]
 
 
 def test_zt_open_count_20d_rolling_sum(board_env):
