@@ -12,9 +12,12 @@
 - **评估失败不静默**：缺字段/类型错返回 ``evaluation_error`` 并带原因，
   绝不悄悄当成"未触发"—— 错误的规则比没有规则更危险。
 
-alert_type 首批四种（都是纯数值比较，不碰数据源）：
+alert_type 首批五种（都是纯数值比较，不碰数据源）：
   price_above / price_below   —— ctx 需 last_price
   pct_change_up / pct_change_down —— ctx 需 last_price + pre_close
+  ic_below                    —— ctx 需 ic（因子监控消费，见 factors/monitor.py：
+                                 run_daily_check 把因子近窗口 IC 组装成 ctx 喂进来，
+                                 target 放因子名；threshold 语义 = IC 下限，跌破即告警）
 """
 
 from __future__ import annotations
@@ -45,7 +48,7 @@ NOT_TRIGGERED = "not_triggered"
 EVAL_ERROR = "evaluation_error"
 COOLDOWN = "cooldown"
 
-ALERT_TYPES = ("price_above", "price_below", "pct_change_up", "pct_change_down")
+ALERT_TYPES = ("price_above", "price_below", "pct_change_up", "pct_change_down", "ic_below")
 SCOPES = ("single_symbol", "watchlist", "portfolio", "market")
 SEVERITIES = ("info", "warning", "critical")
 
@@ -278,6 +281,9 @@ def evaluate(rule: AlertRule, ctx: dict) -> tuple[str, str]:
         if rule.alert_type in ("price_above", "price_below"):
             px = float(ctx["last_price"])
             hit = px >= threshold if rule.alert_type == "price_above" else px <= threshold
+        elif rule.alert_type == "ic_below":
+            ic = float(ctx["ic"])
+            hit = ic <= threshold
         else:  # pct_change_up / pct_change_down
             px, pre = float(ctx["last_price"]), float(ctx["pre_close"])
             if pre <= 0:

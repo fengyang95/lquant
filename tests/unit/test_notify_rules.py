@@ -239,3 +239,12 @@ def test_validate_rejects_unimplemented_scopes():
         parameters={"threshold": 10.0},
     )
     assert ok_rule.validate() == []
+
+
+def test_evaluate_ic_below():
+    """因子监控消费的 ic_below：threshold 语义 = IC 下限，跌破即触发。"""
+    rule = AlertRule(name="f", alert_type="ic_below", parameters={"threshold": 0.02})
+    assert evaluate(rule, {"ic": -0.01})[0] == TRIGGERED
+    assert evaluate(rule, {"ic": 0.05})[0] == NOT_TRIGGERED
+    status, detail = evaluate(rule, {})  # 缺 ic 字段 → 明确的评估错误，不是未触发
+    assert status == EVAL_ERROR and "缺字段" in detail

@@ -219,6 +219,14 @@ DDL_STATEMENTS: list[str] = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS factor_ic_daily (
+        factor VARCHAR, trade_date DATE,
+        ic DOUBLE, rank_ic DOUBLE, n INTEGER,
+        updated_at TIMESTAMP,
+        PRIMARY KEY (factor, trade_date)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS factor_mining_run (
         run_id VARCHAR PRIMARY KEY, agent VARCHAR, generator VARCHAR,
         n_evaluated INTEGER, n_static_fail INTEGER, n_low_ic INTEGER,

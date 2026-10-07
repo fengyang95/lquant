@@ -1051,3 +1051,54 @@ def reports(
             "--prune-stale --yes 删除"
         )
     click.echo(json.dumps(_clean(out), ensure_ascii=False))
+
+
+@factor.command("ic-sync")
+@click.argument("names", nargs=-1, required=True)
+@click.option("--start", default=None, help="窗口起点 YYYY-MM-DD（缺省按 --lookback 回推）")
+@click.option("--end", default=None, help="窗口终点 YYYY-MM-DD（缺省今天，Asia/Shanghai）")
+@click.option("--lookback", "lookback_days", default=120, show_default=True,
+              help="回看窗口（日历日）；起点缺省时按终点回推")
+def ic_sync(names: tuple[str, ...], start: str | None, end: str | None,
+            lookback_days: int) -> None:
+    """同步因子逐日 IC 到 factor_ic_daily（因子在线监控闭环的写入侧）。
+
+    每日收盘后跑一次；同窗口重跑幂等（快照替换，不会出现半新半旧行）。
+    配 lq factor ic-health 与 ic_below 告警规则组成闭环，示例见 README。
+    """
+    import json
+    from datetime import date as _date
+
+    from lquant.factors import monitor
+
+    out = []
+    for name in names:
+        try:
+            out.append(monitor.sync_factor_ic(
+                name,
+                start=_date.fromisoformat(start) if start else None,
+                end=_date.fromisoformat(end) if end else None,
+                lookback_days=lookback_days,
+            ))
+        except Exception as e:  # noqa: BLE001 - 单因子失败继续（原因可见）
+            out.append({"factor": name, "error": f"{type(e).__name__}: {e}"})
+    click.echo(json.dumps(_clean(out), ensure_ascii=False))
+
+
+@factor.command("ic-health")
+@click.option("--factor", "name", default=None, help="只看该因子（缺省全部）")
+@click.option("--window", default=20, show_default=True, help="近 N 个交易日")
+@click.option("--min-ic", "min_ic", default=0.0, show_default=True, help="IC 均值下限")
+@click.option("--min-icir", "min_icir", default=0.0, show_default=True, help="ICIR 下限")
+def ic_health(name: str | None, window: int, min_ic: float, min_icir: float) -> None:
+    """因子健康度评估（只读 DryRun）：ok / stale / degraded / no_data。
+
+    verdict=degraded 的因子该警惕下线或重构 —— 衰减是常态，装看不见不是。
+    """
+    import json
+
+    from lquant.factors import monitor
+
+    click.echo(json.dumps(_clean(
+        monitor.factor_health(name, window=window, min_ic=min_ic, min_icir=min_icir)
+    ), ensure_ascii=False))
