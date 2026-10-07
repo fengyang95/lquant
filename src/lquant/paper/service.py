@@ -165,7 +165,12 @@ def _is_trading_day(d) -> bool:
 
 
 def day_close(name: str, d=None) -> dict:
-    """日终：解冻 T+N → 官方日线对账重算 official 净值。"""
+    """日终：解冻 T+N → 官方日线对账重算 official 净值。
+
+    对账 verdict 非 ok 时顺手发通知（warning/critical 是「官方价与盯市价
+    背离」的信号，等第二天看板才发现就晚了）。通知旁路永不抛异常、
+    未配置 LQ_NOTIFY_CHANNELS 时零开销 —— 详见 lquant/notify。
+    """
     d = d or today_cn()
     with store.account_lock(name):
         broker = store.load_broker(name)
@@ -173,7 +178,23 @@ def day_close(name: str, d=None) -> dict:
         store.save_broker(name, broker)
 
     from lquant.paper.reconcile import reconcile
-    return {"account": name, "trade_date": str(d), "reconcile": reconcile(name, d)}
+    rep = reconcile(name, d)
+    _notify_reconcile(name, d, rep)
+    return {"account": name, "trade_date": str(d), "reconcile": rep}
+
+
+def _notify_reconcile(name: str, d, rep: dict) -> None:
+    """对账告警旁路：verdict=critical/warning 才发，ok 静默（别把群里灌满噪音）。"""
+    verdict = rep.get("verdict", "ok")
+    if verdict == "ok":
+        return
+    try:
+        from lquant.notify import notify
+        notify(f"模拟盘对账告警 · {name}",
+               f"trade_date={d} verdict={verdict}\n{rep.get('detail', '')}")
+    except Exception as e:  # noqa: BLE001 - 通知失败绝不影响对账主链路
+        from loguru import logger
+        logger.warning(f"paper reconcile notify failed: {e}")
 
 
 def status(name: str) -> dict:

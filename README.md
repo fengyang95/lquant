@@ -60,6 +60,24 @@ lq data status             # 数据覆盖度一览
 - **防未来函数**：财务必须带 `pub_date`；上市/退市日期入 `security` 表防幸存者偏差
 - **T+N per-instrument**：跨境/债券/黄金/货币 ETF = T+0，股票 ETF = T+1，存 `etf_meta.sellable_after_days`
 
+## 通知旁路（结果找人）
+
+链路结果目前只能「人找看板」；`lquant/notify` 把关键结果主动推出去 ——
+首个场景是**模拟盘对账告警**：`day_close` 对账 verdict 为 warning/critical
+（官方收盘价与盯市价背离）时自动推送，ok 静默不刷群。
+
+```bash
+export LQ_NOTIFY_CHANNELS=wecom,feishu            # 逗号分隔；不配 = 功能关闭
+export LQ_WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..
+export LQ_FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/..
+lq notify status          # 自检：看 env 配置出了哪些通道
+lq notify test            # 各通道发一条测试消息并逐个回报
+```
+
+支持：企业微信 / 飞书 / 钉钉（含加签）/ Telegram / 通用 webhook（自建接收端）。
+纪律与仓库一致：**零新依赖**（stdlib urllib）、**永不阻断主链路**（通道炸了
+对账照常）、**密钥只走 env**（webhook URL 本质是凭证，不入 config/仓库）。
+
 ## 仓库地图
 
 | 目录 | 职责 |
@@ -70,6 +88,7 @@ lq data status             # 数据覆盖度一览
 | `src/lquant/backtest` | 规则表、撮合引擎、账户、策略 |
 | `src/lquant/portfolio` | 选池 / 去重 / 权重 |
 | `src/lquant/market` | 看板热通路（实时采集） |
+| `src/lquant/notify` | 通知旁路：企微/飞书/钉钉/TG webhook，对账告警接线 |
 | `src/lquant/research` | JQ 方言兼容、ML 选股、研报复现 |
 | `src/lquant/server` | FastAPI + RQ(可降级) + WebSocket |
 | `src/lquant/cli` | `lq` 命令行 |
