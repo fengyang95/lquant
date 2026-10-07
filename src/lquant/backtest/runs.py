@@ -26,7 +26,7 @@ import uuid
 from datetime import date, datetime
 from pathlib import Path
 
-__all__ = ["diff_runs", "get_run", "git_hash", "list_runs", "record_run"]
+__all__ = ["count_runs", "diff_runs", "get_run", "git_hash", "list_runs", "record_run"]
 
 # 本包上溯的仓库根（editable 安装 = src 上一级）。pip 装进 site-packages 时
 # 该目录不在 git 仓库内 → git_hash 返回 None，不会误记别处仓库的 hash。
@@ -173,6 +173,22 @@ def list_runs(limit: int = 20, strategy: str | None = None) -> list[dict]:
         }
         for r in rows
     ]
+
+
+def count_runs(strategy: str | None = None) -> int:
+    """试验台账行数 —— DSR 的 n_trials 来源。
+
+    台账纪律：必须统计**所有**试过的配置（含放弃的、失败的），只数
+    活下来的会让 DSR 变成橡皮图章。所以这里数的是 backtest_run 全表
+    （可选按策略过滤），不做任何「成功」过滤。
+    """
+    sql = "SELECT count(*) FROM backtest_run"
+    args: list = []
+    if strategy:
+        sql += " WHERE strategy = ?"
+        args.append(strategy)
+    with _reader() as con:
+        return int(con.execute(sql, args).fetchone()[0])
 
 
 def get_run(run_id: str) -> dict:

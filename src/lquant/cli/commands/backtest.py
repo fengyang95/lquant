@@ -176,3 +176,61 @@ def diff(run_a: str, run_b: str) -> None:
             click.echo(f"  变更 {k}: {va}  ->  {vb}")
     click.echo(f"A: {run_a} ({d['a']['strategy']}, {d['a']['created_at']})")
     click.echo(f"B: {run_b} ({d['b']['strategy']}, {d['b']['created_at']})")
+
+
+@backtest.command("confidence")
+@click.option("--returns", "returns_csv", required=True,
+              type=click.Path(exists=True),
+              help="日收益 CSV（单列；首行为表头或直接数值）")
+@click.option("--n-trials", "n_trials", default=None,
+              help="试验次数 N：整数，或 auto=数实验台账（配合 --strategy）")
+@click.option("--strategy", default=None, help="n-trials=auto 时按策略名数台账")
+@click.option("--benchmark-sr", "bench_annual", default=0.0,
+              help="年化夏普基准（换算为日频后做 PSR）")
+@click.option("--freq", default=252, show_default=True, help="年化频率")
+def confidence(returns_csv: str, n_trials: str | None, strategy: str | None,
+               bench_annual: float, freq: int) -> None:
+    """回答「这个 Sharpe 是本事还是运气」：PSR + DSR + E[maxSR]。
+
+    台账纪律：n_trials 要数**所有**试过的配置（含放弃的）。auto 模式从
+    实验记录器统计；只有 1 次试验时只报 PSR（DSR 需 N>=2，别自欺）。
+    网格级别的过拟合检验（PBO）见 lquant.backtest.confidence.cscv_pbo。
+    """
+    import json
+    import math
+
+    import polars as pl
+
+    from lquant.backtest import confidence as conf
+
+    df = pl.read_csv(returns_csv)
+    rets = df[df.columns[0]].drop_nulls().to_list()
+    sr_annual = conf.sharpe_ratio(rets, freq=freq)
+    psr_v = conf.psr(rets, sr_benchmark=bench_annual / math.sqrt(freq))
+
+    out = {
+        "n_obs": len(rets),
+        "sharpe_annual": round(sr_annual, 4),
+        "benchmark_sr_annual": bench_annual,
+        "psr": round(psr_v, 4),
+    }
+    if n_trials is None:
+        out["note"] = "未给 --n-trials，跳过 DSR（多重检验校正需要 N>=2）"
+    else:
+        n = (conf_runs_count(strategy)
+             if n_trials == "auto" else int(n_trials))
+        out["n_trials"] = n
+        if n < 2:
+            out["note"] = f"n_trials={n} < 2，无选择偏差可校正，跳过 DSR"
+        else:
+            d = conf.deflated_sharpe(rets, n_trials=n)
+            out["dsr"] = round(d["dsr"], 4)
+            out["expected_max_sharpe_annual"] = round(
+                d["expected_max_sharpe_daily"] * math.sqrt(freq), 4)
+    click.echo(json.dumps(out, ensure_ascii=False))
+
+
+def conf_runs_count(strategy: str | None) -> int:
+    from lquant.backtest.runs import count_runs
+
+    return count_runs(strategy)
