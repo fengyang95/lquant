@@ -121,6 +121,53 @@ lq backtest diff <run_a> <run_b>     # params/metrics 键级对比，代码版�
 纪律与仓库一致：**零新依赖**（stdlib urllib）、**永不阻断主链路**（通道炸了
 对账照常）、**密钥只走 env**（webhook URL 本质是凭证，不入 config/仓库）。
 
+### 评价口径：as-of 指数成分（防幸存者偏差）
+
+评价 / trace / 冗余分析 / 因子合成的股票池，在请求带区间时自动取「区间起点
+当日已生效」的成分快照（`IndexConsRepo.symbols_as_of`，与 JQ 方言
+`get_index_stocks` 防前视同一口径）——用今天的成分回溯十年历史会引入幸存者
+偏差（中途调入的大牛股被追溯进池、被调出的衰落股丢失），IC 系统性高估。
+历史区间评价需要按期同步累积成分快照；起点前无任何快照时 503 明说，不假装。
+
+### 统计置信度：PSR / DSR / CSCV-PBO
+
+```bash
+lq backtest confidence --returns day_ret.csv --n-trials auto --strategy mom_20
+# → {"sharpe_annual": ..., "psr": ..., "n_trials": ..., "dsr": ..., "expected_max_sharpe_annual": ...}
+```
+
+回答「这个 Sharpe 是本事还是运气」：PSR 显著性（偏度/峰度校正）、E[maxSR]
+噪声水位、DSR 校正（López de Prado 方法论，零新依赖）。`--n-trials auto`
+从实验记录器数台账——**含放弃的**：只数活下来的等于给橡皮图章盖章。网格级
+过拟合检验 `backtest/confidence.py::cscv_pbo`（函数级 API；sweep 输出契约
+连着前端，集成留给独立 commit，不假装已自动接入）。
+
+### 因子在线监控闭环
+
+```bash
+lq factor ic-sync mom_20             # 逐日 IC/RankIC 落 factor_ic_daily（窗口快照替换，幂等）
+30 15 * * 1-5  lq factor ic-sync mom_20   # 外部 cron：交易日收盘后
+lq factor ic-health                  # ok / stale / degraded / no_data（只读 DryRun）
+```
+
+借鉴 qlib Online Serving 的「上线后持续评估」：因子入库只是起点，真正的
+风险在上线后衰减。`factors/monitor.py::run_daily_check` 编排
+「同步 → 健康评估 → 告警」：规则引擎新增 `ic_below` 类型（threshold=IC
+下限），因子近窗口 IC 跌破下限自动走既有 8 渠道通知；单因子同步失败
+不阻断但 error 逐条可见。
+
+### 再平衡管理：换手约束 + no-trade band
+
+```python
+# 优化器内 L1 换手约束（平滑化求解 + 真 L1 事后核验，与 TE 约束同构）
+enhanced_indexing_weight(..., max_turnover=0.05, prev_weights=prev)
+# 权重输出层 no-trade band：小偏离是噪声驱动的纯摩擦，不动
+weights(M, "enhanced_indexing", syms, scores=..., band=0.03, prev_weights=prev)
+```
+
+cost_matrix 已证明高换手是收益杀手，这里给权重层装刹车；band 吸收后
+权重和 < 1 即现金缓冲。
+
 ## 技术指标
 
 `src/lquant/indicators` 注册表驱动（趋势/摆动/量能/**形态**/通道五类），
@@ -134,9 +181,9 @@ lq backtest diff <run_a> <run_b>     # params/metrics 键级对比，代码版�
 |---|---|
 | `src/lquant/core` | 配置 / 类型 / 注册表 / 日历 / 单写者 DB 连接 |
 | `src/lquant/data` | Provider 抽象、多源适配、入库、质量校验、存储 |
-| `src/lquant/factors` | DSL、算子、预处理、评价 |
-| `src/lquant/backtest` | 规则表、撮合引擎、账户、策略、实验记录器（list/show/diff） |
-| `src/lquant/portfolio` | 选池 / 去重 / 权重 / 选股策略库（一策略一纯函数）/ 仓位模型（ATR 风险预算 + Kelly） |
+| `src/lquant/factors` | DSL、算子、预处理、评价、在线监控（IC 日表 + 健康度） |
+| `src/lquant/backtest` | 规则表、撮合引擎、账户、策略、实验记录器（list/show/diff）、统计置信度（PSR/DSR/PBO） |
+| `src/lquant/portfolio` | 选池 / 去重 / 权重（no-trade band）/ 优化器（TE + 换手约束）/ 选股策略库（一策略一纯函数）/ 仓位模型（ATR 风险预算 + Kelly） |
 | `src/lquant/indicators` | 技术指标注册表（五类）：CYQ 筹码、K线形态信号列等 |
 | `src/lquant/market` | 看板热通路（实时采集）/ 自选股与组合绩效日报编排 |
 | `src/lquant/notify` | 通知旁路：企微/飞书/钉钉/TG webhook，对账告警接线 |
