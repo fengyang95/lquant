@@ -104,6 +104,34 @@ def test_git_hash_timeout_is_swallowed(monkeypatch):
 # ---------------- record / list / get ----------------
 
 
+def test_record_run_self_heals_missing_table(tmp_path, monkeypatch):
+    """老库缺 ``backtest_run`` 表时记录不该失败（默认落库路径必须自愈）。
+
+    这张表只在 ``DDL_STATEMENTS`` 里（init_db / 服务启动才执行），而
+    ``lq backtest run`` 默认记录 —— 缺表会让「记一条实验」变成一条警告，
+    连 stdout 的 JSON 都被污染（CLI 的 --json 输出要求纯 JSON）。
+    """
+    monkeypatch.setenv("LQ_ROOT", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    from lquant.core.config import get_settings
+
+    get_settings.cache_clear()
+
+    import duckdb
+
+    (tmp_path / "data" / "duckdb").mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(str(get_settings().duckdb_path))
+    con.execute("CREATE TABLE unrelated (x INTEGER)")  # 库存在但没建 DDL
+    con.close()
+
+    from lquant.backtest import runs
+
+    rid = runs.record_run("factor_quantile", {"factor": "mom_20"}, {"monotonicity": 1})
+    assert rid and len(rid) == 12
+    assert [r["run_id"] for r in runs.list_runs()] == [rid]
+    get_settings.cache_clear()
+
+
 def test_record_and_list_roundtrip(runs_env):
     from lquant.backtest import runs
 

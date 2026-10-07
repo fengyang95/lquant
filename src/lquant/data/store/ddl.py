@@ -421,6 +421,40 @@ def ensure_collect_log(con) -> int:
     return 1
 
 
+def _ensure_table(con, table: str) -> int:
+    """按 ``DDL_STATEMENTS`` 里的建表语句惰性补建 ``table``（幂等）。
+
+    给「只进了 DDL_STATEMENTS、没跟着 init_db / 服务启动迁移」的新表用：
+    老库上直接读写会裸 ``CatalogException``，补建一次即自愈。
+    返回 1 = 本次真的建了表。
+    """
+    ddl = next(s for s in DDL_STATEMENTS if f"CREATE TABLE IF NOT EXISTS {table} " in s)
+    before = con.execute(
+        "SELECT count(*) FROM duckdb_tables() WHERE table_name = ?", [table]
+    ).fetchone()[0]
+    con.execute(ddl)
+    return 0 if before else 1
+
+
+def ensure_backtest_run(con) -> int:
+    """按需补建 ``backtest_run``（CLI 实验记录器与 Web 回测提交共用）。
+
+    这张表一直只在 ``DDL_STATEMENTS`` 里（init_db / 服务启动才执行），而
+    ``lq backtest run`` 默认落库 —— 老库上缺表时记录失败，只剩一条 stderr
+    警告（回测结果不受影响）。惰性补建让老库自愈。返回 1 = 本次建了表。
+    """
+    return _ensure_table(con, "backtest_run")
+
+
+def ensure_factor_ic_daily(con) -> int:
+    """按需补建 ``factor_ic_daily``（因子在线监控的逐日 IC 表）。
+
+    同 ``ensure_backtest_run``：监控写路径与 ``lq factor ic-health`` 读路径
+    在老库上都撞到过裸的 ``CatalogException``。返回 1 = 本次建了表。
+    """
+    return _ensure_table(con, "factor_ic_daily")
+
+
 def ensure_ml_run_columns(con) -> int:
     """ml_run 增列迁移（Phase 2.1 模型注册表）。
 

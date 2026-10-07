@@ -19,6 +19,7 @@ nav 与成交流，硬造明细只会得到空表。
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import subprocess
@@ -119,6 +120,10 @@ def record_run(
     params 里自动附 ``git_hash``（拿得到时）。数据库错误原样上抛
     （含 run_id 撞键：12 hex 随机主键撞概率极低，但 OR REPLACE 的
     「静默覆盖旧实验」后果不可接受 —— 宁可报错，由 CLI 转警告）。
+
+    写前按需补建 ``backtest_run``：该表只在 ``DDL_STATEMENTS`` 里（init_db /
+    服务启动执行），老库或隔离测试库上缺表会让「默认记录」变成一条警告 ——
+    惰性补建把这条路径修成「记录就该成功」。
     """
     run_id = uuid.uuid4().hex[:12]
     payload = dict(params or {})
@@ -127,6 +132,7 @@ def record_run(
         payload["git_hash"] = gh
     now = _now()
     with _writer() as con:
+        _ensure_table(con)
         con.execute(
             "INSERT INTO backtest_run (run_id, strategy, params, start_date, "
             "end_date, status, metrics, created_at, finished_at) "
@@ -158,6 +164,7 @@ def list_runs(limit: int = 20, strategy: str | None = None) -> list[dict]:
         args.append(strategy)
     sql += " ORDER BY created_at DESC LIMIT ?"
     args.append(int(limit))
+    _ensure_table()  # 先补表（写锁），再读；避免读连接里开写连接
     with _reader() as con:
         rows = con.execute(sql, args).fetchall()
     return [
@@ -187,12 +194,14 @@ def count_runs(strategy: str | None = None) -> int:
     if strategy:
         sql += " WHERE strategy = ?"
         args.append(strategy)
+    _ensure_table()  # 先补表（写锁），再读；避免读连接里开写连接
     with _reader() as con:
         return int(con.execute(sql, args).fetchone()[0])
 
 
 def get_run(run_id: str) -> dict:
     """单条实验详情；不存在抛 KeyError（fail-loudly，CLI 层转 ClickException）。"""
+    _ensure_table()  # 先补表（写锁），再读；避免读连接里开写连接
     with _reader() as con:
         row = con.execute(
             "SELECT run_id, strategy, params, start_date, end_date, status, "
@@ -251,3 +260,24 @@ def _reader():
     from lquant.core.db import reader
 
     return reader()
+
+
+def _ensure_table(con=None) -> None:
+    """按需补建 backtest_run（迁移路径，见 ``ddl.ensure_backtest_run``）。
+
+    读写两条路径都先补一次：``lq backtest list/show`` 在老库上撞缺表时，
+    报出来的应该是「还没有实验记录」而不是驱动层的 CatalogException。
+
+    写路径传入已持有的写连接（避免重入写锁）；读路径不带参数 → 单独开一次
+    写连接补表（DDL 走写锁，符合 db.py 的并发约定）。补建失败（只读文件系统 /
+    无权限）不阻断：真缺表时后面的查询会照旧报错。
+    """
+    from lquant.data.store.ddl import ensure_backtest_run
+
+    if con is not None:
+        # 迁移尽力而为：失败不掩盖真正的查询错误（缺表时后面的查询会照旧报错）
+        with contextlib.suppress(Exception):
+            ensure_backtest_run(con)
+        return
+    with contextlib.suppress(Exception), _writer() as wcon:
+        ensure_backtest_run(wcon)
