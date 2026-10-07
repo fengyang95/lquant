@@ -100,8 +100,33 @@ lq notify digest          # 对 watchlist 逐票跑多角度分析 → 汇总推
 20 15 * * 1-5  lq notify digest    # 外部 cron 定时：交易日 15:20
 ```
 
+### 组合绩效日报
+
+```bash
+lq notify portfolio --account demo   # 净值/当日盈亏/回撤/TOP1-TOP3 集中度 → report 通道
+25 15 * * 1-5  lq notify portfolio --account demo   # 外部 cron：交易日 15:25
+```
+
+绩效一律取**官方净值口径**（收盘对账重算值）；账户不存在显式 skipped，
+快照失败走 error 通道，绝不静默。
+
+### 回测实验记录器
+
+```bash
+lq backtest run --factor "mom_20"    # 默认落库 backtest_run（params 附 git_hash）
+lq backtest list                     # 实验清单（CLI 与 Web API 落库同源）
+lq backtest diff <run_a> <run_b>     # params/metrics 键级对比，代码版本变化显式可见
+```
+
 纪律与仓库一致：**零新依赖**（stdlib urllib）、**永不阻断主链路**（通道炸了
 对账照常）、**密钥只走 env**（webhook URL 本质是凭证，不入 config/仓库）。
+
+## 技术指标
+
+`src/lquant/indicators` 注册表驱动（趋势/摆动/量能/**形态**/通道五类），
+`GET /api/data/indicators` 自动枚举；形态因子包（十字星/锤头/射击之星/
+看涨看跌吞没/早晨之星）以 0/1 信号列反哺因子层，信号记在确认日、
+全部过 `assert_no_lookahead` 前缀不变性门禁，一字板不误报。
 
 ## 仓库地图
 
@@ -110,9 +135,10 @@ lq notify digest          # 对 watchlist 逐票跑多角度分析 → 汇总推
 | `src/lquant/core` | 配置 / 类型 / 注册表 / 日历 / 单写者 DB 连接 |
 | `src/lquant/data` | Provider 抽象、多源适配、入库、质量校验、存储 |
 | `src/lquant/factors` | DSL、算子、预处理、评价 |
-| `src/lquant/backtest` | 规则表、撮合引擎、账户、策略 |
+| `src/lquant/backtest` | 规则表、撮合引擎、账户、策略、实验记录器（list/show/diff） |
 | `src/lquant/portfolio` | 选池 / 去重 / 权重 / 选股策略库（一策略一纯函数）/ 仓位模型（ATR 风险预算 + Kelly） |
-| `src/lquant/market` | 看板热通路（实时采集）/ 自选股每日报告编排 |
+| `src/lquant/indicators` | 技术指标注册表（五类）：CYQ 筹码、K线形态信号列等 |
+| `src/lquant/market` | 看板热通路（实时采集）/ 自选股与组合绩效日报编排 |
 | `src/lquant/notify` | 通知旁路：企微/飞书/钉钉/TG webhook，对账告警接线 |
 | `src/lquant/research` | JQ 方言兼容、ML 选股、研报复现、研报→因子提案（LLM 接 G0 门禁） |
 | `src/lquant/server` | FastAPI + RQ(可降级) + WebSocket |
