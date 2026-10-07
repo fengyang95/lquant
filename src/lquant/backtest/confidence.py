@@ -38,6 +38,10 @@ __all__ = [
 
 _EULER_GAMMA = 0.5772156649015329
 
+# CSCV 组合枚举的分块上限（元素数）：每块物化 chunk × k/2 × N 的中间张量，
+# 4e6 个 float64 ≈ 32MB —— 与配置数 C(k,k/2) 无关地封顶峰值内存。
+_CSCV_CHUNK_CELLS = 4_000_000
+
 
 def normal_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -169,10 +173,23 @@ def cscv_pbo(returns_matrix, *, n_partitions: int = 16) -> dict:
     block_means = m[:t_used].reshape(k, block, n_cfg).mean(axis=1)  # (k, N)
 
     combos = np.array(list(combinations(range(k), k // 2)))  # (C, k/2)
-    is_means = block_means[combos].mean(axis=1)  # (C, N)
-    oos_means = (block_means.sum(axis=0) - is_means) / (k - k // 2)
+    n_combos = len(combos)
+    is_means = np.empty((n_combos, n_cfg))
+    oos_means = np.empty((n_combos, n_cfg))
+    block_sum = block_means.sum(axis=0)
+    # 分块累加：直接 ``block_means[combos].mean(axis=1)`` 会物化 (C, k/2, N)
+    # 的中间张量 —— k=16/万级配置时是 GB 级（C(16,8)=12870 × 8 × 10000 × 8B
+    # ≈ 8GB），正好在模块 docstring 瞄准的「万级网格」上 MemoryError。
+    # 每块只物化 chunk × k/2 × N，峰值内存与 C 无关。
+    half = k - k // 2
+    chunk = max(1, int(_CSCV_CHUNK_CELLS // max(1, (k // 2) * n_cfg)))
+    for s in range(0, n_combos, chunk):
+        blk = combos[s : s + chunk]
+        blk_is = block_means[blk].mean(axis=1)  # (chunk, N)
+        is_means[s : s + chunk] = blk_is
+        oos_means[s : s + chunk] = (block_sum - blk_is) / half
     j_star = is_means.argmax(axis=1)  # 样本内冠军
-    rows = np.arange(len(combos))
+    rows = np.arange(n_combos)
     # 相对排名 ω：1 = 冠军在样本外**最差**（Bailey et al. 2017 口径）——
     # ω 越小越像过拟合（样本内选出的冠军样本外垫底）
     omega = (oos_means < oos_means[rows, j_star][:, None]).sum(axis=1) + 1
@@ -180,7 +197,7 @@ def cscv_pbo(returns_matrix, *, n_partitions: int = 16) -> dict:
     return {
         # λ ≤ 0 ⇔ 冠军的样本外排名掉到中位以下（含 N 奇数时的中位本身）
         "pbo": float((lam <= 0).mean()),
-        "n_combos": int(len(combos)),
+        "n_combos": int(n_combos),
         "n_partitions": k,
         "t_used": int(t_used),
     }

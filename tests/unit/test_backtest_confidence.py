@@ -133,6 +133,22 @@ def test_cscv_pbo_distinguishes_rank_flip_from_real_signal():
     assert cscv_pbo(real, n_partitions=k)["pbo"] < 0.1
 
 
+def test_cscv_pbo_chunking_does_not_change_result(monkeypatch):
+    """分块累加与一次性物化同解（内存优化不能改口径）。
+
+    直接把 ``_CSCV_CHUNK_CELLS`` 压到 1 → 每个组合一块（最碎的分块路径），
+    与默认（单块）逐字段比对。修复前是 ``block_means[combos]`` 一次性物化
+    (C, k/2, N)，k=16/万级配置时 GB 级内存 —— 分块后的结果必须一模一样。
+    """
+    import lquant.backtest.confidence as conf
+
+    m = _matrix(signal_cols=range(4))
+    baseline = conf.cscv_pbo(m, n_partitions=8)
+    monkeypatch.setattr(conf, "_CSCV_CHUNK_CELLS", 1)
+    chunked = conf.cscv_pbo(m, n_partitions=8)
+    assert chunked == baseline
+
+
 def test_cscv_pbo_validates_shape_and_finiteness():
     from lquant.backtest.confidence import cscv_pbo
 
