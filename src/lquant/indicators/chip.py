@@ -50,18 +50,39 @@ def _price(df: pl.DataFrame) -> pl.Series:
     return ((df["high"] + df["low"] + 2 * df["close"]) / 4).rename("_px")
 
 
-def _turnover(df: pl.DataFrame, float_shares: float | None) -> list[float]:
+def _turnover(df: pl.DataFrame, float_shares) -> list[float]:
     """每日换手率 t ∈ [0, 1]。
 
-    显式 float_shares：``t = volume / float_shares``。
-    代理口径：``t = volume / 截至前一日累积均量``（expanding、不含当日）。
-    首日（或此前累计无成交）取 1.0：首日之前没有历史筹码，全部筹码落在当日，
-    这是模型的初始条件而不是异常降级；当日本身无成交则 t=0（不产生新筹码），
-    连续无成交会让总权重归零，上层显式输出 None 而不是伪造数值。
+    ``float_shares`` 三档口径：
+
+    - ``pl.Series``（逐日股本列）：``t_i = volume_i / float_shares_i`` —— 逐行
+      取值，送转/增发当日之后的换手率随之变化。**必须逐行**：把整列折成一个
+      标量会让早期行的 t 依赖后面才出现的股本，前缀重算就变（未来函数）。
+      个别日 null/0 时该行退回代理口径，而不是整段跳成 0。
+    - 正数标量（调用方按日传入的常数）：``t = volume / float_shares``。
+    - ``None``：代理口径 ``t = volume / 截至前一日累积均量``（expanding、不含当日）。
+
+    代理口径的首日（或此前累计无成交）取 1.0：首日之前没有历史筹码，全部筹码
+    落在当日，这是模型的初始条件而不是异常降级；当日本身无成交则 t=0（不产生
+    新筹码），连续无成交会让总权重归零，上层显式输出 None 而不是伪造数值。
     """
     v = df["volume"].to_list()
+    ts = _proxy_turnover(v)
+    if isinstance(float_shares, pl.Series):
+        fs = float_shares.to_list()
+        if len(fs) != len(v):
+            raise ValueError(f"float_shares 长度 {len(fs)} 与面板 {len(v)} 不一致")
+        return [
+            min(vi / fi, 1.0) if (fi is not None and fi > 0) else ts[i]
+            for i, (vi, fi) in enumerate(zip(v, fs, strict=True))
+        ]
     if float_shares and float_shares > 0:
         return [min(vi / float_shares, 1.0) for vi in v]
+    return ts
+
+
+def _proxy_turnover(v: list[float]) -> list[float]:
+    """代理口径换手率：``t_i = volume_i / 截至前一日的累积均量``（严格因果）。"""
     ts: list[float] = []
     cum = 0.0
     for i, vi in enumerate(v):
@@ -76,7 +97,7 @@ def _turnover(df: pl.DataFrame, float_shares: float | None) -> list[float]:
     return ts
 
 
-def _rolling_ratios(df: pl.DataFrame, float_shares: float | None) -> list[float | None]:
+def _rolling_ratios(df: pl.DataFrame, float_shares) -> list[float | None]:
     """逐日获利盘比例（解析式滚动，严格前缀不变）。
 
     第 i 日新筹码 ``t_i`` 落在 ``p_i``，此后每过一天留存 ``(1 - t_j)``。
@@ -176,17 +197,20 @@ def add_cyq_profit_ratio(df: pl.DataFrame) -> pl.DataFrame:
     （前端/批量链）期望它存在，所以补 null 列而不是原样返回；
     与 ``add_turnover_ma`` 的「缺列 noop」同一防御哲学，取更保守的一档。
 
-    float_shares 口径：取列内**最后一个非空值**贯穿全历史 —— 隐含「窗口内
-    流通股本不变」的假设，遇送转/增发等股本变动序列会有偏差；精确口径
-    请在调用侧按日传入，或等数据源提供逐日股本列后改为逐行换手率。
+    float_shares 口径：**逐行** ``t_i = volume_i / ffill(float_shares)_i`` ——
+    送转/增发当日之后的换手率随股本变化，早期行只看得到当期及此前的股本
+    （前缀不变性因此成立）。此前把整列折成「最后一个非空值」贯穿全历史，
+    等于让早期行读到了未来才知道的股本，既失真又破坏前缀不变性门禁。
+    股本列缺失（主路径 ``read_daily`` 就没有这列）或该行 null/0 时，退回
+    「volume / 截至前一日累积均量」的代理口径（逐行兜底，不整段跳 0）。
     """
     missing = [c for c in _REQUIRED if c not in df.columns]
     if missing:
         return df.with_columns(pl.lit(None, dtype=pl.Float64).alias("cyq_profit_ratio"))
-    fs: float | None = None
+    fs: float | pl.Series | None = None
     if "float_shares" in df.columns:
-        col = df["float_shares"].drop_nulls()
-        if col.len() > 0:
-            fs = float(col[-1]) or None
+        col = df["float_shares"].cast(pl.Float64, strict=False).forward_fill()
+        if col.drop_nulls().len() > 0:
+            fs = col
     ratios = _rolling_ratios(df, fs)
     return df.with_columns(pl.Series("cyq_profit_ratio", ratios, dtype=pl.Float64))

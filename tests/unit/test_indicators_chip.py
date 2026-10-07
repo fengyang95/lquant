@@ -159,3 +159,31 @@ def test_no_lookahead_explicit_float_shares():
     closes = list(100 + np.cumsum(rng.normal(0, 1, 40)))
     df = make_df([float(c) for c in closes]).with_columns(pl.lit(1e8).alias("float_shares"))
     assert_no_lookahead(lambda d: compute("cyq_profit_ratio", d), df, out_cols=["cyq_profit_ratio"])
+
+
+def test_no_lookahead_when_float_shares_changes_midway():
+    """股本列**中途变化**（送转/增发）时仍必须前缀不变。
+
+    修复前把整列折成「最后一个非空值」贯穿全历史：早期行的换手率用到了未来
+    才知道的股本 → 前缀重算结果分叉。常数股本列测不出这个 bug，所以这条用
+    「变化」的股本列守门。
+    """
+    closes = [10.0, 10.2, 10.4, 10.6, 10.8, 11.0, 11.2, 11.4, 11.6, 11.8, 12.0, 12.2]
+    fs = [1e8] * 10 + [5e8] * 2  # 第 11 天（index 10）股本翻 5 倍
+    df = make_df(closes).with_columns(pl.Series("float_shares", fs, dtype=pl.Float64))
+
+    assert_no_lookahead(lambda d: compute("cyq_profit_ratio", d), df, out_cols=["cyq_profit_ratio"])
+
+    full = compute("cyq_profit_ratio", df)["cyq_profit_ratio"].to_list()
+    prefix = compute("cyq_profit_ratio", df.head(8))["cyq_profit_ratio"].to_list()
+    assert full[:8] == prefix, "股本列变化后早期行结果被改写 → 未来函数"
+
+
+def test_float_shares_row_null_falls_back_to_proxy_not_zero():
+    """股本列个别日 null → 该行退回代理口径（不是静默换手 0 / 整段塌掉）。"""
+    closes = [10.0, 10.2, 10.4, 10.6, 10.8, 11.0, 11.2]
+    fs = [1e8, 1e8, None, 1e8, 1e8, 1e8, 1e8]
+    df = make_df(closes).with_columns(pl.Series("float_shares", fs, dtype=pl.Float64))
+    out = compute("cyq_profit_ratio", df)["cyq_profit_ratio"].drop_nulls()
+    assert len(out) == len(closes)  # 没有任何一行因 null 股本而丢失
+    assert (out >= 0).all() and (out <= 1).all()
