@@ -16,7 +16,7 @@ from lquant.portfolio.optimizer import OptimizerError
 
 __all__ = ["equal_weight", "score_weight", "market_cap_weight", "inverse_vol_weight",
            "risk_parity_weight", "min_variance_weight", "hrp_weight",
-           "weights", "METHODS", "weight_report"]
+           "weights", "METHODS", "weight_report", "apply_no_trade_band"]
 
 
 def _returns_matrix(returns, symbols: list[str] | None = None) -> tuple[np.ndarray, list[str]]:
@@ -257,6 +257,40 @@ METHODS = {
 }
 
 
+def apply_no_trade_band(weights: dict[str, float], prev: dict[str, float],
+                        *, band: float) -> tuple[dict[str, float], int]:
+    """no-trade band：|w_new - w_prev| < band 的标的**不动**，其余照旧。
+
+    经典 MVO 缓解高换手的手段：优化输出对输入噪声极敏感，微小偏离驱动的
+    调仓是纯摩擦成本（cost_matrix 已证明）。band 吸收后权重和可能 < 1
+    （差额是现金缓冲）—— 这是特性不是 bug，调用方按现金处理。
+
+    返回 (新权重 dict, 改动标的数)。prev 里没有的标的按 0 处理（新调入
+    门槛）；新权重里没有的标的同样按 0 对（调出门槛）。band <= 0 raise：
+    「别调仓」应该显式不调仓，而不是传个 0 装作设了带。
+    """
+    if not (float(band) > 0):
+        raise ValueError(f"band 必须 > 0，收到 {band}")
+    out, n_changed = {}, 0
+    for s, w_new in weights.items():
+        w_prev = float(prev.get(s, 0.0))
+        if abs(float(w_new) - w_prev) < float(band):
+            out[s] = w_prev
+        else:
+            out[s] = float(w_new)
+            n_changed += 1
+    # prev 独有的持仓：新权重已不含（目标 0）—— |0 - w_prev| < band 说明是
+    # 小仓位摩擦性漂移，不卖（保持 w_prev）；够到门槛才清仓
+    for s, w_prev in prev.items():
+        if s not in out:
+            if float(w_prev) < float(band):
+                out[s] = float(w_prev)
+            else:
+                out[s] = 0.0
+                n_changed += 1
+    return out, n_changed
+
+
 def weights(returns, method: str = "equal", symbols: list[str] | None = None,
             **kw) -> dict[str, float]:
     """统一入口。
@@ -265,10 +299,21 @@ def weights(returns, method: str = "equal", symbols: list[str] | None = None,
     整个流程崩。但**已注册方法**抛的错要照实往上抛：那通常是「缺了必需输入」
     （如 ``enhanced_indexing`` 没给 ``scores``/``expected_returns``），
     静默退回等权会让人以为约束真的生效了。这条不对称是刻意的。
+
+    再平衡纪律（可选）：``band`` + ``prev_weights``（两者必须成对给，
+    缺一会 raise）在方法输出后做 no-trade band 吸收。
     """
+    band = kw.pop("band", None)
+    prev = kw.pop("prev_weights", None)
+    if (band is None) != (prev is None):
+        raise ValueError("band 与 prev_weights 必须成对给：只给一个是装样子")
     if method not in METHODS:
-        return equal_weight(returns, symbols)
-    return METHODS[method](returns, symbols, **kw)
+        w = equal_weight(returns, symbols)
+    else:
+        w = METHODS[method](returns, symbols, **kw)
+    if band is not None:
+        w, _ = apply_no_trade_band(w, prev, band=band)
+    return w
 
 
 def weight_report(returns, symbols: list[str] | None = None,

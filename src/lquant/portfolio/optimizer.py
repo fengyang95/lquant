@@ -92,6 +92,8 @@ def enhanced_indexing_weight(
     cov_method: str | None = "shrink_lw",
     cov_params: dict | None = None,
     risk_aversion: float = 0.0,
+    max_turnover: float | None = None,
+    prev_weights=None,
 ) -> EnhancedIndexingResult:
     """在跟踪误差约束下最大化预期超额。
 
@@ -113,6 +115,11 @@ def enhanced_indexing_weight(
     cov_method : 协方差口径，默认 ``shrink_lw`` —— TE 约束对协方差估计极敏感，
         样本口径在 T<N 时会把 TE 低估到 0，约束失去意义。
     risk_aversion : 可选的风险厌恶项（``αᵀd - λ·dᵀΣd``）；0 = 纯约束优化。
+    max_turnover : 本次调仓的换手上限 —— ``Σ|w - w_prev| ≤ max_turnover``（L1）。
+        cost_matrix 已经证明高换手是收益杀手，这里给权重层装刹车。
+    prev_weights : 上期权重（dict 或数组）；``max_turnover`` 给了就必须给
+        （没有上期权重就没有「换手」可言）。缺省 None = 以基准为原点，
+        不启用换手约束。
 
     返回 :class:`EnhancedIndexingResult`（``dict`` 子类，带 ``_`` 前缀的诊断字段）。
     """
@@ -125,12 +132,22 @@ def enhanced_indexing_weight(
     if te_target <= 0:
         raise OptimizerError(f"te_target 必须为正，收到 {te_target}")
 
+    if max_turnover is not None:
+        if float(max_turnover) <= 0:
+            raise OptimizerError(f"max_turnover 必须为正，收到 {max_turnover}")
+        if prev_weights is None:
+            raise OptimizerError(
+                "max_turnover 必须配 prev_weights：没有上期权重就没有「换手」可言")
+
     if benchmark_weights is None:
         b = np.full(n, 1.0 / n)
         benchmark_source = "equal_weight_default"
     else:
         b = _as_weights(benchmark_weights, syms)
         benchmark_source = "provided"
+
+    # 换手的参照点是上期持仓（不是基准）：上期怎么配的，决定这次要动多少
+    w0 = _as_weights(prev_weights, syms) if prev_weights is not None else b
 
     # 预期收益：直接给 → 用；给分数 → 截面标准化（分数不是收益率）
     if expected_returns is not None:
@@ -178,27 +195,41 @@ def enhanced_indexing_weight(
         d = w - b
         return te_daily ** 2 - float(d @ cov @ d)   # ≥ 0 表示满足约束
 
+    def turnover_constraint(w: np.ndarray) -> float:
+        # |·| 在 w=w0 处不可微，SLSQP 会迭代到上限不收敛 —— 平滑 L1：
+        # sqrt(x²+ε) ≥ |x|（约束略偏紧），核验仍用真 L1，方向安全
+        diff = w - w0
+        smooth = float(np.sqrt(diff * diff + 1e-10).sum())
+        return float(max_turnover) - smooth
+
+    constraints = [
+        {"type": "eq", "fun": lambda w: float(w.sum() - 1.0)},
+        {"type": "ineq", "fun": te_constraint},
+    ]
+    if max_turnover is not None:
+        constraints.append({"type": "ineq", "fun": turnover_constraint})
+
     try:
         from scipy.optimize import minimize
 
-        x0 = np.clip(b, lo, hi)
-        x0 = x0 / x0.sum() if x0.sum() > 1e-12 else b
+        # 换手约束下从上期权重出发（可行点）；否则从基准出发
+        anchor = w0 if max_turnover is not None else b
+        x0 = np.clip(anchor, lo, hi)
+        x0 = x0 / x0.sum() if x0.sum() > 1e-12 else anchor
         res = minimize(
             objective, x0, method="SLSQP",
             bounds=list(zip(lo, hi, strict=True)),
-            constraints=[
-                {"type": "eq", "fun": lambda w: float(w.sum() - 1.0)},
-                {"type": "ineq", "fun": te_constraint},
-            ],
+            constraints=constraints,
             options={"maxiter": 500, "ftol": 1e-12},
         )
     except ImportError as e:  # pragma: no cover - scipy 是既有依赖
         raise OptimizerError("基准相对优化需要 scipy") from e
 
-    if not res.success or not np.all(np.isfinite(res.x)):
-        return _fallback(b, syms, cov,
-                         f"优化未收敛（{getattr(res, 'message', '未知')}）",
-                         benchmark_source)
+    if not np.all(np.isfinite(res.x)):
+        return _fallback(b, syms, cov, "优化解含非有限值", benchmark_source)
+    # res.success 不做一票否决：小量纲 α 下 SLSQP 常迭代到上限才停，但解
+    # 往往已可行 —— 可行性由下面的 TE/换手核验说了算，不冤枉可行解也不
+    # 放行越界解（未收敛而核验又不过的，照旧 fallback 并带原因）
 
     w = np.clip(np.asarray(res.x, dtype=float), lo, hi)
     tot = w.sum()
@@ -213,8 +244,16 @@ def enhanced_indexing_weight(
                          f"解违反 TE 约束（{realized_te:.4f} > {te_target:.4f}）",
                          benchmark_source)
 
+    # 换手约束同样事后核验 —— SLSQP 的 ineq 在非光滑 |·| 上可能轻微越界
+    realized_turnover = float(np.abs(w - w0).sum())
+    if max_turnover is not None and realized_turnover > float(max_turnover) * 1.001:
+        return _fallback(b, syms, cov,
+                         f"解违反换手约束（{realized_turnover:.4f} > "
+                         f"{float(max_turnover):.4f}）", benchmark_source)
+
     out = EnhancedIndexingResult({s: float(v) for s, v in zip(syms, w, strict=True)})
     out["_tracking_error"] = realized_te
+    out["_turnover_from_prev"] = realized_turnover
     out["_active_share"] = active_share(w, b)
     out["_expected_excess"] = float(alpha @ (w - b))
     out["_cov_method"] = cov_method or "sample"
@@ -234,6 +273,7 @@ def _fallback(b: np.ndarray, syms: list[str], cov: np.ndarray, reason: str,
     """
     out = EnhancedIndexingResult({s: float(v) for s, v in zip(syms, b, strict=True)})
     out["_tracking_error"] = 0.0
+    out["_turnover_from_prev"] = None
     out["_active_share"] = 0.0
     out["_expected_excess"] = 0.0
     out["_cov_method"] = "n/a"
