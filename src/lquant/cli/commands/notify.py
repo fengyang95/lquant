@@ -83,3 +83,21 @@ def digest(symbols: str | None, asof: str | None) -> None:
         click.echo("自选清单为空，未发送（先在自选页加票或用 --symbols 指定）")
         return
     click.echo(json.dumps(res, ensure_ascii=False, indent=1))
+
+
+@notify.command("portfolio")
+@click.option("--account", required=True, help="模拟盘账户名")
+def portfolio(account: str) -> None:
+    """组合绩效日报：净值/当日盈亏/回撤/集中度 → report 通道（官方净值口径）。
+
+    定时用法（外部 cron）::
+
+        25 15 * * 1-5  lq notify portfolio --account demo
+    """
+    from lquant.market.digest import run_portfolio_digest
+
+    res = run_portfolio_digest(account=account)
+    if res["skipped"]:
+        click.echo(res["skipped"])
+        return
+    click.echo(json.dumps(res, ensure_ascii=False, indent=1, default=str))
