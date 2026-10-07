@@ -14,7 +14,8 @@
 """
 from __future__ import annotations
 
-from lquant.indicators import momentum, tiandao, trend, volume  # noqa: F401  触发注册
+from lquant.indicators import chip, momentum, tiandao, trend, volume  # noqa: F401  触发注册
+from lquant.indicators.chip import CYQ_PROXY_NOTE, cost_distribution, profit_ratio
 from lquant.indicators.composite import WARMUP, add_all
 from lquant.indicators.future import (
     LookaheadViolation,
@@ -44,6 +45,7 @@ from lquant.indicators.volume import add_turnover_ma, add_volume_ratio, add_volu
 
 __all__ = [
     "CATEGORIES",
+    "CYQ_PROXY_NOTE",
     "INDICATORS",
     "PANES",
     "TIANDAO_DEFAULT_N",
@@ -65,8 +67,10 @@ __all__ = [
     "check_prefix_invariance",
     "compute",
     "compute_many",
+    "cost_distribution",
     "min_window",
     "outputs",
+    "profit_ratio",
     "register_indicator",
     "required_history",
     "xma_half_window",

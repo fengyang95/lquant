@@ -88,16 +88,15 @@ def _run_low_atr(df: pl.DataFrame, *, window: int = 14,
                  max_atr_pct: float = 2.5) -> pl.DataFrame:
     """低波动（InStock: low_atr）：ATR(window)/收盘价 <= max_atr_pct%。
     波动小 = 容错空间大，适合作为底仓筛选条件与其他策略叠加。"""
-    tail = df.tail(window)
-    tr = max(
-        tail["high"][-1] - tail["low"][-1],
-        abs(tail["high"][-1] - df["close"][-2]),
-        abs(tail["low"][-1] - df["close"][-2]),
-    )
-    atr = (tr + df.tail(window).with_columns(
-        ((pl.col("high") - pl.col("low")).abs()).alias("rng"))["rng"].sum()
-        - tr) / window  # 首日用 H-L 近似，其余日用 TR 均摊
-    atr = max(atr, 1e-9)
+    # 多取一根拿前收：TR = max(H-L, |H-C_prev|, |L-C_prev|)，首行 shift 为
+    # null，tail(window) 截掉后恰好是完整 window 根的真 TR。
+    tail = df.tail(window + 1).with_columns(
+        pl.max_horizontal(
+            pl.col("high") - pl.col("low"),
+            (pl.col("high") - pl.col("close").shift(1)).abs(),
+            (pl.col("low") - pl.col("close").shift(1)).abs(),
+        ).alias("tr"))
+    atr = max(float(tail["tr"].tail(window).mean()), 1e-9)
     atr_pct = atr / df["close"][-1] * 100
     if atr_pct <= max_atr_pct:
         return _ok("low_atr",

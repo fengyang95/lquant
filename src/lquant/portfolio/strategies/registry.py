@@ -86,4 +86,4 @@ def run_strategy(name: str, df: pl.DataFrame, **params) -> StrategyResult:
 
 def run_all(df: pl.DataFrame, **params) -> list[StrategyResult]:
     """跑全部注册策略（互不干扰：单策略失败不影响其他）。"""
-    return [run_strategy(name, df, **params) for name in STRATEGIES.keys()]
+    return [run_strategy(name, df, **params) for name in STRATEGIES]
