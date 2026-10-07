@@ -70,11 +70,36 @@ lq data status             # 数据覆盖度一览
 export LQ_NOTIFY_CHANNELS=wecom,feishu            # 逗号分隔；不配 = 功能关闭
 export LQ_WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..
 export LQ_FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/..
+# 飞书开了「签名校验」再加（密钥只走 env）：
+export LQ_FEISHU_WEBHOOK_SECRET=..
+# 钉钉加签同理：LQ_DINGTALK_WEBHOOK_URL + LQ_DINGTALK_WEBHOOK_SECRET
 lq notify status          # 自检：看 env 配置出了哪些通道
 lq notify test            # 各通道发一条测试消息并逐个回报
 ```
 
-支持：企业微信 / 飞书 / 钉钉（含加签）/ Telegram / 通用 webhook（自建接收端）。
+支持：企业微信 / 飞书（含加签）/ 钉钉（含加签）/ Telegram / ntfy / PushPlus /
+Server酱³ / 通用 webhook（自建接收端）。长消息按各通道上限**分片续发**
+（续片带 `[续 i/n]` 编号），不截断丢信息。
+
+### 告警规则引擎
+
+`POST /api/notify/rules` 可注册阈值规则（价格/涨跌幅/量比/换手四类），
+命中即推 `alert` 通道，冷却期落 SQLite 防重复轰炸；DryRun 评估接口
+方便前端预览，评估异常显式报 `evaluation_error` 不静默。
+
+### 消息分类与降噪
+
+`notify(title, text, category=..., severity=...)`：report/alert/error 三类
+可路由到不同通道子集；进程内降噪（去重指纹 TTL / 冷却 / 静默时段，
+critical 豁免）防止告警风暴刷群。
+
+### 自选股每日报告
+
+```bash
+lq notify digest          # 对 watchlist 逐票跑多角度分析 → 汇总推送 report 通道
+20 15 * * 1-5  lq notify digest    # 外部 cron 定时：交易日 15:20
+```
+
 纪律与仓库一致：**零新依赖**（stdlib urllib）、**永不阻断主链路**（通道炸了
 对账照常）、**密钥只走 env**（webhook URL 本质是凭证，不入 config/仓库）。
 
@@ -86,10 +111,10 @@ lq notify test            # 各通道发一条测试消息并逐个回报
 | `src/lquant/data` | Provider 抽象、多源适配、入库、质量校验、存储 |
 | `src/lquant/factors` | DSL、算子、预处理、评价 |
 | `src/lquant/backtest` | 规则表、撮合引擎、账户、策略 |
-| `src/lquant/portfolio` | 选池 / 去重 / 权重 |
-| `src/lquant/market` | 看板热通路（实时采集） |
+| `src/lquant/portfolio` | 选池 / 去重 / 权重 / 选股策略库（一策略一纯函数）/ 仓位模型（ATR 风险预算 + Kelly） |
+| `src/lquant/market` | 看板热通路（实时采集）/ 自选股每日报告编排 |
 | `src/lquant/notify` | 通知旁路：企微/飞书/钉钉/TG webhook，对账告警接线 |
-| `src/lquant/research` | JQ 方言兼容、ML 选股、研报复现 |
+| `src/lquant/research` | JQ 方言兼容、ML 选股、研报复现、研报→因子提案（LLM 接 G0 门禁） |
 | `src/lquant/server` | FastAPI + RQ(可降级) + WebSocket |
 | `src/lquant/cli` | `lq` 命令行 |
 | `crates/` | Rust 内核（lq-ops / lq-backtest / lq-metrics） |
