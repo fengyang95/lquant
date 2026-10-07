@@ -49,14 +49,24 @@ def _read_industry_df(retries: int = 3, delay: float = 0.5):
     ) from last
 
 
-def _panel_with_covs(start=None):
-    """读日线 + 协变量（市值/行业/换手率），与挖掘/评价统一口径。"""
+DEFAULT_COVS = ("market_cap", "industry_sw1", "turnover_1m")
+
+
+def _panel_with_covs(start=None, covs=None):
+    """读日线 + 协变量，与挖掘/评价统一口径。
+
+    ``covs=None``（缺省）= 既有统一口径（``DEFAULT_COVS``），所有既有调用点
+    行为零漂移；显式传清单（如看板另类数据 covariate ``mf_main_ratio``/
+    ``lhb_on_board``，见 ``factors/sources/board.py``）时逐个走 provider
+    注册表 join 面板 —— 是**替换**语义：想在看板 cov 之上保留行业中性化，
+    就把 ``industry_sw1`` 一并写进清单。
+    """
     from lquant.data.store.parquet import read_daily
     from lquant.factors.covariates import build_covariates
 
     df = read_daily(start=start).collect()
     ind = _read_industry_df()
-    covs = ["market_cap", "industry_sw1", "turnover_1m"]
+    covs = list(covs) if covs is not None else list(DEFAULT_COVS)
     df, report = build_covariates(df, covs, industry_df=ind)
     present = [f"cov_{r['covariate']}" for r in report if r["coverage"] > 0]
     return df, present
@@ -114,7 +124,6 @@ def verify_and_register(spec: dict) -> tuple[bool, dict]:
 
     expr = spec["expr"]
     name = spec.get("name") or "cand_" + canonical_id(expr)
-    g0 = g0_static(expr, allowed_fields=_daily_fields())
     payload = {"name": name, "expr": expr, "agent": spec.get("agent", "manual")}
     # SKILL 铁律：无 rationale（研究动机/口径说明）不得入库 —— 缺失直接拒
     if not (spec.get("rationale") or "").strip():
@@ -122,12 +131,23 @@ def verify_and_register(spec: dict) -> tuple[bool, dict]:
                         "reason_code": "MISSING_RATIONALE",
                         "hint": "spec 缺少 rationale（研究动机/口径说明），拒绝入库"})
         return False, payload
+    # 先挂协变量面板（spec.covs 可声明看板另类数据 covariate），G0 白名单随后
+    # 随实际挂载的列走 —— 面板里有什么字段，校验就该认什么：cov 列真实可算、
+    # 中性化也在用它，G0 不认才是口径 bug。放前面的另一层用意：引用的
+    # covariate 数据不可用（coverage=0，列根本没挂上）在 RECOMPUTE 阶段最早
+    # 暴露，而不是入库后第一日因子值全 null 静默失效。
+    try:
+        df, cov_cols = _panel_with_covs(start=spec.get("start"), covs=spec.get("covs"))
+    except Exception as e:  # noqa: BLE001
+        payload.update({"ok": False, "grade": "REJECTED", "stage": "RECOMPUTE",
+                        "reason_code": "COMPUTE_FAIL", "hint": str(e)})
+        return False, payload
+    g0 = g0_static(expr, allowed_fields=_daily_fields() | set(cov_cols))
     if not g0.passed:
         payload.update({"ok": False, "grade": "REJECTED", "stage": "G0",
                         "reason_code": g0.reason_code, "hint": g0.hint})
         return False, payload
     try:
-        df, cov_cols = _panel_with_covs(start=spec.get("start"))
         splits = _split_eval(df, cov_cols, expr)
     except Exception as e:  # noqa: BLE001
         payload.update({"ok": False, "grade": "REJECTED", "stage": "RECOMPUTE",

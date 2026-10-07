@@ -168,6 +168,25 @@ weights(M, "enhanced_indexing", syms, scores=..., band=0.03, prev_weights=prev)
 cost_matrix 已证明高换手是收益杀手，这里给权重层装刹车；band 吸收后
 权重和 < 1 即现金缓冲。
 
+### 看板另类数据因子化（EP-9）
+
+资金流 / 龙虎榜 / 涨停池三张表在 `market/collectors` 采集已久、因子层零
+消费 —— EP-9 把它们做成 `CovariateProvider`（`factors/sources/board.py`，
+6 个特征：主力净占比、3 日主力净占比、上榜标记、5 日净买合计、连板数、
+20 日炸板数），G0-G3 门禁从此能评价情绪/资金面因子：
+
+```bash
+lq factor eval "cov_lhb_on_board * cov_mf_main_ratio" --cov mf_main_ratio,lhb_on_board
+```
+
+防前视是生命线：龙虎榜 T 日盘后晚间定型、资金流/涨停池盘中会漂，所有特征
+按 T 日算好再组内 `shift(1)` —— **T+1 行的因子值只能看到 ≤T 日的看板数据，
+宁可晚一天，不可用未来**。语义分界照 covariates 三硬约束：未上榜/当日无流
+数据 = 0（业务事实），表未同步 = `CovariateUnavailable`（coverage=0 显式
+上报，绝不填 0 冒充）。submit spec 可声明 `covs:`，G0 字段白名单随实际
+挂载的列走 —— 面板里有什么字段，校验就认什么；covariate 数据不可用时
+在 RECOMPUTE 阶段最早暴露，不会入库后因子值全 null 静默失效。
+
 ## 技术指标
 
 `src/lquant/indicators` 注册表驱动（趋势/摆动/量能/**形态**/通道五类），
@@ -181,7 +200,7 @@ cost_matrix 已证明高换手是收益杀手，这里给权重层装刹车；ba
 |---|---|
 | `src/lquant/core` | 配置 / 类型 / 注册表 / 日历 / 单写者 DB 连接 |
 | `src/lquant/data` | Provider 抽象、多源适配、入库、质量校验、存储 |
-| `src/lquant/factors` | DSL、算子、预处理、评价、在线监控（IC 日表 + 健康度） |
+| `src/lquant/factors` | DSL、算子、预处理、评价、在线监控（IC 日表 + 健康度）、看板另类数据协变量（EP-9） |
 | `src/lquant/backtest` | 规则表、撮合引擎、账户、策略、实验记录器（list/show/diff）、统计置信度（PSR/DSR/PBO） |
 | `src/lquant/portfolio` | 选池 / 去重 / 权重（no-trade band）/ 优化器（TE + 换手约束）/ 选股策略库（一策略一纯函数）/ 仓位模型（ATR 风险预算 + Kelly） |
 | `src/lquant/indicators` | 技术指标注册表（五类）：CYQ 筹码、K线形态信号列等 |

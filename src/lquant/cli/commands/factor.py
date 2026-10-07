@@ -65,11 +65,29 @@ def check_expr(expr: str) -> None:
 @click.option("--neutral/--raw", default=True, help="是否中性化（默认中性化）")
 @click.option("--n-groups", default=DEFAULT_N_GROUPS, help="分层组数")
 @click.option("--agent", default=None, help="Agent 名（配额记账 + 校正门槛）")
-def eval_(expr: str, start: str | None, neutral: bool, n_groups: int, agent: str | None) -> None:
+@click.option(
+    "--cov",
+    "covs_csv",
+    default=None,
+    help=(
+        "协变量清单（逗号分隔 provider 名，替换缺省口径）："
+        "如 mf_main_ratio,lhb_on_board 评看板资金/情绪因子；"
+        "想保留行业中性化就把 industry_sw1 一并写进清单"
+    ),
+)
+def eval_(
+    expr: str,
+    start: str | None,
+    neutral: bool,
+    n_groups: int,
+    agent: str | None,
+    covs_csv: str | None,
+) -> None:
     """L1 快筛：IC/ICIR + 分层 + 换手 + 中性化对照 + 校正门槛/配额（方案 6.2/6.3）。
 
     train 段（前 70%）上一次算完，与 audit/submit 共用 ``prepare_segment``，
-    口径不允许分叉。
+    口径不允许分叉。``--cov`` 可挂看板另类数据 covariate（T+1 可用口径，
+    防前视由 provider 保证）。
     """
     import json
 
@@ -80,7 +98,8 @@ def eval_(expr: str, start: str | None, neutral: bool, n_groups: int, agent: str
     from lquant.factors.mining.runner import split_dates
     from lquant.factors.mining.submit import _panel_with_covs, prepare_segment
 
-    df, cov_cols = _panel_with_covs(start=start)
+    covs = [c.strip() for c in covs_csv.split(",") if c.strip()] if covs_csv else None
+    df, cov_cols = _panel_with_covs(start=start, covs=covs)
     if not len(df):
         raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")
     dates = sorted(df["trade_date"].unique().to_list())
@@ -174,6 +193,7 @@ def eval_(expr: str, start: str | None, neutral: bool, n_groups: int, agent: str
                     "annual_turnover": annual_turnover,
                     "ic_raw_mean": ic_raw,
                     "neutralized": bool(cov_cols),
+                    "covariates": cov_cols,
                     "n_trials": n_trials,
                     "corrected_threshold": round(thr, 2) if thr else None,
                     "quota_remaining": remaining,
