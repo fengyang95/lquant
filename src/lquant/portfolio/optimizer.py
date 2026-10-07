@@ -180,7 +180,8 @@ def enhanced_indexing_weight(
         hi = np.minimum(hi, b + float(max_active))
     if lo.sum() > 1.0 + 1e-9 or hi.sum() < 1.0 - 1e-9:
         # 边界与「权重和为 1」矛盾 → 无法行。直接退回基准（见模块 docstring）
-        return _fallback(b, syms, cov, "权重边界与 Σw=1 矛盾", benchmark_source)
+        return _fallback(b, syms, cov, "权重边界与 Σw=1 矛盾", benchmark_source,
+                         w0=w0, max_turnover=max_turnover, alpha=alpha, cov_method=cov_method)
 
     te_daily = float(te_target) / np.sqrt(252)
 
@@ -226,7 +227,8 @@ def enhanced_indexing_weight(
         raise OptimizerError("基准相对优化需要 scipy") from e
 
     if not np.all(np.isfinite(res.x)):
-        return _fallback(b, syms, cov, "优化解含非有限值", benchmark_source)
+        return _fallback(b, syms, cov, "优化解含非有限值", benchmark_source,
+                         w0=w0, max_turnover=max_turnover, alpha=alpha, cov_method=cov_method)
     # res.success 不做一票否决：小量纲 α 下 SLSQP 常迭代到上限才停，但解
     # 往往已可行 —— 可行性由下面的 TE/换手核验说了算，不冤枉可行解也不
     # 放行越界解（未收敛而核验又不过的，照旧 fallback 并带原因）
@@ -234,7 +236,8 @@ def enhanced_indexing_weight(
     w = np.clip(np.asarray(res.x, dtype=float), lo, hi)
     tot = w.sum()
     if tot <= 1e-12:
-        return _fallback(b, syms, cov, "解全为 0", benchmark_source)
+        return _fallback(b, syms, cov, "解全为 0", benchmark_source,
+                         w0=w0, max_turnover=max_turnover, alpha=alpha, cov_method=cov_method)
     w = w / tot
 
     # 收敛后仍可能因数值误差轻微越界 → 显式核验，越界就退回基准
@@ -242,14 +245,16 @@ def enhanced_indexing_weight(
     if realized_te > float(te_target) * 1.001:
         return _fallback(b, syms, cov,
                          f"解违反 TE 约束（{realized_te:.4f} > {te_target:.4f}）",
-                         benchmark_source)
+                         benchmark_source, w0=w0, max_turnover=max_turnover,
+                         alpha=alpha, cov_method=cov_method)
 
     # 换手约束同样事后核验 —— SLSQP 的 ineq 在非光滑 |·| 上可能轻微越界
     realized_turnover = float(np.abs(w - w0).sum())
     if max_turnover is not None and realized_turnover > float(max_turnover) * 1.001:
         return _fallback(b, syms, cov,
                          f"解违反换手约束（{realized_turnover:.4f} > "
-                         f"{float(max_turnover):.4f}）", benchmark_source)
+                         f"{float(max_turnover):.4f}）", benchmark_source,
+                         w0=w0, max_turnover=max_turnover, alpha=alpha, cov_method=cov_method)
 
     out = EnhancedIndexingResult({s: float(v) for s, v in zip(syms, w, strict=True)})
     out["_tracking_error"] = realized_te
@@ -265,20 +270,44 @@ def enhanced_indexing_weight(
 
 
 def _fallback(b: np.ndarray, syms: list[str], cov: np.ndarray, reason: str,
-              benchmark_source: str = "provided") -> EnhancedIndexingResult:
-    """不可行时退回基准权重（主动权重全 0）。
+              benchmark_source: str = "provided", *,
+              w0: np.ndarray | None = None,
+              max_turnover: float | None = None,
+              alpha: np.ndarray | None = None,
+              cov_method: str | None = None) -> EnhancedIndexingResult:
+    """不可行时退回一个**已知可行**的权重组合。
 
-    比「报错让上游崩」安全：基准组合是可解释的、可交易的；而一个违反
-    约束的解会静默产生超出风险预算的暴露。原因记在 ``_fallback_reason``。
+    比「报错让上游崩」安全：一个违反约束的解会静默产生超出风险预算的暴露；
+    退回上期持仓（换手 0）或基准（主动权重 0）都是可解释、可交易的。
+    原因记在 ``_fallback_reason``。
+
+    退给谁由约束决定：
+
+    - 给了 ``max_turnover``（本次调仓有换手上限）：退回**上期持仓 w0** ——
+      退回基准 b 的换手是 ``Σ|b - w0|``，可能远超声明的上限，于是「刹车」
+      恰恰在最该生效的时候缺席。w0 的换手恒为 0，永远满足上限；
+      TE / 主动份额 / 预期超额照实按 w0 vs b 计算，不谎报 0。
+    - 没给换手上限：维持原语义退回基准（主动权重全 0，TE = 0）。
     """
-    out = EnhancedIndexingResult({s: float(v) for s, v in zip(syms, b, strict=True)})
-    out["_tracking_error"] = 0.0
-    out["_turnover_from_prev"] = None
-    out["_active_share"] = 0.0
-    out["_expected_excess"] = 0.0
-    out["_cov_method"] = "n/a"
+    no_trade = max_turnover is not None and w0 is not None
+    w = w0 if no_trade else b
+    out = EnhancedIndexingResult({s: float(v) for s, v in zip(syms, w, strict=True)})
+    if no_trade:
+        reason = f"{reason} → 保持上期持仓（换手上限 {float(max_turnover)} 下无可行解）"
+        out["_tracking_error"] = float(tracking_error(w, b, cov))
+        out["_turnover_from_prev"] = 0.0
+        out["_active_share"] = float(active_share(w, b))
+        out["_expected_excess"] = float(alpha @ (w - b)) if alpha is not None else 0.0
+        out["_cov_method"] = cov_method or "sample"
+        out["_n_active"] = int((np.abs(w - b) > 1e-6).sum())
+    else:
+        out["_tracking_error"] = 0.0
+        out["_turnover_from_prev"] = None
+        out["_active_share"] = 0.0
+        out["_expected_excess"] = 0.0
+        out["_cov_method"] = "n/a"
+        out["_n_active"] = 0
     out["_benchmark_source"] = benchmark_source
     out["_fallback"] = True
     out["_fallback_reason"] = reason
-    out["_n_active"] = 0
     return out

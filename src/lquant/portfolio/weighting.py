@@ -256,6 +256,14 @@ METHODS = {
     "enhanced_indexing": _enhanced_indexing,
 }
 
+# 方法自己的入参（非 band 锚）：这些名字归方法，统一入口原样透传。
+# 目前只有 enhanced_indexing 的换手参照点 —— 它经 ``**kw`` 转交
+# ``optimizer.enhanced_indexing_weight(prev_weights=…)``，所以必须在这里
+# 声明，不能靠签名推断（透传壳没有具名参数）。
+_METHOD_OWNED_KWARGS: dict[str, frozenset[str]] = {
+    "enhanced_indexing": frozenset({"prev_weights"}),
+}
+
 
 def apply_no_trade_band(weights: dict[str, float], prev: dict[str, float],
                         *, band: float) -> tuple[dict[str, float], int]:
@@ -302,11 +310,25 @@ def weights(returns, method: str = "equal", symbols: list[str] | None = None,
 
     再平衡纪律（可选）：``band`` + ``prev_weights``（两者必须成对给，
     缺一会 raise）在方法输出后做 no-trade band 吸收。
+
+    ``prev_weights`` 有**两个可能的主人**：band 的锚（与 ``band`` 一起给），
+    或被调方法自己的入参（``enhanced_indexing`` 的换手参照点，见
+    ``optimizer.enhanced_indexing_weight``）。所以只在 band 模式下取走它，
+    否则原样透传给方法 —— 否则统一入口反而比直调方法更窄：
+    ``weights(..., "enhanced_indexing", max_turnover=…, prev_weights=…)``
+    会被「成对校验」拦下，而那两个参数本来正是配着用的。
     """
     band = kw.pop("band", None)
-    prev = kw.pop("prev_weights", None)
-    if (band is None) != (prev is None):
-        raise ValueError("band 与 prev_weights 必须成对给：只给一个是装样子")
+    if band is None:
+        # 非 band 模式：prev_weights 属于方法。方法根本不收这个参数时，
+        # 只给 prev_weights 就是「装样子」—— 照旧 raise（不静默吞掉）。
+        prev = kw.get("prev_weights")
+        if prev is not None and not _accepts(method, "prev_weights"):
+            raise ValueError("band 与 prev_weights 必须成对给：只给一个是装样子")
+    else:
+        prev = kw.pop("prev_weights", None)
+        if prev is None:
+            raise ValueError("band 与 prev_weights 必须成对给：只给一个是装样子")
     if method not in METHODS:
         w = equal_weight(returns, symbols)
     else:
@@ -314,6 +336,17 @@ def weights(returns, method: str = "equal", symbols: list[str] | None = None,
     if band is not None:
         w, _ = apply_no_trade_band(w, prev, band=band)
     return w
+
+
+def _accepts(method: str, param: str) -> bool:
+    """方法是否**自己**收 ``param``（决定 prev_weights 归 band 还是归方法）。
+
+    用 METHODS 旁边的显式表而不是 ``inspect.signature``：注册表里的方法
+    大多是 ``def f(returns, symbols=None, **kw)`` 的透传壳（``_enhanced_indexing``
+    就是），签名里根本没有具名参数 —— 按签名判断会把「透传给优化器」误判成
+    「装样子」，正是本次要修的 bug。新增消费 prev_weights 的方法时同步加一行。
+    """
+    return param in _METHOD_OWNED_KWARGS.get(method, frozenset())
 
 
 def weight_report(returns, symbols: list[str] | None = None,

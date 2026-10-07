@@ -156,6 +156,73 @@ def test_weights_entry_point_band_pairing():
         weights(M, "equal", syms, prev_weights=prev)
 
 
+def test_fallback_holds_prev_weights_when_turnover_capped():
+    """不可行解 + 换手上限 → 退回**上期持仓**（换手 0），而不是退回基准。
+
+    修复前 ``_fallback`` 无条件退回基准 b、并把 ``_turnover_from_prev`` 置 None：
+    声明的换手上限恰好在自己生效的路径上被绕过（实测换手可达上限的万倍），
+    而调用方只看到 ``_fallback=True`` 就以为「退到安全解」了。
+    """
+    n = 10
+    syms = _syms(n)
+    scores = {s: -i for i, s in enumerate(syms)}
+    prev = {syms[0]: 1.0}  # 上期单票满仓；1e-4 的换手预算下无可行解
+    r = enhanced_indexing_weight(
+        _returns(), syms, scores=scores, max_weight=1.0,
+        max_turnover=1e-4, prev_weights=prev,
+    )
+    assert r.diagnostics["_fallback"] is True
+    # 退回上期持仓：换手恒 0，且诊断字段如实给出（不谎报 TE=0）
+    assert r[syms[0]] == pytest.approx(1.0)
+    assert r.diagnostics["_turnover_from_prev"] == pytest.approx(0.0)
+    w = np.array([r[s] for s in syms])
+    w0 = np.array([prev.get(s, 0.0) for s in syms])
+    assert np.abs(w - w0).sum() == pytest.approx(0.0)
+    assert "保持上期持仓" in r.diagnostics["_fallback_reason"]
+    assert r.diagnostics["_tracking_error"] > 0  # w0 vs 基准的真实 TE，不是 0
+
+
+def test_fallback_without_turnover_cap_still_returns_benchmark():
+    """没给换手上限时维持原语义：退回基准（主动权重 0、TE 0、turnover None）。"""
+    syms = _syms()
+    b = {s: 0.1 for s in syms}
+    r = enhanced_indexing_weight(
+        _returns(), syms, scores={s: -i for i, s in enumerate(syms)},
+        max_weight=0.02,  # 上界和 < 1 → 权重边界与 Σw=1 矛盾 → fallback
+        benchmark_weights=b,
+    )
+    assert r.diagnostics["_fallback"] is True
+    assert r.diagnostics["_turnover_from_prev"] is None
+    assert r.diagnostics["_tracking_error"] == pytest.approx(0.0)
+    assert all(r[s] == pytest.approx(0.1) for s in syms)
+
+
+def test_weights_entry_point_forwards_prev_weights_to_optimizer():
+    """统一入口必须能把 ``prev_weights`` 透传给优化器（它是换手参照点）。
+
+    修复前 ``weights()`` 无条件 pop 掉 prev_weights 并做「band 成对」校验，
+    于是 ``weights(..., "enhanced_indexing", max_turnover=…, prev_weights=…)``
+    必抛 ValueError —— 注册表入口比直调方法更窄，而这两参数本来就配着用。
+    """
+    from lquant.portfolio.weighting import weights
+
+    syms = _syms()
+    scores = {s: float(-i) for i, s in enumerate(syms)}
+    prev = {s: 0.1 for s in syms}
+    w = weights(
+        _returns(), "enhanced_indexing", syms, scores=scores,
+        max_weight=0.5, max_turnover=0.05, prev_weights=prev,
+    )
+    assert abs(sum(w.values()) - 1.0) < 1e-9
+    direct = enhanced_indexing_weight(
+        _returns(), syms, scores=scores, max_weight=0.5,
+        max_turnover=0.05, prev_weights=prev,
+    )
+    # 透传路径与直调路径同解（证明 prev_weights 真的到了优化器，而不是被吞掉）
+    for s in syms:
+        assert w[s] == pytest.approx(direct[s])
+
+
 def test_weights_band_actually_changes_target_weights():
     from lquant.portfolio.weighting import weights
 
