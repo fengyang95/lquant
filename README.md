@@ -72,7 +72,7 @@ export LQ_WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key
 export LQ_FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/..
 # 飞书开了「签名校验」再加（密钥只走 env）：
 export LQ_FEISHU_WEBHOOK_SECRET=..
-# 钉钉加签同理：LQ_DINGTALK_WEBHOOK_URL + LQ_DINGTALK_WEBHOOK_SECRET
+# 钉钉加签同理：LQ_DINGTALK_WEBHOOK_URL + LQ_DINGTALK_SECRET
 lq notify status          # 自检：看 env 配置出了哪些通道
 lq notify test            # 各通道发一条测试消息并逐个回报
 ```
