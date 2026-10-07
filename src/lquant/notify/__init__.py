@@ -7,9 +7,15 @@ warning/critical 告警），而不是把每条日志都灌进 IM 群。
 用法::
 
     from lquant.notify import notify
-    notify("模拟盘对账告警", "demo: verdict=critical 偏差 12.3%")
+    notify("模拟盘对账告警", "demo: verdict=critical 偏差 12.3%",
+           category="alert", severity="critical")
 
-配置见 ``lquant/notify/service.py`` 模块 docstring（全 env 驱动，密钥不入库）。
+- 分类路由：``category`` ∈ report/alert/error，``LQ_NOTIFY_<类>_CHANNELS`` 收窄渠道
+- 降噪：dedup TTL / 全局冷却 / 静默时段（critical 豁免）/ 最低严重度，env 见 service
+- 渠道：企微 / 飞书(含加签) / 钉钉(含加签) / Telegram / ntfy / PushPlus / Server酱3 / 通用 webhook
+- 长消息按渠道 ``max_chars`` 分片续发，宁可收前 N 片也不静默丢尾部
+
+配置契约见 ``lquant/notify/service.py`` 模块 docstring（全 env 驱动，密钥不入库）。
 """
 from lquant.notify.channels import SendResult
 from lquant.notify.service import (
@@ -18,7 +24,12 @@ from lquant.notify.service import (
     build_chain,
     format_results,
     notify,
+    reset_suppress_state,
+    route_channels,
+    severity_rank,
+    should_suppress,
 )
 
 __all__ = ["notify", "SendResult", "build_chain", "active_channels",
-           "format_results", "CHANNEL_FACTORY"]
+           "format_results", "CHANNEL_FACTORY", "route_channels",
+           "severity_rank", "should_suppress", "reset_suppress_state"]

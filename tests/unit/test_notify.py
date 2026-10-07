@@ -11,6 +11,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+import zoneinfo
 
 import pytest
 
@@ -18,12 +19,25 @@ from lquant.notify.channels import (
     DingTalkBot,
     FeishuBot,
     GenericWebhook,
+    NtfyChannel,
+    PushPlusChannel,
     SendResult,
+    ServerChan3Channel,
     TelegramBot,
     WecomBot,
     _business_error,
+    slice_text,
 )
-from lquant.notify.service import build_chain, format_results, notify
+from lquant.notify.service import (
+    build_chain,
+    format_results,
+    in_quiet_hours,
+    notify,
+    reset_suppress_state,
+    route_channels,
+    severity_rank,
+    should_suppress,
+)
 
 # ---------- fixtures ----------
 
@@ -276,3 +290,200 @@ def test_day_close_notify_failure_never_breaks_reconcile(monkeypatch):
     _patch_daily(monkeypatch, close=5.0)
     out = service.day_close("nc3")   # 不抛
     assert out["reconcile"]["verdict"] == "critical"
+
+
+# ==================== v1.5：分片 / 飞书加签 / 新渠道 / 路由 / 降噪 ====================
+
+
+
+@pytest.fixture(autouse=True)
+def _reset_suppress():
+    """降噪是进程内状态：每个用例从零开始，防止跨用例串扰。"""
+    reset_suppress_state()
+    yield
+    reset_suppress_state()
+
+
+# ---------- 分片 ----------
+
+def test_slice_text_short_message_single_slice():
+    assert slice_text("t", "abc", 100) == [("t", "abc")]
+
+
+def test_slice_text_long_message_marks_continuation():
+    slices = slice_text("标题", "x" * 250, 100)
+    assert len(slices) == 3
+    assert slices[0][0] == "标题"
+    assert slices[1][0] == "[续 1/3]" and slices[2][0] == "[续 2/3]"
+    for _, chunk in slices:
+        assert len(chunk) <= 100
+
+
+def test_slice_text_no_limit_passes_through():
+    assert slice_text("t", "x" * 9999, None) == [("t", "x" * 9999)]
+
+
+def test_send_slices_long_text_and_stops_on_error(captured, monkeypatch):
+    """分片续发：全片送达；中途失败即停，不重复发剩余片。"""
+    monkeypatch.setenv("LQ_NOTIFY_CHANNELS", "webhook")
+    monkeypatch.setenv("LQ_GENERIC_WEBHOOK_URL",
+                       "https://x/hook")  # generic max_chars=None → 不分片
+
+    class _Sliced(GenericWebhook):
+        name = "webhook"
+        max_chars = 50
+
+    res = _Sliced().send("t", "y" * 120)   # body_cap=50-10-1=39 → 4 片
+    assert res.ok and len(captured) == 4
+    titles = [b[1]["title"] for b in captured]
+    assert titles[0] == "t" and titles[1] == "[续 1/4]"
+
+    captured.clear()
+
+    class _FailSecond(_Sliced):
+        pass
+
+    monkeypatch.setenv("LQ_GENERIC_WEBHOOK_URL", "https://x/fail-500")
+    # 第一片成功（fail-500 也成功？不——fail-500 全部失败）→ 换真实策略：
+    # 用自定义 urlopen 让第 2 片失败
+    state = {"n": 0}
+
+    def flaky(req, timeout=None):
+        state["n"] += 1
+        if state["n"] == 2:
+            raise urllib.error.HTTPError(req.full_url, 429, "slow down", None, None)
+        return _FakeResp('{"errcode":0}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", flaky)
+    res2 = _Sliced().send("t", "y" * 120)
+    assert not res2.ok and "429" in (res2.error or "")
+    assert state["n"] == 2   # 第 2 片失败 → 第 3 片不再发送
+
+
+# ---------- 飞书加签 ----------
+
+def test_feishu_signing_uses_string_to_sign_as_key(monkeypatch):
+    monkeypatch.setenv("LQ_FEISHU_WEBHOOK_URL",
+                       "https://open.feishu.cn/open-apis/bot/v2/hook/x")
+    monkeypatch.setenv("LQ_FEISHU_WEBHOOK_SECRET", "SECf")
+    monkeypatch.setattr("time.time", lambda: 1_700_000_000)
+
+    ch = FeishuBot()
+    url = ch._post_url(ch._url())
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    assert q["timestamp"] == ["1700000000"]
+    # 飞书口径：key = f"{ts}\n{secret}"，message 为空串
+    expected = base64.b64encode(hmac.new(
+        b"1700000000\nSECf", b"", digestmod=hashlib.sha256).digest()).decode()
+    assert q["sign"] == [expected]
+
+
+# ---------- 新渠道 payload ----------
+
+def test_ntfy_request_uses_plain_text_with_title_header():
+    body, headers = NtfyChannel()._request("标题", "正文")
+    assert body.decode() == "正文"
+    assert headers["Content-Type"].startswith("text/plain")
+    assert "X-Title" in headers   # 非 ASCII 标题被 ascii-ignore 处理，键必在
+
+
+def test_pushplus_payload():
+    assert PushPlusChannel()._payload("t", "c")["template"] == "txt"
+
+
+def test_serverchan3_url_embeds_sendkey(monkeypatch):
+    monkeypatch.setenv("LQ_SERVERCHAN3_SENDKEY", "SCT123")
+    assert ServerChan3Channel()._url() == "https://SCT123.push.ft07.com/send"
+
+
+def test_registry_contains_v15_channels():
+    assert {"ntfy", "pushplus", "serverchan3"} <= set(
+        __import__("lquant.notify.service", fromlist=["CHANNEL_FACTORY"]).CHANNEL_FACTORY)
+
+
+# ---------- 分类路由 ----------
+
+def _chain(*names):
+    from lquant.notify.service import CHANNEL_FACTORY
+    return [CHANNEL_FACTORY[n]() for n in names]
+
+
+def test_route_without_env_keeps_all(monkeypatch):
+    chain = _chain("wecom", "feishu")
+    assert route_channels(chain, "alert") == chain
+
+
+def test_route_narrows_by_category(monkeypatch):
+    monkeypatch.setenv("LQ_NOTIFY_ALERT_CHANNELS", "wecom")
+    chain = _chain("wecom", "feishu")
+    assert [c.name for c in route_channels(chain, "alert")] == ["wecom"]
+    assert [c.name for c in route_channels(chain, "report")] == ["wecom", "feishu"]
+
+
+def test_notify_category_routes_only_alert_channel(captured, monkeypatch):
+    monkeypatch.setenv("LQ_NOTIFY_CHANNELS", "wecom,feishu")
+    monkeypatch.setenv("LQ_WECOM_WEBHOOK_URL", "https://x/wecom")
+    monkeypatch.setenv("LQ_FEISHU_WEBHOOK_URL", "https://x/feishu")
+    monkeypatch.setenv("LQ_NOTIFY_ALERT_CHANNELS", "wecom")
+    results = notify("对账", "critical", category="alert", severity="critical")
+    assert [r.channel for r in results] == ["wecom"]   # feishu 被路由收窄
+
+
+def test_notify_category_without_match_reports_skip(monkeypatch):
+    monkeypatch.setenv("LQ_NOTIFY_CHANNELS", "wecom")
+    monkeypatch.setenv("LQ_NOTIFY_ERROR_CHANNELS", "feishu")
+    results = notify("err", "x", category="error")
+    assert results[0].skipped and "路由后无渠道" in results[0].error
+
+
+# ---------- 降噪 ----------
+
+def test_severity_rank_ordering():
+    assert severity_rank("info") < severity_rank("warning") < severity_rank("critical")
+    assert severity_rank("bogus") == 0   # 未知级别按 info 兜底
+
+
+def test_suppress_min_severity(monkeypatch):
+    monkeypatch.setenv("LQ_NOTIFY_MIN_SEVERITY", "warning")
+    assert should_suppress("t", "x", "info") == "min_severity"
+    assert should_suppress("t", "x", "critical") is None
+
+
+def test_suppress_quiet_hours_exempts_critical(monkeypatch):
+    monkeypatch.setenv("LQ_NOTIFY_QUIET_HOURS", "23:00-08:00")
+    # 2026-09-30 是周三；01:00 落在跨午夜静默区间
+    night = datetime.datetime(2026, 9, 30, 1, 0,
+                              tzinfo=zoneinfo.ZoneInfo("Asia/Shanghai"))
+    noon = datetime.datetime(2026, 9, 30, 12, 0,
+                             tzinfo=zoneinfo.ZoneInfo("Asia/Shanghai"))
+    assert in_quiet_hours(night) and not in_quiet_hours(noon)
+    # should_suppress 用真实时钟，钉住"正在静默"再断言豁免关系
+    import lquant.notify.service as nsvc
+    monkeypatch.setattr(nsvc, "in_quiet_hours", lambda now=None: True)
+    assert should_suppress("t", "x", "info") == "quiet_hours"
+    assert should_suppress("t", "x", "critical") is None   # critical 豁免
+
+
+def test_suppress_dedup_within_ttl(monkeypatch):
+    monkeypatch.setenv("LQ_NOTIFY_DEDUP_TTL_SECONDS", "300")
+    assert should_suppress("t", "x") is None          # 首次放行
+    notify("t", "x", channels=_chain("webhook"))       # 登记指纹（webhook 无 URL 会 skip 但先登记）
+    assert should_suppress("t", "x") == "dedup"        # TTL 内重复压制
+    assert should_suppress("t", "different") is None   # 内容不同不压制
+
+
+def test_suppress_cooldown(monkeypatch):
+    monkeypatch.setenv("LQ_NOTIFY_COOLDOWN_SECONDS", "60")
+    notify("t1", "x", channels=_chain("webhook"))
+    assert should_suppress("t2", "y") == "cooldown"    # 全局冷却与内容无关
+
+
+def test_notify_suppressed_returns_reason(captured, monkeypatch):
+    monkeypatch.setenv("LQ_NOTIFY_CHANNELS", "webhook")
+    monkeypatch.setenv("LQ_GENERIC_WEBHOOK_URL", "https://x/hook")
+    monkeypatch.setenv("LQ_NOTIFY_DEDUP_TTL_SECONDS", "300")
+    notify("t", "x")
+    n_before = len(captured)
+    results = notify("t", "x")
+    assert results[0].skipped and results[0].channel == "suppressed"
+    assert len(captured) == n_before                   # 被压制的消息不发网络请求
