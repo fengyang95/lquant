@@ -8,6 +8,12 @@
 
 方法：几何布朗运动 + 跳空，代码全部用真实存在的格式（600xxx.SH / 000xxx.SZ /
 510xxx.SH ETF），但数据是合成的。**绝不用于真实回测结论。**
+
+**自洽是硬要求**：演示环境要能跑通仿真里的**全部**下游，否则「缺数据」会被
+误读成「功能坏了」。两道曾经缺失的地基（2026-10-06 CI 全红的原因）：
+``float_mv``（协变量 market_cap 的来源，DAILY_BAR schema 里有、演示数据里没有）
+与 ``industry_classify``（申万行业，协变量 industry_sw1 的来源，演示建库后是空表）。
+缺了它们，因子报告的「归因分解 / 风格相关性体检」不会报错，只会安静地整块消失。
 """
 from __future__ import annotations
 
@@ -15,7 +21,12 @@ import numpy as np
 import polars as pl
 
 from lquant.core.types import now_cn, today_cn
-from lquant.data.store.catalog import EtfMetaRepo, SecurityRepo, TradeCalendarRepo
+from lquant.data.store.catalog import (
+    EtfMetaRepo,
+    IndustryClassifyRepo,
+    SecurityRepo,
+    TradeCalendarRepo,
+)
 from lquant.data.store.parquet import write_daily
 
 STOCK_CODES = [
@@ -35,6 +46,14 @@ ETF_CODES = [
     ("513100.SH", "纳指ETF", 0), ("513050.SH", "中概互联ETF", 0),
     ("512880.SH", "证券ETF", 1), ("512690.SH", "酒ETF", 1),
     ("511260.SH", "十年国债ETF", 0), ("518880.SH", "黄金ETF", 0),
+]
+
+# 申万一级行业（演示用，代码/名称为真实格式）。分类是 PIT 协变量栈的必需输入：
+# 没有它，报告的归因分解、行业中性化、风格体检都会**安静地**整块消失 ——
+# 而这是代码问题还是数据问题，看报告是分不出来的（见 generate_demo 注释）。
+DEMO_INDUSTRIES = [
+    ("801780.SI", "银行"), ("801080.SI", "电子"), ("801120.SI", "食品饮料"),
+    ("801180.SI", "房地产"), ("801730.SI", "电力设备"), ("801150.SI", "医药生物"),
 ]
 
 
@@ -61,6 +80,12 @@ def _synth_bars(symbol: str, dates: list, seed: int, base_price: float,
     low = np.minimum(open_, close) * (1 - np.abs(rng.normal(0, 0.008, n)))
     pre_close = np.concatenate([[base_price], close[:-1]])
     volume = rng.lognormal(15, 0.6, n)
+    # float_mv（流通市值，元）与真实 provider 同一恒等式推导：
+    # 换手率(%) = 成交量 / 流通股本 × 100 → 流通市值 = close × volume / (turn / 100)。
+    # 必须**在 round 之前**由未取整的 close/volume/turn 算出，否则三处各自的
+    # 取整误差会叠进市值；份额下限 0.2% 保证除数恒正、不产 inf。
+    turnover = rng.uniform(0.2, 5, n)
+    float_mv = close * volume / (turnover / 100)
     return pl.DataFrame({
         "trade_date": dates,
         "symbol": [symbol] * n,
@@ -69,7 +94,8 @@ def _synth_bars(symbol: str, dates: list, seed: int, base_price: float,
         "pre_close": pre_close.round(2),
         "volume": volume.round(0),
         "amount": (volume * close).round(0),
-        "turnover_rate": rng.uniform(0.2, 5, n).round(2),
+        "turnover_rate": turnover.round(2),
+        "float_mv": float_mv.round(0),
         "adj_factor": np.ones(n),
         "sec_type": [sec_type] * n,
     })
@@ -149,6 +175,23 @@ def generate_demo(start: str = "2024-01-01", end: str | None = None) -> dict:
     })
     EtfMetaRepo().upsert(etfs)
 
+    # 行业分类：演示环境必须**自洽**。缺失的后果不是报错，而是报告的归因分解 /
+    # 行业中性化 / 风格体检静默消失（协变量 coverage=0 → cat_col=None → 那几段
+    # 直接不渲染），从报告上看不出是「没数据」还是「代码坏了」——
+    # tests/unit/test_report_extras_parity.py 正是这么红的。
+    # std_date 取 2010-01-01（早于演示区间起点）：PIT as-of join 需要「当日已生效」。
+    industries = pl.DataFrame({
+        "symbol": [c for c, _ in STOCK_CODES],
+        "std": ["SW"] * len(STOCK_CODES),
+        "code": [DEMO_INDUSTRIES[i % len(DEMO_INDUSTRIES)][0]
+                 for i in range(len(STOCK_CODES))],
+        "name": [DEMO_INDUSTRIES[i % len(DEMO_INDUSTRIES)][1]
+                 for i in range(len(STOCK_CODES))],
+        "std_date": [date(2010, 1, 1)] * len(STOCK_CODES),
+        "source": ["demo"] * len(STOCK_CODES),
+    })
+    n_ind = IndustryClassifyRepo().upsert(industries)
+
     frames = []
     for i, (sym, _) in enumerate(STOCK_CODES):
         frames.append(_synth_bars(sym, dates, seed=100 + i,
@@ -164,5 +207,9 @@ def generate_demo(start: str = "2024-01-01", end: str | None = None) -> dict:
     )
     write_daily(daily)
 
-    logger.info(f"演示数据就绪: 日历 {n_cal} 天 / 标的 {n_sec} 只 / 日线 {len(daily)} 行")
-    return {"calendar": n_cal, "securities": n_sec, "daily_rows": len(daily)}
+    logger.info(
+        f"演示数据就绪: 日历 {n_cal} 天 / 标的 {n_sec} 只 / 行业 {n_ind} 条 / "
+        f"日线 {len(daily)} 行"
+    )
+    return {"calendar": n_cal, "securities": n_sec, "industries": n_ind,
+            "daily_rows": len(daily)}
