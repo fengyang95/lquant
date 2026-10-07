@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from datetime import timedelta
 
 import polars as pl
@@ -77,12 +78,31 @@ def upsert_ic_daily(rows: pl.DataFrame, *, factor: str) -> int:
     )
     lo, hi = d["trade_date"].min(), d["trade_date"].max()
     with _writer() as con:
+        _ensure_ic_daily_table(con)
         con.execute(
             "DELETE FROM factor_ic_daily WHERE factor = ? AND trade_date BETWEEN ? AND ?",
             [factor, lo, hi],
         )
         con.execute("INSERT INTO factor_ic_daily SELECT * FROM d")
     return len(d)
+
+
+def _ensure_ic_daily_table(con=None) -> None:
+    """按需补建 factor_ic_daily（老库迁移路径，见 ``ddl.ensure_factor_ic_daily``）。
+
+    表只进了 ``DDL_STATEMENTS``（init_db / 服务启动才执行）：老库上监控写路径
+    与 ``lq factor ic-health`` 读路径都会撞裸的 CatalogException。写路径传入
+    已持有的写连接，读路径不带参数（自己开写连接，遵守 db.py 的写锁约定）。
+    """
+    from lquant.data.store.ddl import ensure_factor_ic_daily
+
+    if con is not None:
+        # 迁移尽力而为：失败不掩盖真正的查询错误（缺表时后面的查询会照旧报错）
+        with contextlib.suppress(Exception):
+            ensure_factor_ic_daily(con)
+        return
+    with contextlib.suppress(Exception), _writer() as wcon:
+        ensure_factor_ic_daily(wcon)
 
 
 def _now_ts():
@@ -146,9 +166,16 @@ def factor_health(
 ) -> list[dict]:
     """近 window 个交易日的因子健康度。纯只读评估（DryRun 语义）。
 
-    verdict 原因码：``no_data``（零记录）/ ``stale``（覆盖不足一半窗口，
-    同步断了）/ ``degraded``（mean_ic 或 ICIR 跌破下限）/ ``ok``。
+    verdict 原因码：``no_data``（零记录）/ ``stale``（有限 IC 覆盖不足一半
+    窗口，同步断了）/ ``degraded``（窗口内 IC 全非有限，或 mean_ic / ICIR
+    跌破下限）/ ``ok``。
     ICIR = mean(ic)/std(ic)，日频不做年化 —— 与 ic_summary 的口径一致。
+
+    **非有限 IC（NaN/Inf）不算「健康」**：因子在某日截面内是常数（0/1 信号
+    因子常见）时 ``pl.corr`` 返回 NaN —— 那正是「因子已无区分度」的证据。
+    NaN 参与 mean/std 会让全部判定（``mean_ic < 下限``）恒为 False，于是退化
+    因子被判成 ok、ic_below 永不触发。这里先剔除非有限值再算统计，并对
+    「窗口内一条有限值都没有」单独给 degraded + 明说原因。
     """
     if int(window) < 1:
         raise ValueError(f"window 必须 >= 1，收到 {window}")
@@ -159,6 +186,7 @@ def factor_health(
             {
                 "factor": name,
                 "n_days": 0,
+                "n_valid": 0,
                 "mean_ic": None,
                 "icir": None,
                 "last_date": None,
@@ -168,14 +196,22 @@ def factor_health(
         ]
     out = []
     for factor, rows in con_ds:
-        n = len(rows["ic"])
-        mean_ic = float(rows["ic"].mean()) if n else None
-        std_ic = float(rows["ic"].std()) if n > 1 else None
+        n = len(rows["ic"])  # 窗口内记录数（含非有限值）：staleness 的可见性口径
+        valid = _finite_ic(rows)
+        n_valid = len(valid)
+        mean_ic = float(valid["ic"].mean()) if n_valid else None
+        std_ic = float(valid["ic"].std()) if n_valid > 1 else None
         icir = (mean_ic / std_ic) if (mean_ic is not None and std_ic and std_ic > 1e-12) else None
         if n == 0:
             verdict, detail = "no_data", "factor_ic_daily 无记录"
-        elif n < max(2, int(window) // 2):
-            verdict, detail = "stale", f"近 {window} 日仅 {n} 日有 IC（同步断了？）"
+        elif n_valid == 0:
+            verdict, detail = (
+                "degraded",
+                f"近 {window} 日 {n} 条 IC 全为非有限值（NaN/Inf）—— "
+                "因子在该窗口无截面区分度（退化成常数？）或样本不足",
+            )
+        elif n_valid < max(2, int(window) // 2):
+            verdict, detail = "stale", f"近 {window} 日仅 {n_valid} 日有有效 IC（同步断了？）"
         elif mean_ic < float(min_ic):
             verdict, detail = "degraded", f"mean_ic {mean_ic:.4f} < 下限 {min_ic}"
         elif icir is not None and icir < float(min_icir):
@@ -186,6 +222,7 @@ def factor_health(
             {
                 "factor": factor,
                 "n_days": n,
+                "n_valid": n_valid,
                 "mean_ic": mean_ic,
                 "icir": icir,
                 "last_date": str(rows["trade_date"].max()) if n else None,
@@ -196,14 +233,32 @@ def factor_health(
     return out
 
 
+def _finite_ic(rows: pl.DataFrame) -> pl.DataFrame:
+    """剔除非有限 IC 的行（NaN/Inf 不是「IC = 0」）。
+
+    ``is_finite`` 对 null 也返回 null，所以必须同时判 ``is_not_null``；
+    非数值列（理论上不会出现）时退回原帧，让上层照旧看到 NaN。
+    """
+    if "ic" not in rows.columns:
+        return rows
+    try:
+        return rows.filter(pl.col("ic").is_not_null() & pl.col("ic").is_finite())
+    except Exception:  # noqa: BLE001 - 非浮点列（旧库 Int？）时不做过滤
+        return rows
+
+
 def _health_rows(name, window):
-    """近 window 个交易日 per 因子的 IC 行。返回 [(factor, df)]。"""
-    with _reader() as con:
+    """近 window 个交易日 per 因子的 IC 行。返回 [(factor, df)]。
+
+    表缺失（老库没跑过 init_db / 服务未重启）先按需补建再查一次 ——
+    ``lq factor ic-health`` 在那种库上原本是裸 CatalogException。
+    """
+    def _query(con):
         where, params = "", []
         if name is not None:
             where = "WHERE factor = ?"
             params.append(name)
-        rows = con.execute(
+        return con.execute(
             f"""
             SELECT factor, trade_date, ic
             FROM (
@@ -215,6 +270,15 @@ def _health_rows(name, window):
             """,
             params,
         ).pl()
+
+    from duckdb import CatalogException
+
+    with _reader() as con:
+        try:
+            rows = _query(con)
+        except CatalogException:
+            _ensure_ic_daily_table()
+            rows = _query(con)
     if not len(rows):
         return []
     return [(f, g) for (f,), g in rows.group_by(["factor"], maintain_order=True)]
@@ -253,7 +317,14 @@ def run_daily_check(
             get_logger(__name__).warning(f"因子 IC 同步失败 {name}: {e}")
             errors.append({"factor": name, "error": f"{type(e).__name__}: {e}"})
     health = factor_health(window=window, min_ic=min_ic, min_icir=min_icir)
-    ctxs = [{"symbol": h["factor"], "ic": h["mean_ic"]} for h in health if h["mean_ic"] is not None]
+    # ctx 带上 verdict：ic=None 的 degraded（窗口内 IC 全非有限）也要进规则引擎，
+    # 否则「因子退化成常数」这条最该告警的路径会被过滤掉（ic_below 静默漏报）。
+    # 反过来 no_data / stale 不进：那两种是「没数据」，不是「因子失效」。
+    ctxs = [
+        {"symbol": h["factor"], "ic": h["mean_ic"], "verdict": h["verdict"]}
+        for h in health
+        if h["mean_ic"] is not None or h["verdict"] == "degraded"
+    ]
     from lquant.notify.rules import run_rules
 
     alerts = run_rules(ctxs, notify_fn=notify_fn)

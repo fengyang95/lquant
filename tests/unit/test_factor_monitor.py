@@ -173,6 +173,91 @@ def test_health_rejects_bad_window(monitor_env):
         monitor_env.factor_health(window=0)
 
 
+def test_missing_ic_table_self_heals(tmp_path, monkeypatch):
+    """老库缺 ``factor_ic_daily`` 表：写路径与 ``ic-health`` 读路径都要自愈。
+
+    表只在 ``DDL_STATEMENTS`` 里（init_db / 服务启动才执行）—— 修复前写路径
+    报 CatalogException（sync 结果里逐条 error），``lq factor ic-health`` 直接
+    以裸驱动异常退出。
+    """
+    monkeypatch.setenv("LQ_ROOT", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    from lquant.core.config import get_settings
+
+    get_settings.cache_clear()
+
+    import duckdb
+
+    (tmp_path / "data" / "duckdb").mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(str(get_settings().duckdb_path))
+    con.execute("CREATE TABLE unrelated (x INTEGER)")  # 库在，但没建 factor_ic_daily
+    con.close()
+
+    from lquant.factors import monitor
+
+    # 读路径：无表 → 自愈后按「无记录」回答，不是 CatalogException
+    assert monitor.factor_health("ghost")[0]["verdict"] == "no_data"
+    # 写路径：落表成功
+    rows = pl.DataFrame(
+        {
+            "trade_date": [date(2026, 6, 1), date(2026, 6, 2)],
+            "ic": [0.1, 0.2],
+            "rank_ic": [0.1, 0.2],
+            "n": [8, 8],
+        }
+    )
+    assert monitor.upsert_ic_daily(rows, factor="healed") == 2
+    h = {x["factor"]: x for x in monitor.factor_health("healed")}["healed"]
+    assert h["n_days"] == 2 and h["mean_ic"] == pytest.approx(0.15)
+    get_settings.cache_clear()
+
+
+def _nan_ic_rows(n: int = 3) -> pl.DataFrame:
+    """全 NaN 的 IC 序列：截面内因子是常数时 pl.corr 的真实返回。"""
+    d0 = date(2026, 6, 1)
+    return pl.DataFrame(
+        {
+            "trade_date": [d0 + timedelta(days=i) for i in range(n)],
+            "ic": [float("nan")] * n,
+            "rank_ic": [float("nan")] * n,
+            "n": [8] * n,
+        }
+    )
+
+
+def test_health_all_nan_ic_is_degraded_not_ok(monitor_env):
+    """窗口内 IC 全为 NaN（因子退化成常数）→ degraded，绝不判 ok。
+
+    NaN 参与 mean/std 会让 ``mean_ic < min_ic`` 与 ``icir < min_icir`` 恒为
+    False —— 修复前这种因子显示 ok，监控对它完全失明。
+    """
+    monitor_env.upsert_ic_daily(_nan_ic_rows(), factor="flat_demo")
+    h = {x["factor"]: x for x in monitor_env.factor_health("flat_demo", window=20)}["flat_demo"]
+    assert h["verdict"] == "degraded"
+    assert h["n_days"] == 3  # 记录在（staleness 仍看得见）
+    assert h["n_valid"] == 0  # 但一条有限 IC 都没有
+    assert h["mean_ic"] is None
+    assert "非有限" in h["detail"]
+
+
+def test_health_mixed_nan_rows_count_only_finite(monitor_env):
+    """有限 + NaN 混合：统计只看有限行，且 staleness 按有限行数判。"""
+    rows = pl.DataFrame(
+        {
+            "trade_date": [date(2026, 6, 1), date(2026, 6, 2), date(2026, 6, 3)],
+            "ic": [0.2, float("nan"), float("nan")],
+            "rank_ic": [0.1, float("nan"), float("nan")],
+            "n": [8, 8, 8],
+        }
+    )
+    monitor_env.upsert_ic_daily(rows, factor="mixed_demo")
+    h = {x["factor"]: x for x in monitor_env.factor_health("mixed_demo", window=20)}["mixed_demo"]
+    # 1 条有限 IC < max(2, 20//2)=10 → stale（不是被 NaN 拉低成 ok/degraded）
+    assert h["verdict"] == "stale"
+    assert h["n_valid"] == 1 and h["n_days"] == 3
+    assert "仅 1 日有有效 IC" in h["detail"]
+
+
 # ---------------- run_daily_check 编排 ----------------
 
 
@@ -207,6 +292,37 @@ def test_run_daily_check_end_to_end_with_alert(monitor_env):
     assert any(a["status"] == TRIGGERED for a in out["alerts"])
     assert len(seen) >= 1
     assert store.list(enabled_only=True)[0].last_triggered_at is not None
+
+
+def test_run_daily_check_alerts_on_degenerate_factor(monitor_env):
+    """全 NaN IC 的退化因子必须触发 ic_below 告警（含通知真的发出）。
+
+    修复前 ctx 只收 ``mean_ic is not None`` 的健康行，退化因子（mean_ic=None）
+    连规则引擎都进不去；即便进去，``nan <= threshold`` 也恒为 False —— 双重
+    静默。ic=None/degraded 的 ctx 现在必须命中并说明原因。
+    """
+    from lquant.notify.rules import TRIGGERED, AlertRule, get_store
+
+    monitor_env.upsert_ic_daily(_nan_ic_rows(), factor="flat_demo")
+    store = get_store()
+    store.add(
+        AlertRule(
+            name="flat 失效告警",
+            target="flat_demo",
+            alert_type="ic_below",
+            parameters={"threshold": 0.0},
+            cooldown_seconds=0,
+        )
+    )
+    seen = []
+    out = monitor_env.run_daily_check(
+        factors=["flat_demo"], notify_fn=lambda *a, **k: seen.append(a)
+    )
+    hits = [a for a in out["alerts"] if a["status"] == TRIGGERED]
+    assert hits, out["alerts"]
+    assert "缺失/非有限" in hits[0]["detail"]
+    assert hits[0]["detail"].startswith("flat_demo")
+    assert len(seen) == 1
 
 
 def test_run_daily_check_defaults_to_enabled_factors(monitor_env):
