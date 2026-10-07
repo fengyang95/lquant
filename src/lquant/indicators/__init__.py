@@ -12,9 +12,18 @@
    窗口化纯函数，表达不了中枢/浪型这类分段结构。指标以「预计算信号列」
    的形式反哺因子层。
 """
+
 from __future__ import annotations
 
-from lquant.indicators import momentum, tiandao, trend, volume  # noqa: F401  触发注册
+from lquant.indicators import (  # noqa: F401  触发注册
+    chip,
+    momentum,
+    patterns,
+    tiandao,
+    trend,
+    volume,
+)
+from lquant.indicators.chip import CYQ_PROXY_NOTE, cost_distribution, profit_ratio
 from lquant.indicators.composite import WARMUP, add_all
 from lquant.indicators.future import (
     LookaheadViolation,
@@ -22,6 +31,14 @@ from lquant.indicators.future import (
     check_prefix_invariance,
 )
 from lquant.indicators.momentum import add_kdj, add_rsi
+from lquant.indicators.patterns import (
+    add_bearish_engulfing,
+    add_bullish_engulfing,
+    add_doji,
+    add_hammer,
+    add_morning_star,
+    add_shooting_star,
+)
 from lquant.indicators.registry import (
     CATEGORIES,
     INDICATORS,
@@ -44,19 +61,26 @@ from lquant.indicators.volume import add_turnover_ma, add_volume_ratio, add_volu
 
 __all__ = [
     "CATEGORIES",
+    "CYQ_PROXY_NOTE",
     "INDICATORS",
     "PANES",
     "TIANDAO_DEFAULT_N",
     "LookaheadViolation",
     "WARMUP",
     "add_all",
+    "add_bearish_engulfing",
     "add_bbi",
     "add_boll",
+    "add_bullish_engulfing",
+    "add_doji",
     "add_ema",
+    "add_hammer",
     "add_kdj",
     "add_ma",
     "add_macd",
+    "add_morning_star",
     "add_rsi",
+    "add_shooting_star",
     "add_tiandao",
     "add_turnover_ma",
     "add_volume_ratio",
@@ -65,8 +89,10 @@ __all__ = [
     "check_prefix_invariance",
     "compute",
     "compute_many",
+    "cost_distribution",
     "min_window",
     "outputs",
+    "profit_ratio",
     "register_indicator",
     "required_history",
     "xma_half_window",

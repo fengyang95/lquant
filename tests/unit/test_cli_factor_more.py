@@ -302,7 +302,7 @@ def _empty_panel(monkeypatch):
     import lquant.factors.mining.submit as submit_mod
 
     monkeypatch.setattr(submit_mod, "_panel_with_covs",
-                        lambda start=None: (pl.DataFrame(), []))
+                        lambda start=None, covs=None: (pl.DataFrame(), []))
 
 
 def test_eval_empty_panel(monkeypatch):
@@ -316,7 +316,7 @@ def test_eval_train_empty(monkeypatch):
     import lquant.factors.mining.submit as submit_mod
 
     monkeypatch.setattr(submit_mod, "_panel_with_covs",
-                        lambda start=None: (pl.DataFrame({"trade_date": ["2024-01-02"]}), []))
+                        lambda start=None, covs=None: (pl.DataFrame({"trade_date": ["2024-01-02"]}), []))
     monkeypatch.setattr(submit_mod, "prepare_segment",
                         lambda *a, **k: pl.DataFrame())
     r = _invoke("eval", "Ts_Mean($close,5)")

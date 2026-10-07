@@ -41,7 +41,7 @@ def test_verify_grades_claimed(monkeypatch, tmp_path):
         s = pl.DataFrame({"ic": [0.05, 0.06] * 15, "rank_ic": [0.04, 0.05] * 15})
         return {"train": s, "val": s}
 
-    monkeypatch.setattr(sub, "_panel_with_covs", lambda start=None: (_panel(), []))
+    monkeypatch.setattr(sub, "_panel_with_covs", lambda start=None, covs=None: (_panel(), []))
     monkeypatch.setattr(sub, "_split_eval", fake_split)
     ok, payload = sub.verify_and_register({
         "name": "t_fine", "expr": "Ts_Mean($close,5)", "agent": "tester",
@@ -80,7 +80,7 @@ def test_verify_rejects_nan_tstat(monkeypatch):
         s = pl.DataFrame({"ic": [float("nan")] * 30, "rank_ic": [0.04] * 30})
         return {"train": s, "val": s}
 
-    monkeypatch.setattr(sub, "_panel_with_covs", lambda start=None: (_panel(), []))
+    monkeypatch.setattr(sub, "_panel_with_covs", lambda start=None, covs=None: (_panel(), []))
     monkeypatch.setattr(sub, "_split_eval", fake_split)
     archived = []
 

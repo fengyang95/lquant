@@ -2,6 +2,7 @@
 
 CLI stderr 带结构化淘汰原因码 —— Agent 读错误即自我修正。
 """
+
 from __future__ import annotations
 
 import math
@@ -50,8 +51,7 @@ def check_expr(expr: str) -> None:
     from lquant.factors.mining.submit import _daily_fields
 
     r = g0_static(expr, allowed_fields=_daily_fields())
-    payload = {"passed": r.passed, "stage": r.stage,
-               "reason_code": r.reason_code, "hint": r.hint}
+    payload = {"passed": r.passed, "stage": r.stage, "reason_code": r.reason_code, "hint": r.hint}
     line = json.dumps(payload, ensure_ascii=False)
     click.echo(line)
     if not r.passed:
@@ -65,12 +65,29 @@ def check_expr(expr: str) -> None:
 @click.option("--neutral/--raw", default=True, help="是否中性化（默认中性化）")
 @click.option("--n-groups", default=DEFAULT_N_GROUPS, help="分层组数")
 @click.option("--agent", default=None, help="Agent 名（配额记账 + 校正门槛）")
-def eval_(expr: str, start: str | None, neutral: bool, n_groups: int,
-          agent: str | None) -> None:
+@click.option(
+    "--cov",
+    "covs_csv",
+    default=None,
+    help=(
+        "协变量清单（逗号分隔 provider 名，替换缺省口径）："
+        "如 mf_main_ratio,lhb_on_board 评看板资金/情绪因子；"
+        "想保留行业中性化就把 industry_sw1 一并写进清单"
+    ),
+)
+def eval_(
+    expr: str,
+    start: str | None,
+    neutral: bool,
+    n_groups: int,
+    agent: str | None,
+    covs_csv: str | None,
+) -> None:
     """L1 快筛：IC/ICIR + 分层 + 换手 + 中性化对照 + 校正门槛/配额（方案 6.2/6.3）。
 
     train 段（前 70%）上一次算完，与 audit/submit 共用 ``prepare_segment``，
-    口径不允许分叉。
+    口径不允许分叉。``--cov`` 可挂看板另类数据 covariate（T+1 可用口径，
+    防前视由 provider 保证）。
     """
     import json
 
@@ -81,7 +98,8 @@ def eval_(expr: str, start: str | None, neutral: bool, n_groups: int,
     from lquant.factors.mining.runner import split_dates
     from lquant.factors.mining.submit import _panel_with_covs, prepare_segment
 
-    df, cov_cols = _panel_with_covs(start=start)
+    covs = [c.strip() for c in covs_csv.split(",") if c.strip()] if covs_csv else None
+    df, cov_cols = _panel_with_covs(start=start, covs=covs)
     if not len(df):
         raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")
     dates = sorted(df["trade_date"].unique().to_list())
@@ -106,11 +124,12 @@ def eval_(expr: str, start: str | None, neutral: bool, n_groups: int,
         from lquant.factors.evaluate.quantile import quantile_summary
 
         qs = quantile_summary(train, "f", "fwd_ret_1", n_groups)
-        quant = {"n_groups": n_groups,
-                 "monotonicity": _clean_num(qs.get("monotonicity")),
-                 "top_bottom_spread": _clean_num(qs.get("top_bottom_spread")),
-                 "long_short": {k: _clean_num(v)
-                                for k, v in (qs.get("long_short") or {}).items()}}
+        quant = {
+            "n_groups": n_groups,
+            "monotonicity": _clean_num(qs.get("monotonicity")),
+            "top_bottom_spread": _clean_num(qs.get("top_bottom_spread")),
+            "long_short": {k: _clean_num(v) for k, v in (qs.get("long_short") or {}).items()},
+        }
     except Exception as e:  # noqa: BLE001
         errors["quantile"] = f"{type(e).__name__}: {e}"
     try:
@@ -118,8 +137,7 @@ def eval_(expr: str, start: str | None, neutral: bool, n_groups: int,
 
         to_df = factor_turnover(train, "f", n_groups)
         mean_to = to_df["turnover_avg"].drop_nulls().mean() if len(to_df) else None
-        annual_turnover = (round(float(mean_to) * 252, 2)
-                           if mean_to is not None else None)
+        annual_turnover = round(float(mean_to) * 252, 2) if mean_to is not None else None
     except Exception as e:  # noqa: BLE001
         errors["turnover"] = f"{type(e).__name__}: {e}"
 
@@ -149,7 +167,7 @@ def eval_(expr: str, start: str | None, neutral: bool, n_groups: int,
         if not a:
             raise click.ClickException(f"Agent 未注册: {agent}")
         try:
-            ensure_quota(agent, 1)      # 先判后记：超配额时不该再计数
+            ensure_quota(agent, 1)  # 先判后记：超配额时不该再计数
         except ValueError as e:
             raise click.ClickException(str(e)) from e
         n_trials = record_eval(agent)
@@ -158,22 +176,34 @@ def eval_(expr: str, start: str | None, neutral: bool, n_groups: int,
         if abs(t) < thr:
             hints.append(f"|t|={abs(t):.2f} 低于校正门槛 {thr:.2f}（n_trials={n_trials}）")
         hints.append(f"剩余配额 {remaining} 次")
-    click.echo(json.dumps(_clean({
-        "ic_mean": round(ic, 4),
-        "rank_ic_mean": round(sr["mean"], 4),
-        "icir": _clean_num(st["ir"]),
-        "rank_icir": _clean_num(sr["ir"]),
-        "t_stat": round(t, 2) if t is not None and math.isfinite(t) else None,
-        "t_stat_nw": _clean_num(st.get("t_stat_nw")),
-        "positive_rate": _clean_num(st.get("positive_rate")),
-        "ic_autocorr": _clean_num(st.get("ic_autocorr")),
-        "n_days": len(s_tr),
-        "quantile": quant,
-        "annual_turnover": annual_turnover,
-        "ic_raw_mean": ic_raw, "neutralized": bool(cov_cols),
-        "n_trials": n_trials, "corrected_threshold": round(thr, 2) if thr else None,
-        "quota_remaining": remaining, "hints": hints, "errors": errors,
-    }), ensure_ascii=False))
+    click.echo(
+        json.dumps(
+            _clean(
+                {
+                    "ic_mean": round(ic, 4),
+                    "rank_ic_mean": round(sr["mean"], 4),
+                    "icir": _clean_num(st["ir"]),
+                    "rank_icir": _clean_num(sr["ir"]),
+                    "t_stat": round(t, 2) if t is not None and math.isfinite(t) else None,
+                    "t_stat_nw": _clean_num(st.get("t_stat_nw")),
+                    "positive_rate": _clean_num(st.get("positive_rate")),
+                    "ic_autocorr": _clean_num(st.get("ic_autocorr")),
+                    "n_days": len(s_tr),
+                    "quantile": quant,
+                    "annual_turnover": annual_turnover,
+                    "ic_raw_mean": ic_raw,
+                    "neutralized": bool(cov_cols),
+                    "covariates": cov_cols,
+                    "n_trials": n_trials,
+                    "corrected_threshold": round(thr, 2) if thr else None,
+                    "quota_remaining": remaining,
+                    "hints": hints,
+                    "errors": errors,
+                }
+            ),
+            ensure_ascii=False,
+        )
+    )
 
 
 def _clean_num(v):
@@ -215,8 +245,7 @@ def submit(spec_path: str) -> None:
 @click.option("--n-groups", default=DEFAULT_N_GROUPS, help="分层组数")
 @click.option("--horizons", default=DECAY_HORIZONS_CSV, help="衰减曲线持有期（逗号分隔）")
 @click.option("--agent", default=None, help="Agent 名（配额记账 + 校正门槛）")
-def run(name: str, start: str | None, n_groups: int, horizons: str,
-        agent: str | None) -> None:
+def run(name: str, start: str | None, n_groups: int, horizons: str, agent: str | None) -> None:
     """按注册名跑 L2 深度校验（从 factor_def 取表达式，与 ``audit`` 同一实现）。
 
     此前是空壳（只 echo 一行），命令名暗示能算却没有计算也没有入库。
@@ -226,8 +255,7 @@ def run(name: str, start: str | None, n_groups: int, horizons: str,
     from lquant.core.db import reader
 
     with reader() as con:
-        row = con.execute(
-            "SELECT expression FROM factor_def WHERE name = ?", [name]).fetchone()
+        row = con.execute("SELECT expression FROM factor_def WHERE name = ?", [name]).fetchone()
     if not row or not row[0]:
         raise click.ClickException(f"未注册的因子或表达式为空: {name}（见 lq factor add）")
     payload = _audit_payload(row[0], start, n_groups, horizons, agent)
@@ -251,8 +279,9 @@ def mine(agent: str, generator: str, n: int, proposals: str | None, start: str |
     click.echo(json.dumps(payload, ensure_ascii=False))
 
 
-def _mine_session(agent: str, generator: str, n: int, proposals: str | None,
-                  start: str | None) -> tuple[dict, str | None]:
+def _mine_session(
+    agent: str, generator: str, n: int, proposals: str | None, start: str | None
+) -> tuple[dict, str | None]:
     """平台驱动挖掘会话的实现体 —— ``lq factor mine`` 与 ``lq agent run`` 共用。
 
     返回 (结果载荷, 记账告警或 None)。两条入口共用一套配额账、一套门禁、
@@ -284,7 +313,8 @@ def _mine_session(agent: str, generator: str, n: int, proposals: str | None,
     if generator == "proposals" and not proposals:
         raise click.ClickException(
             "generator=proposals 需要 --proposals <JSONL 路径>"
-            "（每行一个 {\"expr\": \"...\", \"note\": \"...\"} 对象）")
+            '（每行一个 {"expr": "...", "note": "..."} 对象）'
+        )
 
     # 方案红线：G1 快筛与适应度一律用中性化后 IC —— 挖掘会话必须带协变量。
     # 只读一次面板：此前 read_daily 判空 + _panel_with_covs 各翻一遍湖，
@@ -313,9 +343,7 @@ def _mine_session(agent: str, generator: str, n: int, proposals: str | None,
         except Exception as e:  # noqa: BLE001 - CLI 出口：结构化报错而非 traceback
             raise click.ClickException(f"加载 proposals 失败: {e}") from e
 
-    res, survivors = run_session(eng, df, gen, agent=agent, n_candidates=n,
-                                 covs=cov_cols)
-
+    res, survivors = run_session(eng, df, gen, agent=agent, n_candidates=n, covs=cov_cols)
     # 记账落库
     run_id = uuid.uuid4().hex[:12]
     import datetime as dt
@@ -325,18 +353,77 @@ def _mine_session(agent: str, generator: str, n: int, proposals: str | None,
         with writer() as con:
             con.execute(
                 "INSERT OR REPLACE INTO factor_mining_run VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                [run_id, agent, generator, res.n_evaluated, res.n_static_fail,
-                 res.n_low_ic, res.n_redundant, res.n_size_proxy, res.n_survivors,
-                 json.dumps(res.corrections, ensure_ascii=False)[:10000], dt.datetime.now()])
+                [
+                    run_id,
+                    agent,
+                    generator,
+                    res.n_evaluated,
+                    res.n_static_fail,
+                    res.n_low_ic,
+                    res.n_redundant,
+                    res.n_size_proxy,
+                    res.n_survivors,
+                    json.dumps(res.corrections, ensure_ascii=False)[:10000],
+                    dt.datetime.now(),
+                ],
+            )
     except Exception as e:  # noqa: BLE001
         warning = f"记账落库失败（结果仍有效）: {e}"
     return {
-        "run_id": run_id, "agent": agent, "generator": generator,
-        "n_evaluated": res.n_evaluated, "n_static_fail": res.n_static_fail,
-        "n_low_ic": res.n_low_ic, "n_redundant": res.n_redundant,
-        "n_size_proxy": res.n_size_proxy, "n_survivors": res.n_survivors,
+        "run_id": run_id,
+        "agent": agent,
+        "generator": generator,
+        "n_evaluated": res.n_evaluated,
+        "n_static_fail": res.n_static_fail,
+        "n_low_ic": res.n_low_ic,
+        "n_redundant": res.n_redundant,
+        "n_size_proxy": res.n_size_proxy,
+        "n_survivors": res.n_survivors,
         "survivors": survivors[:10],
     }, warning
+
+
+@factor.command()
+@click.argument("report", type=click.Path(exists=True), required=False)
+@click.option("--out", default=None, help="提案 JSONL 输出路径（缺省只打印）")
+@click.option("--max", "max_proposals", default=10, help="最多保留几条提案")
+def propose(report: str | None, out: str | None, max_proposals: int) -> None:
+    """研报文本 → LLM 因子提案（RD-Agent 式，需 LQ_LLM_API_KEY）。
+
+    LLM 只产表达式；每条都过 G0 静态门禁，不合格的带原因码进 rejected
+    （stderr 可见，不静默）。产出接
+    ``lq factor mine --generator proposals --proposals <out>``。
+    REPORT 文件路径缺省读 stdin。
+    """
+    import json
+    import sys
+
+    from lquant.research.report_extract import extract_proposals, write_proposals
+
+    text = ""
+    if report:
+        with open(report, encoding="utf-8") as f:
+            text = f.read()
+    else:
+        text = sys.stdin.read()
+    try:
+        res = extract_proposals(text, max_proposals=max_proposals)
+    except Exception as e:  # noqa: BLE001 - CLI 出口：结构化报错而非 traceback
+        raise click.ClickException(f"提取失败: {e}") from e
+    for r in res["rejected"]:
+        click.echo(f"[rejected] {r['expr']}: {r['reason']}", err=True)
+    if not res["accepted"]:
+        raise click.ClickException(
+            f"没有通过 G0 的提案（{len(res['rejected'])} 条被拒，明细见 stderr）"
+        )
+    if out:
+        write_proposals(res["accepted"], out)
+        # stdout 保持结构化 JSON；人类可读的指引一律走 stderr
+        click.echo(f"已写 {len(res['accepted'])} 条提案 -> {out}", err=True)
+        click.echo(f"下一步: lq factor mine --generator proposals --proposals {out}", err=True)
+        click.echo(json.dumps(res, ensure_ascii=False))
+    else:
+        click.echo(json.dumps(res, ensure_ascii=False))
 
 
 @factor.command()
@@ -371,18 +458,23 @@ def series(expr: str, start: str | None) -> None:
     ic = [_clean_num(v) for v in s["ic"].to_list()]
     rank_ic = [_clean_num(v) for v in s["rank_ic"].to_list()]
     cum = np.nancumsum(np.array([v if v is not None else 0.0 for v in ic], dtype=float))
-    click.echo(json.dumps({
-        "expr": expr,
-        "n_days": len(s),
-        "neutralized": bool(cov_cols),
-        "covariates": cov_cols,
-        "dates": [str(x) for x in s["trade_date"].to_list()],
-        "ic": ic,
-        "rank_ic": rank_ic,
-        "cum_ic": [round(float(v), 6) for v in cum],
-        "ic_mean": _clean_num(s["ic"].mean()),
-        "rank_ic_mean": _clean_num(s["rank_ic"].mean()),
-    }, ensure_ascii=False))
+    click.echo(
+        json.dumps(
+            {
+                "expr": expr,
+                "n_days": len(s),
+                "neutralized": bool(cov_cols),
+                "covariates": cov_cols,
+                "dates": [str(x) for x in s["trade_date"].to_list()],
+                "ic": ic,
+                "rank_ic": rank_ic,
+                "cum_ic": [round(float(v), 6) for v in cum],
+                "ic_mean": _clean_num(s["ic"].mean()),
+                "rank_ic_mean": _clean_num(s["rank_ic"].mean()),
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 @factor.command()
@@ -401,6 +493,8 @@ def corr(exprs: tuple, start: str | None, threshold: float) -> None:
         raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")
     res = correlation(df, list(exprs), threshold=threshold)
     click.echo(json.dumps(res, ensure_ascii=False))
+
+
 # ─────────────────────── L2/L3：深度校验 · 鲁棒性 · 报告 ───────────────────────
 #
 # 三级评估面对应参考实现（alpha-skills）的 L0-L3：
@@ -428,8 +522,7 @@ def _parse_floats(s: str) -> tuple[float, ...]:
     return tuple(float(x) for x in s.split(",") if x.strip())
 
 
-def _load_segments(start: str | None, expr: str, *, horizons=(1, 5),
-                   with_pre: bool = False):
+def _load_segments(start: str | None, expr: str, *, horizons=(1, 5), with_pre: bool = False):
     """读日线 + 协变量 → 70/15/15 切分 → train/val 两段分析就绪面板。
 
     与 submit 重验共用 ``prepare_segment``，所以 audit 报的 IC 和入库时
@@ -446,8 +539,7 @@ def _load_segments(start: str | None, expr: str, *, horizons=(1, 5),
         raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")
     dates = sorted(df["trade_date"].unique().to_list())
     train_d, val_d, test_d = split_dates(dates)
-    train = prepare_segment(df, cov_cols, expr, train_d, horizons=list(horizons),
-                            with_pre=with_pre)
+    train = prepare_segment(df, cov_cols, expr, train_d, horizons=list(horizons), with_pre=with_pre)
     pre = None
     if with_pre:
         train, pre = train
@@ -473,8 +565,7 @@ def _quota(agent: str | None, expr: str, t_stat: float) -> dict:
     from lquant.factors.mining.fitness import corrected_threshold
 
     if not agent:
-        return {"n_trials": None, "corrected_threshold": None,
-                "quota_remaining": None, "hints": []}
+        return {"n_trials": None, "corrected_threshold": None, "quota_remaining": None, "hints": []}
     from lquant.factors.agents import (
         ensure_quota,
         find_agent,
@@ -485,7 +576,7 @@ def _quota(agent: str | None, expr: str, t_stat: float) -> dict:
     if not find_agent(agent):
         raise click.ClickException(f"Agent 未注册: {agent}")
     try:
-        ensure_quota(agent, 1)      # 先判后记：超配额时不该再计数（与 eval 一致）
+        ensure_quota(agent, 1)  # 先判后记：超配额时不该再计数（与 eval 一致）
     except ValueError as e:
         raise click.ClickException(str(e)) from e
     n_trials = record_eval(agent)
@@ -495,8 +586,12 @@ def _quota(agent: str | None, expr: str, t_stat: float) -> dict:
     if abs(t_stat) < thr:
         hints.append(f"|t|={abs(t_stat):.2f} 低于校正门槛 {thr:.2f}（n_trials={n_trials}）")
     hints.append(f"剩余配额 {remaining} 次")
-    return {"n_trials": n_trials, "corrected_threshold": round(thr, 2),
-            "quota_remaining": remaining, "hints": hints}
+    return {
+        "n_trials": n_trials,
+        "corrected_threshold": round(thr, 2),
+        "quota_remaining": remaining,
+        "hints": hints,
+    }
 
 
 @factor.command()
@@ -513,12 +608,14 @@ def audit(expr: str, start: str | None, n_groups: int, horizons: str, agent: str
     """
     import json
 
-    click.echo(json.dumps(_audit_payload(expr, start, n_groups, horizons, agent),
-                          ensure_ascii=False))
+    click.echo(
+        json.dumps(_audit_payload(expr, start, n_groups, horizons, agent), ensure_ascii=False)
+    )
 
 
-def _audit_payload(expr: str, start: str | None, n_groups: int, horizons: str,
-                   agent: str | None) -> dict:
+def _audit_payload(
+    expr: str, start: str | None, n_groups: int, horizons: str, agent: str | None
+) -> dict:
     """L2 深度校验的载荷构造 —— ``audit`` 与 ``run``（按注册名）共用同一实现，
     保证「按名字跑」和「按表达式跑」拿到的是同一份数字。"""
     from lquant.factors.dsl.printer import canonical_id
@@ -547,8 +644,7 @@ def _audit_payload(expr: str, start: str | None, n_groups: int, horizons: str,
     rating = factor_rating(ic, qs, n_trials=q["n_trials"])
     # val 段 ICIR 须为有限值才做 oos 对比（_icir 缺数据返回 nan，nan is not None 恒真）
     icir_val = _icir(ic_val)
-    oos = (oos_decay(_icir(ic), icir_val)
-           if len(val) and math.isfinite(icir_val) else None)
+    oos = oos_decay(_icir(ic), icir_val) if len(val) and math.isfinite(icir_val) else None
 
     cat = next((c for c in ("cov_industry_sw1", "industry_sw1") if c in train.columns), None)
     attr = None
@@ -559,41 +655,71 @@ def _audit_payload(expr: str, start: str | None, n_groups: int, horizons: str,
             attr = {
                 "by": cat,
                 "gross_exposure": a["gross_exposure"],
-                "industry_exposure": (sorted(exp.to_dicts(),
-                                             key=lambda r: -abs(r["exposure"]))[:10]
-                                      if len(exp) else []),
+                "industry_exposure": (
+                    sorted(exp.to_dicts(), key=lambda r: -abs(r["exposure"]))[:10]
+                    if len(exp)
+                    else []
+                ),
             }
         except Exception as e:  # noqa: BLE001
             # 归因失败必须可见：静默成 null 会被读成「这个因子没有行业暴露」
             attr = {"by": cat, "error": f"{type(e).__name__}: {e}"}
 
-    return _clean({
-        "factor": expr,
-        "factor_id": canonical_id(expr),
-        "n_days": days,
-        "neutralized": bool(cov_cols),
-        "covariates": cov_cols,
-        "rating": rating,
-        "ic": {k: (ic.get("ic") or {}).get(k) for k in
-               ("mean", "std", "ir", "t_stat", "t_stat_nw", "positive_rate",
-                "ic_gt_002_rate", "ic_autocorr", "n_days")},
-        "rank_ic": {k: (ic.get("rank_ic") or {}).get(k) for k in
-                    ("mean", "std", "ir", "t_stat", "t_stat_nw", "positive_rate",
-                     "ic_gt_002_rate", "ic_autocorr", "n_days")},
-        "quantile": {"monotonicity": qs.get("monotonicity"),
-                     "top_bottom_spread": qs.get("top_bottom_spread"),
-                     "long_short": qs.get("long_short"),
-                     "groups": qs.get("groups")},
-        "decay": {"half_life": dec.get("half_life"),
-                  "suggested_rebalance": dec.get("suggested_rebalance"),
-                  "profile": dec["profile"].to_dicts() if len(dec.get("profile")) else []},
-        "attribution": attr,
-        "oos_decay": oos,
-        "n_trials": q["n_trials"],
-        "corrected_threshold": q["corrected_threshold"],
-        "quota_remaining": q["quota_remaining"],
-        "hints": q["hints"],
-    })
+    return _clean(
+        {
+            "factor": expr,
+            "factor_id": canonical_id(expr),
+            "n_days": days,
+            "neutralized": bool(cov_cols),
+            "covariates": cov_cols,
+            "rating": rating,
+            "ic": {
+                k: (ic.get("ic") or {}).get(k)
+                for k in (
+                    "mean",
+                    "std",
+                    "ir",
+                    "t_stat",
+                    "t_stat_nw",
+                    "positive_rate",
+                    "ic_gt_002_rate",
+                    "ic_autocorr",
+                    "n_days",
+                )
+            },
+            "rank_ic": {
+                k: (ic.get("rank_ic") or {}).get(k)
+                for k in (
+                    "mean",
+                    "std",
+                    "ir",
+                    "t_stat",
+                    "t_stat_nw",
+                    "positive_rate",
+                    "ic_gt_002_rate",
+                    "ic_autocorr",
+                    "n_days",
+                )
+            },
+            "quantile": {
+                "monotonicity": qs.get("monotonicity"),
+                "top_bottom_spread": qs.get("top_bottom_spread"),
+                "long_short": qs.get("long_short"),
+                "groups": qs.get("groups"),
+            },
+            "decay": {
+                "half_life": dec.get("half_life"),
+                "suggested_rebalance": dec.get("suggested_rebalance"),
+                "profile": dec["profile"].to_dicts() if len(dec.get("profile")) else [],
+            },
+            "attribution": attr,
+            "oos_decay": oos,
+            "n_trials": q["n_trials"],
+            "corrected_threshold": q["corrected_threshold"],
+            "quota_remaining": q["quota_remaining"],
+            "hints": q["hints"],
+        }
+    )
 
 
 @factor.command()
@@ -603,8 +729,9 @@ def _audit_payload(expr: str, start: str | None, n_groups: int, horizons: str,
 @click.option("--top-months", default=5, help="剔除收益最好的前 N 个月")
 @click.option("--deltas", default="0.1,0.2,0.3", help="窗口扰动幅度（逗号分隔）")
 @click.option("--agent", default=None, help="Agent 名（配额记账 + 校正门槛）")
-def robust(expr: str, start: str | None, n_groups: int, top_months: int,
-           deltas: str, agent: str | None) -> None:
+def robust(
+    expr: str, start: str | None, n_groups: int, top_months: int, deltas: str, agent: str | None
+) -> None:
     """L3 鲁棒性检验：窗口扰动 / 分段稳定 / 起点敏感 / 剔除最佳月份 / 样本外衰减。
 
     通过 ≠ 因子好，只说明「它不是因为某个特定窗口或某一段行情才成立」。
@@ -624,31 +751,62 @@ def robust(expr: str, start: str | None, n_groups: int, top_months: int,
     q = _quota(agent, expr, float("nan"))
 
     res = robustness_summary(
-        train, "f", "fwd_ret_1", expr=expr, covs=cov_cols,
-        icir_is=icir_is, icir_oos=icir_oos,
-        deltas=_parse_floats(deltas), top_n=top_months, n_groups=n_groups,
+        train,
+        "f",
+        "fwd_ret_1",
+        expr=expr,
+        covs=cov_cols,
+        icir_is=icir_is,
+        icir_oos=icir_oos,
+        deltas=_parse_floats(deltas),
+        top_n=top_months,
+        n_groups=n_groups,
     )
-    res.update({"expr": expr, "n_days": days, "neutralized": bool(cov_cols),
-                "covariates": cov_cols, "n_trials": q["n_trials"],
-                "quota_remaining": q["quota_remaining"], "hints": q["hints"]})
+    res.update(
+        {
+            "expr": expr,
+            "n_days": days,
+            "neutralized": bool(cov_cols),
+            "covariates": cov_cols,
+            "n_trials": q["n_trials"],
+            "quota_remaining": q["quota_remaining"],
+            "hints": q["hints"],
+        }
+    )
     click.echo(json.dumps(_clean(res), ensure_ascii=False))
 
 
 @factor.command()
 @click.argument("expr")
-@click.option("--out", default=None, help="输出 HTML 路径（默认 <仓库根>/data/reports/factor_<id>.html）")
+@click.option(
+    "--out", default=None, help="输出 HTML 路径（默认 <仓库根>/data/reports/factor_<id>.html）"
+)
 @click.option("--start", default=None, help="数据窗口起点 YYYY-MM-DD")
 @click.option("--n-groups", default=DEFAULT_N_GROUPS, help="分层组数")
 @click.option("--bps", default=BPS_CSV, help="成本敏感性 bps 列表（逗号分隔）")
-@click.option("--filter-zscore", default=None, type=float,
-              help="截面异常收益过滤阈值（|z| 上限，口径同 alphalens；默认不过滤）")
-@click.option("--exclude-st", is_flag=True, default=False,
-              help="剔除 ST/*ST（默认否 —— 打开会改变 IC/分层口径）")
-@click.option("--exclude-suspended", is_flag=True, default=False,
-              help="剔除停牌（默认否）")
-def report(expr: str, out: str | None, start: str | None, n_groups: int, bps: str,
-           filter_zscore: float | None, exclude_st: bool,
-           exclude_suspended: bool) -> None:
+@click.option(
+    "--filter-zscore",
+    default=None,
+    type=float,
+    help="截面异常收益过滤阈值（|z| 上限，口径同 alphalens；默认不过滤）",
+)
+@click.option(
+    "--exclude-st",
+    is_flag=True,
+    default=False,
+    help="剔除 ST/*ST（默认否 —— 打开会改变 IC/分层口径）",
+)
+@click.option("--exclude-suspended", is_flag=True, default=False, help="剔除停牌（默认否）")
+def report(
+    expr: str,
+    out: str | None,
+    start: str | None,
+    n_groups: int,
+    bps: str,
+    filter_zscore: float | None,
+    exclude_st: bool,
+    exclude_suspended: bool,
+) -> None:
     """生成自包含 HTML 因子研究报告（离线可看，涨红跌绿）。
 
     报告含「结论（评级）」+「样本与口径」+ IC/滚动/分层/超额/衰减/分年度/
@@ -656,16 +814,30 @@ def report(expr: str, out: str | None, start: str | None, n_groups: int, bps: st
     """
     import json
 
-    payload = _build_report(expr, out=out, start=start, n_groups=n_groups, bps=bps,
-                            filter_zscore=filter_zscore, exclude_st=exclude_st,
-                            exclude_suspended=exclude_suspended)
+    payload = _build_report(
+        expr,
+        out=out,
+        start=start,
+        n_groups=n_groups,
+        bps=bps,
+        filter_zscore=filter_zscore,
+        exclude_st=exclude_st,
+        exclude_suspended=exclude_suspended,
+    )
     click.echo(json.dumps(payload, ensure_ascii=False))
 
 
-def _build_report(expr: str, *, out: str | None = None, start: str | None = None,
-                  n_groups: int = DEFAULT_N_GROUPS, bps: str = BPS_CSV,
-                  filter_zscore: float | None = None, exclude_st: bool = False,
-                  exclude_suspended: bool = False) -> dict:
+def _build_report(
+    expr: str,
+    *,
+    out: str | None = None,
+    start: str | None = None,
+    n_groups: int = DEFAULT_N_GROUPS,
+    bps: str = BPS_CSV,
+    filter_zscore: float | None = None,
+    exclude_st: bool = False,
+    exclude_suspended: bool = False,
+) -> dict:
     """生成一份报告并返回摘要 dict（``report`` 与 ``reports --rebuild-stale`` 共用）。"""
     from pathlib import Path
 
@@ -682,15 +854,17 @@ def _build_report(expr: str, *, out: str | None = None, start: str | None = None
 
     # 衰减阶梯与 API/报告默认同源；with_pre 拿中性化之前的帧做 IC 归因阶梯的基线。
     seg, cov_cols, days, pre_recipe = _load_segments(
-        start, expr, horizons=list(DEFAULT_DECAY_HORIZONS), with_pre=True)
+        start, expr, horizons=list(DEFAULT_DECAY_HORIZONS), with_pre=True
+    )
     train = seg["train"]
     if not len(train):
         raise click.ClickException("train 段为空 —— 数据或表达式问题")
 
     # 样本过滤（默认关）：与 API 同口径，报告里会写明到底剔没剔
     if exclude_st or exclude_suspended:
-        train = apply_sample_filters(train, exclude_st=exclude_st,
-                                     exclude_suspended=exclude_suspended)
+        train = apply_sample_filters(
+            train, exclude_st=exclude_st, exclude_suspended=exclude_suspended
+        )
         if not len(train):
             raise click.ClickException("样本过滤后没有剩余数据 —— 检查 ST/停牌标记")
 
@@ -699,28 +873,41 @@ def _build_report(expr: str, *, out: str | None = None, start: str | None = None
     # 口头诚实：`prepare_segment` 在有协变量时**确实**跑了默认配方
     # （mad 去极值 → zscore → 市值/行业/换手 OLS 中性化）。报告必须披露真实配方，
     # 否则「预处理配方」一栏会写着「原始因子直接评价」—— 那是假的。
-    recipe = ([
-        {"op": "winsorize", "method": "mad", "n": 5},
-        {"op": "standardize", "method": "zscore"},
-        {"op": "neutralize", "method": "ols", "factors": list(cov_cols)},
-    ] if cov_cols else None)
-    cov_map = {c.removeprefix("cov_"): round(
-        1 - train[c].null_count() / max(len(train), 1), 4)
-        for c in cov_cols if c in train.columns}
+    recipe = (
+        [
+            {"op": "winsorize", "method": "mad", "n": 5},
+            {"op": "standardize", "method": "zscore"},
+            {"op": "neutralize", "method": "ols", "factors": list(cov_cols)},
+        ]
+        if cov_cols
+        else None
+    )
+    cov_map = {
+        c.removeprefix("cov_"): round(1 - train[c].null_count() / max(len(train), 1), 4)
+        for c in cov_cols
+        if c in train.columns
+    }
 
     # 归因阶梯 / 中性化视图 / 分组 IC / 研报三件套 —— 与 API 共用同一份编排，
     # 否则 CLI 生成的报告永远比 API 的薄一截（评审 R12）。
     errors: dict[str, str] = {}
     extras = build_report_extras(
-        train, "f", "fwd_ret_1", n_groups=n_groups, group_col=cat,
-        pre_recipe_df=pre_recipe, cov_report=cov_map, errors=errors)
+        train,
+        "f",
+        "fwd_ret_1",
+        n_groups=n_groups,
+        group_col=cat,
+        pre_recipe_df=pre_recipe,
+        cov_report=cov_map,
+        errors=errors,
+    )
 
     # 结论层：CLI 只跑 L2 评级（不跑 L3 稳健性 —— 要重算因子多遍，太贵）
     rating = None
     try:
         rating = factor_rating(
-            ic_summary(train, "f", "fwd_ret_1"),
-            quantile_summary(train, "f", "fwd_ret_1", n_groups))
+            ic_summary(train, "f", "fwd_ret_1"), quantile_summary(train, "f", "fwd_ret_1", n_groups)
+        )
     except Exception as e:  # noqa: BLE001 - 评级失败不该让整份报告生成不了
         rating = None
         errors["rating"] = f"{type(e).__name__}: {e}"
@@ -735,16 +922,24 @@ def _build_report(expr: str, *, out: str | None = None, start: str | None = None
     # 分组 IC：按行业分组（有行业列时）。此前硬编码 None，导致报告里
     # 「分组 IC」这一节永远不出现 —— 引擎有能力，接线处丢了参数。
     html = factor_report(
-        train, "f", "fwd_ret_1", n_groups=n_groups,
-        cat_col=cat, group_col=cat,
+        train,
+        "f",
+        "fwd_ret_1",
+        n_groups=n_groups,
+        cat_col=cat,
+        group_col=cat,
         bps_list=list(_parse_floats(bps)),
         filter_zscore=filter_zscore,
-        display_name=expr, expr=expr,
-        data_start=start, n_samples=len(train),
-        steps=recipe, covariates=cov_map,
+        display_name=expr,
+        expr=expr,
+        data_start=start,
+        n_samples=len(train),
+        steps=recipe,
+        covariates=cov_map,
         universe="all",
         sample_filters=describe_sample_filters(
-            train, exclude_st=exclude_st, exclude_suspended=exclude_suspended),
+            train, exclude_st=exclude_st, exclude_suspended=exclude_suspended
+        ),
         rating=rating,
         errors=errors,
         extras={**extras, "capacity": capacity},
@@ -757,31 +952,50 @@ def _build_report(expr: str, *, out: str | None = None, start: str | None = None
         base = base if base.is_absolute() else (s.root / base)
         path = base / f"factor_{canonical_id(expr)}.html"
     p = save_report(html, path)
-    return _clean({
-        "report": str(p.resolve()), "bytes": p.stat().st_size,
-        "factor": expr, "factor_id": canonical_id(expr), "n_days": days,
-        "neutralized": bool(cov_cols), "cov_names": cov_cols,
-        "rating": (rating or {}).get("rating"),
-        "capacity_aum": (capacity or {}).get("capacity_aum"),
-        "recipe": recipe, "covariates": cov_map,
-        "sections": sorted(k for k in extras),
-        "errors": errors,
-        "exclude_st": exclude_st, "exclude_suspended": exclude_suspended,
-        "filter_zscore": filter_zscore,
-    })
+    return _clean(
+        {
+            "report": str(p.resolve()),
+            "bytes": p.stat().st_size,
+            "factor": expr,
+            "factor_id": canonical_id(expr),
+            "n_days": days,
+            "neutralized": bool(cov_cols),
+            "cov_names": cov_cols,
+            "rating": (rating or {}).get("rating"),
+            "capacity_aum": (capacity or {}).get("capacity_aum"),
+            "recipe": recipe,
+            "covariates": cov_map,
+            "sections": sorted(k for k in extras),
+            "errors": errors,
+            "exclude_st": exclude_st,
+            "exclude_suspended": exclude_suspended,
+            "filter_zscore": filter_zscore,
+        }
+    )
 
 
 @factor.command("reports")
 @click.option("--stale-only", is_flag=True, default=False, help="只列旧口径报告")
-@click.option("--rebuild-stale", is_flag=True, default=False,
-              help="重算旧口径报告（能推断出表达式的才重算，其余跳过并给原因）")
-@click.option("--prune-stale", is_flag=True, default=False,
-              help="删除旧口径报告（不加 --yes 只演练，不真删）")
+@click.option(
+    "--rebuild-stale",
+    is_flag=True,
+    default=False,
+    help="重算旧口径报告（能推断出表达式的才重算，其余跳过并给原因）",
+)
+@click.option(
+    "--prune-stale", is_flag=True, default=False, help="删除旧口径报告（不加 --yes 只演练，不真删）"
+)
 @click.option("--limit", default=0, type=int, help="最多处理 N 份（0 = 不限）")
 @click.option("--yes", is_flag=True, default=False, help="确认删除（--prune-stale 需要）")
 @click.option("--start", default=None, help="重算时的数据窗口起点 YYYY-MM-DD")
-def reports(stale_only: bool, rebuild_stale: bool, prune_stale: bool, limit: int,
-            yes: bool, start: str | None) -> None:
+def reports(
+    stale_only: bool,
+    rebuild_stale: bool,
+    prune_stale: bool,
+    limit: int,
+    yes: bool,
+    start: str | None,
+) -> None:
     """报告中心维护：列出 / 重算 / 清理旧口径报告。
 
     报告文件名不含版本，正文也看不出口径 —— 只有 ``<head>`` 里的生成器版本能证明
@@ -812,8 +1026,10 @@ def reports(stale_only: bool, rebuild_stale: bool, prune_stale: bool, limit: int
         "n_reports": len(all_rows),
         "scope": "stale" if scope_stale else "all",
         "n_selected": len(rows),
-        "reports": [{k: r[k] for k in ("name", "generator_version", "generated_at",
-                                       "size_kb", "stale")} for r in rows],
+        "reports": [
+            {k: r[k] for k in ("name", "generator_version", "generated_at", "size_kb", "stale")}
+            for r in rows
+        ],
     }
 
     if rebuild_stale:
@@ -825,8 +1041,15 @@ def reports(stale_only: bool, rebuild_stale: bool, prune_stale: bool, limit: int
                 continue
             try:
                 info = _build_report(expr, out=r["path"], start=start)
-                rebuilt.append({"name": r["name"], "expr": expr, "why": why,
-                                "version": "current", "bytes": info["bytes"]})
+                rebuilt.append(
+                    {
+                        "name": r["name"],
+                        "expr": expr,
+                        "why": why,
+                        "version": "current",
+                        "bytes": info["bytes"],
+                    }
+                )
             except Exception as e:  # noqa: BLE001 - 单份失败不阻断整批
                 skipped.append({"name": r["name"], "reason": f"{type(e).__name__}: {e}"})
         out["rebuilt"] = rebuilt
@@ -843,6 +1066,59 @@ def reports(stale_only: bool, rebuild_stale: bool, prune_stale: bool, limit: int
                     Path(r["path"]).unlink()
             out["prune"]["deleted"] = len(rows)
     elif stale_only:
-        out["hint"] = ("旧口径报告不会自动失效：--rebuild-stale 重算（需能推断表达式），"
-                       "--prune-stale --yes 删除")
+        out["hint"] = (
+            "旧口径报告不会自动失效：--rebuild-stale 重算（需能推断表达式），"
+            "--prune-stale --yes 删除"
+        )
     click.echo(json.dumps(_clean(out), ensure_ascii=False))
+
+
+@factor.command("ic-sync")
+@click.argument("names", nargs=-1, required=True)
+@click.option("--start", default=None, help="窗口起点 YYYY-MM-DD（缺省按 --lookback 回推）")
+@click.option("--end", default=None, help="窗口终点 YYYY-MM-DD（缺省今天，Asia/Shanghai）")
+@click.option("--lookback", "lookback_days", default=120, show_default=True,
+              help="回看窗口（日历日）；起点缺省时按终点回推")
+def ic_sync(names: tuple[str, ...], start: str | None, end: str | None,
+            lookback_days: int) -> None:
+    """同步因子逐日 IC 到 factor_ic_daily（因子在线监控闭环的写入侧）。
+
+    每日收盘后跑一次；同窗口重跑幂等（快照替换，不会出现半新半旧行）。
+    配 lq factor ic-health 与 ic_below 告警规则组成闭环，示例见 README。
+    """
+    import json
+    from datetime import date as _date
+
+    from lquant.factors import monitor
+
+    out = []
+    for name in names:
+        try:
+            out.append(monitor.sync_factor_ic(
+                name,
+                start=_date.fromisoformat(start) if start else None,
+                end=_date.fromisoformat(end) if end else None,
+                lookback_days=lookback_days,
+            ))
+        except Exception as e:  # noqa: BLE001 - 单因子失败继续（原因可见）
+            out.append({"factor": name, "error": f"{type(e).__name__}: {e}"})
+    click.echo(json.dumps(_clean(out), ensure_ascii=False))
+
+
+@factor.command("ic-health")
+@click.option("--factor", "name", default=None, help="只看该因子（缺省全部）")
+@click.option("--window", default=20, show_default=True, help="近 N 个交易日")
+@click.option("--min-ic", "min_ic", default=0.0, show_default=True, help="IC 均值下限")
+@click.option("--min-icir", "min_icir", default=0.0, show_default=True, help="ICIR 下限")
+def ic_health(name: str | None, window: int, min_ic: float, min_icir: float) -> None:
+    """因子健康度评估（只读 DryRun）：ok / stale / degraded / no_data。
+
+    verdict=degraded 的因子该警惕下线或重构 —— 衰减是常态，装看不见不是。
+    """
+    import json
+
+    from lquant.factors import monitor
+
+    click.echo(json.dumps(_clean(
+        monitor.factor_health(name, window=window, min_ic=min_ic, min_icir=min_icir)
+    ), ensure_ascii=False))

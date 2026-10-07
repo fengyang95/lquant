@@ -268,6 +268,29 @@ class IndexConsRepo:
             ).fetchall()
         return sorted(r[0] for r in rows)
 
+    def earliest_batch(self, index_code: str) -> tuple[date | None, list[str]]:
+        """现存**最早**一批快照：(eff_date, symbols)；无快照 → (None, [])。
+
+        给「请求的 as-of 早于一切快照」时的降级口径用：``symbols_as_of`` 严格
+        按 ``eff_date <= d`` 取，而成分快照目前只同步最新一批
+        （``ingest/index_cons.py`` 只写窗口内最后一个 trade_date）—— 于是
+        「评价区间起点早于首次同步」这种常态请求会拿到空池。降级到最早一批 =
+        该指数现存最接近请求起点的成分，并由调用方**显式披露口径替换**；
+        不要拿它假装严格 point-in-time。
+        """
+        with reader() as con:
+            row = con.execute(
+                "SELECT min(eff_date) FROM index_cons WHERE index_code = ?", [index_code]
+            ).fetchone()
+            eff = row[0] if row and row[0] is not None else None
+            if eff is None:
+                return None, []
+            rows = con.execute(
+                "SELECT symbol FROM index_cons WHERE index_code = ? AND eff_date = ?",
+                [index_code, eff],
+            ).fetchall()
+        return eff, sorted(r[0] for r in rows)
+
     def upsert(self, df: pl.DataFrame) -> int:
         # 快照替换：同一 (index_code, eff_date) 批次整体重写，旧成分不留僵尸
         return _upsert("index_cons", df, epoch_cols=("index_code", "eff_date"))

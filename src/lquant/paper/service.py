@@ -11,6 +11,7 @@ tick 的三步职责（对应「实时盯市」设计）：
 停牌股整只跳过：不撮合、不改盯市价 —— 挂单保持 pending 等复牌，
 净值沿用最近可得价，与「last known price 盯市」的业界惯例一致。
 """
+
 from __future__ import annotations
 
 import importlib
@@ -54,11 +55,11 @@ def resolve_strategy(ref: str | None):
     mod_name, _, attr = ref.partition(":")
     if not mod_name or not attr:
         raise ValueError(f"策略引用格式须为 module:Attr，收到: {ref}")
-    if not any(mod_name == p or mod_name.startswith(p + ".")
-               for p in _strategy_prefixes()):
+    if not any(mod_name == p or mod_name.startswith(p + ".") for p in _strategy_prefixes()):
         raise ValueError(
             f"策略模块 {mod_name} 不在白名单内（允许前缀: "
-            f"{', '.join(_strategy_prefixes())}，可用 LQ_PAPER_STRATEGY_PREFIXES 扩展）")
+            f"{', '.join(_strategy_prefixes())}，可用 LQ_PAPER_STRATEGY_PREFIXES 扩展）"
+        )
     cls = getattr(importlib.import_module(mod_name), attr)
     inst = cls()
     if not callable(getattr(inst, "signals", None)):
@@ -66,15 +67,15 @@ def resolve_strategy(ref: str | None):
     return inst
 
 
-def create_account(name: str, initial_cash: float, strategy: str = "manual",
-                   universe: list[str] | None = None) -> dict:
-    s = resolve_strategy(strategy)   # 引用合法性前置校验
+def create_account(
+    name: str, initial_cash: float, strategy: str = "manual", universe: list[str] | None = None
+) -> dict:
+    s = resolve_strategy(strategy)  # 引用合法性前置校验
     del s
     return store.create_account(name, initial_cash, strategy, universe)
 
 
-def submit_order(name: str, symbol: str, side: str, qty: int,
-                 price: float | None = None) -> dict:
+def submit_order(name: str, symbol: str, side: str, qty: int, price: float | None = None) -> dict:
     """人工下单。price 缺省取实时快照最新价（停牌则拒收，要求显式限价）。"""
     if side not in ("buy", "sell"):
         raise ValueError(f"side 须为 buy/sell，收到: {side}")
@@ -82,6 +83,7 @@ def submit_order(name: str, symbol: str, side: str, qty: int,
         broker = store.load_broker(name)
         if price is None:
             from lquant.paper.quotes import fetch_snapshot
+
             snaps = fetch_snapshot([symbol])
             px = snaps[0]["price"] if snaps else 0.0
             if not px:
@@ -89,8 +91,15 @@ def submit_order(name: str, symbol: str, side: str, qty: int,
             price = px
         o = broker.submit(symbol, side, int(qty), float(price))
         store.save_broker(name, broker)
-    return {"order_id": o.order_id, "status": o.status, "reason": o.reason,
-            "symbol": o.symbol, "side": o.side, "qty": o.qty, "price": o.price}
+    return {
+        "order_id": o.order_id,
+        "status": o.status,
+        "reason": o.reason,
+        "symbol": o.symbol,
+        "side": o.side,
+        "qty": o.qty,
+        "price": o.price,
+    }
 
 
 def cancel_order(name: str, order_id: str) -> dict:
@@ -117,6 +126,7 @@ def tick(name: str) -> dict:
     held = {p.symbol for p in probe.positions.values() if p.qty > 0}
     symbols = sorted(set(acct["universe"]) | held | pending)
     from lquant.paper.quotes import fetch_snapshot
+
     quotes = fetch_snapshot(symbols) if symbols else []
 
     with store.account_lock(name):
@@ -127,28 +137,37 @@ def tick(name: str) -> dict:
             if q["suspended"]:
                 continue
             for od in strategy.signals(broker, q):
-                broker.submit(od["symbol"], od["side"], int(od["qty"]),
-                              float(od.get("price") or q["price"]))
-            touched += len(broker.on_quote(q["symbol"], q["price"],
-                                           q["limit_up"], q["limit_down"]))
+                broker.submit(
+                    od["symbol"], od["side"], int(od["qty"]), float(od.get("price") or q["price"])
+                )
+            touched += len(broker.on_quote(q["symbol"], q["price"], q["limit_up"], q["limit_down"]))
             pos = broker.positions.get(q["symbol"])
             if pos is not None and pos.qty > 0:
-                pos.last_price = q["price"]       # 盯市（委托撮合价之外的行情刷新）
+                pos.last_price = q["price"]  # 盯市（委托撮合价之外的行情刷新）
 
         store.save_broker(name, broker)
     # 非交易日（周末/节假日手动跑 tick）不落 intraday 净值：日历上没有这天的
     # 官方日线，曲线里会多一个用陈旧快照捏出来的点，对账时对不上。
     if _is_trading_day(today_cn()):
-        store.record_nav(name, today_cn(), broker.nav(), broker.cash,
-                         sum(1 for p in broker.positions.values() if p.qty > 0),
-                         "intraday")
-    return {"account": name, "n_quotes": len(quotes),
-            "n_suspended": sum(1 for q in quotes if q["suspended"]),
-            "orders_touched": touched,
-            "nav": round(broker.nav(), 2), "cash": round(broker.cash, 2),
-            "n_orders": len(broker.orders),
-            "n_filled": sum(1 for o in broker.orders if o.status == "filled"),
-            "n_rejected": sum(1 for o in broker.orders if o.status == "rejected")}
+        store.record_nav(
+            name,
+            today_cn(),
+            broker.nav(),
+            broker.cash,
+            sum(1 for p in broker.positions.values() if p.qty > 0),
+            "intraday",
+        )
+    return {
+        "account": name,
+        "n_quotes": len(quotes),
+        "n_suspended": sum(1 for q in quotes if q["suspended"]),
+        "orders_touched": touched,
+        "nav": round(broker.nav(), 2),
+        "cash": round(broker.cash, 2),
+        "n_orders": len(broker.orders),
+        "n_filled": sum(1 for o in broker.orders if o.status == "filled"),
+        "n_rejected": sum(1 for o in broker.orders if o.status == "rejected"),
+    }
 
 
 def _is_trading_day(d) -> bool:
@@ -165,7 +184,12 @@ def _is_trading_day(d) -> bool:
 
 
 def day_close(name: str, d=None) -> dict:
-    """日终：解冻 T+N → 官方日线对账重算 official 净值。"""
+    """日终：解冻 T+N → 官方日线对账重算 official 净值。
+
+    对账 verdict 非 ok 时顺手发通知（warning/critical 是「官方价与盯市价
+    背离」的信号，等第二天看板才发现就晚了）。通知旁路永不抛异常、
+    未配置 LQ_NOTIFY_CHANNELS 时零开销 —— 详见 lquant/notify。
+    """
     d = d or today_cn()
     with store.account_lock(name):
         broker = store.load_broker(name)
@@ -173,7 +197,35 @@ def day_close(name: str, d=None) -> dict:
         store.save_broker(name, broker)
 
     from lquant.paper.reconcile import reconcile
-    return {"account": name, "trade_date": str(d), "reconcile": reconcile(name, d)}
+
+    rep = reconcile(name, d)
+    _notify_reconcile(name, d, rep)
+    return {"account": name, "trade_date": str(d), "reconcile": rep}
+
+
+def _notify_reconcile(name: str, d, rep: dict) -> None:
+    """对账告警旁路：verdict=critical/warning 才发，ok 静默（别把群里灌满噪音）。
+
+    必须 ``category="alert"``：这是告警不是报告 —— 走 alert 路由通道，
+    且 severity 达到 warning/critical 才能在深夜静默时段豁免（对账背离
+    恰恰是最该叫醒人的信号）。漏传会退化成 report/info 被降噪压掉。
+    """
+    verdict = rep.get("verdict", "ok")
+    if verdict == "ok":
+        return
+    try:
+        from lquant.notify import notify
+
+        notify(
+            f"模拟盘对账告警 · {name}",
+            f"trade_date={d} verdict={verdict}\n{rep.get('detail', '')}",
+            category="alert",
+            severity="critical" if verdict == "critical" else "warning",
+        )
+    except Exception as e:  # noqa: BLE001 - 通知失败绝不影响对账主链路
+        from lquant.core.logging import get_logger
+
+        get_logger(__name__).warning(f"paper reconcile notify failed: {e}")
 
 
 def status(name: str) -> dict:
@@ -186,13 +238,29 @@ def status(name: str) -> dict:
         "cash": round(broker.cash, 2),
         "total_return": round(broker.nav() / acct["initial_cash"] - 1, 4),
         "positions": broker.positions_frame().to_dicts(),
-        "pending_orders": [{"order_id": o.order_id, "symbol": o.symbol,
-                            "side": o.side, "qty": o.qty, "price": o.price}
-                           for o in orders if o.status == "pending"],
-        "recent_orders": [{"order_id": o.order_id, "ts": str(o.ts),
-                           "symbol": o.symbol, "side": o.side, "qty": o.qty,
-                           "status": o.status, "reason": o.reason}
-                          for o in orders[:10]],
+        "pending_orders": [
+            {
+                "order_id": o.order_id,
+                "symbol": o.symbol,
+                "side": o.side,
+                "qty": o.qty,
+                "price": o.price,
+            }
+            for o in orders
+            if o.status == "pending"
+        ],
+        "recent_orders": [
+            {
+                "order_id": o.order_id,
+                "ts": str(o.ts),
+                "symbol": o.symbol,
+                "side": o.side,
+                "qty": o.qty,
+                "status": o.status,
+                "reason": o.reason,
+            }
+            for o in orders[:10]
+        ],
     }
 
 
