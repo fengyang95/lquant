@@ -99,3 +99,39 @@ def test_digest_defaults_to_watchlist_table(monkeypatch):
     res = run_watchlist_digest(analyze_fn=lambda s, a: make_report(s), notify_fn=spy)
     assert res["ok"] == ["600519.SH"]
     assert spy.calls[0]["category"] == "report"
+
+
+# ---------- 审阅修复回归：sent 按真实送达判定 ----------
+
+
+class SuppressedNotify:
+    """模拟通知被降噪压制 / 通道全挂：返回 ok=False 的结果对象。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, title, text, *, category="report", **kw):
+        self.calls += 1
+        from types import SimpleNamespace
+
+        return [SimpleNamespace(ok=False, skipped=True, channel="suppressed")]
+
+
+def test_digest_sent_false_when_notification_suppressed():
+    """通知被压制时 sent 如实为 False —— 「已生成」不冒充「已送达」。"""
+    spy = SuppressedNotify()
+    res = run_watchlist_digest(
+        symbols=["600519.SH"], analyze_fn=lambda s, a: make_report(s), notify_fn=spy
+    )
+    assert res["sent"] is False
+    assert res["ok"] == ["600519.SH"]  # 分析本身是成功的
+    assert spy.calls == 1
+
+
+def test_digest_sent_true_when_delivered():
+    """真实送达（ok=True）→ sent=True；mock 无返回值的注入方保持兼容。"""
+    spy = NotifySpy()
+    res = run_watchlist_digest(
+        symbols=["600519.SH"], analyze_fn=lambda s, a: make_report(s), notify_fn=spy
+    )
+    assert res["sent"] is True

@@ -17,6 +17,7 @@ InStock（14.7k star）的约定是每个策略一个 ``check_xxx(code_name, dat
     res = run_strategy("volume_surge", df)   # 单策略
     for r in run_all(df): ...                # 全策略扫
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -25,8 +26,7 @@ import polars as pl
 
 from lquant.core.registry import Registry
 
-__all__ = ["STRATEGIES", "register_strategy", "StrategyResult", "run_strategy",
-           "run_all"]
+__all__ = ["STRATEGIES", "register_strategy", "StrategyResult", "run_strategy", "run_all"]
 
 
 STRATEGIES = Registry("strategies")
@@ -44,8 +44,7 @@ class StrategyResult:
 
 def register_strategy(name: str, label: str, desc: str, min_rows: int):
     """注册装饰器。meta 随 Registry.describe() 输出，供 API/前端枚举。"""
-    return STRATEGIES.register(name, {"label": label, "desc": desc,
-                                      "min_rows": min_rows})
+    return STRATEGIES.register(name, {"label": label, "desc": desc, "min_rows": min_rows})
 
 
 def _spec(name: str) -> dict:
@@ -61,16 +60,25 @@ def _no(name: str, evidence: str, *, insufficient: bool = False) -> StrategyResu
 
 
 def _guard(name: str, df: pl.DataFrame, **params) -> StrategyResult:
-    """公共前置：行数够不够。数据不足是显式降级，不是 False。"""
+    """公共前置：行数够不够。数据不足是显式降级，不是 False。
+
+    ``params`` 按目标函数签名过滤（如 ``min_amount`` 只有 volume_surge 认）：
+    ``run_all(df, **common_params)`` 的公共参数不该打到无此形参的策略上 ——
+    否则 TypeError 会被下面的 except 吞成「计算失败」，表面不崩实则功能坏。
+    """
     min_rows = int(_spec(name).get("min_rows", 0))
     if df.height < min_rows:
-        return _no(name, f"数据不足: {df.height} 行 < 需要 {min_rows} 行",
-                   insufficient=True)
+        return _no(name, f"数据不足: {df.height} 行 < 需要 {min_rows} 行", insufficient=True)
     try:
+        import inspect
+
         from lquant.portfolio.strategies import rules as _rules_mod
+
         fn = getattr(_rules_mod, f"_run_{name}")
     except (ImportError, AttributeError) as e:  # pragma: no cover
         return _no(name, f"策略实现缺失: {e}")
+    known = inspect.signature(fn).parameters
+    params = {k: v for k, v in params.items() if k in known}
     try:
         return fn(df, **params)
     except Exception as e:  # noqa: BLE001  策略算炸也要给出原因而不是静默消失

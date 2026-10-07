@@ -175,6 +175,10 @@ def add_cyq_profit_ratio(df: pl.DataFrame) -> pl.DataFrame:
     缺输入列时输出全 null 占位（保持行数）—— outputs 声明了这列，下游
     （前端/批量链）期望它存在，所以补 null 列而不是原样返回；
     与 ``add_turnover_ma`` 的「缺列 noop」同一防御哲学，取更保守的一档。
+
+    float_shares 口径：取列内**最后一个非空值**贯穿全历史 —— 隐含「窗口内
+    流通股本不变」的假设，遇送转/增发等股本变动序列会有偏差；精确口径
+    请在调用侧按日传入，或等数据源提供逐日股本列后改为逐行换手率。
     """
     missing = [c for c in _REQUIRED if c not in df.columns]
     if missing:

@@ -398,8 +398,10 @@ def propose(report: str | None, out: str | None, max_proposals: int) -> None:
         )
     if out:
         write_proposals(res["accepted"], out)
+        # stdout 保持结构化 JSON；人类可读的指引一律走 stderr
         click.echo(f"已写 {len(res['accepted'])} 条提案 -> {out}", err=True)
-        click.echo(f"下一步: lq factor mine --generator proposals --proposals {out}")
+        click.echo(f"下一步: lq factor mine --generator proposals --proposals {out}", err=True)
+        click.echo(json.dumps(res, ensure_ascii=False))
     else:
         click.echo(json.dumps(res, ensure_ascii=False))
 

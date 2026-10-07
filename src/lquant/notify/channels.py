@@ -32,6 +32,7 @@
 - Server酱3: ``POST https://<sendkey>.push.ft07.com/send`` ``{title, desp}``。
 - 通用 webhook: POST JSON ``{"title": .., "text": ..}``，留给自建接收端。
 """
+
 from __future__ import annotations
 
 import base64
@@ -45,10 +46,21 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-__all__ = ["SendResult", "Channel", "WecomBot", "FeishuBot", "DingTalkBot",
-           "TelegramBot", "NtfyChannel", "PushPlusChannel", "ServerChan3Channel",
-           "GenericWebhook", "DEFAULT_TIMEOUT_S", "DEFAULT_TEXT_LIMIT",
-           "slice_text"]
+__all__ = [
+    "SendResult",
+    "Channel",
+    "WecomBot",
+    "FeishuBot",
+    "DingTalkBot",
+    "TelegramBot",
+    "NtfyChannel",
+    "PushPlusChannel",
+    "ServerChan3Channel",
+    "GenericWebhook",
+    "DEFAULT_TIMEOUT_S",
+    "DEFAULT_TEXT_LIMIT",
+    "slice_text",
+]
 
 
 DEFAULT_TIMEOUT_S = 5.0
@@ -73,7 +85,11 @@ def slice_text(title: str, text: str, max_chars: int | None) -> list[tuple[str, 
     # 首片给标题留位；续片给 "[续 i/N]" 头留位 —— 长度上限是硬约束，先扣头再装正文。
     cont_head = "[续 99/99]\n"
     body_cap = max_chars - max(len(title), len(cont_head)) - 1
-    chunks = [text[i:i + body_cap] for i in range(0, len(text), body_cap)]
+    if body_cap < 1:
+        # max_chars 小到装不下标题本身属配置错误：返回单片让平台报错（可见），
+        # 而不是在 range(step=0) 上抛 ValueError 把发送线程炸掉。
+        return [(title, text)]
+    chunks = [text[i : i + body_cap] for i in range(0, len(text), body_cap)]
     n = len(chunks)
     out = [(title, chunks[0])]
     out += [(f"[续 {i}/{n}]", c) for i, c in enumerate(chunks[1:], start=1)]
@@ -84,8 +100,8 @@ class Channel:
     """通道基类：子类给 ``_url`` + ``_payload``（或覆写 ``_request``），基类管分片与错。"""
 
     name = "base"
-    max_chars: int | None = 4000   # 单片正文上限；None = 不分片（自建接收端可不限）
-    slice_pause = 0.2              # 片间停顿，防机器人限流
+    max_chars: int | None = 4000  # 单片正文上限；None = 不分片（自建接收端可不限）
+    slice_pause = 0.2  # 片间停顿，防机器人限流
 
     def __init__(self, timeout: float = DEFAULT_TIMEOUT_S) -> None:
         self.timeout = timeout
@@ -101,8 +117,7 @@ class Channel:
 
     def _request(self, title: str, text: str) -> tuple[bytes, dict[str, str]]:
         """构造请求体与头。JSON 协议通道用默认实现；ntfy 这类纯文本覆写。"""
-        body = json.dumps(self._payload(title, text),
-                          ensure_ascii=False).encode("utf-8")
+        body = json.dumps(self._payload(title, text), ensure_ascii=False).encode("utf-8")
         return body, {"Content-Type": "application/json"}
 
     def _post_url(self, url: str) -> str:
@@ -115,15 +130,14 @@ class Channel:
         """分片发送。全部片成功才 ok；任何一片失败即停并回报该错误。"""
         url = self._url()
         if not url:
-            return SendResult(self.name, ok=False,
-                              error="未配置（缺 webhook URL / token）",
-                              skipped=True)
+            return SendResult(
+                self.name, ok=False, error="未配置（缺 webhook URL / token）", skipped=True
+            )
         slices = slice_text(title, text, self.max_chars)
         first_err: str | None = None
         for i, (t, chunk) in enumerate(slices):
             body, headers = self._request(t, chunk)
-            req = urllib.request.Request(self._post_url(url), data=body,
-                                         headers=headers)
+            req = urllib.request.Request(self._post_url(url), data=body, headers=headers)
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     raw = resp.read().decode("utf-8", errors="replace")
@@ -154,6 +168,14 @@ def _business_error(channel: str, raw: str) -> str | None:
         if not data.get("ok", True):
             return f"telegram: {str(data.get('description'))[:200]}"
         return None
+    if channel == "pushplus" and "errcode" not in data and "code" in data:
+        # pushplus 官方成功响应是 {"code": 200}（企微/钉钉的 errcode 才是 0=成功），
+        # 直接套通用口径会把每次成功发送误判为 FAIL 并中断分片续发。
+        # 探测式判定：响应里真有 code 字段才按 pushplus 口径（测试 mock 走通用分支）。
+        code = data.get("code", 0)
+        if code != 200:
+            return f"pushplus code={code}: {str(data.get('msg'))[:200]}"
+        return None
     code = data.get("errcode", data.get("code", 0))
     if code:
         return f"{channel} errcode={code}: {str(data.get('errmsg'))[:200]}"
@@ -163,6 +185,7 @@ def _business_error(channel: str, raw: str) -> str | None:
 def _env(key: str) -> str | None:
     """函数内 import os：通道实例化发生在 build_chain（可能早于 env 就绪的测试）。"""
     import os
+
     return os.getenv(key) or None
 
 
@@ -170,14 +193,13 @@ class WecomBot(Channel):
     """企业微信群机器人。env: LQ_WECOM_WEBHOOK_URL"""
 
     name = "wecom"
-    max_chars = 1200   # content 上限 4096 字节，UTF-8 中文 3 字节/字，留余量
+    max_chars = 1200  # content 上限 4096 字节，UTF-8 中文 3 字节/字，留余量
 
     def _url(self) -> str | None:
         return _env("LQ_WECOM_WEBHOOK_URL")
 
     def _payload(self, title: str, text: str) -> dict[str, Any]:
-        return {"msgtype": "text",
-                "text": {"content": f"{title}\n{text}".strip()}}
+        return {"msgtype": "text", "text": {"content": f"{title}\n{text}".strip()}}
 
 
 class FeishuBot(Channel):
@@ -199,15 +221,13 @@ class FeishuBot(Channel):
         if not secret:
             return url
         ts = str(int(time.time()))
-        digest = hmac.new(f"{ts}\n{secret}".encode(), b"",
-                          digestmod=hashlib.sha256).digest()
+        digest = hmac.new(f"{ts}\n{secret}".encode(), b"", digestmod=hashlib.sha256).digest()
         sign = base64.b64encode(digest).decode()
         sep = "&" if urllib.parse.urlparse(url).query else "?"
         return f"{url}{sep}timestamp={ts}&sign={urllib.parse.quote_plus(sign)}"
 
     def _payload(self, title: str, text: str) -> dict[str, Any]:
-        return {"msg_type": "text",
-                "content": {"text": f"{title}\n{text}".strip()}}
+        return {"msg_type": "text", "content": {"text": f"{title}\n{text}".strip()}}
 
 
 class DingTalkBot(Channel):
@@ -229,23 +249,22 @@ class DingTalkBot(Channel):
         if not secret:
             return url
         ts = str(int(time.time() * 1000))
-        digest = hmac.new(secret.encode("utf-8"),
-                          f"{ts}\n{secret}".encode(),
-                          digestmod=hashlib.sha256).digest()
+        digest = hmac.new(
+            secret.encode("utf-8"), f"{ts}\n{secret}".encode(), digestmod=hashlib.sha256
+        ).digest()
         sign = urllib.parse.quote_plus(base64.b64encode(digest))
         sep = "&" if urllib.parse.urlparse(url).query else "?"
         return f"{url}{sep}timestamp={ts}&sign={sign}"
 
     def _payload(self, title: str, text: str) -> dict[str, Any]:
-        return {"msgtype": "text",
-                "text": {"content": f"{title}\n{text}".strip()}}
+        return {"msgtype": "text", "text": {"content": f"{title}\n{text}".strip()}}
 
 
 class TelegramBot(Channel):
     """Telegram Bot API。env: LQ_TELEGRAM_BOT_TOKEN + LQ_TELEGRAM_CHAT_ID"""
 
     name = "telegram"
-    max_chars = 1500   # text 上限 4096 字符
+    max_chars = 1500  # text 上限 4096 字符
 
     def _url(self) -> str | None:
         token = _env("LQ_TELEGRAM_BOT_TOKEN")
@@ -254,8 +273,7 @@ class TelegramBot(Channel):
         return f"https://api.telegram.org/bot{token}/sendMessage"
 
     def _payload(self, title: str, text: str) -> dict[str, Any]:
-        return {"chat_id": _env("LQ_TELEGRAM_CHAT_ID") or "",
-                "text": f"{title}\n{text}".strip()}
+        return {"chat_id": _env("LQ_TELEGRAM_CHAT_ID") or "", "text": f"{title}\n{text}".strip()}
 
 
 class NtfyChannel(Channel):
@@ -268,8 +286,10 @@ class NtfyChannel(Channel):
         return _env("LQ_NTFY_URL")
 
     def _request(self, title: str, text: str) -> tuple[bytes, dict[str, str]]:
-        headers = {"Content-Type": "text/plain; charset=utf-8",
-                   "X-Title": title.encode("ascii", "ignore").decode() or "lquant"}
+        headers = {
+            "Content-Type": "text/plain; charset=utf-8",
+            "X-Title": title.encode("ascii", "ignore").decode() or "lquant",
+        }
         token = _env("LQ_NTFY_TOKEN")
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -289,8 +309,12 @@ class PushPlusChannel(Channel):
         return "https://www.pushplus.plus/send"
 
     def _payload(self, title: str, text: str) -> dict[str, Any]:
-        return {"token": _env("LQ_PUSHPLUS_TOKEN") or "",
-                "title": title, "content": text, "template": "txt"}
+        return {
+            "token": _env("LQ_PUSHPLUS_TOKEN") or "",
+            "title": title,
+            "content": text,
+            "template": "txt",
+        }
 
 
 class ServerChan3Channel(Channel):
@@ -317,7 +341,7 @@ class GenericWebhook(Channel):
     """
 
     name = "webhook"
-    max_chars = None   # 自建端点无协议上限，交由调用方与 service 兜底截断
+    max_chars = None  # 自建端点无协议上限，交由调用方与 service 兜底截断
 
     def _url(self) -> str | None:
         return _env("LQ_GENERIC_WEBHOOK_URL")

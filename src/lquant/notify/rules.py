@@ -16,6 +16,7 @@ alert_type 首批四种（都是纯数值比较，不碰数据源）：
   price_above / price_below   —— ctx 需 last_price
   pct_change_up / pct_change_down —— ctx 需 last_price + pre_close
 """
+
 from __future__ import annotations
 
 import json
@@ -27,8 +28,17 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-__all__ = ["AlertRule", "RuleStore", "get_store", "evaluate", "run_rules",
-           "TRIGGERED", "NOT_TRIGGERED", "EVAL_ERROR", "COOLDOWN"]
+__all__ = [
+    "AlertRule",
+    "RuleStore",
+    "get_store",
+    "evaluate",
+    "run_rules",
+    "TRIGGERED",
+    "NOT_TRIGGERED",
+    "EVAL_ERROR",
+    "COOLDOWN",
+]
 
 TRIGGERED = "triggered"
 NOT_TRIGGERED = "not_triggered"
@@ -46,6 +56,7 @@ def db_path() -> Path:
         p = Path(env)
     else:
         from lquant.core.config import get_settings
+
         p = Path(get_settings().parquet_dir).parent / "notify" / "rules.db"
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
@@ -56,13 +67,13 @@ class AlertRule:
     """告警规则。parameters 语义由 alert_type 决定（threshold / pct 等，全数值）。"""
 
     name: str
-    target_scope: str = "single_symbol"      # single_symbol|watchlist|portfolio|market
-    target: str = ""                          # symbol（600000.SH）或池名；market 留空
+    target_scope: str = "single_symbol"  # single_symbol|watchlist|portfolio|market
+    target: str = ""  # symbol（600000.SH）或池名；market 留空
     alert_type: str = "price_above"
     parameters: dict = field(default_factory=lambda: {"threshold": 0.0})
     severity: str = "warning"
     enabled: bool = True
-    cooldown_seconds: int = 300               # 触发后 N 秒内不再重复触发
+    cooldown_seconds: int = 300  # 触发后 N 秒内不再重复触发
     id: int | None = None
     last_triggered_at: str | None = None
     cooldown_until: str | None = None
@@ -74,6 +85,13 @@ class AlertRule:
             errs.append("name 不能为空")
         if self.target_scope not in SCOPES:
             errs.append(f"target_scope 须为 {'/'.join(SCOPES)}")
+        elif self.target_scope in ("watchlist", "portfolio"):
+            # run_rules 只按 symbol 匹配 ctx；池名永不命中会让规则「配了却
+            # 永远不响」—— 与其静默不触发，不如创建时就拒绝（不静默哲学）。
+            errs.append(
+                f"target_scope={self.target_scope} 暂不支持（当前仅 "
+                "single_symbol / market 可实际触发）"
+            )
         if self.alert_type not in ALERT_TYPES:
             errs.append(f"alert_type 须为 {'/'.join(ALERT_TYPES)}")
         if self.severity not in SEVERITIES:
@@ -124,13 +142,18 @@ class RuleStore:
     @staticmethod
     def _row_to_rule(r: sqlite3.Row) -> AlertRule:
         return AlertRule(
-            id=r["id"], name=r["name"], target_scope=r["target_scope"],
-            target=r["target"], alert_type=r["alert_type"],
+            id=r["id"],
+            name=r["name"],
+            target_scope=r["target_scope"],
+            target=r["target"],
+            alert_type=r["alert_type"],
             parameters=json.loads(r["parameters_json"]),
-            severity=r["severity"], enabled=bool(r["enabled"]),
+            severity=r["severity"],
+            enabled=bool(r["enabled"]),
             cooldown_seconds=r["cooldown_seconds"],
             last_triggered_at=r["last_triggered_at"],
-            cooldown_until=r["cooldown_until"])
+            cooldown_until=r["cooldown_until"],
+        )
 
     def add(self, rule: AlertRule) -> AlertRule:
         errs = rule.validate()
@@ -141,9 +164,18 @@ class RuleStore:
                 "INSERT INTO notify_rules(name,target_scope,target,alert_type,"
                 "parameters_json,severity,enabled,cooldown_seconds,created_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?)",
-                [rule.name, rule.target_scope, rule.target, rule.alert_type,
-                 json.dumps(rule.parameters), rule.severity, int(rule.enabled),
-                 rule.cooldown_seconds, _now_iso()])
+                [
+                    rule.name,
+                    rule.target_scope,
+                    rule.target,
+                    rule.alert_type,
+                    json.dumps(rule.parameters),
+                    rule.severity,
+                    int(rule.enabled),
+                    rule.cooldown_seconds,
+                    _now_iso(),
+                ],
+            )
             rule.id = cur.lastrowid
         return rule
 
@@ -166,16 +198,23 @@ class RuleStore:
                 "UPDATE notify_rules SET name=?,target_scope=?,target=?,"
                 "alert_type=?,parameters_json=?,severity=?,enabled=?,"
                 "cooldown_seconds=? WHERE id=?",
-                [cur_rule.name, cur_rule.target_scope, cur_rule.target,
-                 cur_rule.alert_type, json.dumps(cur_rule.parameters),
-                 cur_rule.severity, int(cur_rule.enabled),
-                 cur_rule.cooldown_seconds, rule_id])
+                [
+                    cur_rule.name,
+                    cur_rule.target_scope,
+                    cur_rule.target,
+                    cur_rule.alert_type,
+                    json.dumps(cur_rule.parameters),
+                    cur_rule.severity,
+                    int(cur_rule.enabled),
+                    cur_rule.cooldown_seconds,
+                    rule_id,
+                ],
+            )
         return cur_rule
 
     def get(self, rule_id: int) -> AlertRule | None:
         with self._conn() as con:
-            r = con.execute("SELECT * FROM notify_rules WHERE id=?",
-                            [rule_id]).fetchone()
+            r = con.execute("SELECT * FROM notify_rules WHERE id=?", [rule_id]).fetchone()
         return self._row_to_rule(r) if r else None
 
     def list(self, enabled_only: bool = False) -> list[AlertRule]:
@@ -198,8 +237,9 @@ class RuleStore:
         until = (now + timedelta(seconds=cooldown_seconds)).isoformat()
         with self._conn() as con:
             con.execute(
-                "UPDATE notify_rules SET last_triggered_at=?, cooldown_until=? "
-                "WHERE id=?", [now.isoformat(), until, rule_id])
+                "UPDATE notify_rules SET last_triggered_at=?, cooldown_until=? WHERE id=?",
+                [now.isoformat(), until, rule_id],
+            )
 
 
 _store: RuleStore | None = None
@@ -243,8 +283,7 @@ def evaluate(rule: AlertRule, ctx: dict) -> tuple[str, str]:
             if pre <= 0:
                 raise ValueError(f"pre_close 非法: {pre}")
             pct = (px / pre - 1) * 100
-            hit = pct >= threshold if rule.alert_type == "pct_change_up" \
-                else pct <= -abs(threshold)
+            hit = pct >= threshold if rule.alert_type == "pct_change_up" else pct <= -abs(threshold)
     except KeyError as e:
         return EVAL_ERROR, f"ctx 缺字段 {e} —— 规则评估失败不是未触发"
     except (TypeError, ValueError) as e:
@@ -254,8 +293,7 @@ def evaluate(rule: AlertRule, ctx: dict) -> tuple[str, str]:
     return NOT_TRIGGERED, "未命中"
 
 
-def run_rules(ctxs: list[dict], store: RuleStore | None = None,
-              notify_fn=None) -> list[dict]:
+def run_rules(ctxs: list[dict], store: RuleStore | None = None, notify_fn=None) -> list[dict]:
     """评估全部启用规则；命中的发通知并落冷却状态。
 
     ctxs: 每个标的一行 ``{"symbol":.., "last_price":.., "pre_close":..}``；
@@ -264,15 +302,18 @@ def run_rules(ctxs: list[dict], store: RuleStore | None = None,
     """
     if notify_fn is None:
         from lquant.notify import notify as notify_fn_default
+
         notify_fn = notify_fn_default
     store = store or get_store()
     out = []
     for rule in store.list(enabled_only=True):
-        matched = [c for c in ctxs
-                   if rule.target_scope == "market" or c.get("symbol") == rule.target]
+        matched = [
+            c for c in ctxs if rule.target_scope == "market" or c.get("symbol") == rule.target
+        ]
         if rule.target_scope != "market" and not matched:
-            out.append({"rule_id": rule.id, "status": NOT_TRIGGERED,
-                        "detail": "ctx 中无 target 标的行情"})
+            out.append(
+                {"rule_id": rule.id, "status": NOT_TRIGGERED, "detail": "ctx 中无 target 标的行情"}
+            )
             continue
         # 同一规则对多条行情逐一评估，任一命中即触发一次（合并 detail，不刷屏）
         results = [evaluate(rule, c) for c in matched]
@@ -281,17 +322,24 @@ def run_rules(ctxs: list[dict], store: RuleStore | None = None,
         if hit:
             store.mark_triggered(rule.id, rule.cooldown_seconds)
             sym = matched[results.index(hit)].get("symbol", "")
-            notify_fn(f"[{rule.severity}] {rule.name}", f"{sym} {hit[1]}",
-                      category="alert", severity=rule.severity)
-            out.append({"rule_id": rule.id, "status": TRIGGERED,
-                        "detail": f"{sym} {hit[1]}"})
+            notify_fn(
+                f"[{rule.severity}] {rule.name}",
+                f"{sym} {hit[1]}",
+                category="alert",
+                severity=rule.severity,
+            )
+            out.append({"rule_id": rule.id, "status": TRIGGERED, "detail": f"{sym} {hit[1]}"})
         elif err:
             out.append({"rule_id": rule.id, "status": EVAL_ERROR, "detail": err[1]})
         else:
             cd = next((r for r in results if r[0] == COOLDOWN), None)
-            out.append({"rule_id": rule.id,
-                        "status": cd[0] if cd else NOT_TRIGGERED,
-                        "detail": (cd[1] if cd else "未命中")})
+            out.append(
+                {
+                    "rule_id": rule.id,
+                    "status": cd[0] if cd else NOT_TRIGGERED,
+                    "detail": (cd[1] if cd else "未命中"),
+                }
+            )
     return out
 
 

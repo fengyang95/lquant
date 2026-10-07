@@ -12,7 +12,8 @@ task_center、server 生命周期），job 只是一个纯函数，谁定时谁�
 失败语义（与 collect 同哲学）：
   - 单只标的分析失败不影响其他（失败明细进返回值，绝不静默）；
   - 清单为空 → 显式 skipped，不发送空报告；
-  - 全部失败 → 不发正文，改为 notify(category="error") 报错摘要。
+  - 全部失败 → 不发正文，改为 notify(category="error") 报错摘要；
+  - ``sent`` 按真实送达判定：通知被降噪压制或通道全挂时如实回 False。
 """
 
 from __future__ import annotations
@@ -89,15 +90,20 @@ def run_watchlist_digest(
             failed.append({"symbol": sym, "error": f"{type(e).__name__}: {e}"})
             log.warning("个股分析失败 symbol=%s err=%s", sym, e)
 
+    sent = False
     if ok:
         text = "\n\n".join(blocks)
         if failed:
             text += "\n\n（另有 " + ", ".join(f["symbol"] for f in failed) + " 分析失败，详见日志）"
-        notify_fn(
+        results = notify_fn(
             "自选股每日报告",
             f"{asof or '最新交易日'} · {len(ok)}/{len(syms)} 只\n\n{text}",
             category="report",
         )
+        # sent 按真实送达判定：被降噪压制 / 通道全挂时 SendResult.ok=False，
+        # 如实回报而不是把「已生成」冒充「已送达」；注入式 mock 无返回值
+        # （results is None）视为已发，保持测试桩兼容。
+        sent = results is None or any(getattr(r, "ok", True) for r in results or [])
     else:
         detail = "\n".join(f"{f['symbol']}: {f['error']}" for f in failed)
         notify_fn(
@@ -105,4 +111,4 @@ def run_watchlist_digest(
             f"{len(failed)} 只全部失败，未发送正文：\n{detail}",
             category="error",
         )
-    return {"sent": bool(ok), "ok": ok, "failed": failed, "skipped": None}
+    return {"sent": sent, "ok": ok, "failed": failed, "skipped": None}
