@@ -206,7 +206,16 @@ def backfill_pool(
                 if len(df):
                     try:
                         if cls == "index":
-                            _write_index_bars(df)
+                            # int(... or 0)：_write_index_bars 可能被替换/吞异常
+                            # 返回 None —— 校验必须对「假成功」稳健
+                            n_written = int(_write_index_bars(df) or 0)
+                            # market.persist 会吞掉 DuckDB 写库异常（返回 0）：
+                            # 不检查返回值的话，指数数据没落库却被标 done，
+                            # 断点/coverage 都不会再补 —— 基准序列静默停更。
+                            if n_written < len(df):
+                                raise RuntimeError(
+                                    f"index_daily 写入不完整（{n_written}/{len(df)} 行，"
+                                    "写库异常被 persist 吞掉）")
                         else:
                             write_daily(_stamp(df, _provider_source(src)))
                             # 日级完整性记账：按**本次应写标的数**当分母，
@@ -224,6 +233,10 @@ def backfill_pool(
                         logger.error(f"质量门禁拦截（fatal，不入湖）: {e}")
                         for sym in syms:
                             batch_failed.setdefault(sym, f"quality: {e}")
+                    except RuntimeError as e:
+                        logger.error(str(e))
+                        for sym in syms:
+                            batch_failed.setdefault(sym, f"index_write: {e}")
         ok = [s for s, _ in chunk if s not in batch_failed]
         cp.mark(ok)
         done += len(ok)

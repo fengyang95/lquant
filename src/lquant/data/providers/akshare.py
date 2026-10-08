@@ -265,11 +265,17 @@ class AkShareProvider(MappingProvider):
         if not out:
             return pl.DataFrame()
         df = pl.concat(out).with_columns(
-            # close==0（停牌等脏数据）回落 1.0：fail-soft，不因子化异常行
+            # close<=0（停牌等脏数据）因子无定义 → 置 null 后组内前值填充，
+            # 无前值可填的行丢弃。此前兜底 1.0 会把停牌前真实因子覆写成
+            # 1.0：refresh_adj_factors 全量写回日线湖，回测按因子比调整
+            # 持仓份额时在停牌日凭空缩水（除权前因子 1.5 → 0.667）。
             factor=pl.when(pl.col("close") > 0)
                    .then(pl.col("hfq_close") / pl.col("close"))
-                   .otherwise(1.0),
+                   .otherwise(None),
         )
+        df = (df.sort(["symbol", "trade_date"])
+              .with_columns(pl.col("factor").forward_fill().over("symbol"))
+              .drop_nulls("factor"))
         return normalize_symbols(df).select(
             "symbol", "trade_date", "factor", pl.lit("akshare").alias("source")
         )

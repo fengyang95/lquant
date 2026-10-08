@@ -106,6 +106,7 @@ def collect_and_save(schedule: str | None = "close", trade_date=None, *,
     d = trade_date or started.date()
     frames: dict[str, pl.DataFrame] = {}
     errors: dict[str, str] = {}
+    ok_jobs: list[tuple[str, datetime, int]] = []   # (job, t0, 采集行数)
     for k in COLLECTORS:
         meta = COLLECTORS.meta(k)
         if schedule and meta.get("schedule") != schedule:
@@ -124,10 +125,20 @@ def collect_and_save(schedule: str | None = "close", trade_date=None, *,
             errors[k] = errs
             _log_one(k, d, t0, now_cn_naive(), 0, "failed", errs)
             continue
-        _log_one(k, d, t0, now_cn_naive(), len(frames[k]),
-                 "ok" if len(frames[k]) else "empty")
+        ok_jobs.append((k, t0, len(frames[k])))
 
     counts = persist(frames)
+    # "ok" 记账必须在 persist 之后：upsert 失败时 persist() 返回 0 行而不抛，
+    # 先记 ok 会把「采到了但没入库」记成健康（collect_log 假绿）
+    for k, t0, n in ok_jobs:
+        persisted = counts.get(k, 0)
+        if n == 0:
+            status = "empty"
+        elif persisted == 0:
+            status = "persist_failed"
+        else:
+            status = "ok"
+        _log_one(k, d, t0, now_cn_naive(), persisted, status)
     return {"collected": {k: len(v) for k, v in frames.items()},
             "persisted": counts, "errors": errors}
 

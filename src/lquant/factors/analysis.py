@@ -71,14 +71,20 @@ def compute_factor_col(df: pl.DataFrame, formula: str, name: str | None = None) 
 
 
 def build_matrix(df: pl.DataFrame, formulas: list[str]) -> pl.DataFrame:
-    """多因子宽表：[date, symbol, f1...fk]，任一因子缺失的行剔除。"""
+    """多因子宽表：[date, symbol, f1...fk]，任一因子缺失/无效的行剔除。
+
+    NaN 不是 null：drop_nulls 剔不掉，而 polars rank 会把 NaN 顶格排在
+    所有有限值之上 —— 不过滤的话「因子无效」的股票以最高秩进入相关性/
+    RankIC/合成计算（入库判冗余、IC 加权合成的核心统计量全部失真）。
+    """
     if not formulas:
         raise ValueError("至少需要一个因子")
     wide = df
     for f in formulas:
         wide = compute_factor_col(wide, f)
     cols = [f.replace(".", "_") for f in formulas]
-    return wide.drop_nulls(cols)
+    return wide.drop_nulls(cols).filter(
+        pl.all_horizontal([pl.col(c).is_finite() for c in cols]))
 
 
 def correlation(df: pl.DataFrame, formulas: list[str], *,
@@ -141,7 +147,8 @@ def _mean_rank_ic(df: pl.DataFrame, factor: str, ret_col: str, *,
     加权、抹掉日间变异，和「日均 RankIC」可以差 20%（实测 0.446 vs 0.372）。
     无有效截面时返回 0.0（调用方据此退化为等权）。
     """
-    d = df.drop_nulls([factor, ret_col])
+    d = df.drop_nulls([factor, ret_col]).filter(
+        pl.col(factor).is_finite() & pl.col(ret_col).is_finite())
     if not len(d):
         return 0.0
     per_day = (
@@ -192,7 +199,9 @@ def synthesize(df: pl.DataFrame, formulas: list[str], *,
 
     out = wide
     for c, w in zip(names, weights, strict=False):
-        r = pl.col(c).rank().over("trade_date")
+        # rank 前过滤非有限值：NaN 顶格秩会把「因子无效」的股票当成最强信号
+        v = pl.when(pl.col(c).is_finite()).then(pl.col(c)).otherwise(None)
+        r = v.rank().over("trade_date")
         z = (r - r.mean().over("trade_date")) / (r.std().over("trade_date") + 1e-12)
         out = out.with_columns((z * w).alias(f"_z_{c}"))
     zcols = [f"_z_{c}" for c in names]

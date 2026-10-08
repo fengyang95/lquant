@@ -112,6 +112,12 @@ class ExitStrategy(ABC):
         self.params = params
         self._peak: dict[str, float] = {}
         self._prev: dict[str, dict] = {}
+        self._prev_adj: dict[str, float] = {}
+        # 本轮 track_peak 感知到的除权比 {sym: f_t/f_{t-1}}（每轮清空）。
+        # 自存「绝对价格状态」的子类（如 tiered 的棘轮止盈线）必须用它
+        # 同步缩放，否则除权日后状态停在除权前价格尺度 —— peak/avg_cost
+        # 缩了、棘轮没缩，止盈线被抬到现价之上，除权次日必然假退出。
+        self._turn_ratios: dict[str, float] = {}
 
     # ---------- 子类实现 ----------
 
@@ -125,26 +131,46 @@ class ExitStrategy(ABC):
         """清空跨 bar 状态。引擎重复 run 或复用到新账户时必须调用。"""
         self._peak.clear()
         self._prev.clear()
+        self._prev_adj.clear()
+        self._turn_ratios.clear()
 
     def track_peak(self, ctx: ExitContext) -> None:
         """用当日最高价更新峰值；持仓已清则丢弃该标的的峰值。
 
         用 ``high`` 而非 ``close`` 作为峰值基准：最高价在收盘时已经发生过，
         不属于未来数据；而移动止盈要防的正是「冲高回落」。
+
+        除权日缩放用**相邻两日的因子比**（f_t / f_{t-1}），但方向必须与账户层
+        份额调整一致：``qty *= ratio`` 且 **``avg_cost /= ratio``** —— peak 与
+        avg_cost 同为每股原始价口径，所以历史峰值同样 ``/= ratio``（10 送 5：
+        ratio=1.5，旧峰值 10 元 ÷1.5 = 6.67，与新除权价 6.67 持平 —— 除权本身
+        不产生盈亏）。此前误写 ``prev * ratio``，方向与 avg_cost 相反：除权日
+        峰值被放大而成本被缩小，假浮盈把止盈线抬到现价之上，移动止盈在每次
+        除权后立即误触发。更早版本直接乘绝对累计因子（后复权因子锚定上市日、
+        单调增长），峰值逐日指数爆炸，问题同源。
         """
         held = {p.symbol for p in ctx.positions if p.qty > 0}
+        self._turn_ratios.clear()
         for sym in list(self._peak):
             if sym not in held:
                 del self._peak[sym]
+                self._prev_adj.pop(sym, None)
         for sym in held:
             bar = ctx.bars.get(sym)
             if bar is None:
                 continue
+            f = bar.adj_factor if bar.adj_factor > 0 else 1.0
             prev = self._peak.get(sym, 0.0)
-            # 除权日复权因子变化：峰值按比例同步缩放，否则除权后会被误判为回撤
-            ratio = bar.adj_factor if bar.adj_factor > 0 else 1.0
-            base = prev * ratio if prev > 0 else 0.0
+            if prev <= 0:
+                base = bar.high                      # 首日：峰值就是当日 high
+            else:
+                prev_f = self._prev_adj.get(sym)
+                ratio = f / prev_f if prev_f and prev_f > 0 else 1.0
+                base = prev / ratio                  # 除权日按因子比缩放旧峰值（与 avg_cost 同向）
+                if abs(ratio - 1.0) > 1e-12:
+                    self._turn_ratios[sym] = ratio   # 暴露给子类同步缩放自有价格状态
             self._peak[sym] = max(base, bar.high)
+            self._prev_adj[sym] = f
 
     def peak_of(self, position: PositionView) -> float:
         """该标的峰值价；无记录时回退到成本价。"""

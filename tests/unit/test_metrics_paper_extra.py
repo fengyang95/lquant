@@ -196,8 +196,26 @@ def test_reconcile_stale_and_no_intraday(monkeypatch) -> None:
     rep = R.reconcile("a", "2026-09-17")            # 字符串日期也接受
     assert rep["stale_symbols"] == ["000001.SZ"]
     assert rep["n_uncovered"] == 1
-    assert rep["nav_intraday"] is None and rep["verdict"] == "ok"
+    assert rep["nav_intraday"] is None
     assert rep["rel_dev"] is None
+    # 部分 stale 至少 warning：官方净值部分由盯市价捏造必须可见（不再是静默 ok）
+    assert rep["verdict"] == "warning"
+    assert "盯市价" in rep["detail"]
+
+
+def test_reconcile_all_stale_rejects_official(monkeypatch) -> None:
+    """全量 stale：拒绝以盯市价冒充官方净值落库（verdict=critical，不写 official）。"""
+    record_calls: list[tuple] = []
+
+    broker = _Broker([_Pos("600000.SH", 100, 10.0)], cash=1000.0)
+    _patch_store(monkeypatch, broker, [])
+    monkeypatch.setattr(R, "_official_closes", lambda s, d: pl.DataFrame())
+    monkeypatch.setattr(store, "record_nav",
+                        lambda *a, **k: record_calls.append(a))
+    rep = R.reconcile("a", date(2026, 9, 17))
+    assert rep["verdict"] == "critical"
+    assert rep["stale_symbols"] == ["600000.SH"]
+    assert record_calls == []                       # official 未被捏造写入
 
 
 def test_reconcile_empty_positions(monkeypatch) -> None:

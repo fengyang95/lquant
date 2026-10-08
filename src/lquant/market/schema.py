@@ -20,6 +20,7 @@ MARKET_TABLES: dict[str, str] = {
             close           DOUBLE,
             change_pct      DOUBLE,
             amount          DOUBLE,
+            seal_amount     DOUBLE,
             turnover_rate   DOUBLE,
             first_limit_time VARCHAR,
             last_limit_time  VARCHAR,
@@ -37,6 +38,7 @@ MARKET_TABLES: dict[str, str] = {
             close           DOUBLE,
             change_pct      DOUBLE,
             amount          DOUBLE,
+            seal_amount     DOUBLE,
             industry        VARCHAR,
             collected_at    TIMESTAMP,
             PRIMARY KEY (trade_date, symbol)
@@ -146,10 +148,10 @@ TABLE_DOCS: dict[str, str] = {
 # 允许写入的字段（用于写入前对齐，换源时列可能不全）
 TABLE_COLUMNS: dict[str, list[str]] = {
     "limit_up_pool": ["trade_date", "symbol", "name", "close", "change_pct", "amount",
-                      "turnover_rate", "first_limit_time", "last_limit_time", "open_count",
-                      "limit_up_type", "industry", "collected_at"],
+                      "seal_amount", "turnover_rate", "first_limit_time", "last_limit_time",
+                      "open_count", "limit_up_type", "industry", "collected_at"],
     "limit_down_pool": ["trade_date", "symbol", "name", "close", "change_pct", "amount",
-                        "industry", "collected_at"],
+                        "seal_amount", "industry", "collected_at"],
     "money_flow": ["trade_date", "symbol", "name", "close", "change_pct", "main_net_inflow",
                    "main_net_ratio", "super_large_net", "large_net", "medium_net",
                    "small_net", "collected_at"],
@@ -186,6 +188,17 @@ def ensure_market_tables(con: Any) -> int:
     n = 0
     for table, sql in MARKET_TABLES.items():
         # 加列迁移：新增可空列时优先 ALTER（保留历史数据），不动 drop-rebuild 路径
+        if table in ("limit_up_pool", "limit_down_pool"):
+            # seal_amount（封板资金）：老库没有这列。涨停池源站**无历史回溯**，
+            # 走 drop-rebuild 等于把历史永久删掉 —— 必须 ALTER 保数据。
+            try:
+                existing_cols = {r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()}
+                if existing_cols and "seal_amount" not in existing_cols:
+                    con.execute(
+                        f"ALTER TABLE {table} ADD COLUMN seal_amount DOUBLE")
+                    print(f"[migrate] {table} 加列 seal_amount（历史行为 NULL）")
+            except Exception as e:  # noqa: BLE001  表可能不存在，走下面正常建表
+                print(f"[migrate] {table} seal_amount 列检查跳过: {e}")
         if table == "sector_daily":
             try:
                 existing_cols = {r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()}

@@ -220,15 +220,30 @@ def test_adj_factors_ok(patch_wd) -> None:
 
 
 def test_adj_factors_zero_close_and_mismatch(patch_wd) -> None:
+    """停牌行（close<=0）因子无定义：沿组内前值 forward-fill，无前值则丢弃。
+
+    此前兜底 1.0 会把除权前的真实因子覆写成 1.0 —— 回测按因子比调整
+    份额时凭空缩水持仓（2026-10 审计修复）。
+    """
+    # 单点停牌行：无前值可沿用 → 整帧为空（绝不输出假因子 1.0）
     raw = [["2024-01-02", "sz.000001", "0"]]
     hfq = [["2024-01-02", "sz.000001", "20.0"]]
     patch_wd([raw, hfq])
     df = BaoStockProvider().adj_factors(["000001.SZ"], date(2024, 1, 2), date(2024, 1, 2))
-    assert df["factor"].to_list() == [1.0]
+    assert df.is_empty()
     # 长度不一致 → 跳过 → 空帧
     patch_wd([[raw[0]], []])
     assert BaoStockProvider().adj_factors(
         ["000001.SZ"], date(2024, 1, 2), date(2024, 1, 2)).is_empty()
+
+
+def test_adj_factors_halt_forward_fills_previous_factor(patch_wd) -> None:
+    """停牌次日沿用停牌前的最后有效因子，而不是回落 1.0。"""
+    raw = [["2024-01-02", "sz.000001", "10.0"], ["2024-01-03", "sz.000001", "0"]]
+    hfq = [["2024-01-02", "sz.000001", "20.0"], ["2024-01-03", "sz.000001", "21.0"]]
+    patch_wd([raw, hfq])
+    df = BaoStockProvider().adj_factors(["000001.SZ"], date(2024, 1, 2), date(2024, 1, 3))
+    assert df["factor"].to_list() == pytest.approx([2.0, 2.0])
 
 
 # ---------------------------------------------------------------- 参考数据
@@ -329,13 +344,13 @@ def test_financial_pit_ok(patch_wd) -> None:
 
 
 def test_financial_pit_skip_paths(patch_wd) -> None:
+    """数据级脏行跳过不炸（缺 pubDate/空日期/非数字），有效行照常返回。"""
     bad = [["code", "statDate"], ["sz.000001", "2024-03-31"]]  # 缺 pubDate
     nodate = [["code", "statDate", "pubDate", "roe"],
               ["sz.000001", "", "2024-04-20", "1.0"]]           # 无报告期
     nonnum = [["code", "statDate", "pubDate", "roe"],
               ["sz.000001", "2024-03-31", "2024-04-20", "n/a"]]
     patch_wd([
-        TimeoutError("t"),          # 超时
         [HEAD],                     # 只有表头 <2 行
         bad,                        # 缺 pubDate
         nodate,                     # 日期空
@@ -344,6 +359,21 @@ def test_financial_pit_skip_paths(patch_wd) -> None:
     df = BaoStockProvider().financial_pit(
         ["000001.SZ"], date(2024, 1, 1), date(2024, 3, 31), kinds=("profit",))
     assert df.is_empty()
+
+
+def test_financial_pit_network_failure_raises(patch_wd) -> None:
+    """网络类失败整体报错：本批已拉到的 recs 一并放弃（下次重跑重拉）。
+
+    半成功半失败的批次一旦被记 coverage，缺口就永久不可发现 ——
+    宁可失败留给上层批次级重试。
+    """
+    patch_wd([
+        [HEAD, ["sz.000001", "2024-03-31", "2024-04-20", "3.5"]],
+        TimeoutError("t"),          # 第二个查询点超时 → 整体失败
+    ])
+    with pytest.raises(RuntimeError, match="financial_pit 有 1 个查询点失败"):
+        BaoStockProvider().financial_pit(
+            ["000001.SZ"], date(2024, 1, 1), date(2024, 3, 31), kinds=("profit",))
 
 
 def test_financial_pit_multiple_quarters(patch_wd) -> None:

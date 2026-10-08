@@ -45,7 +45,9 @@ CREATE TABLE IF NOT EXISTS paper_account(
   strategy TEXT NOT NULL DEFAULT '',
   universe_json TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  -- 最近一次 day_close 的交易日（ISO 字符串）：日终幂等标记
+  last_day_close TEXT
 );
 CREATE TABLE IF NOT EXISTS paper_order(
   account TEXT NOT NULL,
@@ -59,6 +61,9 @@ CREATE TABLE IF NOT EXISTS paper_order(
   reason TEXT NOT NULL DEFAULT '',
   filled_qty INTEGER NOT NULL DEFAULT 0,
   filled_price REAL NOT NULL DEFAULT 0,
+  -- 是否限价单（1=限价 0=市价）：市价单成交价按报价±滑点、不设限价帽。
+  -- 持久化是为了 load_broker 后挂单语义不漂移。
+  is_limit INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY(account, order_id)
 );
 CREATE TABLE IF NOT EXISTS paper_position(
@@ -92,7 +97,6 @@ CREATE TABLE IF NOT EXISTS paper_nav(
 
 def _migrate(con) -> None:
     """老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列。
-
     新增 frozen_json/is_st 后不迁移，老账户一读就会 `no such column`。
     """
     cols = {r[1] for r in con.execute("PRAGMA table_info(paper_position)").fetchall()}
@@ -104,6 +108,15 @@ def _migrate(con) -> None:
     if "name" not in cols:
         con.execute("ALTER TABLE paper_position ADD COLUMN name "
                     "TEXT NOT NULL DEFAULT ''")
+    ocols = {r[1] for r in con.execute("PRAGMA table_info(paper_order)").fetchall()}
+    if "is_limit" not in ocols:
+        con.execute("ALTER TABLE paper_order ADD COLUMN is_limit "
+                    "INTEGER NOT NULL DEFAULT 1")
+    acols = {r[1] for r in con.execute("PRAGMA table_info(paper_account)").fetchall()}
+    if "last_day_close" not in acols:
+        # 日终幂等标记：day_close 重复调用（cron 配错/UI 误点/重试）会把
+        # T+N 冻结台账多减一天，T+1 买入当日即解冻 —— 必须持久化
+        con.execute("ALTER TABLE paper_account ADD COLUMN last_day_close TEXT")
 
 
 @contextmanager
@@ -170,13 +183,14 @@ def get_account(name: str) -> dict:
     with _conn() as con:
         row = con.execute(
             "SELECT name, initial_cash, cash, seq, strategy, universe_json, "
-            "created_at, updated_at FROM paper_account WHERE name = ?", [name]
+            "created_at, updated_at, last_day_close FROM paper_account WHERE name = ?",
+            [name]
         ).fetchone()
     if not row:
         raise AccountNotFound(name)
     return {"name": row[0], "initial_cash": row[1], "cash": row[2], "seq": row[3],
             "strategy": row[4], "universe": json.loads(row[5] or "[]"),
-            "created_at": row[6], "updated_at": row[7]}
+            "created_at": row[6], "updated_at": row[7], "last_day_close": row[8]}
 
 
 def list_accounts() -> list[dict]:
@@ -194,12 +208,13 @@ def now_iso() -> str:
 
 
 def load_broker(name: str, cfg: PaperConfig | None = None) -> PaperBroker:
-    """从库中重建 PaperBroker（现金/持仓/委托/单号序列全部还原）。"""
+    """从库中重建 PaperBroker（现金/持仓/委托/单号序列/日终标记全部还原）。"""
     acct = get_account(name)
     config = cfg or PaperConfig(initial_cash=acct["initial_cash"])
     broker = PaperBroker(config)
     broker.cash = acct["cash"]
     broker._seq = acct["seq"]
+    broker.last_day_close = acct.get("last_day_close")
     with _conn() as con:
         pos_rows = con.execute(
             "SELECT symbol, qty, available, avg_cost, last_price, "
@@ -207,7 +222,7 @@ def load_broker(name: str, cfg: PaperConfig | None = None) -> PaperBroker:
             "WHERE account = ? AND qty > 0", [name]).fetchall()
         order_rows = con.execute(
             "SELECT order_id, ts, symbol, side, qty, price, status, reason, "
-            "filled_qty, filled_price FROM paper_order WHERE account = ? "
+            "filled_qty, filled_price, is_limit FROM paper_order WHERE account = ? "
             "ORDER BY ts, order_id", [name]).fetchall()
     for r in pos_rows:
         try:
@@ -222,7 +237,8 @@ def load_broker(name: str, cfg: PaperConfig | None = None) -> PaperBroker:
         broker.orders.append(PaperOrder(
             order_id=r[0], ts=from_iso(r[1]), symbol=r[2], side=r[3], qty=r[4],
             price=r[5], status=r[6], reason=r[7], filled_qty=r[8],
-            filled_price=r[9]))
+            filled_price=r[9],
+            limit=True if len(r) < 11 or r[10] is None else bool(r[10])))
     return broker
 
 
@@ -247,16 +263,18 @@ def save_broker(name: str, broker: PaperBroker) -> None:
         for o in broker.orders:
             con.execute(
                 "INSERT INTO paper_order(account, order_id, ts, symbol, side, "
-                "qty, price, status, reason, filled_qty, filled_price) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+                "qty, price, status, reason, filled_qty, filled_price, is_limit) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(account, order_id) DO UPDATE SET status=excluded.status, "
                 "reason=excluded.reason, filled_qty=excluded.filled_qty, "
                 "filled_price=excluded.filled_price",
                 [name, o.order_id, o.ts.isoformat(), o.symbol, o.side, o.qty,
-                 o.price, o.status, o.reason, o.filled_qty, o.filled_price])
+                 o.price, o.status, o.reason, o.filled_qty, o.filled_price,
+                 int(o.limit)])
         con.execute(
-            "UPDATE paper_account SET cash=?, seq=?, updated_at=? WHERE name=?",
-            [broker.cash, broker._seq, now_iso(), name])
+            "UPDATE paper_account SET cash=?, seq=?, updated_at=?, "
+            "last_day_close=? WHERE name=?",
+            [broker.cash, broker._seq, now_iso(), broker.last_day_close, name])
 
 
 def set_universe(name: str, universe: list[str]) -> None:

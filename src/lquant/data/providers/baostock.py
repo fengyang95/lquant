@@ -598,6 +598,12 @@ class BaoStockProvider(MappingProvider):
         """后复权因子 = 后复权收盘 / 不复权收盘。
 
         BaoStock 不直接给因子，只能两次拉取相除；前复权在读取时用最新因子归一。
+
+        两次独立查询按 **trade_date join** 对齐（此前按位置 zip：部分返回/
+        停牌行差异导致错位时，因子会被安到错误的交易日，且这种错位因子
+        仍满足单调不减，现有质量检查检不出来）。停牌行（close<=0）的因子
+        无定义，沿组内前值 forward-fill —— 此前兜底 1.0 会把除权前的真实
+        因子覆写成 1.0，回测引擎按因子比调整份额时凭空缩水持仓。
         """
         from lquant.data.watchdog import run_with_watchdog
 
@@ -610,17 +616,22 @@ class BaoStockProvider(MappingProvider):
             hfq = run_with_watchdog(
                 _bs_query, _bs_code(sym), fields, start.isoformat(), end.isoformat(), "1d", "1"
             )
-            if not raw or not hfq or len(raw) != len(hfq):
+            if not raw or not hfq:
                 continue
+            raw_df = pl.DataFrame(
+                [[r[0], r[1], float(r[2])] for r in raw],
+                schema=["trade_date", "symbol", "close"],
+                orient="row",
+            )
+            hfq_df = pl.DataFrame(
+                [[h[0], h[1], float(h[2])] for h in hfq],
+                schema=["trade_date", "symbol", "hfq_close"],
+                orient="row",
+            )
+            # 按 trade_date inner join：两次拉取日期错位/缺行时只丢对不上的
+            # 日期，绝不位置错配产出错误因子（与 akshare 同一口径）
             out.append(
-                pl.DataFrame(
-                    [
-                        [r[0], r[1], float(r[2]), float(h[2])]
-                        for r, h in zip(raw, hfq, strict=False)
-                    ],
-                    schema=["trade_date", "symbol", "close", "hfq_close"],
-                    orient="row",
-                )
+                raw_df.join(hfq_df.drop("symbol"), on="trade_date", how="inner")
             )
         if not out:
             return pl.DataFrame()
@@ -628,8 +639,13 @@ class BaoStockProvider(MappingProvider):
             pl.col("trade_date").str.to_date("%Y-%m-%d"),
             factor=pl.when(pl.col("close") > 0)
             .then(pl.col("hfq_close") / pl.col("close"))
-            .otherwise(1.0),
+            .otherwise(None),
         )
+        # 停牌行（close<=0）因子无定义：组内前值填充；窗口起点之前就停牌、
+        # 无前值可填的行直接丢弃 —— 宁可让湖里保留原值，也不写断裂的 1.0
+        df = (df.sort(["symbol", "trade_date"])
+              .with_columns(pl.col("factor").forward_fill().over("symbol"))
+              .drop_nulls("factor"))
         return normalize_symbols(df).select(
             "symbol", "trade_date", "factor", pl.lit("baostock").alias("source")
         )
@@ -766,6 +782,7 @@ class BaoStockProvider(MappingProvider):
         from lquant.data.watchdog import run_with_watchdog
 
         recs: list[dict] = []
+        failures = 0
         for sym in symbols:
             for y, q in _quarters(start, end):
                 for kind in kinds:
@@ -774,6 +791,11 @@ class BaoStockProvider(MappingProvider):
                             _bs_report, kind, _bs_code(sym), y, q, timeout=30
                         )
                     except (TimeoutError, RuntimeError):
+                        # 静默 continue 会让「整批超时」与「确实无数据」不可分，
+                        # 上层 ingest 把 0 行记成 coverage 成功 → 永久静默缺口。
+                        # 这里只计数不抛：循环尾部若有失败整体报错，让批次级
+                        # 重试语义（不记 coverage）接管。
+                        failures += 1
                         continue
                     if len(payload) < 2:
                         continue
@@ -807,4 +829,12 @@ class BaoStockProvider(MappingProvider):
                                     "ingested_at": now_cn_naive(),
                                 }
                             )
+        # 任一点查询失败都整体报错：本批已拉到的 recs 一并放弃（下次重跑
+        # 重拉），换取「coverage 记账只反映完整覆盖」这一硬保证 —— 半成功
+        # 半失败的批次一旦被记账，缺口就永久不可发现。
+        if failures:
+            raise RuntimeError(
+                f"financial_pit 有 {failures} 个查询点失败（超时/网络），"
+                f"本批 {len(symbols)} 只标的不记账，留待重试"
+            )
         return pl.DataFrame(recs) if recs else pl.DataFrame()

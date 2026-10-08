@@ -35,9 +35,12 @@ def test_ymd_variants():
 
 
 def test_ts_to_hhmmss_variants():
+    # fbt/lbt 是 HHMMSS 整数（92503=09:25:03，akshare zfill(6) 同口径），
+    # 不是 Unix 秒 —— 旧实现 fromtimestamp 产出 1970 年垃圾时刻
     assert lu._ts_to_hhmmss(0) == ""
     assert lu._ts_to_hhmmss(None) == ""
-    assert lu._ts_to_hhmmss(34200) == datetime.fromtimestamp(34200).strftime("%H:%M:%S")
+    assert lu._ts_to_hhmmss(92503) == "09:25:03"
+    assert lu._ts_to_hhmmss(140100) == "14:01:00"
     assert lu._ts_to_hhmmss("bad") == "bad"
 
 
@@ -75,7 +78,7 @@ def test_limit_type_branches():
 def _zt_items():
     return [{
         "c": "600000", "n": "浦发银行", "p": 12345, "zdp": 10.0, "fund": 1.5e8,
-        "hs": 512, "fbt": 9 * 3600 + 30 * 60, "lbt": 15 * 3600, "zbc": 1,
+        "hs": 512, "fbt": 93000, "lbt": 150000, "zbc": 1,
         "lbc": 2, "h": 12345, "l": 11000, "hybk": "银行",
     }, {
         "c": "000001", "n": "平安银行", "p": 8000, "zdp": 10.0, "fund": 0,
@@ -91,7 +94,11 @@ def test_fetch_limit_up_pool_rows(monkeypatch):
     assert df["symbol"].to_list() == ["600000.SH", "000001.SZ"]
     assert df["close"].to_list() == [12.345, 8.0]
     assert df["limit_up_type"].to_list() == ["T字板", "一字板"]
-    assert df["first_limit_time"][0] == datetime.fromtimestamp(34200).strftime("%H:%M:%S")
+    # fbt=93000 按 HHMMSS 口径 → 09:30:00（不是 fromtimestamp 秒数）
+    assert df["first_limit_time"][0] == "09:30:00"
+    assert df["last_limit_time"][0] == "15:00:00"
+    # fund（封单资金）落 seal_amount，量纲与 amount（成交额）分离
+    assert df["seal_amount"].to_list() == [1.5e8, 0.0]
 
 
 def test_fetch_limit_up_pool_empty(monkeypatch):

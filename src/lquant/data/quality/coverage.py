@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 
 from lquant.core.db import reader
-from lquant.core.types import today_cn
+from lquant.core.types import now_cn, today_cn
 from lquant.data.ingest.tasks import TaskConflictError, create_task
 from lquant.data.quality.issues import Issue, save_issues
 from lquant.data.store.parquet import read_daily, read_daily_basic
@@ -29,6 +29,11 @@ __all__ = ["DEFAULT_DAY_MIN_RATIO", "DayGap", "day_completeness",
 # issue 的 extra.dates 超过这个数就截断，避免 detail JSON 无限膨胀
 _MAX_DATES_IN_EXTRA = 30
 _TABLES = ("daily", "daily_basic")
+
+# 15:00 收盘 + 数据源（tushare/东财日线）落地缓冲：此前的当日数据不可信。
+# 对账窗口必须把「还没收盘的今天」排除，否则盘中/午后跑对账必报
+# COVERAGE_GAP error，还可能触发一轮注定空手而归的 daily_update 修复
+_MARKET_SETTLED_HOUR = 16
 
 
 def _trade_days(start: date, end: date) -> list[date]:
@@ -195,8 +200,14 @@ def scan_coverage(days: int = 30, *, repair: bool = False) -> dict:
     返回 report dict（missing_dates / sparse_symbols / issues_recorded /
     repair），缺口以 COVERAGE_GAP issue 落库；repair=True 且 daily 有整日
     缺口时建 daily_update 任务（basic 缺口不触发 repair）。
+
+    收盘前（北京时间 < 16:00）今日不可能有完整日线，窗口 end 自动退到
+    昨日 —— 否则任何盘中触发的对账都会把「今天还没同步」误报成缺口。
     """
     end = today_cn()
+    now = now_cn()
+    if (now.hour, now.minute) < (_MARKET_SETTLED_HOUR, 0):
+        end -= timedelta(days=1)
     start = end - timedelta(days=days)
     trade_days = _trade_days(start, end)
     expected = _expected_symbols(end, start)

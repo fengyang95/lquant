@@ -81,12 +81,16 @@ def _p_industry(panel, industry_df=None):
     if industry_df is None or not len(industry_df):
         raise CovariateUnavailable("industry classify data not provided")
     ind = industry_df.filter(pl.col("std") == "SW").select(["symbol", "std_date", "code"]).sort("std_date")
-    d = _panel_sorted(panel).select(["trade_date", "symbol"]).unique()
-    # check_sortedness=False：带 by 组时 polars 无法跨组校验排序，每次调用都会
-    # 刷一条 UserWarning 噪音。组内按 trade_date 有序由上面的 sort 保证。
+    # unique() 是无序语义（实测 8/8 次打乱行序）：会把上面 sort 建立的
+    # 「组内 trade_date 升序」前提破坏掉，join_asof(check_sortedness=False)
+    # 静默拿到错误的行业记录。unique 后必须重排序。
+    d = _panel_sorted(panel).select(["trade_date", "symbol"]).unique().sort(
+        ["symbol", "trade_date"])
     out = d.join_asof(ind.rename({"code": "industry_sw1", "std_date": "ind_date"}),
                       left_on="trade_date", right_on="ind_date", by="symbol",
                       strategy="backward", check_sortedness=False)
+    # check_sortedness=False：带 by 组时 polars 无法跨组校验排序，每次调用
+    # 都会刷一条 UserWarning 噪音；组内有序由上面 unique 后的重排序保证。
     return out.select(["trade_date", "symbol", "industry_sw1"])
 
 
