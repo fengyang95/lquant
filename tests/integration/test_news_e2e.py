@@ -14,7 +14,6 @@ mock 锚点（与 test_api_news.py 一致，patch 必须落在源模块属性上
 from __future__ import annotations
 
 import shutil
-from datetime import date
 from pathlib import Path
 
 import akshare as ak
@@ -25,6 +24,7 @@ from fastapi.testclient import TestClient
 
 import lquant.server.api.news as news_api
 from lquant.core.config import get_settings
+from lquant.core.types import today_cn
 from lquant.server.main import create_app
 
 
@@ -54,9 +54,16 @@ def client(fake_env):
 
 def _cls_df() -> pd.DataFrame:
     """财联社电报假 DataFrame：一条命中平安银行 + 半导体关键词，
-    一条无关（不应被 000001.SZ 过滤命中）。发布日期取今天，summary 按
-    published_at 当日计数才命中。"""
-    today = date.today().isoformat()
+    一条无关（不应被 000001.SZ 过滤命中）。发布日期取**业务日**
+    （``today_cn()``，与 news/tasks.py 的口径一致），summary 按
+    published_at 当日计数才命中。
+
+    不能用 ``date.today()``：采集侧刻意用 ``today_cn()``（服务器时区非
+    Asia/Shanghai 时 ``date.today()`` 会错位一天），CI 跑在 UTC、UTC 16:00 之后
+    就是 CN 的次日 —— 假数据日期与采集业务日不一致，任务会写 0 行、
+    ``rows_written`` 变成 None。本机 TZ=CST 所以过去一直没暴露。
+    """
+    today = today_cn().isoformat()
     # 时间必须是常量：若每次调用取 datetime.now()，第二次采集跨秒时
     # external_id（发布日期+发布时间）变化，去重失效（测试曾因此翻倍）
     return pd.DataFrame({

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date
 
 import polars as pl
 import pytest
 
 from lquant.core.errors import DataUnavailable
+from lquant.core.types import today_cn
 from lquant.market.collectors import dragon_tiger as dt
 from lquant.market.collectors import limit_up as lu
 
@@ -27,7 +28,10 @@ class _Resp:
 
 
 def test_ymd_variants():
-    assert lu._ymd(None) == datetime.now().strftime("%Y%m%d")
+    # 缺省业务日必须与生产侧同源（core.types.today_cn，Asia/Shanghai）。
+    # 用 datetime.now() 比对是错的：CI 跑在 UTC，UTC 16:00 之后就是 CN 的次日，
+    # 断言会假红（本机 TZ=CST 所以过去一直没暴露）。
+    assert lu._ymd(None) == today_cn().strftime("%Y%m%d")
     assert lu._ymd("2024-01-02") == "20240102"
     assert lu._ymd(date(2024, 1, 2)) == "20240102"
 
