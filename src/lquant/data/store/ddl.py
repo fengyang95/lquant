@@ -355,6 +355,46 @@ DDL_STATEMENTS: list[str] = [
         PRIMARY KEY (condition_id, checked_through)
     )
     """,
+    # B4 研判闭环：不可变研判快照 + 逐次对账结果。
+    # 拆表理由同 B5：研判快照**落库即不可改**（改判只能另起一个交易日的新研判），
+    # 而「窗口推进到哪一天、当时怎么判」必须多版本累积。合成一张带状态列的表，
+    # 就会为了更新状态而重写快照 —— 那正好把「当时写了什么」抹掉。
+    #
+    # `UNIQUE (trade_date)`：一个交易日**只允许一条**研判快照。应用层已经会对
+    # 「同内容重复记录」幂等返回、对「同交易日不同内容」显式报错，这里再加一道
+    # 数据库约束：并发写入也绝不会悄无声息地多出一行「改判版本」。
+    """
+    CREATE TABLE IF NOT EXISTS research_outlook (
+        outlook_id   VARCHAR PRIMARY KEY,   -- 内容哈希：同内容重复记录不新增行
+        trade_date   DATE,                  -- 做出研判的交易日（收盘后）
+        market_state VARCHAR,
+        evidence     JSON,                  -- 冻结的当时证据（regime 全量输出等）
+        scenarios    JSON,
+        directions   JSON,
+        focus_next   JSON,
+        checklist    JSON,                  -- 冻结后的可核验清单（含 FrozenCondition 全文）
+        notes        VARCHAR,
+        weights      JSON,                  -- 记录时使用的维度权重口径
+        created_at   TIMESTAMP DEFAULT now(),
+        UNIQUE (trade_date)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS research_outlook_validation (
+        outlook_id      VARCHAR,
+        checked_through DATE,               -- 本次对账用到的最近已完成交易日
+        final           BOOLEAN,            -- 是否全部清单项窗口已走完
+        score           DOUBLE,             -- 0~100；分母**只含已判定项**，未判定不拉低分数
+        coverage        DOUBLE,             -- 已判定权重 / 全部权重（未判定留在分母里，不消失）
+        counts          JSON,
+        dimensions      JSON,
+        items           JSON,
+        lessons         JSON,
+        realized_risks  JSON,
+        created_at      TIMESTAMP DEFAULT now(),
+        PRIMARY KEY (outlook_id, checked_through)
+    )
+    """,
 ]
 
 # 注意：daily_bar / minute_bar 两张 DuckDB 表是**遗留占位**。
@@ -517,6 +557,18 @@ def ensure_research_verify_tables(con) -> int:
     """
     return (_ensure_table(con, "research_condition")
             + _ensure_table(con, "research_verify_result"))
+
+
+def ensure_research_journal_tables(con) -> int:
+    """按需补建研判闭环两张表（research_outlook / research_outlook_validation）。
+
+    同 ``ensure_research_verify_tables``：这两张表只进了 ``DDL_STATEMENTS``，
+    老库/隔离测试库上直接写研判快照会撞裸 ``CatalogException`` —— 而「判断
+    说了却没留痕」正是本功能要消灭的静默失败。惰性补建让老库自愈。
+    返回本次建表数（0~2），幂等。
+    """
+    return (_ensure_table(con, "research_outlook")
+            + _ensure_table(con, "research_outlook_validation"))
 
 
 def ensure_ml_run_columns(con) -> int:
