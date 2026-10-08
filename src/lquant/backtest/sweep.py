@@ -133,7 +133,7 @@ def _approx_cost_rates(ruleset, d: date,
 
     inst = ruleset.for_symbol("600000.SH", SecType.STOCK, Board.MAIN)
     comm = float(inst.commission.rate)
-    transfer = float(inst.transfer_fee_rate)
+    transfer = float(inst.transfer_fee_rate_on(d))
     try:
         stamp = float(inst.tax_rate(d, "sell"))
     except Exception:  # noqa: BLE001 - 税率表缺档时按 0 处理，不让整次快扫失败

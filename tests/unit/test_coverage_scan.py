@@ -198,3 +198,49 @@ def test_basic_empty_lake_info_no_repair(env) -> None:
                for i in issues if i["dataset"] == "daily_basic")
     assert rep["repair"]["reason"] == "no_gap"
     assert rep["repair"]["created"] is False
+
+
+# ---------- 日级完整性门禁（day_completeness）----------
+
+def test_day_completeness_flags_partial_days():
+    """某日覆盖不足阈值 → 报缺口；达标的日子不报。"""
+    from lquant.data.quality.coverage import day_completeness
+
+    d1, d2, d3 = date(2026, 9, 1), date(2026, 9, 2), date(2026, 9, 3)
+    gaps = day_completeness({d1: 100, d2: 50, d3: 95}, expected=100, min_ratio=0.7)
+    assert [g.trade_date for g in gaps] == [d2]
+    assert gaps[0].symbols == 50 and gaps[0].expected == 100
+    assert gaps[0].ratio == 0.5
+    assert "只有 50/100 只" in gaps[0].detail()
+
+
+def test_day_completeness_flags_sparse_tip():
+    """最新交易日只写了一半 → kind=tip（水位前移门禁主要防这个形态）。"""
+    from lquant.data.quality.coverage import day_completeness
+
+    d1, d2 = date(2026, 9, 1), date(2026, 9, 2)
+    gaps = day_completeness({d1: 100, d2: 10}, expected=100)
+    assert [g.kind for g in gaps] == ["tip"]
+    assert "疑似只写了一半" in gaps[0].detail()
+
+
+def test_day_completeness_edge_cases():
+    """expected<=0 不报（没有分母就谈不了覆盖率）；全空的日子也要报。"""
+    from lquant.data.quality.coverage import day_completeness
+
+    assert day_completeness({date(2026, 9, 1): 0}, expected=0) == []
+    gaps = day_completeness({date(2026, 9, 1): 0}, expected=100)
+    assert len(gaps) == 1 and gaps[0].ratio == 0.0
+
+
+def test_day_gap_issues_shape():
+    """缺口 → issue：规则名/严重度/明细字段齐备（落库后前端要能读）。"""
+    from lquant.data.quality.coverage import DayGap, day_gap_issues
+
+    g = DayGap(trade_date=date(2026, 9, 2), symbols=30, expected=100)
+    issues = day_gap_issues([g])
+    assert len(issues) == 1
+    i = issues[0]
+    assert i.rule == "DAY_INCOMPLETE" and i.severity == "error"
+    assert i.trade_date == date(2026, 9, 2) and i.count == 70
+    assert i.extra["kind"] == "day" and i.extra["ratio"] == 0.3

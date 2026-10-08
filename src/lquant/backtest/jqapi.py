@@ -49,6 +49,7 @@ from datetime import date, datetime
 from datetime import time as dtime
 
 import polars as pl
+from loguru import logger
 
 from lquant.backtest.account import Account
 from lquant.backtest.broker import Broker
@@ -439,7 +440,8 @@ class JQRunner:
                  factor_formulas: list[str] | None = None,
                  security_meta: dict[str, dict] | None = None,
                  timeout_s: float | None = None,
-                 delist_recovery: float = 0.0) -> None:
+                 delist_recovery: float = 0.0,
+                 strict_adj: bool | None = None) -> None:
         self.code = code
         self.initial_cash = initial_cash
         # 用户代码墙钟预算（秒）。None = 不限；服务端入口必须设置（防死循环 DoS）。
@@ -454,6 +456,10 @@ class JQRunner:
         self._delist_recovery = float(delist_recovery)
         self._jf_state: JQFundamentalsState = JQFundamentalsState()
         self._security_meta_resolved: dict[str, dict] = {}
+        # 严格复权（缺 adj_factor 时抛错而不是静默按 1.0 顶替）。
+        # None = 跟随 app.yaml data.strict_adj / LQ_STRICT_ADJ。
+        self._strict_adj_opt = strict_adj
+        self._adj_warned: set[str] = set()
 
         # 运行期状态
         self.account = Account(cash=initial_cash)
@@ -874,6 +880,18 @@ class JQRunner:
             return bar.volume
         return float(getattr(bar, f, float("nan")))
 
+    @property
+    def _strict_adj(self) -> bool:
+        """严格复权开关：显式参数优先，否则跟随 app.yaml data.strict_adj。"""
+        if self._strict_adj_opt is not None:
+            return bool(self._strict_adj_opt)
+        try:
+            from lquant.core.config import get_settings
+
+            return bool(get_settings().strict_adj)
+        except Exception:  # noqa: BLE001 - 配置不可用时退回宽松口径
+            return False
+
     def _fq_ref(self, sym: str) -> float:
         """pre 复权的归一基准 = 今日复权因子；今日无 bar 时退回最近可见因子。"""
         bar = self._bars_today.get(sym)
@@ -883,11 +901,25 @@ class JQRunner:
         return f if f and f > 0 else 1.0
 
     def _bar_field_fq(self, sym: str, bar: Bar, f: str, fq, f_now: float):
-        """取 bar 字段并按 fq 复权。"""
+        """取 bar 字段并按 fq 复权。
+
+        复权因子缺失时**不再静默按因子=1.0 顶替**：那会让复权序列里混入原始价，
+        收益率凭空跳变。``strict_adj``（app.yaml ``data.strict_adj`` / ``LQ_STRICT_ADJ``）
+        打开时抛错，否则每只标的最多告警一次。
+        """
         raw = self._bar_field(bar, f)
         if fq in (None, "none") or f not in _FQ_PRICE_FIELDS:
             return raw
-        fday = bar.adj_factor if bar.adj_factor and bar.adj_factor > 0 else f_now
+        fday = bar.adj_factor if bar.adj_factor and bar.adj_factor > 0 else None
+        if fday is None:
+            msg = (f"复权缺因子：{sym} 在 {bar.trade_date} 没有有效 adj_factor"
+                   f"（fq={fq}），该日按原始价参与复权序列")
+            if self._strict_adj:
+                raise ValueError(msg)
+            if sym not in self._adj_warned:
+                self._adj_warned.add(sym)
+                logger.warning(msg + "；同类标的只告警一次，可用 LQ_STRICT_ADJ=1 改为报错")
+            fday = f_now
         if not math.isfinite(raw):
             return raw
         return raw * fday / f_now if fq == "pre" else raw * fday

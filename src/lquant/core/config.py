@@ -142,6 +142,9 @@ class Settings(BaseModel):
     reports_dir: str = "./data/reports"
     ingest_concurrency: int = 4
     ingest_watchdog_sec: int = 120
+    #: 严格复权：请求 fq 复权但缺 adj_factor 时抛错而不是静默按 factor=1.0 顶替。
+    #: 默认关闭（真实湖里有 1480 行 ETF 无因子），可用 LQ_STRICT_ADJ=1 打开。
+    strict_adj: bool = False
     redis_url: str = "redis://localhost:6379/0"
     monitor_enabled: bool = True
     monitor_flush_interval_sec: int = 10
@@ -178,6 +181,7 @@ def get_settings() -> Settings:
         reports_dir=str(paths.get("reports", "./data/reports")),
         ingest_concurrency=int(ingest.get("concurrency", 4)),
         ingest_watchdog_sec=int(ingest.get("watchdog_sec", 120)),
+        strict_adj=(raw.get("data", {}) or {}).get("strict_adj", False),
         redis_url=os.getenv("LQ_REDIS_URL", "redis://localhost:6379/0"),
         monitor_enabled=(
             os.getenv("LQ_MONITOR_ENABLED") != "0"
