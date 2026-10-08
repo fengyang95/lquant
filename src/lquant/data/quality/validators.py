@@ -346,4 +346,20 @@ def check_adj_factor(df: pl.DataFrame, *, dataset: str = "daily_bar") -> list[Is
             detail=f"{len(jump)} 行复权因子跳变 >50%，疑似除权，需与除权事件比对",
             count=len(jump),
             extra={"symbols": jump["symbol"].unique().to_list()[:20]}))
+
+    # 覆盖度：缺失/非正因子是**静默**的口径错误来源 —— 复权序列里混入原始价，
+    # 收益率凭空跳变。这里按标的报，而不是只报行数（要知道该去补哪只）。
+    missing = df.filter(
+        pl.col("adj_factor").is_null()
+        | (pl.col("adj_factor").cast(pl.Float64) <= 0))
+    if len(missing):
+        bad_syms = missing["symbol"].unique().to_list()
+        rate = len(missing) / len(df)
+        issues.append(Issue(
+            rule="ADJ_MISSING", severity="warn" if rate < 0.05 else "error",
+            dataset=dataset,
+            detail=(f"{len(missing)}/{len(df)} 行（{rate:.1%}）无有效复权因子，"
+                    f"涉及 {len(bad_syms)} 只标的；这些标的的 fq 复权会退回原始价"),
+            count=len(missing),
+            extra={"symbols": bad_syms[:20], "n_symbols": len(bad_syms)}))
     return issues
