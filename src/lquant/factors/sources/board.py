@@ -26,7 +26,7 @@ import polars as pl
 
 from lquant.factors.covariates import CovariateUnavailable, provider
 
-__all__ = ["board_cov_names", "BOARD_COVARIATES"]
+__all__ = ["BOARD_COVARIATES"]
 
 
 def _norm_sym(code) -> str:
@@ -98,11 +98,6 @@ def _shift1(df: pl.DataFrame, value_col: str) -> pl.DataFrame:
         .with_columns(pl.col(value_col).shift(1).over("symbol").alias(value_col))
         .select(["trade_date", "symbol", value_col])
     )
-
-
-def board_cov_names() -> list[str]:
-    """本模块注册的全部看板 covariate 名（挖掘/评价侧枚举用）。"""
-    return list(BOARD_COVARIATES)
 
 
 BOARD_COVARIATES: tuple[str, ...] = (

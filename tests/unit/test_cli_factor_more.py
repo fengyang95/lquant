@@ -312,6 +312,20 @@ def test_eval_empty_panel(monkeypatch):
     assert "日线数据为空" in r.output
 
 
+def test_eval_unknown_cov_is_actionable_not_keyerror():
+    """拼错的 ``--cov`` 必须报可操作错误 + 可选清单，而不是裸 KeyError。
+
+    修复前 ``covariates.PROVIDERS.get`` 不命中直接抛 KeyError（无 stdout、无提示），
+    Agent 无从自我修正。参数校验必须前置在面板加载之前 —— 所以这里不依赖数据。
+    """
+    r = _invoke("eval", "Ts_Mean($close,5)", "--cov", "mf_main_ratios")
+    assert r.exit_code != 0
+    assert not isinstance(r.exception, KeyError), r.exception
+    assert "未注册的协变量" in r.output
+    assert "'mf_main_ratio'" in r.output  # 可选清单里给出正确写法的列表项
+    assert "covariate_providers" not in r.output  # 不再是注册表内部报错
+
+
 def test_eval_train_empty(monkeypatch):
     import lquant.factors.mining.submit as submit_mod
 

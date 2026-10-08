@@ -32,11 +32,16 @@ def test_ymd_variants():
     assert lu._ymd(date(2024, 1, 2)) == "20240102"
 
 
-def test_ts_to_hhmmss_variants():
-    assert lu._ts_to_hhmmss(0) == ""
-    assert lu._ts_to_hhmmss(None) == ""
-    assert lu._ts_to_hhmmss(34200) == datetime.fromtimestamp(34200).strftime("%H:%M:%S")
-    assert lu._ts_to_hhmmss("bad") == "bad"
+def test_hhmmss_to_time_variants():
+    """fbt/lbt 是 HHMMSS 整数，不是 epoch 秒 —— 直接单测转换函数。"""
+    assert lu._hhmmss_to_time(92500) == "09:25:00"
+    assert lu._hhmmss_to_time(93021) == "09:30:21"
+    assert lu._hhmmss_to_time(142730) == "14:27:30"
+    assert lu._hhmmss_to_time("92500") == "09:25:00"  # 数字字符串同样接受
+    assert lu._hhmmss_to_time(92500.0) == "09:25:00"  # 整数值 float
+    # 非法/缺失/哨兵 → None（绝不造一个看起来合法的假时间）
+    for bad in (None, "", "bad", 0, 99999, 240000, 246060, 92500.5, True):
+        assert lu._hhmmss_to_time(bad) is None, bad
 
 
 def test_norm_symbol_fallback():
@@ -60,20 +65,34 @@ def test_fetch_pool_empty_and_rows(monkeypatch):
     assert lu._fetch_pool("ZT") == []
 
 
-def test_limit_type_branches():
-    assert lu._limit_type({"h": 10000, "l": 10000}) == "一字板"
-    assert lu._limit_type({"h": 10000, "l": 9000, "zbc": 2, "lbc": 3}) == "T字板"
-    assert lu._limit_type({"h": 10000, "l": 9000, "zbc": 1, "lbc": 1}) == "换手板"
-    assert lu._limit_type({}) == "换手板"
+def test_limit_type_from_fbt_and_open_count():
+    """板型由 fbt（首次封板时间，HHMMSS）+ zbc 判定 —— 不再依赖契约里没有的 h/l。
+
+    修复前用 h/l 判一字板，而真实涨停池没有这两个字段 → 该分支永不可达，
+    板型恒回落成换手板/T字板。
+    """
+    assert lu._limit_type({"fbt": 92500, "zbc": 0, "lbc": 4}) == "一字板"
+    assert lu._limit_type({"fbt": 92502, "zbc": 0}) == "一字板"  # 竞价尾秒封板
+    assert lu._limit_type({"fbt": 92500, "zbc": 2, "lbc": 1}) == "T字板"
+    assert lu._limit_type({"fbt": 93021, "zbc": 0, "lbc": 1}) == "换手板"
+    assert lu._limit_type({"fbt": 142730, "zbc": 1}) == "换手板"
+    # h/l 不在契约里：不能据此判一字板（旧实现正是在这里假绿）
+    assert lu._limit_type({"h": 10000, "l": 10000}) == "未知板型"
+    # fbt 缺失/非法/不可能的时间 → 显式未知，不回落成确定错误
+    assert lu._limit_type({}) == "未知板型"
+    assert lu._limit_type({"fbt": "bad", "zbc": 1}) == "未知板型"
+    assert lu._limit_type({"fbt": None}) == "未知板型"
+    assert lu._limit_type({"fbt": 34200}) == "未知板型"  # 03:42 不是封板时间
 
 
 # ---------- limit_up: 三个池 ----------
 
 
 def _zt_items():
+    # fbt/lbt 用真实契约的 HHMMSS 整数（92500 = 09:25:00，150000 = 15:00:00）
     return [{
         "c": "600000", "n": "浦发银行", "p": 12345, "zdp": 10.0, "fund": 1.5e8,
-        "hs": 512, "fbt": 9 * 3600 + 30 * 60, "lbt": 15 * 3600, "zbc": 1,
+        "hs": 512, "fbt": 92500, "lbt": 150000, "zbc": 1,
         "lbc": 2, "h": 12345, "l": 11000, "hybk": "银行",
     }, {
         "c": "000001", "n": "平安银行", "p": 8000, "zdp": 10.0, "fund": 0,
@@ -88,8 +107,11 @@ def test_fetch_limit_up_pool_rows(monkeypatch):
     df = lu.fetch_limit_up_pool("2024-01-02")
     assert df["symbol"].to_list() == ["600000.SH", "000001.SZ"]
     assert df["close"].to_list() == [12.345, 8.0]
-    assert df["limit_up_type"].to_list() == ["T字板", "一字板"]
-    assert df["first_limit_time"][0] == datetime.fromtimestamp(34200).strftime("%H:%M:%S")
+    # 板型由 fbt HHMMSS + zbc 判定：竞价即封且炸过板 → T字板；fbt 缺失 → 未知板型
+    assert df["limit_up_type"].to_list() == ["T字板", "未知板型"]
+    # fbt/lbt 是 HHMMSS，不是 epoch 秒（旧实现 92500 → 01:41:40）
+    assert df["first_limit_time"].to_list() == ["09:25:00", None]
+    assert df["last_limit_time"][0] == "15:00:00"
 
 
 def test_fetch_limit_up_pool_empty(monkeypatch):
@@ -129,6 +151,11 @@ def test_demo_pools_all_kinds():
     down = lu.fetch_limit_down_pool("2024-01-02", demo=True)
     assert len(up) == 42 and len(broken) == 15 and len(down) == 6
     assert "limit_up_type" in up.columns
+    # 真实 fetch_broken_pool 契约没有 limit_up_type（入库为 NULL）；demo 必须一致，
+    # 否则 board.py 的 zt_streak 会把 demo 炸板当涨停。
+    assert "limit_up_type" not in broken.columns
+    # 真实实盘涨停池与炸板池交集为 0；demo 的两个 symbol 段也不能重叠。
+    assert set(up["symbol"]).isdisjoint(set(broken["symbol"]))
     assert "turnover_rate" not in down.columns
 
 

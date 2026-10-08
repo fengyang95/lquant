@@ -372,10 +372,9 @@ def test_coverage_reports_zero_fill_vs_missing(board_env):
     资金流表只采了 5 行，若留 null 覆盖会被压到 0.13 —— 那不是「数据可算」，
     而是评价样本被协变量自己截断（中性化剔除 null 行）的隐蔽来源。
     """
-    from lquant.factors.sources.board import BOARD_COVARIATES, board_cov_names
+    from lquant.factors.sources.board import BOARD_COVARIATES
 
-    assert board_cov_names() == list(BOARD_COVARIATES)
-    df, report = _cov_frame(board_env, board_cov_names())
+    df, report = _cov_frame(board_env, list(BOARD_COVARIATES))
     r = {x["covariate"]: x for x in report}
     assert set(r) == set(BOARD_COVARIATES)
     # 48 行面板（6 票 × 8 日）：只有每股 shift 首行 null → 42/48 = 0.875
@@ -472,6 +471,25 @@ def test_board_providers_registered_via_factors_import():
     for name in BOARD_COVARIATES:
         meta = PROVIDERS.meta(name)
         assert "label" in meta and "T+1 可用" in meta["label"]
+
+
+# ---------------- demo 数据契约：必须能复现真实采集的涨停/炸板分界 ----------------
+
+def test_demo_pool_matches_real_collector_contract():
+    """demo 炸板池不得带 ``limit_up_type``，且与涨停池 symbol 无交集。
+
+    board.py 的 ``zt_streak`` 按 ``limit_up_type IS NOT NULL`` 区分涨停与炸板。
+    修复前 ``_demo_pool("broken")`` 也生成该列（15/15 非空），且 up/broken 共用
+    同一套 symbol 生成式（交集 15/15）—— 在 demo 上验证「炸板不算涨停」会得到
+    与真实实盘相反的假结论。real ``fetch_broken_pool`` 契约里本就没有该列。
+    """
+    from lquant.market.collectors.limit_up import fetch_broken_pool, fetch_limit_up_pool
+
+    up = fetch_limit_up_pool("2024-01-02", demo=True)
+    broken = fetch_broken_pool("2024-01-02", demo=True)
+    assert "limit_up_type" in up.columns
+    assert "limit_up_type" not in broken.columns
+    assert set(up["symbol"]).isdisjoint(set(broken["symbol"]))
 
 
 # ---------------- CLI：eval --cov 端到端 ----------------
