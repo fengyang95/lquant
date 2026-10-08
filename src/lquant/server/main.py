@@ -28,6 +28,7 @@ from lquant.server.api import (
     news,
     notify,
     paper,
+    portfolio,
     qlib,
     security,
     settings,
@@ -61,7 +62,8 @@ def create_app() -> FastAPI:
         allow_origins=["http://localhost:3000"],
         allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
     )
-    for r in (health, data, data_admin, factors, backtests, market, paper, watchlist,
+    for r in (health, data, data_admin, factors, backtests, market, paper, portfolio,
+              watchlist,
               strategies, analyses, sync, etf, news, settings, ask, agent,
               qlib, task_center, monitor, fundamental, ml, security,
               notify):
