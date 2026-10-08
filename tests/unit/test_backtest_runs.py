@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import date, datetime
 
 import pytest
 from click.testing import CliRunner
@@ -194,6 +195,74 @@ def test_record_bad_date_fails_loudly(runs_env):
 
     with pytest.raises(ValueError):
         runs.record_run("s", {}, {}, start_date="2024/13/01")
+
+
+def test_api_persist_result_writes_cn_wall_clock(runs_env, monkeypatch):
+    """Web 路径的 created_at/finished_at 必须走 CN 墙钟（与 CLI 同源）。
+
+    ``backtest_run`` 由 CLI（``runs.record_run`` → ``now_cn_naive``）与 Web
+    （``server/api/backtests._persist_result``）两个写入方共用，``list_runs``
+    的 ``ORDER BY created_at DESC`` 只有在两者同一时区时才正确。本机默认
+    TZ 恰好是 Asia/Shanghai，裸 ``datetime.now()`` 在这里看不出差别 ——
+    所以直接给 ``now_cn_naive`` 打哨兵：Web 路径若回退成裸本地时间，写进去
+    的就不再是哨兵值，这条立刻红。
+    """
+    import duckdb
+    import polars as pl
+
+    from lquant.core import types as core_types
+    from lquant.core.config import get_settings
+    from lquant.server.api.backtests import _persist_result
+
+    class _FakeRes:
+        def __init__(self, nav):
+            self._nav = nav
+            self.metrics = {"n_trades": 0}
+            self.positions = {}
+
+        def to_frame(self):
+            return self._nav
+
+        def trades_frame(self):
+            return pl.DataFrame({
+                "trade_date": [], "symbol": [], "side": [],
+                "qty": [], "price": [], "fee": [],
+            })
+
+    sentinel = datetime(2019, 3, 4, 5, 6, 7)
+    monkeypatch.setattr(core_types, "now_cn_naive", lambda: sentinel)
+
+    _persist_result(
+        "rid_cn_clock", "factor_topn", {},
+        _FakeRes(pl.DataFrame({"trade_date": [date(2024, 1, 2)], "nav": [1.0]})),
+    )
+
+    con = duckdb.connect(str(get_settings().duckdb_path), read_only=True)
+    created, finished = con.execute(
+        "SELECT created_at, finished_at FROM backtest_run WHERE run_id = 'rid_cn_clock'"
+    ).fetchone()
+    con.close()
+    assert created == sentinel
+    assert finished == sentinel
+
+
+def test_record_run_uses_cn_wall_clock(runs_env, monkeypatch):
+    """CLI 写入方（runs.record_run）与 Web 共用同一个 CN 墙钟函数。"""
+    import duckdb
+
+    from lquant.backtest import runs
+    from lquant.core import types as core_types
+    from lquant.core.config import get_settings
+
+    sentinel = datetime(2019, 3, 4, 5, 6, 7)
+    monkeypatch.setattr(core_types, "now_cn_naive", lambda: sentinel)
+
+    rid = runs.record_run("s", {}, {})
+    con = duckdb.connect(str(get_settings().duckdb_path), read_only=True)
+    created = con.execute(
+        "SELECT created_at FROM backtest_run WHERE run_id = ?", [rid]).fetchone()[0]
+    con.close()
+    assert created == sentinel
 
 
 def test_get_run_missing_raises(runs_env):

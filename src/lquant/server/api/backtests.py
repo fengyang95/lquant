@@ -10,7 +10,7 @@ import json
 import math
 import os
 import uuid
-from datetime import date, datetime
+from datetime import date
 
 import polars as pl
 from fastapi import APIRouter, HTTPException, Query
@@ -76,6 +76,13 @@ def _persist_result(run_id: str, strategy: str, params: dict, res,
         ).with_columns((1 - pl.col("nav") / pl.col("_peak")).alias("drawdown")).drop("_peak")
     m = metrics if metrics is not None else res.metrics
 
+    # created_at / finished_at 统一用仓库约定的 Asia/Shanghai 墙钟。backtest_run
+    # 同时被 CLI（runs.record_run，已用 now_cn_naive）与 Web 写入，混用裸
+    # datetime.now()（本机时区）会让 list_runs 的 ORDER BY created_at DESC
+    # 在非 CN 时区机器上把两条时间线的顺序排乱。
+    from lquant.core.types import now_cn_naive
+
+    now = now_cn_naive()
     with writer() as con:
         con.execute(
             "INSERT OR REPLACE INTO backtest_run VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -83,7 +90,7 @@ def _persist_result(run_id: str, strategy: str, params: dict, res,
              _json_dumps(params),
              nav_df["trade_date"].min() if len(nav_df) else None,
              nav_df["trade_date"].max() if len(nav_df) else None,
-             "done", _json_dumps(m), datetime.now(), datetime.now()],
+             "done", _json_dumps(m), now, now],
         )
         con.execute("DELETE FROM backtest_nav WHERE run_id = ?", [run_id])
         con.execute("DELETE FROM backtest_order WHERE run_id = ?", [run_id])

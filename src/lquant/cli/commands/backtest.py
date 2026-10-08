@@ -203,48 +203,57 @@ def confidence(returns_csv: str, n_trials: str | None, strategy: str | None,
 
     from lquant.backtest import confidence as conf
 
-    df = pl.read_csv(returns_csv)
-    rets = df[df.columns[0]].drop_nulls().to_list()
-    sr_annual = conf.sharpe_ratio(rets, freq=freq)
-    psr_v = conf.psr(rets, sr_benchmark=bench_annual / math.sqrt(freq))
+    try:
+        df = pl.read_csv(returns_csv)
+        # drop_nulls 只滤 null：CSV 里的字面量 nan/inf 会被 polars 解析成
+        # NaN/Inf 原样留下，交给 confidence 的输入校验去 fail-loudly。
+        rets = df[df.columns[0]].drop_nulls().to_list()
+        sr_annual = conf.sharpe_ratio(rets, freq=freq)
+        psr_v = conf.psr(rets, sr_benchmark=bench_annual / math.sqrt(freq))
 
-    out = {
-        "n_obs": len(rets),
-        "sharpe_annual": round(sr_annual, 4),
-        "benchmark_sr_annual": bench_annual,
-        "psr": round(psr_v, 4),
-    }
-    if n_trials is None:
-        out["note"] = "未给 --n-trials，跳过 DSR（多重检验校正需要 N>=2）"
-    else:
-        if n_trials == "auto":
-            n = conf_runs_count(strategy)
+        out = {
+            "n_obs": len(rets),
+            "sharpe_annual": round(sr_annual, 4),
+            "benchmark_sr_annual": bench_annual,
+            "psr": round(psr_v, 4),
+        }
+        if n_trials is None:
+            out["note"] = "未给 --n-trials，跳过 DSR（多重检验校正需要 N>=2）"
         else:
-            try:
-                n = int(n_trials)
-            except ValueError as e:
-                raise click.BadParameter(
-                    f"--n-trials 需为整数或 auto，收到 {n_trials!r}") from e
-        out["n_trials"] = n
-        if n < 2:
             if n_trials == "auto":
-                # auto=0 的语义是「台账没数到 N」，不是「无需校正」：
-                # 被分析的那条收益本身就是一次试验，真实 N 只会 ≥1。
-                # 把前者说成「无选择偏差可校正」会把结论方向说反，
-                # 而 DSR 恰恰是本模块存在的意义。
-                scope = f"匹配 {strategy!r} 的" if strategy else ""
-                out["note"] = (
-                    f"台账里没有{scope}试验记录（n_trials=0）：N 未知，DSR 不可用"
-                    "（这不等于「无选择偏差」）。请确认 --strategy 与落库口径，"
-                    "或显式传 --n-trials <N>"
-                )
+                n = conf_runs_count(strategy)
             else:
-                out["note"] = f"n_trials={n} < 2，无选择偏差可校正，跳过 DSR"
-        else:
-            d = conf.deflated_sharpe(rets, n_trials=n)
-            out["dsr"] = round(d["dsr"], 4)
-            out["expected_max_sharpe_annual"] = round(
-                d["expected_max_sharpe_daily"] * math.sqrt(freq), 4)
+                try:
+                    n = int(n_trials)
+                except ValueError as e:
+                    raise click.BadParameter(
+                        f"--n-trials 需为整数或 auto，收到 {n_trials!r}") from e
+            out["n_trials"] = n
+            if n < 2:
+                if n_trials == "auto":
+                    # auto=0 的语义是「台账没数到 N」，不是「无需校正」：
+                    # 被分析的那条收益本身就是一次试验，真实 N 只会 ≥1。
+                    # 把前者说成「无选择偏差可校正」会把结论方向说反，
+                    # 而 DSR 恰恰是本模块存在的意义。
+                    scope = f"匹配 {strategy!r} 的" if strategy else ""
+                    out["note"] = (
+                        f"台账里没有{scope}试验记录（n_trials=0）：N 未知，DSR 不可用"
+                        "（这不等于「无选择偏差」）。请确认 --strategy 与落库口径，"
+                        "或显式传 --n-trials <N>"
+                    )
+                else:
+                    out["note"] = f"n_trials={n} < 2，无选择偏差可校正，跳过 DSR"
+            else:
+                d = conf.deflated_sharpe(rets, n_trials=n)
+                out["dsr"] = round(d["dsr"], 4)
+                out["expected_max_sharpe_annual"] = round(
+                    d["expected_max_sharpe_daily"] * math.sqrt(freq), 4)
+    except ValueError as e:
+        # confidence.py 的输入校验（CSV 含 NaN/Inf、零方差、样本过短）报的是
+        # **用户数据问题**，不是程序 bug。裸抛会打一整段 traceback 淹没有效
+        # 信息，也与 show/diff 的 "Error: 实验不存在: …" 风格不一致。
+        # 这里只换呈现方式：仍非 0 退出、仍把原因原样说清（fail-loudly）。
+        raise click.ClickException(str(e)) from None
     click.echo(json.dumps(out, ensure_ascii=False))
 
 
