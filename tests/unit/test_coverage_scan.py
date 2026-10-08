@@ -66,6 +66,29 @@ def _seed_calendar(start: date, end: date) -> list[date]:
     return rows
 
 
+def _scan_window_days(n: int = 5) -> tuple[date, date, list[date]]:
+    """锚定 **today_cn** 的 5 个交易日窗口 —— scan_coverage 扫的是 [今天-30, 今天]。
+
+    固定写死 ``2026-09-07..09-11`` 的老写法只在「今天 ≈ 2026-10-07」附近成立，
+    一旦这 5 天掉出 30 天窗口，断言必然变成「Right contains one more item」——
+    时间越久越红。这里按今天回溯取周末除外的 5 天，语义与原用例一致。
+    """
+    from lquant.core.types import today_cn
+
+    end = today_cn()
+    days: list[date] = []
+    d = end
+    while len(days) < n:
+        if d.weekday() < 5:
+            days.append(d)
+        d -= timedelta(days=1)
+    days.reverse()
+    start = days[0]
+    # 日历只播这 5 天，_trade_days 于是恰好等于 days
+    _seed_calendar(start, end)
+    return start, end, days
+
+
 def _seed_securities(symbols: list[str]) -> None:
     from lquant.data.store.catalog import SecurityRepo
 
@@ -95,8 +118,7 @@ def test_no_gap(env) -> None:
     from lquant.data.quality.coverage import scan_coverage
     from lquant.data.store.parquet import write_daily, write_daily_basic
 
-    start, end = date(2026, 9, 7), date(2026, 9, 11)
-    days = _seed_calendar(start, end)
+    start, end, days = _scan_window_days()
     syms = ["600000.SH", "000001.SZ", "510300.SH"]
     _seed_securities(syms)
     write_daily(_daily_df(syms, days))
@@ -118,8 +140,7 @@ def test_daily_date_gap_creates_repair(env) -> None:
     from lquant.data.quality.coverage import scan_coverage
     from lquant.data.store.parquet import write_daily
 
-    start, end = date(2026, 9, 7), date(2026, 9, 11)
-    days = _seed_calendar(start, end)
+    start, end, days = _scan_window_days()
     syms = ["600000.SH", "000001.SZ", "510300.SH"]
     _seed_securities(syms)
     write_daily(_daily_df(syms, days[1:]))  # 第一天整缺
@@ -139,8 +160,7 @@ def test_symbol_sparse_gap(env) -> None:
     from lquant.data.quality.coverage import scan_coverage
     from lquant.data.store.parquet import write_daily
 
-    start, end = date(2026, 9, 7), date(2026, 9, 11)
-    days = _seed_calendar(start, end)
+    start, end, days = _scan_window_days()
     _seed_securities(["600000.SH", "000001.SZ"])
     write_daily(_daily_df(["600000.SH"], days))
     write_daily(_daily_df(["000001.SZ"], days[:2]))  # 后 3 天缺
@@ -183,8 +203,7 @@ def test_basic_empty_lake_info_no_repair(env) -> None:
     from lquant.data.quality.coverage import scan_coverage
     from lquant.data.store.parquet import write_daily
 
-    start, end = date(2026, 9, 7), date(2026, 9, 11)
-    days = _seed_calendar(start, end)
+    start, end, days = _scan_window_days()
     syms = ["600000.SH", "000001.SZ"]
     _seed_securities(syms)
     write_daily(_daily_df(syms, days))
@@ -198,3 +217,49 @@ def test_basic_empty_lake_info_no_repair(env) -> None:
                for i in issues if i["dataset"] == "daily_basic")
     assert rep["repair"]["reason"] == "no_gap"
     assert rep["repair"]["created"] is False
+
+
+# ---------- 日级完整性门禁（day_completeness）----------
+
+def test_day_completeness_flags_partial_days():
+    """某日覆盖不足阈值 → 报缺口；达标的日子不报。"""
+    from lquant.data.quality.coverage import day_completeness
+
+    d1, d2, d3 = date(2026, 9, 1), date(2026, 9, 2), date(2026, 9, 3)
+    gaps = day_completeness({d1: 100, d2: 50, d3: 95}, expected=100, min_ratio=0.7)
+    assert [g.trade_date for g in gaps] == [d2]
+    assert gaps[0].symbols == 50 and gaps[0].expected == 100
+    assert gaps[0].ratio == 0.5
+    assert "只有 50/100 只" in gaps[0].detail()
+
+
+def test_day_completeness_flags_sparse_tip():
+    """最新交易日只写了一半 → kind=tip（水位前移门禁主要防这个形态）。"""
+    from lquant.data.quality.coverage import day_completeness
+
+    d1, d2 = date(2026, 9, 1), date(2026, 9, 2)
+    gaps = day_completeness({d1: 100, d2: 10}, expected=100)
+    assert [g.kind for g in gaps] == ["tip"]
+    assert "疑似只写了一半" in gaps[0].detail()
+
+
+def test_day_completeness_edge_cases():
+    """expected<=0 不报（没有分母就谈不了覆盖率）；全空的日子也要报。"""
+    from lquant.data.quality.coverage import day_completeness
+
+    assert day_completeness({date(2026, 9, 1): 0}, expected=0) == []
+    gaps = day_completeness({date(2026, 9, 1): 0}, expected=100)
+    assert len(gaps) == 1 and gaps[0].ratio == 0.0
+
+
+def test_day_gap_issues_shape():
+    """缺口 → issue：规则名/严重度/明细字段齐备（落库后前端要能读）。"""
+    from lquant.data.quality.coverage import DayGap, day_gap_issues
+
+    g = DayGap(trade_date=date(2026, 9, 2), symbols=30, expected=100)
+    issues = day_gap_issues([g])
+    assert len(issues) == 1
+    i = issues[0]
+    assert i.rule == "DAY_INCOMPLETE" and i.severity == "error"
+    assert i.trade_date == date(2026, 9, 2) and i.count == 70
+    assert i.extra["kind"] == "day" and i.extra["ratio"] == 0.3

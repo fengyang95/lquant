@@ -14,6 +14,7 @@ issue 复用内容指纹幂等：同一缺口重复扫描覆盖原行，不膨�
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, timedelta
 
 from lquant.core.db import reader
@@ -22,7 +23,8 @@ from lquant.data.ingest.tasks import TaskConflictError, create_task
 from lquant.data.quality.issues import Issue, save_issues
 from lquant.data.store.parquet import read_daily, read_daily_basic
 
-__all__ = ["scan_coverage"]
+__all__ = ["DEFAULT_DAY_MIN_RATIO", "DayGap", "day_completeness",
+           "day_gap_issues", "scan_coverage"]
 
 # issue 的 extra.dates 超过这个数就截断，避免 detail JSON 无限膨胀
 _MAX_DATES_IN_EXTRA = 30
@@ -34,6 +36,69 @@ def _trade_days(start: date, end: date) -> list[date]:
     from lquant.data.store.catalog import TradeCalendarRepo
 
     return TradeCalendarRepo().range(start, end)
+
+
+#: 日级完整性阈值：某交易日实际写入标的数 / 本次应写标的数 低于它即判「不完整」。
+#: 0.7 是经验值（正常批次总有个别标的停牌/源站缺失）；可被调用方覆盖。
+DEFAULT_DAY_MIN_RATIO = 0.7
+
+
+@dataclass(frozen=True)
+class DayGap:
+    """某交易日的完整性缺口。kind: ``day`` = 窗口内的整日/大面积缺口；
+    ``tip`` = **最新若干日**的缺口（最典型的形态：`end=today` 只写完一部分
+    标的，水位却推到最大分区 —— 分区看着新鲜，覆盖率断崖）。"""
+
+    trade_date: date
+    symbols: int
+    expected: int
+    kind: str = "day"
+
+    @property
+    def ratio(self) -> float:
+        return self.symbols / self.expected if self.expected else 0.0
+
+    def detail(self) -> str:
+        return (f"{self.trade_date} 只有 {self.symbols}/{self.expected} 只"
+                f"（{self.ratio:.0%} < {DEFAULT_DAY_MIN_RATIO:.0%}）"
+                + ("，且是最新交易日（疑似只写了一半）" if self.kind == "tip" else ""))
+
+
+def day_completeness(per_day_counts: dict[date, int], expected: int, *,
+                     min_ratio: float = DEFAULT_DAY_MIN_RATIO,
+                     tip_days: int = 1) -> list[DayGap]:
+    """按「本次应写标的数」评估每个交易日的覆盖率，返回不完整的那些日。
+
+    为什么用**本次应写数**而不是 security 表里的全市场数：security 表本身可能
+    是空的/不全（真实库实测只有 3 行），拿它当分母会把「期望」算错。本次任务
+    尝试了多少只，是同一批次内自洽的分母，足以回答「这个交易日到底写全了没」。
+
+    最新的 ``tip_days`` 天额外标 ``kind="tip"``：水位前移门禁主要防的就是它 ——
+    尾部那天只写了一半时，不能当作「这一天已经齐了」。
+    """
+    if expected <= 0:
+        return []
+    days = sorted(per_day_counts)
+    tail = set(days[-tip_days:]) if tip_days > 0 else set()
+    gaps: list[DayGap] = []
+    for d in days:
+        n = int(per_day_counts[d])
+        if n / expected >= min_ratio:
+            continue
+        gaps.append(DayGap(trade_date=d, symbols=n, expected=expected,
+                           kind="tip" if d in tail else "day"))
+    return gaps
+
+
+def day_gap_issues(gaps: list[DayGap], *, dataset: str = "daily_bar",
+                   severity: str = "error") -> list[Issue]:
+    """缺口 → data_quality_issue（与既有 issue 表同构，按内容指纹幂等）。"""
+    return [Issue(rule="DAY_INCOMPLETE", severity=severity, dataset=dataset,
+                  trade_date=g.trade_date, count=max(g.expected - g.symbols, 0),
+                  detail=g.detail(),
+                  extra={"kind": g.kind, "symbols": g.symbols,
+                         "expected": g.expected, "ratio": round(g.ratio, 4)})
+            for g in gaps]
 
 
 def _expected_symbols(end: date, start: date) -> list[str]:
