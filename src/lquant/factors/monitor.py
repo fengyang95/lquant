@@ -49,6 +49,19 @@ def _today():
     return today_cn()
 
 
+def _latest_completed_session():
+    """最近一个**已收盘**的交易日（延迟 import 同上：别把 DuckDB 连接栈拖进 CLI）。"""
+    from lquant.core.sessions import latest_completed_session
+
+    return latest_completed_session()
+
+
+def _session_lag(last_date):
+    from lquant.core.sessions import session_lag
+
+    return session_lag(last_date)
+
+
 def _panel(start=None, end=None) -> pl.DataFrame:
     """日线面板读取。测试替身注入点；生产口径与评价主路径同为 read_daily。"""
     from lquant.data.store.parquet import read_daily
@@ -122,6 +135,9 @@ def sync_factor_ic(
 ) -> dict:
     """单因子近窗口逐日 IC：读日线 → 算因子 → 前瞻收益 → ic_series → 落表。
 
+    ``end`` 缺省取**最近一个已收盘交易日**（``core.sessions``），不是裸 today：
+    15:00 前跑监控时不能把当日未收盘的 bar 当成完整日线。
+
     expression 缺省从 factor_def 读（未注册的因子名 KeyError fail-loudly，
     监控一个不存在的表达式没有意义）。返回落表摘要。
     """
@@ -137,7 +153,10 @@ def sync_factor_ic(
         expression = row[0]
 
     if end is None:
-        end = _today()
+        # 收盘前不能把当日当完整 bar：日线湖里可能已经有盘中采集写入的当日行，
+        # 拿它当窗口末端会把「半天行情」算出的 IC 当作最终值写进 factor_ic_daily，
+        # 而且行数和数值都正常 —— 典型的静默错误。窗口末端一律取已收盘会话。
+        end = _latest_completed_session()
     if start is None:
         start = end - timedelta(days=int(lookback_days))
 
@@ -176,7 +195,13 @@ def factor_health(
     的，同步停摆（定时任务/采集挂了）后窗口里永远塞满历史 IC，mean_ic/ICIR 一切
     正常 → 恒判 ok、ic_below 永不触发。``last_date`` 落后今天超过 ``max_age_days``
     个自然日即判 stale（``data_stale=True``）—— 数据是几个月前的，谈「今天 IC
-    多少」没有意义。长假期会误报，可按需调大或设 ``None`` 关闭。
+    多少」没有意义。
+
+    **但自然日会因长假虚增**：周末/国庆里行情本就不更新，只按自然日会把「节后
+    第一个交易日」的正常数据误报成停摆。所以还要求 ``lag_sessions``（按交易会话
+    计龄，见 ``core.sessions.session_lag``）也超过 ``max_age_days`` 才判 stale ——
+    ``lag_days`` 仍按自然日给出（保持 CLI ``--max-age-days`` 的原口径），两个口径
+    都在结果里可见。``max_age_days=None`` 仍可整体关闭时效判定。
 
     **非有限 IC（NaN/Inf）不算「健康」**：因子在某日截面内是常数（0/1 信号
     因子常见）时 ``pl.corr`` 返回 NaN —— 那正是「因子已无区分度」的证据。
@@ -201,6 +226,7 @@ def factor_health(
                 "icir": None,
                 "last_date": None,
                 "lag_days": None,
+                "lag_sessions": None,
                 "data_stale": False,
                 "verdict": "no_data",
                 "detail": "factor_ic_daily 无记录",
@@ -217,15 +243,23 @@ def factor_health(
         last_date = rows["trade_date"].max() if n else None
         last_d = last_date.date() if hasattr(last_date, "date") else last_date
         lag_days = (today - last_d).days if last_d is not None else None
+        # 会话级计龄：长假里自然日膨胀而交易会话不增，只按自然日判 stale 会把
+        # 「节后第一个交易日」误报成同步停摆（本函数 docstring 原先承认的误报）。
+        # 两个口径都超过阈值才判 stale —— max_age_days 的 CLI 口径（自然日）不变，
+        # 只是去掉长假误报，不会让任何原本不 stale 的数据变 stale。
+        lag_sessions = _session_lag(last_d) if last_d is not None else None
         data_stale = (
-            max_age_days is not None and lag_days is not None and lag_days > int(max_age_days)
+            max_age_days is not None
+            and lag_days is not None and lag_days > int(max_age_days)
+            and lag_sessions is not None and lag_sessions > int(max_age_days)
         )
         if n == 0:
             verdict, detail = "no_data", "factor_ic_daily 无记录"
         elif data_stale:
             verdict, detail = (
                 "stale",
-                f"末条 IC {last_d} 落后今天 {lag_days} 天（> {max_age_days} 天）——"
+                f"末条 IC {last_d} 落后今天 {lag_days} 个自然日 / {lag_sessions} 个交易日"
+                f"（都 > {max_age_days}）——"
                 "同步停摆？基于陈旧数据的 mean_ic/ICIR 不可信",
             )
         elif n_valid == 0:
@@ -251,6 +285,7 @@ def factor_health(
                 "icir": icir,
                 "last_date": str(last_d) if n else None,
                 "lag_days": lag_days,
+                "lag_sessions": lag_sessions,
                 "data_stale": data_stale,
                 "verdict": verdict,
                 "detail": detail,
@@ -359,6 +394,7 @@ def run_daily_check(
             ctxs.append({
                 "symbol": h["factor"], "ic": None, "verdict": h["verdict"],
                 "last_date": h["last_date"], "lag_days": h["lag_days"],
+                "lag_sessions": h["lag_sessions"],
             })
         elif h["mean_ic"] is not None or h["verdict"] == "degraded":
             ctxs.append({
