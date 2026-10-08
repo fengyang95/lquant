@@ -57,6 +57,11 @@ class OnlineConfig:
     valid_months: int = 6
     test_months: int = 6
     step_months: int = 6
+    #: purge/embargo（单位：交易日根数），见 walk_forward_splits 的口径。
+    #: None = 按 ``label_horizon`` 自动取 h（默认就该这样：标签是前瞻 h 日收益，
+    #: 训练段尾部 h 根的标签会伸进下一段）。显式给值时才覆盖。
+    purge_bars: int | None = None
+    embargo_bars: int = 1
     promote_metric: str = DEFAULT_METRIC
     min_improvement: float = 0.0                # 新版本相对线上至少要高多少
     strategy_cls: object | None = None
@@ -90,8 +95,14 @@ def rolling_retrain(
         features=cfg.features, label_horizon=cfg.label_horizon,
         processors=cfg.processors))
 
+    # 标签是前瞻 label_horizon 日收益：训练段最后一根的标签要等到之后第 h 根
+    # 才定型。purge 取 h，训练样本的标签终点就严格早于验证/测试段起点，不再
+    # 「见过」测试期；embargo 再留 1 根，隔开边界处的自相关（特征窗口/波动）。
+    # 两笔都是「按标签口径算出来的」，不是拍脑袋的常数。
+    purge = cfg.label_horizon if cfg.purge_bars is None else cfg.purge_bars
     splits = walk_forward_splits(ds.dates, cfg.train_months, cfg.valid_months,
-                                 cfg.test_months, cfg.step_months)
+                                 cfg.test_months, cfg.step_months,
+                                 purge_bars=purge, embargo_bars=cfg.embargo_bars)
     if not splits:
         raise MLError(
             f"数据跨度不足以切出滚动窗口（{len(ds.dates)} 个交易日；"
@@ -112,8 +123,10 @@ def rolling_retrain(
         try:
             # 必须传 test_end：否则早期窗口的"样本外"指标会吃进后面所有
             # 窗口的数据，滚动重训的评估就全废了。
+            # 必须传 window（而不是只传端点）：purge/embargo 的隔离带只有
+            # split_window 才认，用连续 split 重建会把缺口并回训练段。
             ml = train_and_predict(ds, tr_e, va_e, test_end=sp["test"][1],
-                                   kind=cfg.kind, **cfg.model_params)
+                                   window=sp, kind=cfg.kind, **cfg.model_params)
         except Exception as e:  # noqa: BLE001  单窗口失败不该毁掉整轮重训
             logger.error(f"窗口 {i + 1} 训练失败，跳过: {type(e).__name__}: {e}")
             versions.append({"window": i + 1, "status": "failed", "error": str(e)[:200]})

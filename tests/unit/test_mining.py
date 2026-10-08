@@ -10,7 +10,11 @@ import pytest
 from lquant.factors.mining.fitness import corrected_threshold, fitness
 from lquant.factors.mining.gates import g0_static, g1_fast_screen
 from lquant.factors.mining.random_gen import make_generator
-from lquant.factors.mining.runner import run_session, split_dates
+from lquant.factors.mining.runner import (
+    horizon_from_ret_col,
+    run_session,
+    split_dates,
+)
 from lquant.factors.ops import cs_ops, el_ops, ts_ops  # noqa: F401
 
 
@@ -51,6 +55,55 @@ def test_split_dates_70_15_15():
     ds = [dt.date(2025, 1, 1) + dt.timedelta(days=i) for i in range(100)]
     tr, va, te = split_dates(ds)
     assert len(tr) == 70 and len(va) == 15 and len(te) == 15
+
+
+def test_split_dates_zero_purge_embargo_is_identical():
+    """回归保护：显式传 0 必须与默认逐元素一致。"""
+    ds = [dt.date(2025, 1, 1) + dt.timedelta(days=i) for i in range(100)]
+    assert split_dates(ds) == split_dates(ds, purge_bars=0, embargo_bars=0)
+
+
+def test_split_dates_purge_embargo_has_no_time_overlap():
+    """purge/embargo 生效后，用索引证明三段之间留了隔离带、且互不重叠。"""
+    ds = [dt.date(2025, 1, 1) + dt.timedelta(days=i) for i in range(100)]
+    tr, va, te = split_dates(ds, purge_bars=1, embargo_bars=1)
+    # 尾部各剪 1 根，头部再各推 1 根
+    assert len(tr) == 69 and len(va) == 13 and len(te) == 14
+    idx = {d: i for i, d in enumerate(ds)}
+    # 训练末端与验证起点之间：1(purge) + 1(embargo) 根谁都不属于
+    assert idx[va[0]] - idx[tr[-1]] - 1 == 2
+    assert idx[te[0]] - idx[va[-1]] - 1 == 2
+    # 训练集与测试集在时间上完全不重叠
+    assert set(tr).isdisjoint(te) and set(tr).isdisjoint(va)
+    assert max(tr) < min(va) and max(va) < min(te)
+
+
+def test_split_dates_negative_purge_embargo_raises():
+    ds = [dt.date(2025, 1, 1) + dt.timedelta(days=i) for i in range(100)]
+    with pytest.raises(ValueError, match="不能为负"):
+        split_dates(ds, purge_bars=-1)
+    with pytest.raises(ValueError, match="不能为负"):
+        split_dates(ds, embargo_bars=-1)
+
+
+def test_horizon_from_ret_col():
+    """purge 必须从标签列名解析出前瞻期数，不允许拍魔法常数。"""
+    assert horizon_from_ret_col("fwd_ret_1") == 1
+    assert horizon_from_ret_col("fwd_ret_5") == 5
+    with pytest.raises(ValueError, match="解析前瞻期数"):
+        horizon_from_ret_col("close")
+
+
+def test_run_session_rejects_unparsable_label_col():
+    """标签列名解析不了 → 直接报错。静默退回 purge=0 等于没做防泄漏。"""
+    from lquant.factors.engine import FactorEngine
+
+    panel = _panel()
+    eng = FactorEngine(panel.lazy())
+    with pytest.raises(ValueError, match="解析前瞻期数"):
+        run_session(eng, panel, make_generator(seed=1), n_candidates=1,
+                    ret_col="close")
+
 
 
 def test_run_session_random_smoke():

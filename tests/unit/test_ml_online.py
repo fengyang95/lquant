@@ -182,6 +182,40 @@ def test_rolling_retrain_test_window_is_bounded(ml_env):
     assert ends[-1] < str(panel["trade_date"].max())
 
 
+def test_rolling_retrain_uses_purged_windows(ml_env, monkeypatch):
+    """调用点必须真把 purge/embargo 传下去：默认 purge=label_horizon、embargo=1。
+
+    只看 `rolling_retrain` 有没有把带缺口的 window 递给 train_and_predict ——
+    参数加了不接线，切分再对也不生效。
+    """
+    from lquant.research.ml import backtest
+    from lquant.research.ml.dataset import DatasetConfig, build_dataset
+    from lquant.research.ml.panel import build_feature_panel
+
+    h = 5
+    panel = _panel(months=30)
+    seen: list[dict] = []
+    real = backtest.train_and_predict
+
+    def spy(*a, **kw):
+        seen.append(kw.get("window"))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(backtest, "train_and_predict", spy)
+    out = rolling_retrain(panel, _cfg(label_horizon=h), promote=False)
+    assert out["n_trained"] >= 1
+    assert seen and all(w is not None for w in seen)
+
+    ds = build_dataset(build_feature_panel(panel, ["pct_change_20"]),
+                       DatasetConfig(features=["pct_change_20"], label_horizon=h))
+    idx = {d: i for i, d in enumerate(ds.dates)}
+    for w in seen:
+        # purge=h 剪训练尾 + embargo=1 推验证头 → 恰好 h+1 根隔离带
+        assert idx[w["valid"][0]] - idx[w["train"][1]] - 1 == h + 1
+        # 训练段最后一根的标签终点（+h 根）严格早于验证段起点
+        assert idx[w["train"][1]] + h < idx[w["valid"][0]]
+
+
 def test_rolling_retrain_without_promote_keeps_candidates(ml_env):
     from lquant.research.ml import registry
 
