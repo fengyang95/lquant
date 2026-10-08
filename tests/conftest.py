@@ -1,6 +1,8 @@
 """测试夹具。"""
 from __future__ import annotations
 
+import contextlib
+
 import polars as pl
 import pytest
 
@@ -67,23 +69,101 @@ def _isolate_app_logs(tmp_path_factory):
         os.environ["LQ_LOG_DIR"] = prev
 
 
-def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
-    """收尾：关掉 agent service 单例持有的 aiosqlite 连接。
+def pytest_configure(config):
+    """注册收尾插件（见 :class:`_ShutdownGuard`）。"""
+    config.pluginmanager.register(_ShutdownGuard(), "lq-shutdown-guard")
 
+
+class _ShutdownGuard:
+    """收尾：尽力关掉 aiosqlite；然后硬退，避免卡在解释器退出。
+
+    ``pytest_sessionfinish`` —— 关掉 agent service 单例持有的 aiosqlite 连接。
     为什么必须显式关：aiosqlite 每条连接的 worker 线程是 non-daemon，只有
-    `await close()`（在事件循环还活着时）才会把它停掉。靠 GC 的 `__del__` 不行——
-    那时循环已关闭，worker 里 `future.get_loop().call_soon_threadsafe(...)` 会抛
-    异常，恰好卡在 `break` 之前，线程永远退不出去。连接不关，解释器就会停在
-    `threading._shutdown` —— 表现为 pytest 打印完结果却不返回。
+    ``await close()``（在事件循环还活着时）才会把它停掉。靠 GC 的 ``__del__``
+    不行 —— 那时循环已关闭，worker 里 ``future.get_loop().call_soon_threadsafe``
+    会抛异常，恰好卡在 ``break`` 之前，线程永远退不出去。连接不关，解释器就会停在
+    ``threading._shutdown`` —— 表现为 pytest 打印完结果却不返回。
     线上由 FastAPI 的 shutdown 钩子收尾，但 ASGITransport 不跑 lifespan。
+
+    ``pytest_unconfigure`` —— 兜底硬退。上面那步只是**尽力而为**：只要有一条连接
+    漏网（或 loguru ``enqueue=True`` 的 ``_queued_writer`` 卡在队列上），进程就会
+    停在 ``threading._shutdown``。实测 CI：3969 passed / 7 skipped / 360s
+    打完结果，然后**干等 34 分钟**被 ``timeout -s ABRT 2400`` 打死（exit 124），
+    job 记成 failure —— 每条用例其实都是绿的。这不是「测试慢」，是「进程退不出」。
+
+    放在 ``pytest_unconfigure`` 是刻意的：它晚于所有 ``pytest_sessionfinish``
+    （pytest-cov 正是在那里 finish() 并写 coverage.xml），所以覆盖率报告、终端
+    摘要、退出码都已定稿，这里再 ``os._exit`` 不会丢东西。解释器级的 atexit /
+    ``Py_Finalize`` 会被跳过，这正是目的。
     """
-    import asyncio
-    import contextlib
 
-    from lquant.agent import service as agent_service
+    _exitstatus = 0
 
-    with contextlib.suppress(Exception):  # 收尾失败不改变测试结论
-        asyncio.run(agent_service.shutdown_agent_service())
+    def pytest_sessionfinish(self, session, exitstatus):  # noqa: ARG002
+        self._exitstatus = int(exitstatus or 0)
+        import asyncio
+        import contextlib
+
+        from lquant.agent import service as agent_service
+
+        with contextlib.suppress(Exception):  # 收尾失败不改变测试结论
+            asyncio.run(agent_service.shutdown_agent_service())
+
+    def pytest_unconfigure(self, config):
+        self._finalize_coverage(config)
+        import os
+        import sys
+
+        with contextlib.suppress(Exception):  # 冲刷失败也必须退出
+            sys.stdout.flush()
+            sys.stderr.flush()
+        os._exit(self._exitstatus)
+
+    @staticmethod
+    def _finalize_coverage(config) -> None:
+        """硬退之前显式落盘 coverage，别让报告凭空消失。
+
+        coverage 默认靠 ``atexit`` 写 ``.coverage`` 与报告，而 ``os._exit`` 跳过
+        atexit —— 不补这一步，``--cov-report=xml:coverage.xml`` 就不再产出文件，
+        pre-push 里读它的 diff-cover 门禁会直接判失败（「文件不存在」）。
+        本函数放在 ``pytest_unconfigure``：此刻 pytest-cov 已在
+        ``pytest_sessionfinish`` 里 finish() 过，数据是完整的，补写报告是纯收益。
+        """
+        with contextlib.suppress(Exception):
+            import coverage
+
+            cov = coverage.Coverage.current()
+            if cov is None:
+                return
+            cov.stop()
+            cov.save()  # 数据文件（diff-cover 也吃这个）
+            specs = _cov_report_specs(config)
+            from coverage.misc import CoverageException
+
+            for spec in specs:
+                kind, _, dest = spec.partition(":") if ":" in spec else (spec, "", None)
+                kind = kind.strip()
+                try:
+                    if kind == "xml":
+                        cov.xml_report(outfile=dest or "coverage.xml", ignore_errors=True)
+                    elif kind == "json":
+                        cov.json_report(outfile=dest or "coverage.json", ignore_errors=True)
+                    elif kind == "html":
+                        cov.html_report(directory=dest or "htmlcov", ignore_errors=True)
+                    elif kind in ("term", "term-missing"):
+                        cov.report(show_missing=(kind == "term-missing"), ignore_errors=True)
+                except CoverageException:
+                    pass  # 单个报告失败不该阻断退出
+
+
+def _cov_report_specs(config) -> list[str]:
+    """从 pytest-cov 的 controller 取 ``--cov-report=`` 规格；没装/没开则空。"""
+    with contextlib.suppress(Exception):
+        plugin = config.pluginmanager.getplugin("_cov")
+        controller = getattr(plugin, "cov_controller", None)
+        if controller is not None:
+            return [str(s) for s in getattr(controller, "report_specs", ())]
+    return []
 
 
 @pytest.fixture
