@@ -3,6 +3,8 @@
 全部离线：合成日线 DataFrame，不读数据湖。
 """
 
+import importlib
+
 import polars as pl
 import pytest
 
@@ -12,6 +14,7 @@ from lquant.portfolio.strategies import (
     run_all,
     run_strategy,
 )
+from lquant.portfolio.strategies.registry import register_strategy
 
 
 def make_df(
@@ -185,3 +188,96 @@ def test_run_all_filters_common_params_by_signature():
     poor = make_df([10.0] * 9 + [10.5], volumes=[1e6] * 9 + [2.5e6], amounts=[1e7] * 9 + [1.5e8])
     r = run_strategy("volume_surge", poor, min_amount=2e8)
     assert not r.passed and "成交额不足" in r.evidence
+
+
+# ---------- 审阅修复回归：参数化窗口/天数 vs 静态 min_rows ----------
+
+
+def test_keep_rising_days_beyond_rows_is_explicit_insufficient():
+    """days 调大而数据不变：必须是显式降级，不是 IndexError 当 evidence。
+
+    注册时静态 min_rows=5 只覆盖默认 days=4；5 行 df + days=10 真实需要 11 行。
+    """
+    r = run_strategy("keep_rising", make_df([10.0] * 5), days=10)
+    assert not r.passed and r.data_insufficient
+    assert "数据不足" in r.evidence and "缺 6 行" in r.evidence
+    assert "IndexError" not in r.evidence and "计算失败" not in r.evidence
+
+
+def test_low_atr_window_beyond_rows_does_not_compute_half_data():
+    """window 调大后不得用更短的 TR 均值冒充 ATR(window)，且不得给数字。"""
+    r = run_strategy("low_atr", make_df([10.0 + 0.01 * i for i in range(15)]), window=30)
+    assert not r.passed and r.data_insufficient
+    assert "数据不足" in r.evidence and "缺 16 行" in r.evidence
+    # 命中时的 evidence 形如 "ATR(30)=..." —— 半截数据的数字一个都不能出现
+    assert "ATR(30)" not in r.evidence
+
+
+def test_turtle_window_beyond_rows_does_not_fake_prev_high():
+    """20 根不得被当成「30 日高点」；不足时只报缺口，不报算出的价位。"""
+    r = run_strategy("turtle_breakout", make_df([10.0 + 0.1 * i for i in range(21)]),
+                     window=30)
+    assert not r.passed and r.data_insufficient
+    assert "数据不足" in r.evidence and "缺 10 行" in r.evidence
+    assert "close=" not in r.evidence  # 未拿半截算出 close/prev_high
+
+
+# ---------- 审阅修复回归：min_pct 从「装样子参数」变为真过滤 ----------
+
+
+def test_volume_surge_min_pct_filters_marginal_gain():
+    closes = [10.0] * 9 + [10.5]  # 尾日涨幅 +5%
+    df = make_df(closes, [1e6] * 9 + [2.5e6], [1e7] * 9 + [2.5e8])
+    assert run_strategy("volume_surge", df).passed  # 默认 min_pct=0 放行
+    r = run_strategy("volume_surge", df, min_pct=6.0)
+    assert not r.passed and "涨幅不足" in r.evidence and "5.00" in r.evidence
+
+
+# ---------- 审阅修复回归：注册表三处（别名 / 热载 / meta 拷贝） ----------
+
+
+@pytest.fixture
+def registry_isolated():
+    """别名与 reload 会改动全局注册表：前后快照恢复，避免串到其他用例。"""
+    items = dict(STRATEGIES._items)
+    meta = {k: dict(v) for k, v in STRATEGIES._meta.items()}
+    yield
+    STRATEGIES._items.clear()
+    STRATEGIES._items.update(items)
+    STRATEGIES._meta.clear()
+    STRATEGIES._meta.update(meta)
+
+
+def test_alias_registration_runs_registered_callable(registry_isolated):
+    """注册名 ≠ `_run_<name>` 时也必须能跑：取注册表里的函数对象。"""
+    from lquant.portfolio.strategies import rules
+
+    register_strategy("keep_rising_alias", label="持续上涨别名",
+                      desc="回归用", min_rows=5)(rules._run_keep_rising)
+    r = run_strategy("keep_rising_alias", make_df([10.0, 10.1, 10.2, 10.3, 10.5]))
+    assert r.passed and "连续 4 日上涨" in r.evidence
+    assert "策略实现缺失" not in r.evidence
+
+
+def test_reload_rules_is_idempotent(registry_isolated):
+    """热载/重复导入路径：同名重注册按替换处理，不抛 ValueError。"""
+    from lquant.portfolio.strategies import rules
+
+    importlib.reload(rules)
+    assert set(STRATEGIES.keys()) >= {
+        "volume_surge", "keep_rising", "pullback_ma250",
+        "turtle_breakout", "low_atr",
+    }
+    r = run_strategy("keep_rising", make_df([10.0, 10.1, 10.2, 10.3, 10.5]))
+    assert r.passed and "连续 4 日上涨" in r.evidence
+
+
+def test_meta_mutation_cannot_change_behavior(registry_isolated):
+    """meta() 返回副本：外部改它不得影响判定的 min_rows。"""
+    closes = [10.0] * 9 + [10.5]
+    df = make_df(closes, [1e6] * 9 + [2.5e6], [1e7] * 9 + [2.5e8])
+    before = run_strategy("volume_surge", df)
+    STRATEGIES.meta("volume_surge")["min_rows"] = 999
+    after = run_strategy("volume_surge", df)
+    assert before.passed and after.passed
+    assert after.evidence == before.evidence
