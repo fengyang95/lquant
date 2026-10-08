@@ -17,6 +17,30 @@ os.environ.setdefault("LQ_SYNC_WORKER", "0")
 
 pytestmark = pytest.mark.usefixtures("gaps_env")
 
+#: 冻结业务日 —— 本文件种的是固定窗口 2026-09-07~09-11（最后一天故意缺失），
+#: 而 /api/data/gaps 的窗口右端来自 today_cn()。不冻结的话，真实日期走出
+#: [end-30, end] ⊇ 种下的日子后，「最后一天缺」就不再是整窗唯一缺口，
+#: expected_days/actual_days 会随之漂移（用例随日历变红，不是代码坏了）。
+FROZEN_TODAY = date(2026, 9, 11)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _frozen_today():
+    """把 gaps 链路读到的业务日钉死在 FROZEN_TODAY。
+
+    两处读取点都要打：``coverage`` 是模块级 ``from ... import today_cn``；
+    ``server.api.data`` 的 repair 分支在函数内 import，走的是 ``core.types``。
+    模块级 fixture 拿不到 monkeypatch（pytest 9 仍限函数级），故用
+    ``MonkeyPatch.context()`` 自带撤销。
+    """
+    from lquant.core import types
+    from lquant.data.quality import coverage
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(types, "today_cn", lambda: FROZEN_TODAY)
+        mp.setattr(coverage, "today_cn", lambda: FROZEN_TODAY)
+        yield
+
 
 @pytest.fixture(scope="module")
 def gaps_env(tmp_path_factory):
