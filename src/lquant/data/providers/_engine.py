@@ -73,6 +73,18 @@ class MappingProvider(DataProvider):
         """归一化后的钩子（补 source 列、单位换算等），默认原样返回。"""
         return df
 
+    def _fetch(self, table: str, *args: Any, **params: Any) -> pl.DataFrame:
+        """带**源级单飞锁**的取数：同一源同一时刻只允许一个会话在打。
+
+        限流（TokenBucket）管速率，这把锁管并发会话 —— 东财/AKShare 的封禁
+        与 BaoStock 的 10001011 都把「并发」列为触发条件。锁按源名区分，
+        并与 watchdog 里的同一把锁嵌套复用（进程内计数，不会自锁）。
+        """
+        from lquant.data.ratelimit import source_lock
+
+        with source_lock(self.source or self.name):
+            return self._fetch_raw(table, *args, **params)
+
     def request(
         self,
         table: str,
@@ -90,7 +102,7 @@ class MappingProvider(DataProvider):
           绝不进入 mapping fill，防止常量覆盖真实数据列
         ``config_dir`` 仅用于定位 mapping yaml，不参与 fill。
         """
-        raw = params.pop("_raw") if "_raw" in params else self._fetch_raw(
+        raw = params.pop("_raw") if "_raw" in params else self._fetch(
             table, *args, **params
         )
         # 空结果短路：零列/零行 raw 进映射管线会在 rename 处炸
