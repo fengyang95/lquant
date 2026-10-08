@@ -323,6 +323,38 @@ DDL_STATEMENTS: list[str] = [
         updated_at  TIMESTAMP DEFAULT now()
     )
     """,
+    # B5 条件级事后核验：冻结的研究判断 + 逐次核验结果。
+    # 拆两张表而不是一张带状态列的表：条件本身**不可变**（锚点/阈值/历史指纹
+    # 一旦冻结就不许改写，否则事后对账失去意义），核验结果则随窗口推进**多版本**
+    # 累积。混在一张表里，「同条件重复核验幂等」就得先擦掉旧结果 —— 那正好把
+    # 「窗口未走完时怎么判、走完后怎么判」的演进过程抹掉了。
+    """
+    CREATE TABLE IF NOT EXISTS research_condition (
+        condition_id   VARCHAR PRIMARY KEY,   -- 内容哈希：同条件重冻结不新增行
+        symbol         VARCHAR,
+        as_of          DATE,                  -- 做出判断的交易日（锚点所在日）
+        anchor         DOUBLE,                -- 冻结时的收盘价锚点，程序算出，不许事后编造
+        conditions     JSON,                  -- [{metric,op,threshold,avg_days}, ...]
+        window_days    INTEGER,               -- 「未来 N 个交易日内」
+        note           VARCHAR,
+        overlap_closes JSON,                  -- as_of 前的重叠收盘价指纹，用于检测复权/修订
+        created_at     TIMESTAMP DEFAULT now()
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS research_verify_result (
+        condition_id    VARCHAR,
+        checked_through DATE,                 -- 本次核验用到的最近已完成交易日
+        verdict         VARCHAR,              -- triggered / not_triggered / unavailable / unverifiable
+        window_complete BOOLEAN,              -- 窗口是否已走完（与「未命中」是两件事）
+        checked_days    INTEGER,
+        missing_days    JSON,                 -- 窗口内缺日线的会话（停牌/采集缺失，不跳过）
+        evidence        JSON,                 -- 逐日逐条件：实际值 / 阈值 / 是否命中
+        reason          VARCHAR,
+        created_at      TIMESTAMP DEFAULT now(),
+        PRIMARY KEY (condition_id, checked_through)
+    )
+    """,
 ]
 
 # 注意：daily_bar / minute_bar 两张 DuckDB 表是**遗留占位**。
@@ -473,6 +505,18 @@ def ensure_factor_ic_daily(con) -> int:
     在老库上都撞到过裸的 ``CatalogException``。返回 1 = 本次建了表。
     """
     return _ensure_table(con, "factor_ic_daily")
+
+
+def ensure_research_verify_tables(con) -> int:
+    """按需补建条件核验两张表（research_condition / research_verify_result）。
+
+    这两张表只进了 ``DDL_STATEMENTS``（init_db / 服务启动才执行）：老库或
+    隔离测试库上直接写核验记录会撞裸 ``CatalogException`` —— 而「冻结了却
+    没记下来」正是本功能要消灭的静默失败（下次没人知道当时判断的是什么）。
+    惰性补建让老库自愈。返回本次建表数（0~2），幂等。
+    """
+    return (_ensure_table(con, "research_condition")
+            + _ensure_table(con, "research_verify_result"))
 
 
 def ensure_ml_run_columns(con) -> int:
