@@ -14,7 +14,6 @@ mock 锚点（与 test_api_news.py 一致，patch 必须落在源模块属性上
 from __future__ import annotations
 
 import shutil
-from datetime import date
 from pathlib import Path
 
 import akshare as ak
@@ -25,6 +24,7 @@ from fastapi.testclient import TestClient
 
 import lquant.server.api.news as news_api
 from lquant.core.config import get_settings
+from lquant.core.types import today_cn
 from lquant.server.main import create_app
 
 
@@ -56,7 +56,10 @@ def _cls_df() -> pd.DataFrame:
     """财联社电报假 DataFrame：一条命中平安银行 + 半导体关键词，
     一条无关（不应被 000001.SZ 过滤命中）。发布日期取今天，summary 按
     published_at 当日计数才命中。"""
-    today = date.today().isoformat()
+    # 业务日必须用 today_cn()：采集/汇总按 Asia/Shanghai 记 trade_date，
+    # 而 UTC 跑批在 16:00-24:00 期间 date.today() 会比业务日早一天
+    # （CI 在 UTC 傍晚必红，本地 CST 白天看不出来）。
+    today = today_cn().isoformat()
     # 时间必须是常量：若每次调用取 datetime.now()，第二次采集跨秒时
     # external_id（发布日期+发布时间）变化，去重失效（测试曾因此翻倍）
     return pd.DataFrame({

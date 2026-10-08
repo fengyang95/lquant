@@ -27,7 +27,9 @@ class _Resp:
 
 
 def test_ymd_variants():
-    assert lu._ymd(None) == datetime.now().strftime("%Y%m%d")
+    from lquant.core.types import today_cn
+
+    assert lu._ymd(None) == today_cn().strftime("%Y%m%d")
     assert lu._ymd("2024-01-02") == "20240102"
     assert lu._ymd(date(2024, 1, 2)) == "20240102"
 

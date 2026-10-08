@@ -53,7 +53,10 @@ def test_fetch_money_flow_demo_deterministic_sorted():
 def test_fetch_money_flow_demo_default_date_today():
     df = fetch_money_flow(demo=True, top=3)
     assert df.height == 3
-    assert df["trade_date"].unique().to_list() == [date.today()]
+    from lquant.core.types import today_cn
+
+    # 缺省业务日是 today_cn()，不是进程本地 date.today()
+    assert df["trade_date"].unique().to_list() == [today_cn()]
 
 
 def test_fetch_money_flow_empty_diff(monkeypatch):

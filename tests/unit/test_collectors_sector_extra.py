@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date
 
 from lquant.market.collectors import sector as sec
 
@@ -16,7 +16,10 @@ def test_norm_keeps_invalid_code() -> None:
 
 
 def test_as_date_variants() -> None:
-    assert sec._as_date(None) == datetime.now().date()
+    # 采集器缺省业务日走 today_cn()（Asia/Shanghai），不是服务器本地日期
+    from lquant.core.types import today_cn
+
+    assert sec._as_date(None) == today_cn()
     assert sec._as_date("2026-09-17") == date(2026, 9, 17)
     assert sec._as_date("20260917") == date(2026, 9, 17)
     assert sec._as_date(date(2026, 9, 17)) == date(2026, 9, 17)
