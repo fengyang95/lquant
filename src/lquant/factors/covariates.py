@@ -124,15 +124,10 @@ def _p_mcap(panel, industry_df=None):
 #: 这里用等权满窗口 —— 口径更简单，且与 lquant「满窗口才出值」的约定一致。
 BETA_WINDOW = 252
 
-
-def _market_proxy(panel) -> pl.Expr:
-    """市场收益代理 = 当日截面等权平均收益。
-
-    没有指数日线也能算（指数表可能为空），且等权口径与 lquant 现有的
-    「基准 = 全市场等权」归因口径一致（见 backtest/attribution.py）。
-    代价是它把个股自己也包含进市场里（小票池尤其明显），报告里会写明。
-    """
-    return pl.col("_ret").mean().over("trade_date")
+#: 市场收益代理 = 当日截面等权平均收益（``_ret`` 的截面均值，见 _beta_frame）。
+#: 没有指数日线也能算（指数表可能为空），且等权口径与 lquant 现有的
+#: 「基准 = 全市场等权」归因口径一致（见 backtest/attribution.py）。
+#: 代价是它把个股自己也包含进市场里（小票池尤其明显）—— 报告里写明。
 
 
 def _beta_frame(panel, window: int) -> pl.DataFrame:

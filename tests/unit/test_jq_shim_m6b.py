@@ -460,3 +460,68 @@ class TestStrictAdj:
             assert post["close"].tolist() == [10.2, 10.8]
         finally:
             jq_shim.bind(None)
+
+
+class TestApplyFqEdges:
+    """apply_fq 的边界分支：不需要数据湖，直接喂帧。"""
+
+    def test_empty_or_priceless_frame_returns_as_is(self):
+        from lquant.research.dialect.jq_shim import apply_fq
+
+        empty = pl.DataFrame({"symbol": [], "trade_date": [], "close": []},
+                             schema_overrides={"trade_date": pl.Date})
+        assert apply_fq(empty, "pre", strict_adj=True).is_empty()
+        # 没有价格列（只有成交额）→ 原样返回
+        no_price = pl.DataFrame({"symbol": ["600000.SH"], "amount": [1.0]})
+        assert apply_fq(no_price, "post", strict_adj=True).columns == ["symbol", "amount"]
+
+    def test_lenient_no_usable_factor_warns_and_returns_raw(self):
+        from loguru import logger
+
+        from lquant.research.dialect.jq_shim import apply_fq
+
+        df = pl.DataFrame({"symbol": ["600000.SH"], "trade_date": [date(2026, 6, 10)],
+                           "close": [10.0], "adj_factor": [None]})
+        seen: list[str] = []
+        sink = logger.add(lambda m: seen.append(m), level="WARNING")
+        try:
+            out = apply_fq(df, "pre", strict_adj=False, where="t")
+        finally:
+            logger.remove(sink)
+        assert out["close"].to_list() == [10.0]
+        assert any("没有任何有效 adj_factor" in m for m in seen)
+
+    def test_strict_default_falls_back_when_settings_unavailable(self, monkeypatch):
+        """配置层不可用时退回宽松口径而不是把取数打挂（line 29-30）。"""
+        from lquant.research.dialect import jq_shim
+
+        def _boom():
+            raise RuntimeError("no settings")
+
+        monkeypatch.setattr("lquant.core.config.get_settings", _boom)
+        assert jq_shim._strict_adj_default() is False
+
+    def test_attribute_history_skip_paused_drops_suspended_rows(self, tmp_path,
+                                                               monkeypatch):
+        df = pl.DataFrame({
+            "symbol": ["600519.SH"] * 3,
+            "trade_date": [date(2026, 6, 10), date(2026, 6, 11), date(2026, 6, 12)],
+            "close": [10.2, None, 11.2],
+            "adj_factor": [1.0, 1.0, 1.0],
+        })
+        root = tmp_path / "data" / "daily" / "year=2026"
+        root.mkdir(parents=True)
+        df.write_parquet(root / "part-0.parquet")
+        monkeypatch.setattr("lquant.data.store.parquet._root",
+                            lambda: tmp_path / "data")
+        from lquant.research.dialect import jq_shim
+
+        jq_shim.bind(jq_shim.JQContext(
+            engine=None, trade_date=date(2026, 6, 12), universe=["600519.SH"]))
+        try:
+            out = jq_shim.attribute_history("600519.SH", 3, fields="close",
+                                            skip_paused=True, fq=None,
+                                            strict_adj=True)
+            assert out["close"].tolist() == [10.2, 11.2]
+        finally:
+            jq_shim.bind(None)

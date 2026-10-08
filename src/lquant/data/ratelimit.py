@@ -57,8 +57,6 @@ def _acquire_flock(name: str, timeout: float) -> None:
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            if time.monotonic() - start > 1.0:
-                logger.info(f"源锁 {name}: 已获得（等待 {time.monotonic() - start:.1f}s）")
             _fds[name] = fd
             return
         except OSError:

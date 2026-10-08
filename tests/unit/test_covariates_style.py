@@ -122,3 +122,14 @@ def test_covariates_for_steps_builds_only_referenced_names():
     # 不引用 = 不加
     assert covariates_for_steps(None, base) == base
     assert covariates_for_steps([{"op": "standardize"}], base) == base
+
+
+def test_covariates_for_steps_handles_odd_shapes():
+    """非法 step 形状跳过、``by`` 给字符串也认 —— 配方来自前端/CLI，形状不保证。"""
+    from lquant.factors.covariates import covariates_for_steps
+
+    base = ["market_cap"]
+    assert covariates_for_steps(["not-a-dict"], base) == base
+    assert covariates_for_steps([{"by": "cov_beta_1y"}], base) == ["market_cap", "beta_1y"]
+    assert covariates_for_steps([{"factors": ["cov_resid_vol", 42, None]}], base) == \
+        ["market_cap", "resid_vol"]

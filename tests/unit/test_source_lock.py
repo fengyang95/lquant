@@ -124,3 +124,56 @@ def test_source_of_derives_provider_name():
     assert _source_of(_fake_bs_query) == "baostock"
     # 推断不出源名时落到共享的 unknown 桶（宁可串行，也不要并发打同一个源）
     assert _source_of(object()) == "unknown"
+
+
+def test_in_process_lock_timeout_raises():
+    """同进程内锁被别的线程占着且超时 → 报错，不无限等（line 98 分支）。"""
+    name = f"test-thr-timeout-{uuid.uuid4().hex}"
+    held = threading.Event()
+    release = threading.Event()
+
+    def holder() -> None:
+        with source_lock(name, timeout=5.0):
+            held.set()
+            release.wait(10.0)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    assert held.wait(5)
+    try:
+        with pytest.raises(TimeoutError, match="同进程内被占用"), \
+                source_lock(name, timeout=0.2):
+            pytest.fail("不应拿到锁")
+    finally:
+        release.set()
+        t.join(10)
+
+
+def test_flock_wait_warns_after_threshold(monkeypatch):
+    """等锁超过告警阈值要留 warning（line 72-75），否则「任务卡住」无从解释。"""
+    from loguru import logger
+
+    name = f"test-warn-{uuid.uuid4().hex}"
+    monkeypatch.setattr(ratelimit, "_WARN_AFTER_SEC", 0.0)
+    seen: list[str] = []
+    sink = logger.add(lambda m: seen.append(m), level="WARNING")
+    ctx = mp.get_context("spawn")
+    ready, release = ctx.Event(), ctx.Event()
+    p = ctx.Process(target=_hold_lock, args=(name, ready, release), daemon=True)
+    p.start()
+    try:
+        assert ready.wait(30)
+        with pytest.raises(TimeoutError), source_lock(name, timeout=0.6):
+            pytest.fail("不应拿到锁")
+    finally:
+        release.set()
+        p.join(10)
+        logger.remove(sink)
+        if p.is_alive():  # pragma: no cover
+            p.kill()
+    assert any("仍在排队" in m for m in seen), seen
+
+
+def test_release_flock_without_holding_is_noop():
+    """没持有锁就释放 → 直接返回（line 81-82），不抛异常。"""
+    ratelimit._release_flock(f"never-held-{uuid.uuid4().hex}")
