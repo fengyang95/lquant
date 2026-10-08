@@ -21,7 +21,7 @@ from lquant.core.types import Board, SecType, Symbol
 
 __all__ = [
     "Commission", "InstrumentRules", "PriceLimit", "RuleSet", "TaxSchedule",
-    "infer_fund_type", "round_tick",
+    "TransferFeeSchedule", "infer_fund_type", "round_tick",
 ]
 
 _SELL_ONLY = frozenset({"sell"})
@@ -96,6 +96,39 @@ class TaxSchedule:
 
 
 @dataclass
+class TransferFeeSchedule:
+    """过户费按日期区间取（无方向维度，双向都收）。
+
+    为什么必须区间化：中国结算两次调整过户费 —— 2015-08-01 起沪深统一按成交金额
+    0.02‰（双向），2022-04-29 起再下调 50% 至 0.01‰。规则表原来只写一个常数
+    0.00001（现行费率），于是 **2022-04-29 之前的回测把过户费少算一半** ——
+    静默偏差，不报错。
+
+    为什么表从 2015-08-01 开始：此前沪市按**成交面额** 0.3‰、深市按成交金额
+    0.0255‰ 收取。面额口径相当于「股数 × 1 元」，折算成成交额费率会依赖股价
+    （面额费率 / 价格），本模型按成交额线性计费，**表达不了**。
+    所以早于 2015-08-01 的日期**查不到区间就抛错**，而不是静默套用现行费率 ——
+    宁可让长回测显式失败，也不要给出一个错的成本数字。
+
+    构造兼容纯 float 的费率表（``schedule`` 为空时退化为常数，见
+    :func:`InstrumentRules.transfer_fee_rate_on`），既有调用方不需要改。
+    """
+
+    schedule: list[tuple] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.schedule = [(item[0], item[1], float(item[2])) for item in self.schedule]
+
+    def rate_at(self, d: date) -> float:
+        for s, e, r in self.schedule:
+            if s <= d <= e:
+                return r
+        raise RuleNotFound(
+            f"无匹配的过户费区间: {d}（区间表 {self.schedule[0][0]} 起；"
+            "更早的日期过户费按成交面额计，本模型不支持，需显式配置 rate）")
+
+
+@dataclass
 class Commission:
     rate: float
     min: float
@@ -166,6 +199,8 @@ class InstrumentRules:
     price_limit: PriceLimit
     lot_size: int
     sellable_after_days: int      # T+0 for QDII/黄金/债券/货币 ETF
+    #: 过户费区间表（空 = 用 transfer_fee_rate 常数）。见 TransferFeeSchedule。
+    transfer_fee_schedule: TransferFeeSchedule | None = None
     is_st: bool = False           # 涨跌停 5% 判定依据（PriceLimit.for_symbol）
     price_tick: float = 0.01      # 最小变动价位：股票 0.01 / 基金 0.001
     no_price_limit: bool = False  # IPO 首日 / 复牌首日 / ST 变更日
@@ -173,6 +208,17 @@ class InstrumentRules:
 
     def tax_rate(self, d: date, side=None) -> float:
         return self.tax.rate_at(d, side)
+
+    def transfer_fee_rate_on(self, d: date) -> float:
+        """当日过户费率。
+
+        有区间表时按区间取，**查不到就抛 RuleNotFound**（早于 2015-08-01 的
+        日期会走到这里，见 TransferFeeSchedule 的口径说明）；没有区间表则退化为
+        ``transfer_fee_rate`` 常数 —— 单测与 selfcheck 仍可直接构造常数规则。
+        """
+        if self.transfer_fee_schedule is not None:
+            return self.transfer_fee_schedule.rate_at(d)
+        return self.transfer_fee_rate
 
     def limit_ratio(self, is_st: bool | None = None) -> float | None:
         """当日涨跌幅比例；None = 不设涨跌停约束。
@@ -244,13 +290,33 @@ class RuleSet:
         pl_raw = base.get("price_limit", {}) or {}
         values = pl_raw.get("values") or {
             k: float(v) for k, v in pl_raw.items() if isinstance(v, (int, float))}
+
+        tf_raw = base.get("transfer_fee", {}) or {}
+        tf_sched = [
+            (date.fromisoformat(str(x["from"])), date.fromisoformat(str(x["to"])),
+             float(x["rate"]))
+            for x in (tf_raw.get("schedule") or [])
+        ]
+        has_flat = "rate" in tf_raw
+        if tf_sched and has_flat:
+            # 常数必须等于区间表最后一段 —— 否则「无日期上下文的估算路径」
+            # （paper 建仓资金预估）会与逐日口径悄悄分叉。
+            tail = max(tf_sched, key=lambda t: t[1])[2]
+            if abs(float(tf_raw["rate"]) - tail) > 1e-15:
+                raise ValueError(
+                    f"transfer_fee.rate={tf_raw['rate']} 与 schedule 末段 {tail} 不一致；"
+                    "常数应为现行（最新区间）费率")
+        tf_flat = float(tf_raw["rate"]) if has_flat else (
+            max(tf_sched, key=lambda t: t[1])[2] if tf_sched else 0.0)
+
         return InstrumentRules(
             symbol=Symbol(*symbol.split(".")),
             sec_type=sec_type,
             commission=Commission(rate=comm.get("rate", 0.0), min=comm.get("min", 0.0),
                                   per_order=comm.get("per_order", True)),
             tax=TaxSchedule(tax_sched),
-            transfer_fee_rate=base.get("transfer_fee", {}).get("rate", 0.0),
+            transfer_fee_rate=tf_flat,
+            transfer_fee_schedule=TransferFeeSchedule(tf_sched) if tf_sched else None,
             price_limit=PriceLimit(
                 mode=pl_raw.get("mode", "by_board"),
                 values={str(k): float(v) for k, v in values.items()},

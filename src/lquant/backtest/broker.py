@@ -162,12 +162,12 @@ class Broker:
         if order.side == Side.BUY and cash is not None:
             a = qty * price
             c = max(r.commission.min, a * r.commission.rate)
-            if a + c + a * r.transfer_fee_rate > cash:
+            if a + c + a * r.transfer_fee_rate_on(d) > cash:
                 if self.insufficient_cash == "reject":
                     order.status = OrderStatus.REJECTED
                     order.reason = "资金不足"
                     return None
-                qty = self._affordable_qty(r, qty, price, cash)
+                qty = self._affordable_qty(r, qty, price, cash, d)
                 if qty <= 0:
                     order.status = OrderStatus.REJECTED
                     order.reason = "数量不足一手或资金不足"
@@ -180,7 +180,7 @@ class Broker:
                     return None
 
         amount = qty * price
-        transfer = amount * r.transfer_fee_rate
+        transfer = amount * r.transfer_fee_rate_on(d)
         # 印花税按日期区间 + 方向取：2008-09-19 前双边征收，之后仅卖方
         tax = amount * r.tax_rate(d, order.side)
 
@@ -202,12 +202,12 @@ class Broker:
         return Fill(order.order_id, order.symbol, order.side, qty, price, fee, d)
 
     def _affordable_qty(self, r: InstrumentRules, qty: float,
-                        price: float, cash: float) -> float:
+                        price: float, cash: float, d: date) -> float:
         """资金不足时能买的最大数量（按含费口径反解，再按整手向下取整）。"""
         if price <= 0:
             return 0.0
         # 反解：q*price*(1 + comm_rate + transfer) + min_comm <= cash
-        unit = price * (1.0 + r.commission.rate + r.transfer_fee_rate)
+        unit = price * (1.0 + r.commission.rate + r.transfer_fee_rate_on(d))
         budget = cash - r.commission.min
         q = min(qty, max(budget, 0.0) / unit)
         if q >= qty - 1e-9:              # 反解已够，不需要截量

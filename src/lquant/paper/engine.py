@@ -183,6 +183,9 @@ class PaperBroker:
         amount = qty * price
         rules = self._ruleset.for_symbol(symbol, parse_symbol(symbol).sec_type,
                                          parse_symbol(symbol).board)
+        # 过户费这里用**现行常数**（transfer_fee_rate）而不是当日区间值：
+        # 本函数只做建仓资金预估，没有交易日上下文；真实扣费在 _fill 里按
+        # transfer_fee_rate_on(trade_date) 逐日取，历史区间不会在这里失真。
         fee = max(amount * rules.commission.rate, rules.commission.min) + \
             amount * rules.transfer_fee_rate
         slip = amount * self.cfg.slippage_pct
@@ -231,7 +234,7 @@ class PaperBroker:
             amount = o.qty * price
             # 印花税按方向取（2008-09-19 前双边都收）—— 与回测 Broker 同口径
             fee = max(amount * rules.commission.rate, rules.commission.min) + \
-                  amount * rules.transfer_fee_rate + \
+                  amount * rules.transfer_fee_rate_on(trade_date) + \
                   amount * rules.tax_rate(trade_date, "buy")
             self.cash -= amount + fee
             pos = self.positions.setdefault(o.symbol, PaperPosition(symbol=o.symbol))
@@ -249,7 +252,7 @@ class PaperBroker:
         else:
             amount = o.qty * price
             fee = max(amount * rules.commission.rate, rules.commission.min) + \
-                  amount * rules.transfer_fee_rate + \
+                  amount * rules.transfer_fee_rate_on(trade_date) + \
                   amount * rules.tax_rate(trade_date, "sell")
             self.cash += amount - fee
             pos = self.positions[o.symbol]
