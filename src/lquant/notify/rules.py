@@ -293,6 +293,15 @@ def evaluate(rule: AlertRule, ctx: dict) -> tuple[str, str]:
         missing_ic = False
         if rule.alert_type in ("price_above", "price_below"):
             px = float(ctx["last_price"])
+            # NaN/Inf 行情不是「价格没到阈值」，而是数据失效：此前
+            # `nan >= threshold` 与 `nan <= threshold` 恒为 False，退化行情被
+            # 静默判成「未命中」。这里选 EVAL_ERROR 而非像 ic_below 那样判命中，
+            # 因为阈值语义不同：ic_below 要抓的失效本身就是「IC 不可用」，
+            # 而 price/pct 的命中必须以真实价格为证据 —— 拿 NaN 触发会发出
+            # 「价格突破 X」的假告警。EVAL_ERROR 让 run_rules 显式报错可见，
+            # 既不静默也不误报。
+            if not math.isfinite(px):
+                raise ValueError(f"last_price 非有限值: {px}")
             hit = px >= threshold if rule.alert_type == "price_above" else px <= threshold
         elif rule.alert_type == "ic_below":
             raw = ctx["ic"]  # KeyError → EVAL_ERROR（缺字段不是「未触发」）
@@ -304,6 +313,8 @@ def evaluate(rule: AlertRule, ctx: dict) -> tuple[str, str]:
             hit = missing_ic or ic <= threshold
         else:  # pct_change_up / pct_change_down
             px, pre = float(ctx["last_price"]), float(ctx["pre_close"])
+            if not math.isfinite(px) or not math.isfinite(pre):
+                raise ValueError(f"last_price/pre_close 非有限值: {px}/{pre}")
             if pre <= 0:
                 raise ValueError(f"pre_close 非法: {pre}")
             pct = (px / pre - 1) * 100

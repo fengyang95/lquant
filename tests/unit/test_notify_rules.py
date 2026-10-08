@@ -3,6 +3,7 @@
 全部离线：sqlite 落 tmp_path，通知走 monkeypatch 替身。
 """
 
+import pytest
 from fastapi.testclient import TestClient
 
 from lquant.notify.rules import (
@@ -72,6 +73,37 @@ def test_evaluate_errors_are_loud_not_silent():
     status, _ = evaluate(rule, {"last_price": 9.0, "pre_close": 0})
     # pct 类型才吃 pre_close；price_above 只看 last_price → 9 < 10 正常未触发
     assert status == NOT_TRIGGERED
+
+
+_NON_FINITE = [float("nan"), float("inf"), float("-inf")]
+
+
+@pytest.mark.parametrize("bad", _NON_FINITE, ids=["nan", "inf", "-inf"])
+@pytest.mark.parametrize("alert_type", ["price_above", "price_below"])
+def test_evaluate_price_non_finite_is_loud(alert_type, bad):
+    """非有限的 last_price 是数据失效，不是「未命中」——必须 EVAL_ERROR。
+
+    修复前 ``nan >= t`` 与 ``nan <= t`` 恒为 False，行情退化时规则静默判未触发。
+    这里与 ic_below 统一为「绝不静默」；区别在于 ic_below 的失效本身就是它要抓
+    的告警，而价格类命中必须以真实价格为证据 —— 拿 NaN 判命中会发出「价格突破
+    X」的假告警，所以走 EVAL_ERROR 让 run_rules 显式报错。
+    """
+    rule = AlertRule(name="a", alert_type=alert_type, parameters={"threshold": 10.0})
+    status, detail = evaluate(rule, {"last_price": bad})
+    assert status == EVAL_ERROR and "非有限" in detail
+
+
+@pytest.mark.parametrize("bad", _NON_FINITE, ids=["nan", "inf", "-inf"])
+@pytest.mark.parametrize("alert_type", ["pct_change_up", "pct_change_down"])
+def test_evaluate_pct_non_finite_is_loud(alert_type, bad):
+    """pct 涨跌同理：last_price 或 pre_close 任一非有限都必须 EVAL_ERROR。"""
+    rule = AlertRule(name="a", alert_type=alert_type, parameters={"threshold": 5.0})
+    for ctx in (
+        {"last_price": bad, "pre_close": 10.0},
+        {"last_price": 10.5, "pre_close": bad},
+    ):
+        status, detail = evaluate(rule, ctx)
+        assert status == EVAL_ERROR and "非有限" in detail, (ctx, status, detail)
 
 
 def test_cooldown_persists_and_blocks(tmp_path):
