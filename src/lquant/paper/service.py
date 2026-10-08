@@ -186,9 +186,10 @@ def _is_trading_day(d) -> bool:
 def day_close(name: str, d=None) -> dict:
     """日终：解冻 T+N → 官方日线对账重算 official 净值。
 
-    对账 verdict 非 ok 时顺手发通知（warning/critical 是「官方价与盯市价
-    背离」的信号，等第二天看板才发现就晚了）。通知旁路永不抛异常、
-    未配置 LQ_NOTIFY_CHANNELS 时零开销 —— 详见 lquant/notify。
+    对账 verdict 非 ok、**或本次对账没有可信基准**（缺 intraday 快照 /
+    全部持仓取不到官方收盘价 —— 见 ``_notify_reconcile``）时顺手发通知：
+    等第二天看板才发现就晚了。通知旁路永不抛异常、未配置
+    LQ_NOTIFY_CHANNELS 时零开销 —— 详见 lquant/notify。
     """
     d = d or today_cn()
     with store.account_lock(name):
@@ -204,21 +205,60 @@ def day_close(name: str, d=None) -> dict:
 
 
 def _notify_reconcile(name: str, d, rep: dict) -> None:
-    """对账告警旁路：verdict=critical/warning 才发，ok 静默（别把群里灌满噪音）。
+    """对账告警旁路：对账结论**不可信或背离**时发，正常 ok 静默。
+
+    只认 verdict 会漏掉两类最该叫醒人的场景 —— verdict 缺省即 "ok"，而
+    reconcile 仅在 ``intraday is not None and official_nav`` 时才计算偏差：
+
+    (a) 当天没有 intraday 快照（tick 没跑/失败、非交易日手动 ``lq paper close``）
+        → 没有基准可对，rel_dev/detail 全空，旧实现判 ok 静音；
+    (b) 全部持仓都取不到官方收盘价（行情源整体没落库 —— 正是对账文案里说的
+        「行情源延迟」的最严重形态）→ 官方 NAV 回退 ``last_price``，与盘中
+        盯市价**同源**，偏差恒 ≈0 → 旧实现判 ok 静音。
+
+    这两类信号在 service 侧显式升格为告警（warning，静默时段豁免）。
+    **部分** stale（个别停牌）属常态，单独不刷屏，只在已经要告警时附注。
 
     必须 ``category="alert"``：这是告警不是报告 —— 走 alert 路由通道，
-    且 severity 达到 warning/critical 才能在深夜静默时段豁免（对账背离
-    恰恰是最该叫醒人的信号）。漏传会退化成 report/info 被降噪压掉。
+    且 severity 达到 warning 才能在深夜静默时段豁免。漏传会退化成
+    report/info 被降噪压掉。通知旁路永不抛异常。
     """
     verdict = rep.get("verdict", "ok")
-    if verdict == "ok":
-        return
+    stale = rep.get("stale_symbols") or []
+    n_held = rep.get("n_held")
+    # 全部持仓 stale：官方价与盯市价同源，本次对账没有独立性
+    all_stale = bool(stale) and (n_held is None or len(stale) >= n_held)
+
+    reasons: list[str] = []
+    if verdict == "critical":
+        reasons.append("官方净值与盘中盯市价严重背离")
+    elif verdict == "warning":
+        reasons.append("官方净值与盘中盯市价偏离偏高")
+    if rep.get("nav_intraday") is None:
+        reasons.append("无盘中基准（当日缺 intraday 快照），本次对账无法给出偏差")
+    if all_stale:
+        reasons.append(
+            f"全部 {len(stale)} 只持仓都取不到官方收盘价（行情源未落库）："
+            "官方 NAV 退回盯市价，本次对账无独立性"
+        )
+    if not reasons:
+        return  # 正常 ok：静默，别把群里灌满噪音
+
+    note = ""
+    if stale and not all_stale:
+        note = f"\n（另有 {len(stale)} 只持仓缺官方收盘价，沿用盯市价）"
+    # verdict 字典契约保持 reconcile 原值（无基准时仍为 ok），告警文案里
+    # 如实显示 unverified，避免「verdict=ok」与「无法对账」自相矛盾
+    shown = "unverified" if verdict == "ok" else verdict
     try:
         from lquant.notify import notify
 
         notify(
             f"模拟盘对账告警 · {name}",
-            f"trade_date={d} verdict={verdict}\n{rep.get('detail', '')}",
+            f"trade_date={d} verdict={shown}\n"
+            + "\n".join(f"· {r}" for r in reasons)
+            + (f"\n{rep.get('detail')}" if rep.get("detail") else "")
+            + note,
             category="alert",
             severity="critical" if verdict == "critical" else "warning",
         )

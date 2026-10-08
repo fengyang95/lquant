@@ -49,7 +49,12 @@ def test_digest_sends_report_category_with_all_blocks():
     res = run_watchlist_digest(
         symbols=["600519.SH", "000001.SZ"], analyze_fn=lambda s, a: make_report(s), notify_fn=spy
     )
-    assert res == {"sent": True, "ok": ["600519.SH", "000001.SZ"], "failed": [], "skipped": None}
+    assert res["sent"] is True
+    assert res["ok"] == ["600519.SH", "000001.SZ"]
+    assert res["failed"] == [] and res["skipped"] is None
+    # 两条一块 → 单页；全部送达 → sent_pages == pages
+    assert res["pages"] == 1 and res["sent_pages"] == 1
+    assert res["truncated"] is False and res["omitted_symbols"] == []
     assert len(spy.calls) == 1
     call = spy.calls[0]
     assert call["category"] == "report"  # 日报走 report 通道
@@ -123,7 +128,9 @@ def test_watchlist_symbols_missing_table_is_empty_not_crash(tmp_path, monkeypatc
     # 端到端：默认读自选清单的日报退化成「清单为空」，而不是异常
     spy = NotifySpy()
     res = run_watchlist_digest(analyze_fn=lambda s, a: make_report(s), notify_fn=spy)
-    assert res == {"sent": False, "ok": [], "failed": [], "skipped": "清单为空"}
+    assert res["sent"] is False and res["ok"] == [] and res["failed"] == []
+    assert res["skipped"] == "清单为空"
+    assert res["pages"] == 0 and res["truncated"] is False
     assert spy.calls == []
     get_settings.cache_clear()
 
@@ -161,3 +168,127 @@ def test_digest_sent_true_when_delivered():
         symbols=["600519.SH"], analyze_fn=lambda s, a: make_report(s), notify_fn=spy
     )
     assert res["sent"] is True
+
+
+# ---------- 分页 / 截断披露（回归 HIGH：通知层静默截断） ----------
+
+
+class CapturingChannel:
+    """真实 notify 链上的假通道：记录实收正文，验证截断行为。"""
+
+    name = "webhook"
+
+    def __init__(self):
+        self.texts: list[str] = []
+
+    def send(self, title: str, text: str):
+        from lquant.notify.channels import SendResult
+
+        self.texts.append(text)
+        return SendResult(self.name, ok=True, sent_parts=1)
+
+
+def _clear_notify_env(monkeypatch):
+    for k in (
+        "LQ_NOTIFY_TEXT_LIMIT",
+        "LQ_NOTIFY_REPORT_CHANNELS",
+        "LQ_NOTIFY_MIN_SEVERITY",
+        "LQ_NOTIFY_QUIET_HOURS",
+        "LQ_NOTIFY_DEDUP_TTL_SECONDS",
+        "LQ_NOTIFY_COOLDOWN_SECONDS",
+    ):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_digest_failed_disclosure_survives_real_notify_truncation(monkeypatch):
+    """60 只标的（正文远超 3500 字）时失败披露仍必须抵达渠道。
+
+    旧实现把 N 只拼成一条无上限正文，notify() 在任何分片之前先
+    ``text[:limit-1] + "…"``，拼在最尾部的「分析失败」是第一个被砍的内容，
+    而 sent 仍按送达报 True。这里走**真实 notify**（只打桩通道）复现。
+    """
+    import lquant.notify.service as notify_service
+
+    _clear_notify_env(monkeypatch)
+    cap = CapturingChannel()
+    monkeypatch.setattr(notify_service, "build_chain", lambda: [cap])
+
+    syms = [f"6005{i:02d}.SH" for i in range(59)] + ["BAD.SH"]
+
+    def analyze(s, a):
+        if s == "BAD.SH":
+            raise RuntimeError("湖内无数据")
+        return make_report(s)
+
+    res = run_watchlist_digest(symbols=syms, analyze_fn=analyze)
+    assert res["sent"] is True
+    assert res["pages"] > 1 and res["sent_pages"] == res["pages"]
+    limit = dg._notify_text_limit()
+    assert all(len(t) <= limit for t in cap.texts)  # 每页都不触发 notify 截断
+    received = "".join(cap.texts)
+    assert "分析失败" in received and "BAD.SH" in received  # 披露没被吃掉
+    assert received.count("【") == len(res["ok"]) == 59  # 成功块一个不少
+
+
+def test_digest_paginates_within_configured_limit(monkeypatch):
+    """LQ_NOTIFY_TEXT_LIMIT 收紧到 400：按标的分页，页数/送达数如实回报。"""
+    _clear_notify_env(monkeypatch)
+    monkeypatch.setenv("LQ_NOTIFY_TEXT_LIMIT", "400")
+    spy = NotifySpy()
+    syms = [f"{i:06d}.SH" for i in range(20)]
+    res = run_watchlist_digest(symbols=syms, analyze_fn=lambda s, a: make_report(s), notify_fn=spy)
+    assert res["sent"] is True
+    assert res["pages"] == len(spy.calls) > 1
+    assert res["sent_pages"] == res["pages"]
+    assert all(len(c["text"]) <= 400 for c in spy.calls)
+    assert set(res["ok"]) == set(syms)
+
+
+def test_digest_partial_page_delivery_reports_sent_false(monkeypatch):
+    """部分页送达：sent 如实 False，并用 sent_pages 给出部分送达明细。"""
+    _clear_notify_env(monkeypatch)
+    monkeypatch.setenv("LQ_NOTIFY_TEXT_LIMIT", "400")
+    from types import SimpleNamespace
+
+    calls: list[str] = []
+
+    def flaky(title, text, *, category="report", **kw):
+        calls.append(text)
+        return [SimpleNamespace(ok=len(calls) != 2, skipped=False, channel="webhook")]
+
+    res = run_watchlist_digest(
+        symbols=[f"{i:06d}.SH" for i in range(20)],
+        analyze_fn=lambda s, a: make_report(s),
+        notify_fn=flaky,
+    )
+    assert res["pages"] > 2
+    assert res["sent_pages"] == res["pages"] - 1
+    assert res["sent"] is False  # 「部分送达」不冒充「全部送达」
+
+
+def test_digest_oversized_single_block_flags_truncation(monkeypatch):
+    """单只报告就超一页：显式 truncated + 正文头披露，绝不静默。"""
+    _clear_notify_env(monkeypatch)
+    monkeypatch.setenv("LQ_NOTIFY_TEXT_LIMIT", "120")
+    spy = NotifySpy()
+    res = run_watchlist_digest(
+        symbols=["600519.SH"], analyze_fn=lambda s, a: make_report(s), notify_fn=spy
+    )
+    assert res["truncated"] is True
+    assert res["omitted_symbols"] == ["600519.SH"]
+    assert "超长被截断" in spy.calls[0]["text"]
+    assert len(spy.calls[0]["text"]) <= 120
+
+
+def test_digest_limit_zero_means_notify_truncation_disabled(monkeypatch):
+    """LQ_NOTIFY_TEXT_LIMIT=0 在 notify 层是「关闭兜底截断」，
+    日报不能把它当成「上限 0」而一条都不发（回归边界）。"""
+    _clear_notify_env(monkeypatch)
+    monkeypatch.setenv("LQ_NOTIFY_TEXT_LIMIT", "0")
+    spy = NotifySpy()
+    res = run_watchlist_digest(
+        symbols=["600519.SH"], analyze_fn=lambda s, a: make_report(s), notify_fn=spy
+    )
+    assert res["sent"] is True and res["pages"] == 1
+    assert res["truncated"] is False
+    assert "【600519.SH】" in spy.calls[0]["text"]

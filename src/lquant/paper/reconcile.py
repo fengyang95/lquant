@@ -34,6 +34,7 @@ def reconcile(name: str, d: date | str) -> dict:
                           daily["close"].to_list(), strict=True)) if len(daily) else {}
 
     stale: list[str] = []
+    n_covered = 0
     official_nav = broker.cash
     for p in broker.positions.values():
         if p.qty <= 0:
@@ -42,6 +43,8 @@ def reconcile(name: str, d: date | str) -> dict:
         if px is None or px <= 0:
             stale.append(p.symbol)          # 停牌/未覆盖：沿用盯市价
             px = p.last_price or p.avg_cost
+        else:
+            n_covered += 1
         official_nav += p.qty * float(px)
 
     intraday = _intraday_nav(name, d)
@@ -52,7 +55,10 @@ def reconcile(name: str, d: date | str) -> dict:
         "nav_intraday": round(intraday, 2) if intraday is not None else None,
         "rel_dev": None,
         "stale_symbols": stale,
-        "n_uncovered": max(len(held) - len(closes), 0),
+        "n_held": len(held),
+        # n_uncovered 用「拿到正收盘价的持仓数」反推：close=0 也会被
+        # {symbol: close} 装进来，直接 len(held)-len(closes) 会低估未覆盖数
+        "n_uncovered": len(held) - n_covered,
         "verdict": "ok",
         "detail": "",
     }

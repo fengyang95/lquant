@@ -68,6 +68,78 @@ def test_missing_proposals_array_raises():
         extract_proposals("text", llm_fn=fake_llm(None, raw=raw))
 
 
+# ---------- 脏 JSON / 结构不可用条目：显式可见，不静默 ----------
+
+
+def test_parse_llm_json_strips_code_fence():
+    """LLM 常把 JSON 包在 ```json 围栏里：这是可解析的，不该报「不是合法 JSON」。"""
+    from lquant.research.report_extract import _parse_llm_json
+
+    assert _parse_llm_json('```json\n{"proposals": [{"expr": "x"}]}\n```') == [{"expr": "x"}]
+
+
+def test_parse_llm_json_extracts_balanced_object_from_prose():
+    """围栏外带前后话术：退化到第一个括号配平的 {...} 片段。"""
+    from lquant.research.report_extract import _parse_llm_json
+
+    raw = '好的，结果如下：{"proposals": [{"expr": "y"}]} 以上。'
+    assert _parse_llm_json(raw) == [{"expr": "y"}]
+
+
+@pytest.mark.parametrize("raw", [None, 123, ["a"], {"proposals": []}])
+def test_parse_llm_json_non_string_raises_value_error(raw):
+    """content 为 None/数字/数组时不能再裸抛 TypeError（逃出 CLI 只剩不可读信息）。"""
+    from lquant.research.report_extract import _parse_llm_json
+
+    with pytest.raises(ValueError):
+        _parse_llm_json(raw)
+
+
+def test_malformed_entry_lands_in_rejected_with_reason():
+    """LLM 用 expression 等键名：条目不再消失，带结构原因进 rejected。"""
+    res = extract_proposals(
+        "研报",
+        llm_fn=fake_llm(
+            [{"expr": GOOD, "note": "ok"}, {"expression": "Rank($close)", "note": "键名不符"}]
+        ),
+    )
+    assert [a["expr"] for a in res["accepted"]] == [GOOD]
+    assert len(res["rejected"]) == 1
+    assert "缺少可用的 expr" in res["rejected"][0]["reason"]
+    assert "expression" in res["rejected"][0]["reason"]  # 原键名/值可见，便于排障
+
+
+def test_non_dict_entry_lands_in_rejected():
+    """非对象条目（LLM 返回字符串数组）也不能被列表推导静默吃掉。"""
+    res = extract_proposals("研报", llm_fn=fake_llm([{"expr": GOOD}, "Rank($close)"]))
+    assert [a["expr"] for a in res["accepted"]] == [GOOD]
+    assert len(res["rejected"]) == 1
+    assert "不是 JSON 对象" in res["rejected"][0]["reason"]
+
+
+def test_all_malformed_raises_real_reason_not_g0():
+    """全部结构不可用：说清是 LLM 输出坏了，绝不冒充「G0 淘汰」。"""
+    with pytest.raises(ValueError, match="全部无法解析"):
+        extract_proposals("研报", llm_fn=fake_llm([{"expression": GOOD}]))
+
+
+def test_empty_proposals_array_raises_distinct_reason():
+    """proposals 合法但为空：也不能让 CLI 报成「G0 淘汰了 0 条」。"""
+    with pytest.raises(ValueError, match="为空数组"):
+        extract_proposals("研报", llm_fn=fake_llm([]))
+
+
+def test_cli_propose_reports_malformed_loudly(monkeypatch):
+    """CLI 出口：结构全坏时报「提取失败: ...全部无法解析」，不是「没有通过 G0」。"""
+    import lquant.research.report_extract as m
+
+    monkeypatch.setattr(m, "_env_llm", lambda: fake_llm([{"expression": GOOD}]))
+    r = CliRunner().invoke(propose, [], input="研报文本：动量效应")
+    assert r.exit_code != 0
+    assert "全部无法解析" in r.output
+    assert "没有通过 G0" not in r.output
+
+
 def test_empty_report_raises():
     with pytest.raises(ValueError, match="研报文本为空"):
         extract_proposals("   ", llm_fn=fake_llm([]))
