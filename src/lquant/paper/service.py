@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from datetime import date
 
 from lquant.core.types import today_cn
 from lquant.paper import store
@@ -190,8 +191,29 @@ def day_close(name: str, d=None) -> dict:
     全部持仓取不到官方收盘价 —— 见 ``_notify_reconcile``）时顺手发通知：
     等第二天看板才发现就晚了。通知旁路永不抛异常、未配置
     LQ_NOTIFY_CHANNELS 时零开销 —— 详见 lquant/notify。
+
+    非交易日是**显式 skipped**：不落 official 净值、也不解冻 T+N。tick 早已
+    用同一 ``_is_trading_day`` 挡住 intraday 落库，这里此前漏了 —— 周末/
+    节假日手动 ``lq paper close`` 或 ``POST /paper/close`` 重试会写进一个
+    日历上不存在的 official 点，组合日报按 ``trade_date`` 取最后一根当
+    「当前」，``prev_nav``/``day_pnl``/``peak``/回撤就全部以幽灵点为基准。
     """
     d = d or today_cn()
+    # 先归一成 date：字符串日期既喂给 _is_trading_day，也决定了后续落库的
+    # trade_date。放在 load_broker 之前是故意的 —— 非法日期不再先改动
+    # broker、再在 reconcile 里才抛错（避免半截副作用）。
+    d = date.fromisoformat(d) if isinstance(d, str) else d
+    if not _is_trading_day(d):
+        # 账户不存在仍要显式报错：跳过不等于「这个账户没问题」，不能吞掉 404。
+        store.get_account(name)
+        return {
+            "account": name,
+            "trade_date": str(d),
+            "skipped": True,
+            "skip_reason": "non_trading_day",
+            "detail": f"{d} 非交易日：跳过 T+N 解冻与官方对账，不落 official 净值",
+            "reconcile": None,
+        }
     with store.account_lock(name):
         broker = store.load_broker(name)
         broker.on_day_close(d)
@@ -210,8 +232,8 @@ def _notify_reconcile(name: str, d, rep: dict) -> None:
     只认 verdict 会漏掉两类最该叫醒人的场景 —— verdict 缺省即 "ok"，而
     reconcile 仅在 ``intraday is not None and official_nav`` 时才计算偏差：
 
-    (a) 当天没有 intraday 快照（tick 没跑/失败、非交易日手动 ``lq paper close``）
-        → 没有基准可对，rel_dev/detail 全空，旧实现判 ok 静音；
+    (a) 当天没有 intraday 快照（tick 没跑/失败）→ 没有基准可对，
+        rel_dev/detail 全空，旧实现判 ok 静音；
     (b) 全部持仓都取不到官方收盘价（行情源整体没落库 —— 正是对账文案里说的
         「行情源延迟」的最严重形态）→ 官方 NAV 回退 ``last_price``，与盘中
         盯市价**同源**，偏差恒 ≈0 → 旧实现判 ok 静音。
@@ -222,7 +244,13 @@ def _notify_reconcile(name: str, d, rep: dict) -> None:
     必须 ``category="alert"``：这是告警不是报告 —— 走 alert 路由通道，
     且 severity 达到 warning 才能在深夜静默时段豁免。漏传会退化成
     report/info 被降噪压掉。通知旁路永不抛异常。
+
+    幂等：同账户 + 同日 + 同 verdict 只发一次（见 ``_claim_reconcile_alert``）。
+    ``lq paper close`` 重跑、``POST /paper/close`` 重试都会二次进入本函数，
+    而 notify 自身的 dedup/cooldown 缺省是关的，挡不住重复告警。
     """
+    if rep.get("skipped"):
+        return  # 非交易日：本次根本没有对账，发告警只会制造噪音
     verdict = rep.get("verdict", "ok")
     stale = rep.get("stale_symbols") or []
     n_held = rep.get("n_held")
@@ -244,21 +272,45 @@ def _notify_reconcile(name: str, d, rep: dict) -> None:
     if not reasons:
         return  # 正常 ok：静默，别把群里灌满噪音
 
+    # 先认领再发：并发/重复 close 只有一个能通过。
+    try:
+        claimed = _claim_reconcile_alert(name, d, verdict)
+    except Exception as e:  # noqa: BLE001 - 幂等状态不可用不能退化成漏告警
+        from lquant.core.logging import get_logger
+
+        get_logger(__name__).warning(f"paper reconcile dedup state unavailable: {e}")
+        claimed = True  # 宁可重发，不可漏发
+    if not claimed:
+        return
+
     note = ""
     if stale and not all_stale:
         note = f"\n（另有 {len(stale)} 只持仓缺官方收盘价，沿用盯市价）"
     # verdict 字典契约保持 reconcile 原值（无基准时仍为 ok），告警文案里
     # 如实显示 unverified，避免「verdict=ok」与「无法对账」自相矛盾
     shown = "unverified" if verdict == "ok" else verdict
+    # 证据行：告警的价值全在这几个数上。旧正文只有 trade_date+verdict+detail，
+    # 收到告警的人看不到两个净值/偏差/缺口数量，只能回看板上翻 —— 对「立刻
+    # 介入」毫无帮助。key=value 形式便于 IM 里目视，也便于日志里 grep。
+    evidence = (
+        f"nav_official={rep.get('nav_official')} "
+        f"nav_intraday={rep.get('nav_intraday')} "
+        f"rel_dev={rep.get('rel_dev')}\n"
+        f"stale={len(stale)} n_uncovered={rep.get('n_uncovered')} n_held={n_held}"
+    )
+    text = (
+        f"trade_date={d} verdict={shown}\n"
+        + "\n".join(f"· {r}" for r in reasons)
+        + f"\n{evidence}"
+        + (f"\n{rep.get('detail')}" if rep.get("detail") else "")
+        + note
+    )
     try:
         from lquant.notify import notify
 
-        notify(
+        results = notify(
             f"模拟盘对账告警 · {name}",
-            f"trade_date={d} verdict={shown}\n"
-            + "\n".join(f"· {r}" for r in reasons)
-            + (f"\n{rep.get('detail')}" if rep.get("detail") else "")
-            + note,
+            text,
             category="alert",
             severity="critical" if verdict == "critical" else "warning",
         )
@@ -266,6 +318,104 @@ def _notify_reconcile(name: str, d, rep: dict) -> None:
         from lquant.core.logging import get_logger
 
         get_logger(__name__).warning(f"paper reconcile notify failed: {e}")
+        _release_reconcile_alert_safely(name, d, verdict)
+        return
+    # 一片都没送出去（通道未配置/全挂）不登记为已完成，下一次 close 仍可重试；
+    # 与 notify 内部「全部失败撤销 dedup 登记」同一语义。
+    if not _alert_delivered(results):
+        _release_reconcile_alert_safely(name, d, verdict)
+
+
+# 对账告警幂等状态。挂在 paper 库（LQ_PAPER_DB）而不是 notify/rules.db：
+# 告警幂等是账户维度状态，跟 paper_nav 同生共死；测试也用同一个 LQ_PAPER_DB
+# 隔离，不必再引第二套路径 + 第二套清理。
+_RECONCILE_ALERT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS paper_reconcile_alert(
+  account TEXT NOT NULL,
+  trade_date TEXT NOT NULL,
+  verdict TEXT NOT NULL,
+  sent_at TEXT NOT NULL,
+  PRIMARY KEY (account, trade_date, verdict)
+);
+"""
+
+
+def _reconcile_alert_conn():
+    import sqlite3
+
+    con = sqlite3.connect(store.db_path(), timeout=30)
+    con.executescript(_RECONCILE_ALERT_SCHEMA)
+    return con
+
+
+def reset_reconcile_alert_state() -> None:
+    """清空对账告警幂等表。
+
+    测试隔离入口（对齐 ``lquant.notify.service.reset_suppress_state``）：
+    幂等状态按 ``(account, trade_date, verdict)`` 持久化，若多个用例共用
+    同一个 ``LQ_PAPER_DB``，前一个用例登记过的键会把后一个用例的告警压掉
+    —— 用例就会变成「整文件跑 FAIL、单跑 PASS」的顺序依赖。生产不需要
+    调用：跨进程保留正是幂等的目的。
+    """
+    con = _reconcile_alert_conn()
+    try:
+        con.execute("DELETE FROM paper_reconcile_alert")
+        con.commit()
+    finally:
+        con.close()
+
+
+def _claim_reconcile_alert(name: str, d, verdict: str) -> bool:
+    """原子认领 (account, trade_date, verdict)。True = 本次由我发送。
+
+    主键冲突即幂等锁：并发的两个 close（server 线程池重试）只有一个
+    ``rowcount == 1``，另一个直接跳过，不会双发。
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    con = _reconcile_alert_conn()
+    try:
+        cur = con.execute(
+            "INSERT OR IGNORE INTO paper_reconcile_alert"
+            "(account,trade_date,verdict,sent_at) VALUES (?,?,?,?)",
+            [name, str(d), verdict, datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()],
+        )
+        con.commit()
+        return cur.rowcount == 1
+    finally:
+        con.close()
+
+
+def _release_reconcile_alert(name: str, d, verdict: str) -> None:
+    con = _reconcile_alert_conn()
+    try:
+        con.execute(
+            "DELETE FROM paper_reconcile_alert WHERE account=? AND trade_date=? AND verdict=?",
+            [name, str(d), verdict],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _release_reconcile_alert_safely(name: str, d, verdict: str) -> None:
+    try:
+        _release_reconcile_alert(name, d, verdict)
+    except Exception as e:  # noqa: BLE001 - 撤销失败最坏是少一次重试，不能掀翻主链路
+        from lquant.core.logging import get_logger
+
+        get_logger(__name__).warning(f"paper reconcile dedup release failed: {e}")
+
+
+def _alert_delivered(results) -> bool:
+    """notify 返回值 → 是否至少有一个通道真正送出。"""
+    if results is None:
+        return True  # 注入的 notify_fn 无返回值：按已送出处理，避免重复刷屏
+    try:
+        return any(bool(getattr(r, "ok", False)) for r in results)
+    except TypeError:  # 非可迭代的测试替身：无法判定，宁可当已送出
+        return True
 
 
 def status(name: str) -> dict:

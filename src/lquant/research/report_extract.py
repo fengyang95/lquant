@@ -22,6 +22,8 @@ HTTP 错误消息只带状态码，不带请求头。
   - ``LQ_LLM_API_BASE`` 缺省 ``https://api.openai.com/v1``（OpenAI 兼容，
     DeepSeek/Qwen/GLM 等换 base 即可）
   - ``LQ_LLM_MODEL``    缺省 ``gpt-4o-mini``
+  - ``LQ_LLM_MAX_INPUT_CHARS`` 单次研报文本字符上限，缺省
+    :data:`DEFAULT_MAX_INPUT_CHARS`；超限显式报错（见 ``extract_proposals``）
 """
 
 from __future__ import annotations
@@ -35,6 +37,11 @@ import urllib.request
 DEFAULT_API_BASE = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_TIMEOUT = 120.0
+# 单次送进 LLM 的研报文本字符上限。取 3 万字：A 股研报正文多数在 1 万字
+# 以内，留足余量；再长基本是整本 PDF/重复段落，继续塞只会让上下文溢出拿
+# HTTP 400（且 400 不带「是文本太长」的信息，排障方向容易被带偏）。
+# 超限行为见 extract_proposals：显式报错，不静默截断。
+DEFAULT_MAX_INPUT_CHARS = 30_000
 
 __all__ = ["extract_proposals", "write_proposals", "capability_prompt"]
 
@@ -102,6 +109,20 @@ def _env_llm(timeout: float = DEFAULT_TIMEOUT):
         return data["choices"][0]["message"]["content"]
 
     return fn
+
+
+def _max_input_chars() -> int:
+    """研报文本字符上限。env 覆盖；非法值显式报错（不静默退回默认）。"""
+    raw = os.getenv("LQ_LLM_MAX_INPUT_CHARS")
+    if raw is None or not raw.strip():
+        return DEFAULT_MAX_INPUT_CHARS
+    try:
+        n = int(raw)
+    except ValueError as e:
+        raise ValueError(f"LQ_LLM_MAX_INPUT_CHARS 须为整数，收到: {raw!r}") from e
+    if n <= 0:
+        raise ValueError(f"LQ_LLM_MAX_INPUT_CHARS 须为正整数，收到: {n}")
+    return n
 
 
 def _raw_snippet(raw, n: int = 200) -> str:
@@ -214,7 +235,12 @@ def _normalize_item(it) -> tuple[dict, str | None]:
 
 
 def extract_proposals(
-    text: str, *, llm_fn=None, max_proposals: int = 10, allowed_fields=None
+    text: str,
+    *,
+    llm_fn=None,
+    max_proposals: int = 10,
+    allowed_fields=None,
+    max_input_chars: int | None = None,
 ) -> dict:
     """研报文本 → 提案。返回 ``{"accepted": [...], "rejected": [...]}``。
 
@@ -224,9 +250,11 @@ def extract_proposals(
     淘汰明细永远可见 —— 不再有被列表推导静默吃掉的条目。
 
     ``llm_fn(system, user) -> str`` 可注入（测试用 FakeLLM；缺省走 env 配置）。
+    ``max_input_chars`` 缺省取 ``LQ_LLM_MAX_INPUT_CHARS`` / 内置默认。
 
     Raises:
-        ValueError: 研报文本为空；LLM 返回不是字符串/不是合法 JSON/缺
+        ValueError: 研报文本为空；研报文本超长（> ``max_input_chars``）；
+            LLM 返回不是字符串/不是合法 JSON/缺
             ``proposals`` 数组；``proposals`` 为空数组；或**全部条目结构
             不可用**（一条都没进过 G0 —— 这时报「G0 淘汰」会误导排障方向，
             所以直接抛错并带上真实原因与原文片段）。
@@ -236,6 +264,19 @@ def extract_proposals(
 
     if not text.strip():
         raise ValueError("研报文本为空，无从提取")
+    # 长度门禁：超长文本送进 LLM 只会换回一个 HTTP 400（上下文超限），而
+    # 400 本身不带「是输入太长」的信息，排障会被带偏。这里显式报错并给出
+    # 可操作的出口（调大 env / 拆分研报）—— 截断是另一种选择，但那会让
+    # 提案悄悄只覆盖研报前半段，研究结论可能因此失真，风险高于直接拒绝。
+    cap = _max_input_chars() if max_input_chars is None else int(max_input_chars)
+    if cap <= 0:
+        raise ValueError(f"max_input_chars 须为正整数，收到: {cap}")
+    if len(text) > cap:
+        raise ValueError(
+            f"研报文本超长：{len(text)} 字 > 上限 {cap} 字；"
+            "直接送 LLM 会因上下文超限拿到 HTTP 400。"
+            "请拆分/精简研报，或调大 LQ_LLM_MAX_INPUT_CHARS 后重试"
+        )
     llm_fn = llm_fn or _env_llm()
     system = _SYSTEM_PROMPT.format(max=max_proposals)
     user = f"{capability_prompt()}\n\n--- 研报文本 ---\n{text}"

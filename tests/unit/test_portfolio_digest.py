@@ -20,6 +20,18 @@ def paper_env(tmp_path, monkeypatch):
     yield tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _isolate_paper_db(tmp_path, monkeypatch):
+    """对账告警的幂等状态挂在 paper 库（LQ_PAPER_DB）：既换独立的库文件，
+    又显式清一次幂等表 —— 即使某些用例共用库，也不会「整文件跑 FAIL、
+    单跑 PASS」。用例顺序因此无关。"""
+    monkeypatch.setenv("LQ_PAPER_DB", str(tmp_path / "paper_autouse.db"))
+    from lquant.paper.service import reset_reconcile_alert_state
+
+    reset_reconcile_alert_state()
+    yield
+
+
 def _seed_account(name: str = ACCOUNT):
     """账户 + 两只持仓 + 三天官方净值（峰值在第 2 天，回撤/负盈亏可测）。"""
     from lquant.paper import store as paper_store
@@ -282,6 +294,112 @@ def test_reconcile_notify_partial_stale_alone_is_not_noise(monkeypatch):
         _reconcile_report(stale_symbols=["600519"], n_uncovered=1, n_held=3),
     )
     assert fired == []
+
+
+def test_reconcile_notify_body_carries_nav_evidence(monkeypatch):
+    """告警正文必须带官方/盘中净值、偏差与 stale/未覆盖数量。
+
+    回归：旧正文只有 trade_date+verdict+detail，收到告警的人看不到这两个
+    净值数字，得回看板上翻才能判断要不要立刻介入。
+    """
+    from lquant.paper.service import _notify_reconcile
+
+    fired = _spy_reconcile_notify(monkeypatch)
+    _notify_reconcile(
+        "demo",
+        "2026-09-17",
+        _reconcile_report(
+            verdict="critical",
+            nav_official=100000.0,
+            nav_intraday=94877.0,
+            rel_dev=0.05123,
+            stale_symbols=["600519"],
+            n_uncovered=1,
+            n_held=3,
+            detail="偏差 5.123% 严重超阈",
+        ),
+    )
+    text = fired[0]["text"]
+    assert "nav_official=100000.0" in text
+    assert "nav_intraday=94877.0" in text
+    assert "rel_dev=0.05123" in text
+    assert "stale=1" in text and "n_uncovered=1" in text
+
+
+def test_reconcile_notify_same_day_verdict_only_once(monkeypatch):
+    """同账户同日同 verdict 只发一次：``lq paper close`` 重跑不再重复告警。"""
+    from lquant.paper.service import _notify_reconcile
+
+    fired = _spy_reconcile_notify(monkeypatch)
+    rep = _reconcile_report(verdict="critical", nav_intraday=94877.0, rel_dev=0.05123)
+    _notify_reconcile("demo", "2026-09-17", rep)
+    _notify_reconcile("demo", "2026-09-17", rep)
+    assert len(fired) == 1
+
+
+def test_reconcile_notify_distinct_verdict_or_date_not_suppressed(monkeypatch):
+    """幂等键含 verdict 与 trade_date：不同 verdict / 不同日都是新告警，都要发。"""
+    from lquant.paper.service import _notify_reconcile
+
+    fired = _spy_reconcile_notify(monkeypatch)
+    _notify_reconcile(
+        "demo", "2026-09-17", _reconcile_report(verdict="warning", rel_dev=0.02,
+                                                 nav_intraday=98000.0)
+    )
+    _notify_reconcile(
+        "demo", "2026-09-17", _reconcile_report(verdict="critical", rel_dev=0.05123,
+                                                 nav_intraday=94877.0)
+    )
+    # 同账户同 verdict 但换一天：也应视为新告警
+    _notify_reconcile(
+        "demo", "2026-09-18", _reconcile_report(verdict="critical", rel_dev=0.05123,
+                                                 nav_intraday=94877.0)
+    )
+    assert len(fired) == 3
+
+
+def test_reconcile_notify_failed_send_allows_retry(monkeypatch):
+    """通道全挂（ok=False）不登记为已完成：下一次 close 仍会重试告警。"""
+    from lquant.paper.service import _notify_reconcile
+
+    calls: list[str] = []
+
+    def failing(title, text, **kw):
+        calls.append(text)
+        return [SimpleNamespace(ok=False, channel="webhook")]
+
+    monkeypatch.setattr("lquant.notify.notify", failing)
+    rep = _reconcile_report(verdict="critical", nav_intraday=94877.0, rel_dev=0.05123)
+    _notify_reconcile("demo", "2026-09-17", rep)
+    _notify_reconcile("demo", "2026-09-17", rep)
+    assert len(calls) == 2  # 没送出去就不占用幂等键
+
+
+def test_day_close_non_trading_day_skips_nav_write(paper_env, monkeypatch):
+    """非交易日 day_close 不落 official 净值，返回值显式 skipped。
+
+    回归：reconcile 曾无条件 record_nav —— 周末重跑 close 会写进一个日历上
+    不存在的 official 点，组合日报按 trade_date 取最后一根当「当前」，
+    prev_nav / day_pnl / peak / 回撤全部以幽灵点为基准。
+    """
+    from lquant.paper import service, store
+
+    store.create_account("demo", 100000.0)
+    monkeypatch.setattr(service, "_is_trading_day", lambda d: False)
+    out = service.day_close("demo", "2024-01-06")
+    assert out["skipped"] is True
+    assert out["skip_reason"] == "non_trading_day"
+    assert out["reconcile"] is None
+    assert len(store.nav_frame("demo")) == 0  # 没有幽灵点落库
+
+
+def test_day_close_non_trading_day_ghost_account_still_raises(monkeypatch):
+    """跳过不等于放行：非交易日跑不存在的账户仍要显式 AccountNotFound。"""
+    from lquant.paper import service, store
+
+    monkeypatch.setattr(service, "_is_trading_day", lambda d: False)
+    with pytest.raises(store.AccountNotFound):
+        service.day_close("ghost", "2024-01-06")
 
 
 # ---------------- 编排 ----------------
