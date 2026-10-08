@@ -13,9 +13,20 @@ from lquant.factors.ops import rust_bridge
 
 @pytest.fixture
 def clean_lq_ops(monkeypatch):
-    monkeypatch.delitem(sys.modules, "lq_ops", raising=False)
+    """摘掉 lq_ops，让被测代码走「真 import」路径。
+
+    **必须连子模块一起摘**：maturin 装出来的 ``lq_ops/__init__.py`` 是
+    ``from .lq_ops import *`` 再取 ``lq_ops.__doc__``，而 ``from .lq_ops import *``
+    不会把 ``lq_ops`` 这个名字绑进包命名空间 —— 名字能取到，靠的是子模块导入时
+    import 机制在父包上挂的那个属性。只摘顶层包时 ``lq_ops.lq_ops`` 仍在
+    ``sys.modules`` 里，重新 import 不会重跑 ``__init__.py``，属性也就没人挂，
+    于是 ``__doc__ = lq_ops.__doc__`` 直接 ``NameError``（CI 上真实复现）。
+    """
+    for mod in ("lq_ops", "lq_ops.lq_ops"):
+        monkeypatch.delitem(sys.modules, mod, raising=False)
     yield
-    monkeypatch.delitem(sys.modules, "lq_ops", raising=False)
+    for mod in ("lq_ops", "lq_ops.lq_ops"):
+        monkeypatch.delitem(sys.modules, mod, raising=False)
 
 
 def _lq_ops_built() -> bool:
