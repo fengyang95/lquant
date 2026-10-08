@@ -6,6 +6,30 @@ from datetime import date, timedelta
 import polars as pl
 import pytest
 
+#: 冻结业务日 —— 这几个用例种的是固定窗口 2026-09-07~09-11，而 scan_coverage
+#: 的窗口右端是 today_cn()。不冻结的话，真实日期一旦走出 [end-30, end] ⊇ 种下
+#: 的日子，窗口就会多露出没种的那一天，用例随日历变红（不是代码坏了）。
+#: 右端取窗口末日，保证 days=30 的回溯区间完整覆盖种下的 5 个交易日。
+FROZEN_TODAY = date(2026, 9, 11)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _frozen_today():
+    """把 scan_coverage 读到的业务日钉死在 FROZEN_TODAY。
+
+    ``coverage`` 是 ``from lquant.core.types import today_cn``，读的是它自己的
+    模块级名字，所以必须打在 ``lquant.data.quality.coverage`` 上。
+    模块级 fixture 拿不到 monkeypatch（pytest 9 仍限函数级），故用
+    ``MonkeyPatch.context()`` 自带撤销。
+    """
+    from lquant.core import types
+    from lquant.data.quality import coverage
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(types, "today_cn", lambda: FROZEN_TODAY)
+        mp.setattr(coverage, "today_cn", lambda: FROZEN_TODAY)
+        yield
+
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
@@ -78,11 +102,9 @@ def test_no_gap(env) -> None:
     write_daily(_daily_df(syms, days))
     write_daily_basic(_daily_df(syms, days))
 
-    from lquant.core.types import today_cn
-
     rep = scan_coverage(30, repair=True)
     # 窗口右端＝业务日（CN 墙钟），不是进程本地 date.today()
-    assert rep["window"]["end"] == today_cn()
+    assert rep["window"]["end"] == FROZEN_TODAY
     assert (rep["window"]["end"] - rep["window"]["start"]).days == 30
     assert rep["tables"]["daily"]["missing_dates"] == []
     assert rep["tables"]["daily"]["sparse_symbols"] == {}
