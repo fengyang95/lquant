@@ -66,29 +66,6 @@ def _seed_calendar(start: date, end: date) -> list[date]:
     return rows
 
 
-def _scan_window_days(n: int = 5) -> tuple[date, date, list[date]]:
-    """锚定 **today_cn** 的 5 个交易日窗口 —— scan_coverage 扫的是 [今天-30, 今天]。
-
-    固定写死 ``2026-09-07..09-11`` 的老写法只在「今天 ≈ 2026-10-07」附近成立，
-    一旦这 5 天掉出 30 天窗口，断言必然变成「Right contains one more item」——
-    时间越久越红。这里按今天回溯取周末除外的 5 天，语义与原用例一致。
-    """
-    from lquant.core.types import today_cn
-
-    end = today_cn()
-    days: list[date] = []
-    d = end
-    while len(days) < n:
-        if d.weekday() < 5:
-            days.append(d)
-        d -= timedelta(days=1)
-    days.reverse()
-    start = days[0]
-    # 日历只播这 5 天，_trade_days 于是恰好等于 days
-    _seed_calendar(start, end)
-    return start, end, days
-
-
 def _seed_securities(symbols: list[str]) -> None:
     from lquant.data.store.catalog import SecurityRepo
 
@@ -118,7 +95,8 @@ def test_no_gap(env) -> None:
     from lquant.data.quality.coverage import scan_coverage
     from lquant.data.store.parquet import write_daily, write_daily_basic
 
-    start, end, days = _scan_window_days()
+    start, end = date(2026, 9, 7), date(2026, 9, 11)
+    days = _seed_calendar(start, end)
     syms = ["600000.SH", "000001.SZ", "510300.SH"]
     _seed_securities(syms)
     write_daily(_daily_df(syms, days))
@@ -140,7 +118,8 @@ def test_daily_date_gap_creates_repair(env) -> None:
     from lquant.data.quality.coverage import scan_coverage
     from lquant.data.store.parquet import write_daily
 
-    start, end, days = _scan_window_days()
+    start, end = date(2026, 9, 7), date(2026, 9, 11)
+    days = _seed_calendar(start, end)
     syms = ["600000.SH", "000001.SZ", "510300.SH"]
     _seed_securities(syms)
     write_daily(_daily_df(syms, days[1:]))  # 第一天整缺
@@ -160,7 +139,8 @@ def test_symbol_sparse_gap(env) -> None:
     from lquant.data.quality.coverage import scan_coverage
     from lquant.data.store.parquet import write_daily
 
-    start, end, days = _scan_window_days()
+    start, end = date(2026, 9, 7), date(2026, 9, 11)
+    days = _seed_calendar(start, end)
     _seed_securities(["600000.SH", "000001.SZ"])
     write_daily(_daily_df(["600000.SH"], days))
     write_daily(_daily_df(["000001.SZ"], days[:2]))  # 后 3 天缺
@@ -203,7 +183,8 @@ def test_basic_empty_lake_info_no_repair(env) -> None:
     from lquant.data.quality.coverage import scan_coverage
     from lquant.data.store.parquet import write_daily
 
-    start, end, days = _scan_window_days()
+    start, end = date(2026, 9, 7), date(2026, 9, 11)
+    days = _seed_calendar(start, end)
     syms = ["600000.SH", "000001.SZ"]
     _seed_securities(syms)
     write_daily(_daily_df(syms, days))
