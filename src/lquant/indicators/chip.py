@@ -8,12 +8,16 @@
     迭代到底得到「按价格分布的持仓成本」：
         dist = dist * (1 - t) + t * day_bin
 
-**float_shares 的两种口径**（按优先级，evidence 不静默）：
-    1. 调用方显式传入（股数）—— 最准；
-    2. 缺省代理：当日量 / 截至前一日的**累积均量**（expanding、不含当日）。
-       A 股数据源普遍不直接给流通股本；「不含当日」仿量比指标的防自稀释
-       （放量日若把分母一起抬高会自己稀释自己），且严格因果 —— 这是滚动
-       指标通过前缀不变性门禁的前提。代理口径会显式标注（``CYQ_PROXY_NOTE``）。
+**换手率的三种口径**（按优先级，实际用了哪个都如实回传，evidence 不静默）：
+    1. 调用方显式传入 ``float_shares``（标量或逐日列）—— 最准；
+    2. ``df`` 自带的 ``turnover_rate`` 列（%，自由流通口径）—— 真实数据一直带这列
+       （``read_daily`` 会 select 它），此前被完全忽略，导致生产链路 100% 落进代理口径；
+    3. 代理：``volume_i / (window × 截至前一日的 window 日均量)`` —— 量级近似。
+       此前是 ``volume_i / 截至前一日累积均量``：那是「当日量 / 自身均值」，与流通
+       股本无关，量级恒在 1 附近 → ``1 - t ≈ 0`` → 历史筹码每天被清零（实测
+       39.5% 的交易日 t 被 clip 到 1.0），它压根不是换手率。
+    三种口径都严格因果（只用截至当日的信息）—— 这是滚动指标通过前缀不变性门禁的
+    前提；代理口径会显式标注（``CYQ_PROXY_NOTE``）。
 
 **无网格解析式 vs 直方图**（为什么有两套实现）：
     - ``profit_ratio`` / 注册指标 ``cyq_profit_ratio`` 用**解析式滚动**：
@@ -32,14 +36,35 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import polars as pl
 
 from lquant.indicators.registry import register_indicator
 
-__all__ = ["cost_distribution", "profit_ratio", "CYQ_PROXY_NOTE"]
+__all__ = ["cost_distribution", "profit_ratio", "CYQ_PROXY_NOTE", "CYQ_TURNOVER_NOTE"]
 
-CYQ_PROXY_NOTE = "float_shares 未给定：换手率用量/累积均量代理（相对结构正确，非精确口径）"
+# 口径名（``_turnover_caliber`` 的返回）：调用方如实回传，不由入参反推。
+CALIBER_EXPLICIT = "explicit"
+CALIBER_TURNOVER = "turnover_rate"
+CALIBER_PROXY = "proxy"
+
+CYQ_EXPLICIT_NOTE = "float_shares 显式给定"
+CYQ_TURNOVER_NOTE = "turnover_rate 列（自由流通口径，%）"
+CYQ_PROXY_NOTE = (
+    "既无 float_shares 也无 turnover_rate：换手率按「20 日均量 ≈ 一次完整换手」"
+    "的量级代理估算（近似口径，非精确换手率）"
+)
+_CALIBER_NOTES = {
+    CALIBER_EXPLICIT: CYQ_EXPLICIT_NOTE,
+    CALIBER_TURNOVER: CYQ_TURNOVER_NOTE,
+    CALIBER_PROXY: CYQ_PROXY_NOTE,
+}
+
+# 代理口径假设「window 个交易日的均量对应一次完整换手」。20 日 ≈ 日换手 5%，
+# 落在 A 股常见的 1%~8% 区间；它只是量级近似，真实数据请走 turnover_rate。
+_PROXY_TURNOVER_WINDOW = 20
 
 # CYQ 依赖的输入列。注册指标的 inputs 与缺列防御共用这一份清单。
 _REQUIRED = ("high", "low", "close", "volume")
@@ -50,58 +75,119 @@ def _price(df: pl.DataFrame) -> pl.Series:
     return ((df["high"] + df["low"] + 2 * df["close"]) / 4).rename("_px")
 
 
-def _turnover(df: pl.DataFrame, float_shares) -> list[float]:
-    """每日换手率 t ∈ [0, 1]。
+def _proxy_turnover(v: list[float], window: int = _PROXY_TURNOVER_WINDOW) -> list[float]:
+    """代理口径换手率（**量级近似**，严格因果）。
 
-    ``float_shares`` 三档口径：
+    ``t_i = volume_i / (window × 截至前一日的 window 日均量)``。
 
-    - ``pl.Series``（逐日股本列）：``t_i = volume_i / float_shares_i`` —— 逐行
-      取值，送转/增发当日之后的换手率随之变化。**必须逐行**：把整列折成一个
-      标量会让早期行的 t 依赖后面才出现的股本，前缀重算就变（未来函数）。
-      个别日 null/0 时该行退回代理口径，而不是整段跳成 0。
-    - 正数标量（调用方按日传入的常数）：``t = volume / float_shares``。
-    - ``None``：代理口径 ``t = volume / 截至前一日累积均量``（expanding、不含当日）。
-
-    代理口径的首日（或此前累计无成交）取 1.0：首日之前没有历史筹码，全部筹码
-    落在当日，这是模型的初始条件而不是异常降级；当日本身无成交则 t=0（不产生
-    新筹码），连续无成交会让总权重归零，上层显式输出 None 而不是伪造数值。
+    为什么不是 ``volume_i / expanding_mean(volume)``：那是「当日量 / 自身均值」，
+    与流通股本无关，量级恒在 1 附近（A 股成交量平稳时 t≈1 → ``1-t≈0`` →
+    历史筹码每天被清零，实测 39.5% 的交易日被 clip 到 1.0），压根不是换手率。
+    除以 ``window × 均量`` 相当于假设「window 个交易日的均量对应一次完整换手」，
+    得到 A 股常见的百分位量级 —— 仍是近似，但不再自我清零。
     """
-    v = df["volume"].to_list()
-    ts = _proxy_turnover(v)
-    if isinstance(float_shares, pl.Series):
-        fs = float_shares.to_list()
-        if len(fs) != len(v):
-            raise ValueError(f"float_shares 长度 {len(fs)} 与面板 {len(v)} 不一致")
-        return [
-            min(vi / fi, 1.0) if (fi is not None and fi > 0) else ts[i]
-            for i, (vi, fi) in enumerate(zip(v, fs, strict=True))
-        ]
-    if float_shares and float_shares > 0:
-        return [min(vi / float_shares, 1.0) for vi in v]
-    return ts
-
-
-def _proxy_turnover(v: list[float]) -> list[float]:
-    """代理口径换手率：``t_i = volume_i / 截至前一日的累积均量``（严格因果）。"""
     ts: list[float] = []
-    cum = 0.0
     for i, vi in enumerate(v):
         if vi <= 0:
-            ts.append(0.0)  # 当日无成交：无新筹码
-        elif i == 0 or cum <= 0:
-            ts.append(1.0)  # 首日/此前累计无成交：全部筹码落在当日
+            ts.append(0.0)  # 当日无成交：不产生新筹码
+            continue
+        hist = v[max(0, i - window):i]      # 严格不含当日 → 前缀重算不变
+        mean = (sum(hist) / len(hist)) if hist else 0.0
+        if mean <= 0:
+            ts.append(1.0)  # 首日/此前累计无成交：全部筹码落在当日（初始条件）
         else:
-            # expanding 均量（不含当日）：严格因果，前缀重算不变
-            ts.append(min(vi / (cum / i), 1.0))
-        cum += vi
+            ts.append(min(vi / (window * mean), 1.0))
     return ts
 
 
-def _rolling_ratios(df: pl.DataFrame, float_shares) -> list[float | None]:
+def _rate_from_column(df: pl.DataFrame) -> list[float] | None:
+    """``df`` 自带 ``turnover_rate``（%）时的逐日换手率；列不可用返回 None。
+
+    缺失/非有限/非正的当日按 t=0 处理（不产生新筹码），**不**回落到代理口径 ——
+    同一列里混两种口径会让序列口径不可复现。
+    """
+    if "turnover_rate" not in df.columns:
+        return None
+    col = df["turnover_rate"].cast(pl.Float64, strict=False).to_list()
+    if all(x is None for x in col):
+        return None
+    out: list[float] = []
+    for x in col:
+        if x is None or not math.isfinite(x) or x <= 0:
+            out.append(0.0)
+        else:
+            out.append(min(x / 100.0, 1.0))
+    return out
+
+
+def _fallback_caliber(df: pl.DataFrame) -> tuple[list[float], str]:
+    """无显式股本时的兜底口径：优先真实 ``turnover_rate``，否则量级代理。"""
+    rate = _rate_from_column(df)
+    if rate is not None:
+        return rate, CALIBER_TURNOVER
+    return _proxy_turnover(df["volume"].to_list()), CALIBER_PROXY
+
+
+def _turnover_caliber(df: pl.DataFrame, float_shares) -> tuple[list[float], str]:
+    """每日换手率 t ∈ [0, 1] + **实际使用的口径名**（``CALIBER_*``）。
+
+    ``float_shares`` 三档：
+
+    - ``pl.Series``（逐日股本列）：逐行 ``t_i = volume_i / 有效股本_i``。有效股本
+      按**前向沿用**语义取（只在"看到"某个值之后才沿用 → 严格因果）：送转/增发
+      当日之后换手率随之变化，而个别日 null 不会凭空产生 100× 的换手尖峰。
+      首个观测值之前的行才退回兜底口径。
+      **必须逐行**：把整列折成一个标量会让早期行的 t 依赖后面才出现的股本，
+      前缀重算就变（未来函数）。
+    - 正数标量：``t = volume / float_shares``。非有限或 ≤0 **显式报错** ——
+      此前静默退回代理口径，却仍对外宣称「float_shares 显式给定」，即 evidence 说谎。
+    - ``None``：走 :func:`_fallback_caliber`（turnover_rate 列 → 量级代理）。
+
+    返回口径名是硬要求：``profit_ratio`` 要把它如实回传，不能由入参的
+    truthiness 反推实际口径。
+    """
+    v = df["volume"].to_list()
+    if isinstance(float_shares, pl.Series):
+        fs = float_shares.cast(pl.Float64, strict=False).to_list()
+        if len(fs) != len(v):
+            raise ValueError(f"float_shares 长度 {len(fs)} 与面板 {len(v)} 不一致")
+        out: list[float] = []
+        last: float | None = None
+        used_explicit = False
+        fallback: tuple[list[float], str] | None = None
+        for i, vi in enumerate(v):
+            cur = fs[i]
+            if cur is not None and math.isfinite(cur) and cur > 0:
+                last = cur  # 只在看到之后才沿用 → 严格因果
+            if last is not None:
+                used_explicit = True
+                out.append(min(vi / last, 1.0) if vi > 0 else 0.0)
+            else:
+                if fallback is None:
+                    fallback = _fallback_caliber(df)
+                out.append(fallback[0][i])
+        if used_explicit:
+            return out, CALIBER_EXPLICIT
+        return fallback if fallback is not None else _fallback_caliber(df)
+    if float_shares is not None:
+        if not isinstance(float_shares, (int, float)) or not math.isfinite(float_shares):
+            raise ValueError(f"float_shares 必须是正的有限股数，收到 {float_shares!r}")
+        if float_shares <= 0:
+            raise ValueError(f"float_shares 必须为正，收到 {float_shares!r}")
+        return [min(vi / float_shares, 1.0) if vi > 0 else 0.0 for vi in v], CALIBER_EXPLICIT
+    return _fallback_caliber(df)
+
+
+def _rolling_ratios(
+    df: pl.DataFrame, float_shares, ts: list[float] | None = None
+) -> list[float | None]:
     """逐日获利盘比例（解析式滚动，严格前缀不变）。
 
     第 i 日新筹码 ``t_i`` 落在 ``p_i``，此后每过一天留存 ``(1 - t_j)``。
     终点 t 的获利比例 = Σ_{i≤t, p_i < close_t} w_i / Σ_{i≤t} w_i。
+
+    ``ts`` 可由调用方预先算好（并据此拿到口径名），避免同一份数据算两遍口径；
+    传 None 时本函数内部走 ``_turnover_caliber``。
 
     实现为预分配数组逐日推进：每日 O(size)，总 O(n²) 但全是 NumPy 向量操作
     （n=250 时约 6 万次元素级运算，微秒级）；代价换正确性 —— 排序前缀和的
@@ -110,7 +196,8 @@ def _rolling_ratios(df: pl.DataFrame, float_shares) -> list[float | None]:
     n = df.height
     px = _price(df).to_list()
     closes = df["close"].to_list()
-    ts = _turnover(df, float_shares)
+    if ts is None:
+        ts, _ = _turnover_caliber(df, float_shares)
     ps = np.empty(n)
     ws = np.empty(n)
     out: list[float | None] = []
@@ -150,7 +237,7 @@ def cost_distribution(
         hi = lo + 1e-9
     width = (hi - lo) / bins
     dist = [0.0] * bins
-    ts = _turnover(df, float_shares)
+    ts, _ = _turnover_caliber(df, float_shares)
 
     for row, t in zip(px.iter_rows(named=True), ts, strict=True):
         p = row["_px"]
@@ -162,20 +249,25 @@ def cost_distribution(
     return [(lo + (i + 0.5) * width, dist[i] / total) for i in range(bins) if dist[i] > 0]
 
 
-def profit_ratio(df: pl.DataFrame, float_shares: float | None = None) -> dict:
+def profit_ratio(df: pl.DataFrame, float_shares=None) -> dict:
     """末端获利盘比例：成本低于现价的筹码占比（0~1）。>0.9 常被视为「高位获利盘重」。
 
-    与滚动指标 ``cyq_profit_ratio`` 同一解析式实现（取末端值），两者口径一致；
-    evidence 里诚实标注 float_shares 是显式口径还是代理口径。
+    与滚动指标 ``cyq_profit_ratio`` 同一解析式实现（同一 ``_turnover_caliber``
+    口径解析），两者对同一输入给同一答案。
+
+    ``proxy`` / ``note`` 由**实际使用的口径**决定，不由入参反推 —— 此前
+    ``float_shares=0`` 会静默走代理口径却宣称「显式给定」，恰好在本函数
+    唯一的意义（把口径诚实回传给调用方）上说谎。
     """
     if df.is_empty() or "close" not in df.columns:
-        return {"profit_ratio": None, "note": "无数据", "proxy": float_shares is None}
-    ratios = _rolling_ratios(df, float_shares)
-    note = "float_shares 显式给定" if float_shares else CYQ_PROXY_NOTE
+        return {"profit_ratio": None, "note": "无数据", "proxy": False, "caliber": None}
+    ts, caliber = _turnover_caliber(df, float_shares)
+    ratios = _rolling_ratios(df, float_shares, ts)
     return {
         "profit_ratio": ratios[-1] if ratios else None,
-        "note": note,
-        "proxy": float_shares is None,
+        "note": _CALIBER_NOTES[caliber],
+        "proxy": caliber == CALIBER_PROXY,
+        "caliber": caliber,
     }
 
 
@@ -197,19 +289,20 @@ def add_cyq_profit_ratio(df: pl.DataFrame) -> pl.DataFrame:
     （前端/批量链）期望它存在，所以补 null 列而不是原样返回；
     与 ``add_turnover_ma`` 的「缺列 noop」同一防御哲学，取更保守的一档。
 
-    float_shares 口径：**逐行** ``t_i = volume_i / ffill(float_shares)_i`` ——
-    送转/增发当日之后的换手率随股本变化，早期行只看得到当期及此前的股本
-    （前缀不变性因此成立）。此前把整列折成「最后一个非空值」贯穿全历史，
-    等于让早期行读到了未来才知道的股本，既失真又破坏前缀不变性门禁。
-    股本列缺失（主路径 ``read_daily`` 就没有这列）或该行 null/0 时，退回
-    「volume / 截至前一日累积均量」的代理口径（逐行兜底，不整段跳 0）。
+    换手率口径与 ``profit_ratio`` **完全同源**（都走 ``_turnover_caliber``）：
+    逐行股本列按前向沿用取有效股本、真实 ``turnover_rate`` 列优先于量级代理。
+    此前只有本注册链路做 ``forward_fill()``，而 ``profit_ratio`` 拿原始列、
+    于是同一份数据两个入口给出不同答案（实测 0.9616 vs 0.0，单行 null 甚至
+    把换手率从 0.01 放大 100 倍），与「两者口径一致」的 docstring 矛盾。
     """
     missing = [c for c in _REQUIRED if c not in df.columns]
     if missing:
         return df.with_columns(pl.lit(None, dtype=pl.Float64).alias("cyq_profit_ratio"))
+    # 这里**不做** forward_fill：前向沿用语义已收口在 _turnover_caliber，
+    # 与 profit_ratio(df, float_shares=<同一列>) 走同一条代码路径。
     fs: float | pl.Series | None = None
     if "float_shares" in df.columns:
-        col = df["float_shares"].cast(pl.Float64, strict=False).forward_fill()
+        col = df["float_shares"].cast(pl.Float64, strict=False)
         if col.drop_nulls().len() > 0:
             fs = col
     ratios = _rolling_ratios(df, fs)

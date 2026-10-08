@@ -10,6 +10,7 @@ import pytest
 
 from lquant.indicators import (
     CYQ_PROXY_NOTE,
+    CYQ_TURNOVER_NOTE,
     INDICATORS,
     assert_no_lookahead,
     compute,
@@ -95,15 +96,79 @@ def test_deep_decline_leaves_little_profit():
 
 
 def test_proxy_turnover_keeps_relative_structure():
-    """代理口径：放量日换手大、缩量日小 —— 结构性断言而非精确数值。"""
+    """代理口径：换手率随成交量放大 —— 结构性断言而非精确数值。
+
+    注意这里断言的是「历史筹码没有被清零」。旧实现 ``volume / expanding_mean``
+    是「当日量 / 自身均值」，恒量铺底时 t ≡ 1.0（实测 11/11 天被 clip 到 1），
+    历史每天清零、获利盘恒 0 —— 那是量级错误，不是"相对结构"。
+    """
     closes = [10.0] * 10 + [12.0]  # 恒量铺底 + 末日放量
-    vols = [1e6] * 10 + [5e6]
-    df = make_df(closes, volumes=vols)
-    got = profit_ratio(df)
+    df_surge = make_df(closes, volumes=[1e6] * 10 + [5e6])
+    df_flat = make_df(closes, volumes=[1e6] * 11)
+    got = profit_ratio(df_surge)
     assert got["proxy"] is True
     assert got["note"] == CYQ_PROXY_NOTE
-    # 末日放量 → 代理换手 clip 到 1 → 历史清零 → 获利盘 0（代表价=close=12 不小于自身）
-    assert got["profit_ratio"] == 0.0
+    assert got["caliber"] == "proxy"
+    # 前 10 日成本 10 < 现价 12 → 历史筹码绝大多数获利（旧口径这里是 0.0）
+    assert got["profit_ratio"] > 0.6
+    # 放量日换手更大 → 落在高价的新筹码更多 → 获利盘比例更低（相对结构成立）
+    assert got["profit_ratio"] < profit_ratio(df_flat)["profit_ratio"]
+
+
+def test_proxy_turnover_does_not_wipe_history():
+    """回归（H2 核心症状）：代理口径不得把历史筹码清零。
+
+    旧代理与流通股本无关，恒量成交量下 t≡1.0 → 每日清零 → 缓涨行情获利盘恒 0。
+    正确的代理必须给出真实换手率的量级（个位数百分比），让历史筹码留存。
+    """
+    closes = [10 + 2 * i / 39 for i in range(40)]  # 10 → 12 匀速缓涨
+    got = profit_ratio(make_df([float(c) for c in closes]))
+    assert got["caliber"] == "proxy"
+    assert got["profit_ratio"] > 0.9  # 缓涨 + 低换手 → 绝大多数筹码获利
+
+
+def test_turnover_rate_column_is_preferred_over_proxy():
+    """真实 turnover_rate 列（%）优先于量级代理，并如实回传口径。
+
+    手算：t=1%/日恒定 → 总权重 Σ_{k=0}^{9} 0.01·0.99^k = 1 - 0.99^10 ≈ 0.0956；
+    前 5 日成本 10 < 现价 12 全部获利，权重 Σ_{k=5}^{9} 0.01·0.99^k ≈ 0.0466
+    → 获利盘 ≈ 0.0466 / 0.0956 ≈ 0.487。
+    """
+    closes = [10.0] * 5 + [12.0] * 5
+    df = make_df(closes).with_columns(pl.lit(1.0).alias("turnover_rate"))  # 1%/日
+    got = profit_ratio(df)
+    assert got["caliber"] == "turnover_rate"
+    assert got["proxy"] is False
+    assert got["note"] == CYQ_TURNOVER_NOTE
+    assert got["profit_ratio"] == pytest.approx(0.487, abs=0.01)
+
+
+def test_float_shares_non_positive_raises():
+    """≤0 / 非有限股本显式报错，不再静默走代理却宣称「显式给定」。"""
+    df = make_df([10.0, 11.0, 12.0])
+    with pytest.raises(ValueError, match="必须为正"):
+        profit_ratio(df, float_shares=0.0)
+    with pytest.raises(ValueError, match="必须为正"):
+        profit_ratio(df, float_shares=-3.0)
+    with pytest.raises(ValueError, match="有限股数"):
+        profit_ratio(df, float_shares=float("nan"))
+
+
+def test_registered_indicator_and_function_agree_on_null_shares():
+    """同一份含 null 股本列的数据，注册指标与 profit_ratio 必须给同一答案。
+
+    旧实现只有注册链路做 forward_fill，profit_ratio 拿原始列 → 同一数据两个
+    入口给出不同答案（实测 0.9616 vs 0.0），且单行 null 会把换手率放大 100 倍。
+    """
+    closes = [10 + 2 * i / 19 for i in range(20)]
+    shares = [1e8] * 20
+    shares[7] = None  # 中途缺一次股本：应前向沿用，不得产生 100× 换手尖峰
+    df = make_df([float(c) for c in closes]).with_columns(
+        pl.Series("float_shares", shares, dtype=pl.Float64)
+    )
+    via_registry = compute("cyq_profit_ratio", df)["cyq_profit_ratio"][-1]
+    via_fn = profit_ratio(df, float_shares=df["float_shares"])["profit_ratio"]
+    assert via_registry == pytest.approx(via_fn)
 
 
 def test_zero_volume_degrades_to_none():
@@ -135,12 +200,18 @@ def test_float_shares_column_is_picked_up():
 def test_cost_distribution_sums_to_one():
     rng = np.random.default_rng(3)
     closes = list(100 + np.cumsum(rng.normal(0, 1, 60)))
-    dist = cost_distribution(make_df([float(c) for c in closes]), bins=30)
+    df = make_df([float(c) for c in closes])
+    dist = cost_distribution(df, bins=30)
     assert dist
     assert sum(p for _, p in dist) == pytest.approx(1.0, abs=1e-9)
     centers = [c for c, _ in dist]
     assert centers == sorted(centers)  # bin 中心有序
-    assert all(99.0 <= c <= 102.0 for c in centers)  # 落在价格区间内
+    # 落在数据的 low..high 区间内
+    assert all(float(df["low"].min()) <= c <= float(df["high"].max()) for c in centers)
+    # 分布不能塌成一根针：换手率衰减正常时筹码应铺开在多个价格格上。
+    # 旧代理（volume/expanding_mean）下 t≡1 → 每天清零 → 只剩当日一个 bin，
+    # 于是「中心落在 [99,102]」这种断言会**因为缺陷**而通过。
+    assert len(centers) > 5
 
 
 # ---------- 前缀不变性（无未来函数门禁） ----------
