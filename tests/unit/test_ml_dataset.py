@@ -181,3 +181,102 @@ def test_resolve_feature_handles_unparsable_suffix():
     # 窗口 <= 0 同样不算（否则 rolling(0) 会在 Polars 里炸）
     with pytest.raises(Exception, match="无法解析特征"):
         resolve_feature(df, "MA_0")
+
+
+# ---------- 可交易性屏蔽 + 可执行标签口径 ----------
+
+def _flagged_panel() -> pl.DataFrame:
+    """3 只标的 × 6 天：S01 第 2 天停牌、S02 第 3 天一字板、S00 全程正常。
+
+    信号日 = 第 1 天（t=1），入场 = 第 2 天（t+1）—— 屏蔽必须按**入场日**判定。
+    """
+    from lquant.data.quality.flags import SUSPENDED
+
+    d0 = date(2026, 1, 5)
+    rows = []
+    for k, s in enumerate(["S00", "S01", "S02"]):
+        px = 10.0 + k
+        for i in range(6):
+            close = px * (1.0 + 0.01 * i)
+            rows.append({
+                "trade_date": d0 + timedelta(days=i), "symbol": s,
+                "close": close, "open": close, "high": close, "low": close,
+                "pre_close": close / (1.0 + 0.01 * i) if i else close,
+                "mom": float(i), "quality_flags": 0,
+            })
+    df = pl.DataFrame(rows)
+    # S01 第 2 天停牌
+    susp_day = d0 + timedelta(days=2)
+    df = df.with_columns(
+        quality_flags=pl.when((pl.col("symbol") == "S01")
+                              & (pl.col("trade_date") == susp_day))
+        .then(pl.lit(SUSPENDED, dtype=pl.Int32))
+        .otherwise(pl.col("quality_flags")))
+    # S02 第 3 天一字板（涨停）：high == low 且较昨收 +10%
+    zday = d0 + timedelta(days=3)
+    df = df.with_columns(
+        close=pl.when((pl.col("symbol") == "S02") & (pl.col("trade_date") == zday))
+        .then(pl.col("pre_close") * 1.10)
+        .otherwise(pl.col("close")))
+    return df.with_columns(
+        open=pl.col("close"), high=pl.col("close"), low=pl.col("close"))
+
+
+def test_tradability_mask_drops_unbuyable_samples():
+    df = _flagged_panel()
+    cfg = DatasetConfig(features=["mom"], label_horizon=2, tradability_mask=True,
+                        clip_label=None, min_samples_per_day=1)
+    ds = build_dataset(df, cfg)
+    assert ds.mask_report["applied"] is True
+    assert ds.mask_report["dropped"] > 0
+    assert ds.mask_report["reasons"]["停牌"] == 1     # S01 的入场日
+    assert ds.mask_report["reasons"]["一字板"] == 1   # S02 的入场日
+    # 被剔的正好是「入场那天买不到」的那两个样本（信号日 = 入场日前一天）
+    d0 = date(2026, 1, 5)
+    kept = {(r["symbol"], r["trade_date"]) for r in ds.df.to_dicts()}
+    assert ("S01", d0 + timedelta(days=1)) not in kept
+    assert ("S02", d0 + timedelta(days=2)) not in kept
+    # 停牌那天本身仍可作为**信号**（只是不能当入场日）
+    assert ("S01", d0 + timedelta(days=2)) in kept
+
+
+def test_mask_disabled_is_explicit():
+    df = _flagged_panel()
+    ds = build_dataset(df, DatasetConfig(features=["mom"], label_horizon=2,
+                                         tradability_mask=False))
+    assert ds.mask_report["applied"] is False
+    assert "显式关闭" in ds.mask_report["note"]
+
+
+def test_mask_without_flags_column_is_reported_not_silent():
+    """面板没有 quality_flags/OHLC → 空操作，但报告必须写明（不是「已检查」）。"""
+    plain = make_panel(20).select(["trade_date", "symbol", "close", "mom"])
+    ds = build_dataset(plain, DatasetConfig(features=["mom"], label_horizon=2))
+    assert ds.mask_report["applied"] is False
+    assert "未做可交易性屏蔽" in ds.mask_report["note"]
+
+
+def test_executable_label_uses_next_open():
+    """entry_price_col='open' → label = close[t+h]/open[t+1]-1（与 T+1 撮合一致）。"""
+    d0 = date(2026, 1, 5)
+    rows = []
+    for i in range(6):
+        rows.append({"trade_date": d0 + timedelta(days=i), "symbol": "S00",
+                     "close": 10.0 + i, "open": 10.0 + i + 0.5, "mom": float(i)})
+    df = pl.DataFrame(rows)
+    ds = build_dataset(df, DatasetConfig(features=["mom"], label_horizon=2,
+                                         entry_price_col="open", clip_label=None,
+                                         tradability_mask=False,
+                                         min_samples_per_day=1))
+    r0 = ds.df.filter(pl.col("trade_date") == d0).row(0, named=True)
+    # close[t+2]=12.0 / open[t+1]=11.5 - 1
+    assert abs(r0["fwd_ret_2"] - (12.0 / 11.5 - 1.0)) < 1e-12
+    assert ds.cfg.label_kind() == "close[t+2]/open[t+1]"
+    assert ds.summary()["label_kind"] == "close[t+2]/open[t+1]"
+    assert ds.summary()["mask"]["applied"] is False
+
+
+def test_default_label_kind_is_close_to_close():
+    ds = build_dataset(make_panel(30), DatasetConfig(features=["mom"],
+                                                     label_horizon=3))
+    assert ds.summary()["label_kind"] == "close[t+3]/close[t+0]"
