@@ -14,6 +14,11 @@
     lq ml production mom_line [--asof 2026-09-30T15:00:00]
     lq ml predict --name mom_line --features MA20 --date 2026-09-30
     lq ml signals --name mom_line [--start ... --end ...]
+
+``--start`` 既是数据窗口起点，也是**成分口径的 as-of**：``--universe`` 非 all 时
+取该日已生效的指数成分快照，而不是「今天的成分」（后者会让中途调入的牛股事后
+追溯进历史样本）。起点早于首批快照时退回现存最早一批，并在输出里给
+``universe_note`` 显式披露，绝不静默。
 """
 from __future__ import annotations
 
@@ -30,22 +35,59 @@ def _echo(obj) -> None:
     click.echo(json.dumps(obj, ensure_ascii=False, indent=2, default=str))
 
 
-def _load(start: str, end: str | None, universe: str):
-    from lquant.data.store.parquet import read_daily
+def _resolve_universe(universe: str, as_of: str) -> tuple[list[str] | None, str | None]:
+    """股票池 → (成分股清单, 口径降级说明)；all → (None, None)。
+
+    与 ``server/api/ml._resolve_universe``（以及 factors 侧）同一口径：按
+    ``--start`` 当时已生效的成分快照过滤，不用「今天的成分」回溯历史窗口
+    —— 那会把中途调入的牛股事后追溯进样本，训练指标系统性高估。
+
+    降级同样显式：起点早于首批快照时退回现存最早一批，并回传披露串由调用
+    命令打印出来，绝不静默冒充严格 point-in-time。
+    """
+    if not universe or universe == "all":
+        return None, None
+    from datetime import date as _date
+
+    from lquant.data.store.catalog import IndexConsRepo
     from lquant.factors.universe import resolve_index_code
 
-    symbols = None
-    if universe and universe != "all":
-        from lquant.data.store.catalog import IndexConsRepo
+    try:
+        as_of_d = _date.fromisoformat(as_of)
+    except ValueError as e:
+        raise SystemExit(f"--start 日期非法: {as_of!r}（需要 YYYY-MM-DD）") from e
+    code = resolve_index_code(universe)
+    repo = IndexConsRepo()
+    symbols = repo.symbols_as_of(code, as_of_d)
+    if symbols:
+        return symbols, None
+    eff, fallback = repo.earliest_batch(code)
+    if eff is None:
+        raise SystemExit(f"指数 {code} 成分股为空（无任何已生效成分快照），"
+                         "先跑 `lq data index-cons`")
+    return fallback, (
+        f"成分口径替换：{as_of} 之前无已生效快照，改用现存最早一批 {eff} 的成分"
+        "（该池非严格 point-in-time，幸存者偏差防护降级；要精确口径需按期累积成分快照）")
 
-        code = resolve_index_code(universe)
-        symbols = IndexConsRepo().latest_symbols(code)
-        if not symbols:
-            raise SystemExit(f"指数 {code} 成分股为空，先跑 `lq data index-cons`")
+
+def _load(start: str, end: str | None, universe: str,
+          note_out: dict | None = None):
+    """读日线面板；``note_out`` 给了就回填 ``universe_note``（口径降级披露）。"""
+    from lquant.data.store.parquet import read_daily
+
+    symbols, note = _resolve_universe(universe, start)
+    if note_out is not None:
+        note_out["universe_note"] = note
     df = read_daily(start=start, end=end, symbols=symbols).collect()
     if not len(df):
         raise SystemExit("日线数据为空，先跑 bootstrap 或 `lq data demo`")
     return df
+
+
+def _echo_note(note: str | None) -> None:
+    """口径降级必须让人看见（人类可读命令用；JSON 命令把 note 并入输出）。"""
+    if note:
+        click.echo(f"  ⚠ {note}")
 
 
 def _features(s: str) -> list[str]:
@@ -89,11 +131,15 @@ def status() -> None:
 @click.option("--limit", default=200, type=int)
 def features(universe: str, start: str, end: str | None, limit: int) -> None:
     """可用特征清单（湖列 + Alpha158 内置 + 简单公式）。"""
+    note: dict = {}
     try:
-        df = _load(start, end, universe)
+        df = _load(start, end, universe, note_out=note)
         out = available_features(df, limit=limit)
-    except SystemExit:
+    except SystemExit as e:
+        # 指数成分未同步/湖空时退回内置清单，但**说清退回了**，不静默
+        click.echo(f"  ⚠ {e}")
         out = available_features(None, limit=limit)
+    _echo_note(note.get("universe_note"))
     click.echo(f"  湖列（前 {len(out['columns'])}）: {', '.join(out['columns'][:30])}"
                + (" ..." if len(out["columns"]) > 30 else ""))
     click.echo(f"  Alpha158 内置: {out['alpha158_count']} 个"
@@ -123,15 +169,19 @@ def train(features_s: str, train_end: str, valid_end: str, model_name: str | Non
     from lquant.research.ml.backtest import run_ml_pipeline
 
     procs = [json.loads(p) for p in processors] if processors else None
-    df = _load(start, end, universe)
+    note: dict = {}
+    df = _load(start, end, universe, note_out=note)
     out = run_ml_pipeline(
         df, _features(features_s), label_horizon=label_horizon,
         train_end=train_end, valid_end=valid_end, kind=kind, top_n=top_n,
         processors=procs, model_name=model_name, record=not no_record,
         note="cli: lq ml train")
-    _echo({"ml_run_id": out.get("ml_run_id"), "model": out.get("model"),
-           "ml": out.get("ml"), "dataset": out.get("dataset"),
-           "backtest": out.get("backtest")})
+    result = {"ml_run_id": out.get("ml_run_id"), "model": out.get("model"),
+              "ml": out.get("ml"), "dataset": out.get("dataset"),
+              "backtest": out.get("backtest")}
+    if note.get("universe_note"):
+        result["universe_note"] = note["universe_note"]   # 口径降级披露，随 JSON 一起走
+    _echo(result)
 
 
 @ml.command()
@@ -158,7 +208,8 @@ def retrain(features_s: str, model_name: str, start: str, end: str | None,
             processors: tuple[str, ...]) -> None:
     """滚动重训：逐窗口训练 + 先验证再晋级（失败保持原线上版）。"""
     procs = [json.loads(p) for p in processors] if processors else None
-    df = _load(start, end, universe)
+    note: dict = {}
+    df = _load(start, end, universe, note_out=note)
     cfg = OnlineConfig(name=model_name, features=_features(features_s),
                        label_horizon=label_horizon, kind=kind,
                        processors=procs, top_n=top_n,
@@ -166,6 +217,8 @@ def retrain(features_s: str, model_name: str, start: str, end: str | None,
                        test_months=test_months, step_months=step_months,
                        min_improvement=min_improvement)
     out = rolling_retrain(df, cfg, promote=not no_promote)
+    if note.get("universe_note"):
+        out["universe_note"] = note["universe_note"]
     _echo(out)
 
 
@@ -237,10 +290,14 @@ def events_cmd(name: str) -> None:
 def predict(name: str, features_s: str, date: str | None, version: int | None,
             start: str, end: str | None, universe: str, no_persist: bool) -> None:
     """用线上版本（或指定版本）产出信号。"""
-    df = _load(start, end, universe)
+    note: dict = {}
+    df = _load(start, end, universe, note_out=note)
     cfg = OnlineConfig(name=name, features=_features(features_s))
-    _echo(daily_inference(df, cfg, date=date, version=version,
-                          persist=not no_persist))
+    out = daily_inference(df, cfg, date=date, version=version,
+                          persist=not no_persist)
+    if note.get("universe_note"):
+        out["universe_note"] = note["universe_note"]      # 口径降级披露，随 JSON 一起走
+    _echo(out)
 
 
 @ml.command()
