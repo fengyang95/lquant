@@ -588,6 +588,13 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
     _step(20, "构建协变量")
     errors: dict[str, str] = {}
     cov_names_all = ["market_cap", "industry_sw1", "turnover_1m", "momentum_1m"]
+    # 用户配方里显式引用的 cov_*（如 CNE5 风格的 cov_beta_1y）按需构建 ——
+    # 默认口径不变，但「注册了却调不到」的退化被堵住。
+    from lquant.factors.covariates import (  # noqa: PLC0415 - 惰性导入，启动提速
+        covariates_for_steps as _cov_for_steps,
+    )
+
+    cov_names_all = _cov_for_steps(req.steps, cov_names_all)
     try:
         with reader() as con:
             ind = con.execute("SELECT symbol, std, code, std_date FROM industry_classify").pl()
