@@ -168,35 +168,50 @@ class InstrumentRules:
     sellable_after_days: int      # T+0 for QDII/黄金/债券/货币 ETF
     is_st: bool = False           # 涨跌停 5% 判定依据（PriceLimit.for_symbol）
     price_tick: float = 0.01      # 最小变动价位：股票 0.01 / 基金 0.001
-    no_price_limit: bool = False  # IPO 首日 / 复牌首日 / ST 变更日
+    # 静态（per-instrument）豁免：IPO 首日 / 复牌首日 / ST 变更日。
+    # 真正的逐日判定走 limit_ratio/limit_up/limit_down 的 no_price_limit 参数
+    # （IPO 上市初期窗口是「某一天」的事实，静态布尔表达不了），这里只作
+    # 调用方未给逐日值时的兜底，保持既有 build_rules(meta=...) 语义不变。
+    no_price_limit: bool = False
     track_index_limit: float | None = None   # ETF 跟踪指数涨跌幅
 
     def tax_rate(self, d: date, side=None) -> float:
         return self.tax.rate_at(d, side)
 
-    def limit_ratio(self, is_st: bool | None = None) -> float | None:
+    def limit_ratio(self, is_st: bool | None = None,
+                    no_price_limit: bool | None = None) -> float | None:
         """当日涨跌幅比例；None = 不设涨跌停约束。
 
-        is_st 传 None 时用本规则的静态值（security 表）；传 True/False 时按当日的
-        真实戴帽状态覆盖 —— ST 会随戴帽/摘帽变化，逐日判定才正确。
+        is_st / no_price_limit 都是**逐日**参数，语义一致：
+        传 None 时用本规则的静态值（security 表 / build_rules(meta=...)）；
+        传 True/False 时按当日的真实状态覆盖。
+
+        - is_st：ST 会随戴帽/摘帽变化，逐日判定才正确。
+        - no_price_limit：IPO 上市初期窗口 / 复牌首日 / ST 变更日都是
+          「某一天」的 per-day 事实，静态布尔表达不了。静态值保留是为了
+          向后兼容（调用方显式注入的 per-instrument 豁免仍然生效）。
         """
-        if self.no_price_limit:
+        eff_no_limit = self.no_price_limit if no_price_limit is None \
+            else bool(no_price_limit)
+        if eff_no_limit:
             return None
         eff_st = self.is_st if is_st is None else bool(is_st)
         return self.price_limit.for_symbol(
             self.symbol, self.symbol.board, is_st=eff_st,
             track_index_limit=self.track_index_limit)
 
-    def limit_up(self, pre_close: float, is_st: bool | None = None) -> float | None:
+    def limit_up(self, pre_close: float, is_st: bool | None = None,
+                 no_price_limit: bool | None = None) -> float | None:
         """涨停价（已按 tick 取整）；None = 无涨跌停约束。"""
-        r = self.limit_ratio(is_st)
+        r = self.limit_ratio(is_st, no_price_limit)
         if r is None:
             return None
         return round_tick(pre_close * (1.0 + r), self.price_tick)
 
-    def limit_down(self, pre_close: float, is_st: bool | None = None) -> float | None:
+    def limit_down(self, pre_close: float, is_st: bool | None = None,
+                   no_price_limit: bool | None = None) -> float | None:
         """跌停价（已按 tick 取整）；None = 无涨跌停约束。"""
-        r = self.limit_ratio(is_st)
+        r = self.limit_ratio(is_st, no_price_limit)
         if r is None:
             return None
         return round_tick(pre_close * (1.0 - r), self.price_tick)

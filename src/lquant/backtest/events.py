@@ -69,4 +69,10 @@ class Bar:
     # 做成逐日是因为 ST 会随戴帽/摘帽变化：静态值会让整段回测用同一个涨跌幅，
     # 摘帽后仍按 5% 处理、戴帽前就按 5% 处理，两个方向都错。
     is_st: bool | None = None
+    # 当日是否免涨跌停约束（逐日，来自 IPO 上市初期窗口 / 复牌首日 / ST 变更日）。
+    # None = 未知（数据缺列或无上市日 → 无法判定）→ 退回 InstrumentRules.no_price_limit
+    # （per-instrument 静态值，保持既有 build_rules(meta=...) 语义）。
+    # 做成逐日是因为这些窗口都是「某一天」的事实：IPO 只有上市后前 N 个交易日、
+    # 复牌与 ST 变更也只有当天 —— 静态布尔会让整段回测要么全免要么全不免。
+    no_price_limit: bool | None = None
     fields: dict = field(default_factory=dict)
