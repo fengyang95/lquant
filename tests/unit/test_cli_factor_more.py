@@ -500,3 +500,37 @@ def test_audit_attribution_error_visible(monkeypatch):
     assert r.exit_code == 0, r.output
     body = json.loads(r.output)
     assert "error" in body["attribution"]
+
+
+def test_ic_sync_exits_nonzero_when_every_factor_fails(monkeypatch):
+    """全部因子同步失败必须用退出码表达 —— README 把 ic-sync 放进 cron。
+
+    修复前无论失败多少都 exit 0，cron/CI 无从发现「同步停摆」；而 monitor 侧
+    健康度又会因为窗口里还留着旧 IC 而恒判 ok、ic_below 永不触发，
+    整个在线监控闭环静默失效。
+    """
+    import lquant.factors.monitor as monitor_mod
+
+    def _boom(name, **kw):
+        raise KeyError(f"未注册因子: {name}")
+
+    monkeypatch.setattr(monitor_mod, "sync_factor_ic", _boom)
+    r = _invoke("ic-sync", "ghost_factor")
+    assert r.exit_code != 0, r.output
+    assert "全部失败" in r.output
+
+
+def test_ic_sync_partial_failure_still_exits_zero(monkeypatch):
+    """部分失败仍退出 0（原因在 stdout 的 error 字段里）—— 别把 cron 打爆。"""
+    import lquant.factors.monitor as monitor_mod
+
+    def _mixed(name, **kw):
+        if name == "bad":
+            raise KeyError("未注册因子: bad")
+        return {"factor": name, "rows": 5}
+
+    monkeypatch.setattr(monitor_mod, "sync_factor_ic", _mixed)
+    r = _invoke("ic-sync", "good", "bad")
+    assert r.exit_code == 0, r.output
+    body = json.loads(r.output)
+    assert {d["factor"] for d in body} == {"good", "bad"}
