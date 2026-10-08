@@ -48,6 +48,37 @@ def test_atr_weight_rejects_bad_inputs(close, atr, risk):
         atr_weight(close, atr, daily_risk=risk)
 
 
+@pytest.mark.parametrize(
+    "close,atr,risk",
+    [
+        (float("nan"), 0.5, 0.01),
+        (10.0, float("nan"), 0.01),
+        (10.0, 0.5, float("nan")),
+        (float("inf"), 0.5, 0.01),
+        (10.0, float("inf"), 0.01),
+    ],
+)
+def test_atr_weight_rejects_nan_inf(close, atr, risk):
+    """NaN 的比较恒为 False，`<= 0` 守卫拦不住它 —— 必须 isfinite 显式拦截。
+
+    修复前 ``atr_weight(nan, 0.5)`` 原样返回 NaN（``min(nan, 1.0) = nan``），
+    脏数据穿透到权重层。
+    """
+    with pytest.raises(ValueError):
+        atr_weight(close, atr, daily_risk=risk)
+
+
+@pytest.mark.parametrize("bad", [-1.0, 0.0, -0.5, 1.5, float("nan")])
+def test_atr_weight_rejects_out_of_range_max_weight(bad):
+    """max_weight 越界会让 ``min(raw, max_weight)`` 直接吐出负权重/超配。
+
+    契约是「返回 ∈ [0, max_weight] 且绝不为负」，max_weight ≤ 0 必须在入口
+    拦下，而不是把 -1.0 当仓位返回。
+    """
+    with pytest.raises(ValueError):
+        atr_weight(10.0, 0.5, max_weight=bad)
+
+
 # ---------- Kelly ----------
 
 
@@ -91,3 +122,17 @@ def test_kelly_no_edge_returns_zero_not_negative():
 def test_kelly_rejects_bad_inputs(p, b, fraction):
     with pytest.raises(ValueError):
         kelly_fraction(p, b, fraction=fraction)
+
+
+def test_sizing_models_are_reachable_from_package():
+    """``atr_weight``/``kelly_fraction`` 必须从 ``lquant.portfolio`` 可达。
+
+    修复前它们只在 ``portfolio.sizing`` 里，``__all__`` 也不含 —— 能力存在
+    但外面拿不到（零调用方正是这么来的）。
+    """
+    import lquant.portfolio as pkg
+
+    assert pkg.atr_weight is atr_weight
+    assert pkg.kelly_fraction is kelly_fraction
+    assert "atr_weight" in pkg.__all__
+    assert "kelly_fraction" in pkg.__all__

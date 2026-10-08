@@ -39,14 +39,20 @@ def atr_weight(
         max_weight: 权重上限。
 
     ATR ≤ 0 或 close ≤ 0 是数据错误而非「零仓位」，显式报错 ——
-    静默夹逼会把脏数据伪装成保守决策。
+    静默夹逼会把脏数据伪装成保守决策。NaN 的比较恒为 False，所以这里必须
+    用 ``math.isfinite`` 而不是 ``<= 0``：否则 NaN 会穿透守卫，再经
+    ``min(raw, max_weight)`` 原样返回 NaN 权重。
     """
-    if close <= 0:
-        raise ValueError(f"close 必须为正，得到 {close!r}")
-    if atr <= 0:
-        raise ValueError(f"ATR 必须为正（数据缺失请上层显式降级），得到 {atr!r}")
-    if daily_risk <= 0:
-        raise ValueError(f"daily_risk 必须为正，得到 {daily_risk!r}")
+    if not math.isfinite(close) or close <= 0:
+        raise ValueError(f"close 必须为有限正数，得到 {close!r}")
+    if not math.isfinite(atr) or atr <= 0:
+        raise ValueError(f"ATR 必须为有限正数（数据缺失请上层显式降级），得到 {atr!r}")
+    if not math.isfinite(daily_risk) or daily_risk <= 0:
+        raise ValueError(f"daily_risk 必须为有限正数，得到 {daily_risk!r}")
+    # 契约：返回 ∈ [0, max_weight] 且绝不为负（做空不在选股链路）。
+    # max_weight ≤ 0 会让 min(raw, max_weight) 直接吐出负权重 —— 显式拒绝。
+    if not math.isfinite(max_weight) or not 0.0 < max_weight <= 1.0:
+        raise ValueError(f"max_weight 必须在 (0,1]，得到 {max_weight!r}")
     raw = daily_risk * close / atr
     return min(raw, max_weight)
 

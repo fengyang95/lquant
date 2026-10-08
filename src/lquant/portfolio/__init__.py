@@ -43,6 +43,7 @@ from lquant.portfolio.screener import (
     score,
     screen,
 )
+from lquant.portfolio.sizing import atr_weight, kelly_fraction
 from lquant.portfolio.weighting import (
     METHODS,
     equal_weight,
@@ -68,4 +69,6 @@ __all__ = [
     # 基准相对优化（Phase 3.2）
     "enhanced_indexing_weight", "EnhancedIndexingResult", "OptimizerError",
     "tracking_error", "active_share",
+    # 单标的仓位模型（ATR 风险预算 / Kelly）
+    "atr_weight", "kelly_fraction",
 ]
