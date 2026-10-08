@@ -176,9 +176,15 @@ def in_quiet_hours(now: datetime | None = None) -> bool:
         start_s, end_s = (p.strip() for p in raw.split("-", 1))
         h1, m1 = (int(x) for x in start_s.split(":"))
         h2, m2 = (int(x) for x in end_s.split(":"))
+        # dtime() 也必须在 try 内：``25:00`` / ``23:70`` / ``23:00-24:00``
+        # 这类很常见的手误会抛 ValueError("hour must be in 0..23")，而它在
+        # 原实现里位于 try 之外 —— 一穿出去就把所有 info/warning 通知打挂
+        # （paper 路径还被 except 吞成一条 warning，即告警静默丢失）。
+        # 「配置错 → 不静默」与上面格式错的处理保持一致。
+        start, end = dtime(h1, m1), dtime(h2, m2)
     except ValueError:
         return False
-    t, start, end = (_now_cn() if now is None else now).time(), dtime(h1, m1), dtime(h2, m2)
+    t = (_now_cn() if now is None else now).time()
     if start <= end:  # 同日区间 09:00-12:00
         return start <= t <= end
     return t >= start or t <= end  # 跨午夜 23:00-08:00
@@ -255,9 +261,12 @@ def notify(
 
     with ThreadPoolExecutor(max_workers=min(len(chain), 8)) as pool:
         results = list(pool.map(lambda c: c.send(title, text), chain))
-    if results and not any(r.ok for r in results):
-        # 全部通道失败：撤销登记允许重试 —— 告警丢失比重复告警更糟，
+    delivered = sum(getattr(r, "sent_parts", 0) for r in results)
+    if results and not any(r.ok for r in results) and delivered == 0:
+        # 只有「一片都没送出去」才撤销登记允许重试 —— 告警丢失比重复告警更糟，
         # 「被 cooldown/dedup 压住的重试」会让故障看起来像已送达。
+        # 部分送达（前几片成功、后面失败）**不能**撤销：重试会把已送达的
+        # 前缀片再发一遍，群里出现重复内容。
         with _SUPPRESS_LOCK:
             _forget_sent(title, text, prev_last)
     return results
@@ -290,8 +299,25 @@ def _forget_sent(title: str, text: str, prev_last: float) -> None:
 
 
 def active_channels() -> list[str]:
-    """当前配置的通道名（构建链并过滤 skipped），供 CLI 展示与自检。"""
-    return [c.name for c in build_chain()]
+    """当前**真正可用**的通道名（URL/凭证齐备），供 CLI 展示与自检。
+
+    只看 ``LQ_NOTIFY_CHANNELS`` 会把未配 URL/token 的通道也算进来：用户以为
+    配好了，直到 ``lq notify test`` 才发现全是 skipped。
+    """
+    return [c.name for c in build_chain() if c.configured()[0]]
+
+
+def channel_status() -> list[tuple[str, bool, str]]:
+    """``(通道名, 是否就绪, 说明)`` —— ``lq notify status`` 的真实自检数据源。
+
+    与 ``active_channels`` 的分工：这个把**未就绪的也列出来并说明缺什么**，
+    status 命令才能告诉用户「为什么这个通道不会发消息」。
+    """
+    out: list[tuple[str, bool, str]] = []
+    for c in build_chain():
+        ready, why = c.configured()
+        out.append((c.name, ready, why))
+    return out
 
 
 class _UnknownChannel(Channel):

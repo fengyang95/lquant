@@ -21,16 +21,19 @@ def notify() -> None:
 
 @notify.command("status")
 def status_cmd() -> None:
-    """列出 env 已配置的通道（连通性不发消息）"""
-    from lquant.notify import build_chain
+    """通道配置自检：逐个说明是否就绪、缺哪个 env（不发消息）"""
+    from lquant.notify import channel_status
 
-    chain = build_chain()
-    if not chain:
+    rows = channel_status()
+    if not rows:
         click.echo("未配置 LQ_NOTIFY_CHANNELS —— 通知旁路关闭（主链路不受影响）")
         return
-    click.echo(f"已配置 {len(chain)} 个通道：")
-    for ch in chain:
-        click.echo(f"  - {ch.name}")
+    ready = [r for r in rows if r[1]]
+    click.echo(f"LQ_NOTIFY_CHANNELS 共 {len(rows)} 个通道，就绪 {len(ready)} 个：")
+    for name, ok, why in rows:
+        click.echo(f"  - {name}: {'就绪' if ok else f'未就绪（{why}）'}")
+    if not ready:
+        click.echo("没有任何通道就绪 —— 通知不会发出，请按上面提示补齐 env")
 
 
 @notify.command()

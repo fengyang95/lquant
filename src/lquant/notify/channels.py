@@ -18,7 +18,8 @@
 各通道 payload 口径（官方机器人协议）：
 
 - 企微群机器人: ``{"msgtype": "text", "text": {"content": str}}``，
-  content 上限 4096 字节（UTF-8），超限直接返回 errcode。
+  ``msgtype=text`` 的 content 上限是 **2048 字节**（UTF-8；4096 是
+  ``markdown`` 类型的上限），超限直接返回 errcode。分片必须按**字节**算。
 - 飞书自定义机器人: ``{"msg_type": "text", "content": {"text": str}}``；
   开启签名校验时 URL 追加 ``&timestamp=..&sign=..``
   （sign = base64(hmac_sha256(key=f"{ts}\\n{secret}", message=""))）。
@@ -76,20 +77,98 @@ class SendResult:
     ok: bool
     error: str | None = None
     skipped: bool = False
+    # 本次**真的送达**的片数。用于区分「一片都没发出去」（可以安全重试）
+    # 与「发了一半才失败」（重试会重复投递已送达的前缀）。见 service.notify。
+    sent_parts: int = 0
 
 
-def slice_text(title: str, text: str, max_chars: int | None) -> list[tuple[str, str]]:
-    """按渠道上限切片。返回 [(每片标题, 每片正文)]；首片带标题，续片带序号标记。"""
-    if max_chars is None or len(title) + len(text) <= max_chars:
+def _safe_url(url: str) -> str:
+    """URL 的脱敏摘要（只留 scheme+host），用于错误串与日志。
+
+    webhook URL 本身就是凭证：path/query 里带企微 key、钉钉 access_token、
+    Telegram bot token。任何可能外泄的字符串都只能带这个摘要。
+    """
+    try:
+        p = urllib.parse.urlsplit(url if "://" in url else f"//{url}")
+        if p.netloc:
+            return f"{p.scheme or '?'}://{p.netloc}/…"
+    except Exception:  # noqa: BLE001 - 脱敏失败也必须给占位符
+        pass
+    return "<webhook>"
+
+
+def _redact(msg: str, *urls: str) -> str:
+    """把错误串里出现的 URL / path / query 片段换成脱敏摘要。
+
+    底层异常的消息形态不一致，两种都含凭证，必须都盖掉：
+    ``ValueError: unknown url type`` 带**整串 URL**；``http.client.InvalidURL``
+    只带 **path+query**（``'/cgi-bin/webhook/send?key=SECRET'``）。
+    """
+    for u in urls:
+        if not u:
+            continue
+        p = urllib.parse.urlsplit(u if "://" in u else f"//{u}")
+        cands = {u}
+        if p.path and p.query:
+            cands.add(f"{p.path}?{p.query}")
+        if p.netloc and p.path:
+            cands.add(f"{p.netloc}{p.path}")
+            if p.query:
+                cands.add(f"{p.netloc}{p.path}?{p.query}")
+        # 只替换足够长的片段：短 path（"/send"）替换掉只会让报错更难读。
+        for c in sorted((c for c in cands if c and len(c) > 8), key=len, reverse=True):
+            msg = msg.replace(c, _safe_url(u) if c == u else "***")
+    return msg
+
+
+def _chunk_by_limits(text: str, char_cap: int | None, byte_cap: int | None) -> list[str]:
+    """按「字符数 + UTF-8 字节数」双上限切分（中文 3 字节/字）。
+
+    只按字符切会在 CJK 文本上超字节上限：企微 ``msgtype=text`` 是 2048
+    **字节**，1200 个中文字 = 3600 字节，首片即被拒且后续片不再发 ——
+    分片续发等于失效。按码点切分天然不会切断代理对。
+    """
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_bytes = 0
+    for ch in text:
+        b = len(ch.encode("utf-8"))
+        if cur and ((char_cap is not None and len(cur) >= char_cap)
+                    or (byte_cap is not None and cur_bytes + b > byte_cap)):
+            chunks.append("".join(cur))
+            cur, cur_bytes = [], 0
+        cur.append(ch)
+        cur_bytes += b
+    if cur:
+        chunks.append("".join(cur))
+    return chunks or [""]
+
+
+def slice_text(title: str, text: str, max_chars: int | None,
+               max_bytes: int | None = None) -> list[tuple[str, str]]:
+    """按渠道上限切片。返回 [(每片标题, 每片正文)]；首片带标题，续片带序号标记。
+
+    ``max_chars`` / ``max_bytes`` 任一为 None 表示该维度不限；两个都给时
+    必须同时满足才收片（CJK 文本下字节通常是更紧的那个约束）。
+    """
+    if max_chars is None and max_bytes is None:
         return [(title, text)]
-    # 首片给标题留位；续片给 "[续 i/N]" 头留位 —— 长度上限是硬约束，先扣头再装正文。
+    fits_chars = max_chars is None or len(title) + len(text) <= max_chars
+    fits_bytes = max_bytes is None or (
+        len(title.encode("utf-8")) + len(text.encode("utf-8")) <= max_bytes)
+    if fits_chars and fits_bytes:
+        return [(title, text)]
+    # 首片给标题留位；续片给 "[续 i/N]" 头留位 —— 上限是硬约束，先扣头再装正文。
     cont_head = "[续 99/99]\n"
-    body_cap = max_chars - max(len(title), len(cont_head)) - 1
-    if body_cap < 1:
-        # max_chars 小到装不下标题本身属配置错误：返回单片让平台报错（可见），
+    head = max(len(title), len(cont_head)) + 1
+    head_bytes = max(len(title.encode("utf-8")), len(cont_head.encode("utf-8"))) + 1
+    body_cap = None if max_chars is None else max_chars - head
+    body_bytes = None if max_bytes is None else max_bytes - head_bytes
+    if (body_cap is not None and body_cap < 1) or (body_bytes is not None and body_bytes < 1):
+        # 上限小到装不下标题本身属配置错误：返回单片让平台报错（可见），
         # 而不是在 range(step=0) 上抛 ValueError 把发送线程炸掉。
         return [(title, text)]
-    chunks = [text[i : i + body_cap] for i in range(0, len(text), body_cap)]
+    chunks = _chunk_by_limits(text, body_cap, body_bytes)
     n = len(chunks)
     out = [(title, chunks[0])]
     out += [(f"[续 {i}/{n}]", c) for i, c in enumerate(chunks[1:], start=1)]
@@ -100,7 +179,8 @@ class Channel:
     """通道基类：子类给 ``_url`` + ``_payload``（或覆写 ``_request``），基类管分片与错。"""
 
     name = "base"
-    max_chars: int | None = 4000  # 单片正文上限；None = 不分片（自建接收端可不限）
+    max_chars: int | None = 4000  # 单片正文上限（字符）；None = 不限
+    max_bytes: int | None = None  # 单片正文上限（UTF-8 字节）；None = 不限
     slice_pause = 0.2  # 片间停顿，防机器人限流
 
     def __init__(self, timeout: float = DEFAULT_TIMEOUT_S) -> None:
@@ -126,36 +206,75 @@ class Channel:
 
     # -- 发送主体 ----------------------------------------------------------
 
+    def configured(self) -> tuple[bool, str]:
+        """(是否就绪, 说明)。供 ``lq notify status`` 做**真实**的自检。
+
+        只看 ``_url()`` 不够：PushPlus 的 token 在 body 里（URL 恒定）、
+        Telegram 还需要 chat_id —— 这类通道会把「未配置」误报成「已配置」，
+        用户直到 ``lq notify test`` 才发现。子类按需覆写。
+        """
+        try:
+            if not self._url():
+                return False, "缺 webhook URL / token"
+        except Exception as e:  # noqa: BLE001 - 自检本身不该抛
+            return False, f"配置读取失败: {type(e).__name__}"
+        return True, "ok"
+
     def send(self, title: str, text: str) -> SendResult:
-        """分片发送。全部片成功才 ok；任何一片失败即停并回报该错误。"""
+        """分片发送。全部片成功才 ok；任何一片失败即停并回报该错误。
+
+        两条硬契约：
+
+        1. **永不抛异常** —— 所以 URL 拼接（含加签）与 ``Request`` 构造也
+           必须在 try 内：URL 漏写 scheme 时 ``Request`` 会抛 ``ValueError``，
+           穿出去就把 day_close / 日报主链路掀翻。
+        2. **错误串不含凭证** —— URL 的 path/query 就是 key/token，而
+           ``SendResult.error`` 会进 API 响应体、CLI 输出与持久化日志，
+           所以一律过 ``_redact``。
+        """
         url = self._url()
         if not url:
             return SendResult(
                 self.name, ok=False, error="未配置（缺 webhook URL / token）", skipped=True
             )
-        slices = slice_text(title, text, self.max_chars)
+        try:
+            post_url = self._post_url(url)
+            scheme = urllib.parse.urlparse(post_url).scheme
+        except Exception as e:  # noqa: BLE001 - 加签/URL 解析失败也只是这条发不出去
+            return SendResult(
+                self.name, ok=False,
+                error=f"webhook URL 非法: {_redact(str(e), url)}")
+        if scheme not in ("http", "https"):
+            return SendResult(
+                self.name, ok=False,
+                error=f"webhook URL 缺 scheme（需 http/https）: {_safe_url(url)}")
+        slices = slice_text(title, text, self.max_chars, self.max_bytes)
         first_err: str | None = None
+        delivered = 0
         for i, (t, chunk) in enumerate(slices):
-            body, headers = self._request(t, chunk)
-            req = urllib.request.Request(self._post_url(url), data=body, headers=headers)
             try:
+                body, headers = self._request(t, chunk)
+                req = urllib.request.Request(post_url, data=body, headers=headers)
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     raw = resp.read().decode("utf-8", errors="replace")
             except urllib.error.HTTPError as e:
-                first_err = f"HTTP {e.code}: {e.reason[:200]}"
+                first_err = f"HTTP {e.code}: {str(e.reason)[:200]}"
                 break
             except Exception as e:  # noqa: BLE001  网络层失败只降级不外抛
-                first_err = f"{type(e).__name__}: {e}"
+                first_err = _redact(f"{type(e).__name__}: {e}", url, post_url)
                 break
 
             # 机器人协议的「业务失败」也是 HTTP 200 + errcode != 0，必须解析：
             # 不看 errcode 的话「key 错了」会被当成发送成功，告警静默丢失。
             first_err = _business_error(self.name, raw)
             if first_err:
+                first_err = _redact(first_err, url, post_url)
                 break
+            delivered += 1
             if i < len(slices) - 1:
                 time.sleep(self.slice_pause)
-        return SendResult(self.name, ok=first_err is None, error=first_err)
+        return SendResult(self.name, ok=first_err is None, error=first_err,
+                          sent_parts=delivered)
 
 
 def _business_error(channel: str, raw: str) -> str | None:
@@ -193,7 +312,11 @@ class WecomBot(Channel):
     """企业微信群机器人。env: LQ_WECOM_WEBHOOK_URL"""
 
     name = "wecom"
-    max_chars = 1200  # content 上限 4096 字节，UTF-8 中文 3 字节/字，留余量
+    max_chars = 1200
+    # msgtype=text 的 content 上限是 2048 字节（4096 是 markdown 类型）。
+    # 只按 1200 字符切，1185 个中文字就是 3585 字节，首片即被拒、后续片
+    # 也不再发 —— 必须让字节上限参与切分。
+    max_bytes = 2048
 
     def _url(self) -> str | None:
         return _env("LQ_WECOM_WEBHOOK_URL")
@@ -266,6 +389,15 @@ class TelegramBot(Channel):
     name = "telegram"
     max_chars = 1500  # text 上限 4096 字符
 
+    def configured(self) -> tuple[bool, str]:
+        """chat_id 缺了就发不出去（body 里会是空串 → 400），要能自检出来。"""
+        ok, why = super().configured()
+        if not ok:
+            return ok, why
+        if not _env("LQ_TELEGRAM_CHAT_ID"):
+            return False, "缺 LQ_TELEGRAM_CHAT_ID"
+        return True, "ok"
+
     def _url(self) -> str | None:
         token = _env("LQ_TELEGRAM_BOT_TOKEN")
         if not token:
@@ -281,6 +413,9 @@ class NtfyChannel(Channel):
     [+ LQ_NTFY_TOKEN]。纯文本 POST + X-Title 头，零门槛的个人手机通知。"""
 
     name = "ntfy"
+    # ntfy.sh 的消息体上限是 4096 字节（不是字符）：4000 个中文字 = 12000 字节，
+    # 会被 413 拒掉，所以字节上限必须一起参与切分。
+    max_bytes = 4096
 
     def _url(self) -> str | None:
         return _env("LQ_NTFY_URL")
@@ -306,6 +441,11 @@ class PushPlusChannel(Channel):
     max_chars = 1800
 
     def _url(self) -> str | None:
+        # token 走 body 而不是 URL，所以「URL 恒定」不等于「已配置」：
+        # 不检查 token 就会在未配置时也发一次注定 903 失败的请求，
+        # 把「没配」误报成「通道故障」（status 自检也会跟着说谎）。
+        if not _env("LQ_PUSHPLUS_TOKEN"):
+            return None
         return "https://www.pushplus.plus/send"
 
     def _payload(self, title: str, text: str) -> dict[str, Any]:
