@@ -12,7 +12,15 @@ from fastapi.testclient import TestClient
 
 os.environ.setdefault("LQ_SYNC_WORKER", "0")
 
-pytestmark = pytest.mark.usefixtures("api_env")
+# xdist_group：本模块用例共享 module 级 duckdb（见下方 api_env fixture），
+# 且 create_task 有「同时仅一个未完成任务」互斥，用例间存在文件内顺序
+# 依赖——--dist loadgroup 把本模块所有用例钉在同一个 worker 按序执行；
+# 不可乱序（retry 语义用例自带 _finalize 收尾，新用例若留下 running 态
+# 任务请先 _clear_active_tasks()）。
+pytestmark = [
+    pytest.mark.usefixtures("api_env"),
+    pytest.mark.xdist_group("task_center"),
+]
 
 
 @pytest.fixture(scope="module")
@@ -210,8 +218,9 @@ def _wait_status(getter, pred, timeout=5.0, interval=0.02):
 
 # 注意：本模块用例共享 module 级 duckdb（client fixture 未按用例换库），
 # 且 create_task 有「同时仅一个未完成任务」互斥，用例间存在文件内顺序
-# 依赖——不可乱序、不可 pytest-xdist 并行；retry 语义用例自带 _finalize
-# 收尾，新用例若留下 running 态任务请先 _clear_active_tasks()。
+# 依赖——不可乱序；xdist 并行通过文件头的 xdist_group 标记解决（整文件
+# 同 worker 按序）。retry 语义用例自带 _finalize 收尾，新用例若留下
+# running 态任务请先 _clear_active_tasks()。
 
 
 def test_list_rejects_unknown_kind_422(client):

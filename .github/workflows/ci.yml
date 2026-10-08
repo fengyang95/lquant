@@ -42,7 +42,11 @@ jobs:
     name: Python (pytest)
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 —— 下面 diff-cover 要 `--compare-branch=origin/main`，
+      # 浅克隆里没有 origin/main 这个 ref，git diff 会直接报 ambiguous argument。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
@@ -93,11 +97,21 @@ jobs:
         # timeout -s ABRT：卡住时用 SIGABRT 触发 faulthandler，把所有线程栈 dump
         # 进日志 —— 哪个用例卡住、卡在哪一行一眼可见，而不是白烧到 6 小时 job
         # 超时（这次就烧了 3 小时以上还没结束）。2400s 是本地 5'40" 的 ~7 倍余量。
-        # 去掉 -m "not slow"：全仓没有任何用例带 slow 标记（selected == all），
-        # 这个过滤是空操作，留着只会让人误以为网络/大数据用例已经被排掉。
+        # xdist 并行分片（runner 2 核 → -n 2；loadgroup 保证 xdist_group 用例
+        # 同 worker 按序）。--cov 两用：全局 fail_under=95 门禁 + diff-cover
+        # 增量门禁（原 pre-push 本地门禁，随增量测试改造迁到 CI）。
         env:
           PYTHONFAULTHANDLER: "1"
-        run: timeout -s ABRT 2400 .venv/bin/python -m pytest tests
+        run: |
+          timeout -s ABRT 2400 .venv/bin/python -m pytest tests \
+            -n auto --dist loadgroup \
+            --cov=src/lquant --cov-report=xml:coverage.xml
+
+      - name: diff-cover（改动行覆盖率 ≥95%）
+        if: github.event_name == 'pull_request' || github.ref != 'refs/heads/main'
+        run: |
+          .venv/bin/python -m diff_cover.diff_cover_tool coverage.xml \
+            --compare-branch=origin/main --fail-under=95
 
   web:
     name: Web (Next.js)

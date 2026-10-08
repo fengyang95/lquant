@@ -40,7 +40,8 @@ description: 全自动功能开发闭环——新 worktree 同步 origin/main，
 按序执行，任何一步失败则修复后重跑：
 
 ```bash
-make test               # pytest（推送前至少跑一次全量）
+make test-changed       # 只跑改动相关测试（日常迭代用，秒级~分钟级反馈）
+make test               # 全量并行 pytest（push 前跑一次；CI 会再全量把关）
 ruff check <改动文件>    # 仅改动文件
 cargo test --workspace  # 若改了 crates/ 下 Rust 代码（在 crates/ 目录内执行）
 ```

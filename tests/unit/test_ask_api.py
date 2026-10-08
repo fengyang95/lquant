@@ -10,6 +10,11 @@ from lquant.agent.service import get_agent_service
 from lquant.server.api import ask as ask_api
 from lquant.server.main import app
 
+# 本模块与「问 AI」其它用例共享同一个 aiosqlite 会话库（<root>/data/ask.db）。
+# xdist 多 worker 并发写会撞 sqlite「database is locked」，故整组钉在同一
+# worker 按序执行（与 test_task_center 同一套做法）。
+pytestmark = pytest.mark.xdist_group("ask_store")
+
 
 @pytest.fixture()
 async def client():
