@@ -160,8 +160,8 @@ def list_runs(limit: int = 20, strategy: str | None = None) -> list[dict]:
     )
     args: list = []
     if strategy:
-        sql += " WHERE strategy = ?"
-        args.append(strategy)
+        sql += " WHERE strategy = ? OR json_extract_string(params, '$.factor') = ?"
+        args.extend([strategy, strategy])
     sql += " ORDER BY created_at DESC LIMIT ?"
     args.append(int(limit))
     _ensure_table()  # 先补表（写锁），再读；避免读连接里开写连接
@@ -188,12 +188,18 @@ def count_runs(strategy: str | None = None) -> int:
     台账纪律：必须统计**所有**试过的配置（含放弃的、失败的），只数
     活下来的会让 DSR 变成橡皮图章。所以这里数的是 backtest_run 全表
     （可选按策略过滤），不做任何「成功」过滤。
+
+    过滤口径必须**同时**匹配 ``strategy`` 列与 ``params.factor``：
+    ``lq backtest run`` 落库时 strategy 列恒为 ``factor_quantile``，因子名
+    只写在 params 里，而 README 的示例是 ``--strategy mom_20`` ——
+    只比 strategy 列会让文档给的命令恒得 0 次试验，进而静默跳过 DSR
+    （把「台账为空」误报成「无选择偏差可校正」）。
     """
     sql = "SELECT count(*) FROM backtest_run"
     args: list = []
     if strategy:
-        sql += " WHERE strategy = ?"
-        args.append(strategy)
+        sql += " WHERE strategy = ? OR json_extract_string(params, '$.factor') = ?"
+        args.extend([strategy, strategy])
     _ensure_table()  # 先补表（写锁），再读；避免读连接里开写连接
     with _reader() as con:
         return int(con.execute(sql, args).fetchone()[0])

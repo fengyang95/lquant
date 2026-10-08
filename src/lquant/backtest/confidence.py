@@ -187,7 +187,12 @@ def cscv_pbo(returns_matrix, *, n_partitions: int = 16) -> dict:
         blk = combos[s : s + chunk]
         blk_is = block_means[blk].mean(axis=1)  # (chunk, N)
         is_means[s : s + chunk] = blk_is
-        oos_means[s : s + chunk] = (block_sum - blk_is) / half
+        # 补集（OOS）块的均值 = 全块均值 − 样本内块均值。
+        # 注意 ``blk_is`` 是 k/2 个 IS 块的**均值**，不是它们的和 ——
+        # 写成 ``(block_sum - blk_is) / half`` 会把 ``(1 - 1/half) · IS均值``
+        # 泄漏进「样本外」表现（k=16 时泄漏系数 0.875），使 PBO 系统性低报
+        # （纯噪声应 ≈0.5，实测掉到 0.14），即「越该报警越不报警」。
+        oos_means[s : s + chunk] = block_sum / half - blk_is
     j_star = is_means.argmax(axis=1)  # 样本内冠军
     rows = np.arange(n_combos)
     # 相对排名 ω：1 = 冠军在样本外**最差**（Bailey et al. 2017 口径）——
