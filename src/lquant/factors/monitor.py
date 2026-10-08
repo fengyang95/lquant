@@ -163,13 +163,20 @@ def factor_health(
     window: int = 20,
     min_ic: float = 0.0,
     min_icir: float = 0.0,
+    max_age_days: int | None = 10,
 ) -> list[dict]:
     """近 window 个交易日的因子健康度。纯只读评估（DryRun 语义）。
 
-    verdict 原因码：``no_data``（零记录）/ ``stale``（有限 IC 覆盖不足一半
-    窗口，同步断了）/ ``degraded``（窗口内 IC 全非有限，或 mean_ic / ICIR
-    跌破下限）/ ``ok``。
+    verdict 原因码：``no_data``（零记录）/ ``stale``（末条 IC 太旧，见
+    ``max_age_days``；或有限 IC 覆盖不足一半窗口）/ ``degraded``（窗口内 IC
+    全非有限，或 mean_ic / ICIR 跌破下限）/ ``ok``。
     ICIR = mean(ic)/std(ic)，日频不做年化 —— 与 ic_summary 的口径一致。
+
+    **时效是独立维度，且优先于统计判定**：只取「最后 N 条记录」而不看它们是哪天
+    的，同步停摆（定时任务/采集挂了）后窗口里永远塞满历史 IC，mean_ic/ICIR 一切
+    正常 → 恒判 ok、ic_below 永不触发。``last_date`` 落后今天超过 ``max_age_days``
+    个自然日即判 stale（``data_stale=True``）—— 数据是几个月前的，谈「今天 IC
+    多少」没有意义。长假期会误报，可按需调大或设 ``None`` 关闭。
 
     **非有限 IC（NaN/Inf）不算「健康」**：因子在某日截面内是常数（0/1 信号
     因子常见）时 ``pl.corr`` 返回 NaN —— 那正是「因子已无区分度」的证据。
@@ -179,6 +186,9 @@ def factor_health(
     """
     if int(window) < 1:
         raise ValueError(f"window 必须 >= 1，收到 {window}")
+    if max_age_days is not None and int(max_age_days) < 0:
+        raise ValueError(f"max_age_days 必须 >= 0 或 None，收到 {max_age_days}")
+    today = _today()
     con_ds = _health_rows(name, int(window))
     if not con_ds and name is not None:
         # 显式点名查某因子但零记录：不能让查询悄悄消失 → no_data 判定
@@ -190,6 +200,8 @@ def factor_health(
                 "mean_ic": None,
                 "icir": None,
                 "last_date": None,
+                "lag_days": None,
+                "data_stale": False,
                 "verdict": "no_data",
                 "detail": "factor_ic_daily 无记录",
             }
@@ -202,8 +214,20 @@ def factor_health(
         mean_ic = float(valid["ic"].mean()) if n_valid else None
         std_ic = float(valid["ic"].std()) if n_valid > 1 else None
         icir = (mean_ic / std_ic) if (mean_ic is not None and std_ic and std_ic > 1e-12) else None
+        last_date = rows["trade_date"].max() if n else None
+        last_d = last_date.date() if hasattr(last_date, "date") else last_date
+        lag_days = (today - last_d).days if last_d is not None else None
+        data_stale = (
+            max_age_days is not None and lag_days is not None and lag_days > int(max_age_days)
+        )
         if n == 0:
             verdict, detail = "no_data", "factor_ic_daily 无记录"
+        elif data_stale:
+            verdict, detail = (
+                "stale",
+                f"末条 IC {last_d} 落后今天 {lag_days} 天（> {max_age_days} 天）——"
+                "同步停摆？基于陈旧数据的 mean_ic/ICIR 不可信",
+            )
         elif n_valid == 0:
             verdict, detail = (
                 "degraded",
@@ -225,7 +249,9 @@ def factor_health(
                 "n_valid": n_valid,
                 "mean_ic": mean_ic,
                 "icir": icir,
-                "last_date": str(rows["trade_date"].max()) if n else None,
+                "last_date": str(last_d) if n else None,
+                "lag_days": lag_days,
+                "data_stale": data_stale,
                 "verdict": verdict,
                 "detail": detail,
             }
@@ -291,13 +317,15 @@ def run_daily_check(
     window: int = 20,
     min_ic: float = 0.0,
     min_icir: float = 0.0,
+    max_age_days: int | None = 10,
     notify_fn=None,
 ) -> dict:
     """编排：同步 → 健康评估 → 喂 notify/rules（ic_below 规则消费）。
 
     factors 缺省 = factor_def 里全部启用因子。单因子同步失败不阻断
     （结果里 error 逐条可见）。ctx 的 symbol 字段放因子名，ic_below
-    规则按 target=因子名（single_symbol）或 scope=market 吃全部因子。
+    规则按 target=因子名（single_symbol）或 scope=market 吃全部因子；
+    ctx 另带 verdict / last_date，通知里能直接看出是「失效」还是「没数据」。
     """
     if factors is None:
         with _reader() as con:
@@ -316,15 +344,27 @@ def run_daily_check(
 
             get_logger(__name__).warning(f"因子 IC 同步失败 {name}: {e}")
             errors.append({"factor": name, "error": f"{type(e).__name__}: {e}"})
-    health = factor_health(window=window, min_ic=min_ic, min_icir=min_icir)
-    # ctx 带上 verdict：ic=None 的 degraded（窗口内 IC 全非有限）也要进规则引擎，
-    # 否则「因子退化成常数」这条最该告警的路径会被过滤掉（ic_below 静默漏报）。
-    # 反过来 no_data / stale 不进：那两种是「没数据」，不是「因子失效」。
-    ctxs = [
-        {"symbol": h["factor"], "ic": h["mean_ic"], "verdict": h["verdict"]}
-        for h in health
-        if h["mean_ic"] is not None or h["verdict"] == "degraded"
-    ]
+    health = factor_health(
+        window=window, min_ic=min_ic, min_icir=min_icir, max_age_days=max_age_days
+    )
+    # ctx 带上 verdict / last_date：ic=None 的 degraded（窗口内 IC 全非有限）也要进
+    # 规则引擎，否则「因子退化成常数」这条最该告警的路径会被过滤掉（ic_below 静默漏报）。
+    # 时效 stale（data_stale）同样必须进，且 ic 一律置 None：数值是几个月前的，
+    # 让 ic_below 在陈旧 mean_ic 上做今天的判断等于漏报「同步停摆」——
+    # 统一走 rules.evaluate 的「IC 缺失/非有限」命中路径，last_date 说明原因。
+    # 反过来 no_data / 覆盖度不足的 stale 不进：那是「没数据」，不是「因子失效」。
+    ctxs = []
+    for h in health:
+        if h["data_stale"]:
+            ctxs.append({
+                "symbol": h["factor"], "ic": None, "verdict": h["verdict"],
+                "last_date": h["last_date"], "lag_days": h["lag_days"],
+            })
+        elif h["mean_ic"] is not None or h["verdict"] == "degraded":
+            ctxs.append({
+                "symbol": h["factor"], "ic": h["mean_ic"], "verdict": h["verdict"],
+                "last_date": h["last_date"],
+            })
     from lquant.notify.rules import run_rules
 
     alerts = run_rules(ctxs, notify_fn=notify_fn)

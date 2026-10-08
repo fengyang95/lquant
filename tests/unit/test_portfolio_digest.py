@@ -121,6 +121,32 @@ def test_snapshot_unpriced_position_weight_is_none(paper_env):
     assert snap["n_positions"] == 3
 
 
+def test_snapshot_all_unpriced_aggregate_is_unknown_not_zero(paper_env):
+    """全部持仓从未定价：聚合 TOP1/TOP3 是「未知」（None），不是 0% 集中度。
+
+    旧实现 `weights or 0.0` 让「算不出」伪装成「没有集中度」，
+    TOP1/TOP3 风控信号失真。
+    """
+    from lquant.paper import store as paper_store
+    from lquant.paper.engine import PaperBroker, PaperConfig, PaperPosition
+
+    paper_store.create_account("unpriced", 100000.0, strategy="test")
+    broker = PaperBroker(PaperConfig(initial_cash=100000.0))
+    broker.cash = 1000.0
+    broker.positions["301999"] = PaperPosition(
+        symbol="301999", qty=500, available=500, avg_cost=20.0, last_price=0.0, name="未定价新股"
+    )
+    paper_store.save_broker("unpriced", broker)
+
+    from lquant.market.digest import format_portfolio_report, portfolio_snapshot
+
+    snap = portfolio_snapshot("unpriced")
+    assert snap["n_positions"] == 1
+    assert snap["top1_weight"] is None and snap["top3_weight"] is None
+    assert snap["positions"][0]["weight"] is None
+    assert "TOP1 —" in format_portfolio_report(snap)
+
+
 def test_snapshot_dirty_nav_derived_fields_none(paper_env):
     """nav<=0 的对账事故：派生比例置 None（「—」优于荒谬数）。"""
     _seed_account()
@@ -133,13 +159,17 @@ def test_snapshot_dirty_nav_derived_fields_none(paper_env):
     con.commit()
     con.close()
 
-    from lquant.market.digest import portfolio_snapshot
+    from lquant.market.digest import format_portfolio_report, portfolio_snapshot
 
     snap = portfolio_snapshot(ACCOUNT)
     assert snap["nav"] == pytest.approx(-100.0)  # 原始值照传（不静默）
     assert snap["day_pct"] is None  # 负/负 → 不再出 +100%
     assert snap["drawdown"] is None
     assert snap["day_pnl"] == pytest.approx(-100.0 - 205000.0)  # 差值仍如实
+    # nav<=0 是脏分母：个股权重与聚合集中度都必须是「未知」，不能出负百分比
+    assert snap["positions"][0]["weight"] is None
+    assert snap["top1_weight"] is None and snap["top3_weight"] is None
+    assert "TOP1 —" in format_portfolio_report(snap)
 
 
 # ---------------- 报文 ----------------
@@ -171,6 +201,87 @@ def test_format_report_defensive_on_empty(paper_env):
     assert "当前回撤" not in text
     assert "持仓 0 只" in text
     assert "TOP1 0.0%" in text  # 无持仓 → 集中度为 0 而非缺失
+
+
+# ---------------- 对账告警接线（paper.service._notify_reconcile） ----------------
+# reconcile 的字典契约「无 intraday 时 verdict 仍为 ok」已被
+# tests/unit/test_metrics_paper_extra.py 固化（属另一层语义，未动）；告警
+# 判据在 service 侧补齐，这里锁住「没有基准 / 全部持仓无官方价 → 必须告警」。
+
+
+def _reconcile_report(**over):
+    rep = {
+        "account": "demo",
+        "trade_date": "2026-09-17",
+        "nav_official": 100000.0,
+        "nav_intraday": 100000.0,
+        "rel_dev": 0.0,
+        "stale_symbols": [],
+        "n_held": 1,
+        "n_uncovered": 0,
+        "verdict": "ok",
+        "detail": "",
+    }
+    rep.update(over)
+    return rep
+
+
+def _spy_reconcile_notify(monkeypatch):
+    fired: list[dict] = []
+
+    def spy(title, text, **kw):
+        fired.append({"title": title, "text": text, **kw})
+        return [SimpleNamespace(ok=True, channel="wecom")]
+
+    monkeypatch.setattr("lquant.notify.notify", spy)
+    return fired
+
+
+def test_reconcile_notify_silent_on_normal_ok(monkeypatch):
+    from lquant.paper.service import _notify_reconcile
+
+    fired = _spy_reconcile_notify(monkeypatch)
+    _notify_reconcile("demo", "2026-09-17", _reconcile_report())
+    assert fired == []  # 有基准且偏差在容忍度内：静默，不刷屏
+
+
+def test_reconcile_notify_fires_when_no_intraday_baseline(monkeypatch):
+    """(a) 没有盘中基准：rel_dev/detail 全空，但必须告警，不能静音。"""
+    from lquant.paper.service import _notify_reconcile
+
+    fired = _spy_reconcile_notify(monkeypatch)
+    _notify_reconcile("demo", "2026-09-17", _reconcile_report(nav_intraday=None))
+    assert len(fired) == 1
+    assert fired[0]["category"] == "alert" and fired[0]["severity"] == "warning"
+    assert "无盘中基准" in fired[0]["text"]
+    assert "unverified" in fired[0]["text"]  # 不显示自相矛盾的 verdict=ok
+
+
+def test_reconcile_notify_fires_when_all_positions_stale(monkeypatch):
+    """(b) 全部持仓取不到官方收盘价：官方 NAV 退回盯市价，偏差≈0 是假阴性。"""
+    from lquant.paper.service import _notify_reconcile
+
+    fired = _spy_reconcile_notify(monkeypatch)
+    _notify_reconcile(
+        "demo",
+        "2026-09-17",
+        _reconcile_report(stale_symbols=["600519"], n_uncovered=1, n_held=1),
+    )
+    assert len(fired) == 1
+    assert "全部 1 只持仓" in fired[0]["text"]
+
+
+def test_reconcile_notify_partial_stale_alone_is_not_noise(monkeypatch):
+    """部分 stale（个别停牌）属常态：单独不告警，避免把告警灌成噪音。"""
+    from lquant.paper.service import _notify_reconcile
+
+    fired = _spy_reconcile_notify(monkeypatch)
+    _notify_reconcile(
+        "demo",
+        "2026-09-17",
+        _reconcile_report(stale_symbols=["600519"], n_uncovered=1, n_held=3),
+    )
+    assert fired == []
 
 
 # ---------------- 编排 ----------------

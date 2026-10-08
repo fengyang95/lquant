@@ -131,21 +131,25 @@ def verify_and_register(spec: dict) -> tuple[bool, dict]:
                         "reason_code": "MISSING_RATIONALE",
                         "hint": "spec 缺少 rationale（研究动机/口径说明），拒绝入库"})
         return False, payload
-    # 先挂协变量面板（spec.covs 可声明看板另类数据 covariate），G0 白名单随后
-    # 随实际挂载的列走 —— 面板里有什么字段，校验就该认什么：cov 列真实可算、
-    # 中性化也在用它，G0 不认才是口径 bug。放前面的另一层用意：引用的
-    # covariate 数据不可用（coverage=0，列根本没挂上）在 RECOMPUTE 阶段最早
-    # 暴露，而不是入库后第一日因子值全 null 静默失效。
+    # G0 是毫秒级静态门禁，永远是第一步：坏表达式（未知字段/语法错）不该先触发
+    # 「读全湖 + 构协变量」。此前为拿实际挂载的 cov_cols 拼白名单把面板读取提到
+    # G0 之前，后果是读湖失败（锁冲突/湖缺失）时真实原因被 COMPUTE_FAIL 掩盖，
+    # 用户拿到的是「lake read boom」而不是可操作的 STATIC_FAIL + 字段提示。
+    # 白名单不必依赖真实挂载：spec.covs 声明了哪些 covariate，就允许哪些 cov_ 字段
+    # （纯语法判断）；真实挂载与 coverage 由随后的 RECOMPUTE 阶段显式校验。
+    declared_covs = {"cov_" + str(c) for c in (spec.get("covs") or [])}
+    g0 = g0_static(expr, allowed_fields=_daily_fields() | declared_covs)
+    if not g0.passed:
+        payload.update({"ok": False, "grade": "REJECTED", "stage": "G0",
+                        "reason_code": g0.reason_code, "hint": g0.hint})
+        return False, payload
+    # G0 之后才读面板：spec.covs 声明的 covariate 数据不可用（coverage=0，列根本没
+    # 挂上）会在 RECOMPUTE 阶段最早暴露，而不是入库后第一日因子值全 null 静默失效。
     try:
         df, cov_cols = _panel_with_covs(start=spec.get("start"), covs=spec.get("covs"))
     except Exception as e:  # noqa: BLE001
         payload.update({"ok": False, "grade": "REJECTED", "stage": "RECOMPUTE",
                         "reason_code": "COMPUTE_FAIL", "hint": str(e)})
-        return False, payload
-    g0 = g0_static(expr, allowed_fields=_daily_fields() | set(cov_cols))
-    if not g0.passed:
-        payload.update({"ok": False, "grade": "REJECTED", "stage": "G0",
-                        "reason_code": g0.reason_code, "hint": g0.hint})
         return False, payload
     try:
         splits = _split_eval(df, cov_cols, expr)
@@ -197,6 +201,12 @@ def verify_and_register(spec: dict) -> tuple[bool, dict]:
         return False, payload
     if grade in ("A", "B") or claimed is None:
         now = dt_now()
+        # 把 spec.covs 一起落库：audit/report/robust/run 的复算路径要靠它读回
+        # 「入库时用的中性化口径」。不落库的话，同一因子在 submit 用 spec.covs
+        # （如看板另类数据）、在 audit 用 DEFAULT_COVS（市值/行业/换手），两边
+        # 报的 IC 不是同一个数 —— 直接违反本模块自述的硬不变量。None 落 NULL，
+        # 老行与未声明 covs 的因子行为不变（复算走 DEFAULT_COVS）。
+        covs_json = json.dumps(list(spec["covs"])) if spec.get("covs") is not None else None
         try:
             upsert("factor_def", pl.DataFrame([{
             "name": name, "expression": expr,
@@ -204,6 +214,7 @@ def verify_and_register(spec: dict) -> tuple[bool, dict]:
             "source": "mined" if spec.get("agent") else "manual",
             "source_ref": spec.get("agent", "manual"),
             "factor_id": canonical_id(expr),
+            "covs": covs_json,
             "enabled": True, "created_at": now,
         }]))
         except Exception as e:  # noqa: BLE001

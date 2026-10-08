@@ -23,7 +23,12 @@ from lquant.indicators import (  # noqa: F401  触发注册
     trend,
     volume,
 )
-from lquant.indicators.chip import CYQ_PROXY_NOTE, cost_distribution, profit_ratio
+from lquant.indicators.chip import (
+    CYQ_PROXY_NOTE,
+    CYQ_TURNOVER_NOTE,
+    cost_distribution,
+    profit_ratio,
+)
 from lquant.indicators.composite import WARMUP, add_all
 from lquant.indicators.future import (
     LookaheadViolation,
@@ -62,6 +67,7 @@ from lquant.indicators.volume import add_turnover_ma, add_volume_ratio, add_volu
 __all__ = [
     "CATEGORIES",
     "CYQ_PROXY_NOTE",
+    "CYQ_TURNOVER_NOTE",
     "INDICATORS",
     "PANES",
     "TIANDAO_DEFAULT_N",

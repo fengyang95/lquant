@@ -235,15 +235,26 @@ class RuleStore:
             cur = con.execute("DELETE FROM notify_rules WHERE id=?", [rule_id])
         return cur.rowcount > 0
 
-    def mark_triggered(self, rule_id: int, cooldown_seconds: int) -> None:
-        """触发即落冷却状态 —— 重启不丢，这是 DB 状态区别于进程内降噪的全部意义。"""
+    def mark_triggered(self, rule_id: int, cooldown_seconds: int) -> bool:
+        """尝试落冷却状态并**认领**这次触发。返回 True = 本次由我触发。
+
+        条件更新把「查冷却 → 写冷却」合成一个原子步骤：原实现先由 evaluate
+        读快照判冷却、再无条件 UPDATE，两个并发入口（FastAPI 线程池里的
+        ``POST /api/notify/rules/run``、cron 与 UI 同时触发）都会读到
+        「不在冷却」而各发一条通知 —— 冷却恰好挡不住它该挡的重复告警。
+        以 ``rowcount == 1`` 作为「本次由我触发」的凭据，再发通知。
+        """
         now = datetime.now(ZoneInfo("Asia/Shanghai"))
+        stamp = now.isoformat()
         until = (now + timedelta(seconds=cooldown_seconds)).isoformat()
         with self._conn() as con:
-            con.execute(
-                "UPDATE notify_rules SET last_triggered_at=?, cooldown_until=? WHERE id=?",
-                [now.isoformat(), until, rule_id],
+            cur = con.execute(
+                "UPDATE notify_rules SET last_triggered_at=?, cooldown_until=? "
+                "WHERE id=? AND (cooldown_until IS NULL OR cooldown_until <= ?)",
+                [stamp, until, rule_id, stamp],
             )
+            # rowcount 必须在连接关闭前读 —— 连接关掉后再读拿到的未必是本次语句的结果。
+            return cur.rowcount == 1
 
 
 _store: RuleStore | None = None
@@ -336,7 +347,15 @@ def run_rules(ctxs: list[dict], store: RuleStore | None = None, notify_fn=None) 
         err = next((r for r in results if r[0] == EVAL_ERROR), None)
         if hit_idx is not None:
             hit = results[hit_idx]
-            store.mark_triggered(rule.id, rule.cooldown_seconds)
+            # 认领这次触发；拿不到（并发下已被别的入口写过冷却）就不发，
+            # 否则同一规则在一次冷却窗口内会被发两次。
+            if not store.mark_triggered(rule.id, rule.cooldown_seconds):
+                cd = next((r for r in results if r[0] == COOLDOWN), None)
+                out.append({
+                    "rule_id": rule.id, "status": COOLDOWN,
+                    "detail": cd[1] if cd else "冷却中（并发触发，已由其他入口发送）",
+                })
+                continue
             # 必须用命中的**那一行**下标取 symbol：此前 matched[results.index(hit)]
             # 是元组相等查找，两个标的给出同样的 (status, detail) 时会指到先出现
             # 的那个 —— 通知里的标的和证据不是同一只。

@@ -43,8 +43,20 @@ def _norm_sym(code) -> str:
         return str(code)
 
 
-def _board_table(table: str, panel: pl.DataFrame) -> pl.DataFrame:
-    """读看板表（覆盖 panel 的日期范围）。表未建/为空 → CovariateUnavailable。"""
+def _board_table(
+    table: str, panel: pl.DataFrame, need: tuple[str, ...] = ()
+) -> pl.DataFrame:
+    """读看板表（覆盖 panel 的日期范围）。表未建/缺列/为空 → CovariateUnavailable。
+
+    ``need`` 是这张表上 provider 真正消费的字段。缺列必须在这里统一收口成
+    ``CovariateUnavailable``：``build_covariates`` 只认这一个异常，而 provider 里
+    裸的 ``pl.col(...)`` 会抛 polars ``ColumnNotFoundError`` 穿透整个协变量构建
+    （CLI 裸 traceback / API 500），而不是 README 承诺的 coverage=0 显式上报。
+    老库 / 只跑过部分采集的库缺字段是真实运维场景；这里显式报缺列，也绝不靠
+    「让 build_covariates 吞掉所有 Exception」来掩盖真错误。
+
+    先查列再查空：空结果一样带 schema，缺列时先报缺列（更可操作）。
+    """
     from duckdb import CatalogException
 
     from lquant.core.db import reader
@@ -58,6 +70,11 @@ def _board_table(table: str, panel: pl.DataFrame) -> pl.DataFrame:
             ).pl()
     except CatalogException as e:
         raise CovariateUnavailable(f"{table} 未建表（看板采集从未跑过）") from e
+    missing = [c for c in need if c not in rows.columns]
+    if missing:
+        raise CovariateUnavailable(
+            f"{table} 缺列 {missing}（老库或只跑过部分采集）——该 covariate 不可计算；"
+            "重跑对应看板采集补齐字段")
     if not len(rows):
         raise CovariateUnavailable(f"{table} 在评价窗口内无数据（先在数据页采集）")
     return (
@@ -100,23 +117,32 @@ BOARD_COVARIATES: tuple[str, ...] = (
 
 @provider("mf_main_ratio", label="T日主力净流入占比（T+1 可用）")
 def _p_mf_main_ratio(panel, industry_df=None):
-    raw = _board_table("money_flow", panel)
+    raw = _board_table("money_flow", panel, need=("main_net_ratio",))
     d = _grid(panel).join(
         raw.select("trade_date", "symbol", "main_net_ratio"),
         on=["trade_date", "symbol"],
         how="left",
     )
+    # 未上榜 / 当日无流数据按模块 docstring 与 README 的业务语义取 0（「没有资金
+    # 异动」是事实，不是缺失）；shift 的窗口首行仍留 null（防前视的代价，已声明）。
+    # 这里绝不能留 null：``money_flow`` 采集按主力净流入降序只取前 200 只，留 null
+    # 会让 OLS 中性化的 valid_mask 把这些行整行剔除，评价样本被「协变量本身」截断
+    # 成当日前 200 只，而 submit/CLI 的 JSON 里没有任何样本量字段能看到这次截断。
+    d = d.with_columns(pl.col("main_net_ratio").fill_null(0.0))
     return _shift1(d, "main_net_ratio")
 
 
 @provider("mf_main_ratio_3d", label="近3日主力净占比均值（T+1 可用）")
 def _p_mf_main_ratio_3d(panel, industry_df=None):
-    raw = _board_table("money_flow", panel)
+    raw = _board_table("money_flow", panel, need=("main_net_ratio",))
     d = _grid(panel).join(
         raw.select("trade_date", "symbol", "main_net_ratio"),
         on=["trade_date", "symbol"],
         how="left",
     )
+    # 与 mf_main_ratio 同口径：无流日先填 0 再滚动，否则 rolling 跳过 null 观测
+    # 会让「近 3 日均值」在缺流日变成非 0 的隔日值，且同样触发中性化截断。
+    d = d.with_columns(pl.col("main_net_ratio").fill_null(0.0))
     d = d.with_columns(
         pl.col("main_net_ratio").rolling_mean(3, min_samples=1).over("symbol").alias("_v")
     )
@@ -135,7 +161,7 @@ def _p_lhb_on_board(panel, industry_df=None):
 
 @provider("lhb_net_buy_5d", label="近5日龙虎榜净买合计，未上榜日计0（T+1 可用）")
 def _p_lhb_net_buy_5d(panel, industry_df=None):
-    raw = _board_table("dragon_tiger", panel)
+    raw = _board_table("dragon_tiger", panel, need=("net_buy",))
     d = _grid(panel).join(
         raw.select("trade_date", "symbol", "net_buy"), on=["trade_date", "symbol"], how="left"
     )
@@ -156,14 +182,11 @@ def _limit_up_only(panel: pl.DataFrame) -> pl.DataFrame:
     按「在池里」计数会把「盘中涨停但收盘没封住」算成涨停日，连板数因此虚高。
 
     炸板行只能在写库时区分，所以这里按 ``limit_up_type`` 过滤；列整个缺失
-    （老库只跑过炸板池采集）就宁可报 CovariateUnavailable 也不假装知道 ——
-    与模块「缺失语义显式上报，绝不填 0 冒充」的约定一致。
+    （老库只跑过炸板池采集）由 ``_board_table(need=...)`` 统一报
+    CovariateUnavailable，绝不假装知道 —— 与模块「缺失语义显式上报，绝不填 0
+    冒充」的约定一致。
     """
-    raw = _board_table("limit_up_pool", panel)
-    if "limit_up_type" not in raw.columns:
-        raise CovariateUnavailable(
-            "limit_up_pool 缺 limit_up_type 列（老库或只采集过炸板池）——"
-            "无法区分涨停与炸板，连板数不可信；重跑涨停池采集补齐该列")
+    raw = _board_table("limit_up_pool", panel, need=("limit_up_type",))
     real = raw.filter(pl.col("limit_up_type").is_not_null())
     if not len(real):
         raise CovariateUnavailable(
@@ -190,7 +213,7 @@ def _p_zt_streak(panel, industry_df=None):
 
 @provider("zt_open_count_20d", label="近20日炸板次数合计，未涨停日计0（T+1 可用）")
 def _p_zt_open_count_20d(panel, industry_df=None):
-    raw = _board_table("limit_up_pool", panel)
+    raw = _board_table("limit_up_pool", panel, need=("open_count",))
     raw = raw.group_by(["trade_date", "symbol"]).agg(
         pl.col("open_count").cast(pl.Int64).sum().alias("_oc")
     )

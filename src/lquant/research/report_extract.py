@@ -10,7 +10,9 @@ RD-Agent（Microsoft）把「读研报 → 提出因子假设 → 形式化 → 
      幻觉算子/字段过不了 G0，与其让验证环节兜底，不如先缩小生成空间；
   2. 产出后逐条过 ``g0_static``（parse + 白名单 + 未来函数 + 算子合法性，
      平台的第一道门禁，语义不分叉），不合格的进 ``rejected`` 并带原因
-     —— 淘汰明细可见，不静默。
+     —— 淘汰明细可见，不静默；LLM 用错键名/漏 ``expr``/返回非对象的条目
+     同样进 ``rejected``（带结构原因），全部不可解析时直接抛错说明真实原因，
+     不冒充「G0 淘汰」。
 
 **密钥卫生**：``LQ_LLM_API_KEY`` 只从 env 读取，不落盘、不进日志；
 HTTP 错误消息只带状态码，不带请求头。
@@ -26,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 
@@ -101,16 +104,113 @@ def _env_llm(timeout: float = DEFAULT_TIMEOUT):
     return fn
 
 
-def _parse_llm_json(raw: str) -> list[dict]:
-    """LLM 返回 → 提案列表。格式坏 = 显式报错带原文片段，不静默吞。"""
-    try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"LLM 返回不是合法 JSON: {e}；原文前 200 字: {raw[:200]!r}") from e
-    items = obj.get("proposals") if isinstance(obj, dict) else obj
+def _raw_snippet(raw, n: int = 200) -> str:
+    """LLM 原文前 N 字的可读片段。
+
+    非字符串（content 为 None / 数字 / 数组）用 repr 兜底：报错路径本身
+    绝不能再抛一次 TypeError，否则逃出 CLI 后只剩不可读的裸异常。
+    """
+    return raw[:n] if isinstance(raw, str) else repr(raw)[:n]
+
+
+def _strip_code_fence(s: str) -> str:
+    """剥掉 ```` ```json ... ``` ```` 围栏：LLM 常无视「只输出 JSON」这句。"""
+    m = re.search(r"```[A-Za-z0-9_+-]*\s*(.*?)```", s, re.DOTALL)
+    return (m.group(1) if m else s).strip()
+
+
+def _balanced_slice(s: str, open_ch: str, close_ch: str) -> str | None:
+    """取第一个括号配平的 ``{...}`` / ``[...]`` 片段（字符串内的括号不计数）。"""
+    start = s.find(open_ch)
+    if start < 0:
+        return None
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(s)):
+        c = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return s[start : i + 1]
+    return None
+
+
+_UNSET = object()
+
+
+def _parse_llm_json(raw) -> list:
+    """LLM 返回 → 提案**原始条目**列表（字段校验交给 extract_proposals）。
+
+    容错但**不静默**：先剥代码块围栏，再退化到第一个括号配平的
+    ``{...}`` / ``[...]``。彻底解析不了、或 content 为 None/数字等非字符串
+    时显式报错 —— 错误串带原文前 200 字，能分清是模型跑偏还是上游把
+    ``message.content`` 拿成了 null（旧实现在这里裸抛 TypeError）。
+    """
+    snippet = _raw_snippet(raw)
+    if not isinstance(raw, str):
+        raise ValueError(f"LLM 返回不是字符串（{type(raw).__name__}）；原文前 200 字: {snippet!r}")
+    text = _strip_code_fence(raw)
+    parsed: object = _UNSET
+    last_err: Exception | None = None
+    for cand in (text, _balanced_slice(text, "{", "}"), _balanced_slice(text, "[", "]")):
+        if not cand:
+            continue
+        try:
+            parsed = json.loads(cand)
+            break
+        except (json.JSONDecodeError, TypeError) as e:  # TypeError 兜底：非 str 入参
+            last_err = e
+    if parsed is _UNSET:
+        raise ValueError(f"LLM 返回不是合法 JSON: {last_err}；原文前 200 字: {snippet!r}")
+    items = parsed.get("proposals") if isinstance(parsed, dict) else parsed
     if not isinstance(items, list):
-        raise ValueError(f"LLM 返回缺少 proposals 数组；原文前 200 字: {raw[:200]!r}")
-    return [it for it in items if isinstance(it, dict) and it.get("expr")]
+        raise ValueError(f"LLM 返回缺少 proposals 数组；原文前 200 字: {snippet!r}")
+    return items
+
+
+def _normalize_item(it) -> tuple[dict, str | None]:
+    """单条 LLM 条目 → (规范化的 ``{expr, note}``, 不可用原因 or None)。
+
+    LLM 用 ``expression``/``factor``/``formula`` 等键名、漏 ``expr``、或把
+    ``expr`` 写成数字时，旧实现用列表推导静默过滤 —— 条目直接消失，全丢时
+    CLI 还会把「一条都没进 G0」误报成「G0 淘汰」。这里把不可用条目显式收回
+    并给出原因（含实际键名/原值片段），保证淘汰明细可见。
+    """
+    if not isinstance(it, dict):
+        return {"expr": "", "note": ""}, (
+            f"LLM 条目不是 JSON 对象（{type(it).__name__}: {_raw_snippet(it, 80)}）"
+        )
+    expr = it.get("expr")
+    if not isinstance(expr, str) or not expr.strip():
+        if expr is None:
+            alt_key = next(
+                (
+                    k
+                    for k in ("expression", "factor", "formula", "signal")
+                    if isinstance(it.get(k), str) and it[k].strip()
+                ),
+                None,
+            )
+            actual = (
+                f"（实际键名 {alt_key}={it[alt_key][:60]!r}）"
+                if alt_key is not None
+                else f"（实际键: {', '.join(str(k) for k in list(it)[:6])}）"
+            )
+        else:
+            actual = f"（expr 实际为 {type(expr).__name__}）"
+        return {"expr": "", "note": str(it.get("note", ""))}, f"LLM 条目缺少可用的 expr 字段{actual}"
+    return {"expr": expr.strip(), "note": str(it.get("note", ""))}, None
 
 
 def extract_proposals(
@@ -120,9 +220,16 @@ def extract_proposals(
 
     accepted 元素为 ``{"expr", "note"}``（可直接写 JSONL 喂
     ``lq factor mine --generator proposals``）；rejected 元素多一个
-    ``reason``（G0 原因码），淘汰可见。
+    ``reason``（G0 原因码，或「LLM 条目缺少可用的 expr 字段」这类结构原因），
+    淘汰明细永远可见 —— 不再有被列表推导静默吃掉的条目。
 
     ``llm_fn(system, user) -> str`` 可注入（测试用 FakeLLM；缺省走 env 配置）。
+
+    Raises:
+        ValueError: 研报文本为空；LLM 返回不是字符串/不是合法 JSON/缺
+            ``proposals`` 数组；``proposals`` 为空数组；或**全部条目结构
+            不可用**（一条都没进过 G0 —— 这时报「G0 淘汰」会误导排障方向，
+            所以直接抛错并带上真实原因与原文片段）。
     """
     from lquant.factors.fields import NUMERIC_FIELDS
     from lquant.factors.mining.gates import g0_static
@@ -137,15 +244,36 @@ def extract_proposals(
 
     accepted: list[dict] = []
     rejected: list[dict] = []
-    for it in _parse_llm_json(raw):
-        expr = str(it["expr"]).strip()
-        item = {"expr": expr, "note": str(it.get("note", ""))}
+    items = _parse_llm_json(raw)
+    if not items:
+        # 「宁缺毋滥」产空数组也是合法的，但静默返回空集合会让 CLI 把
+        # 「LLM 没给提案」误报成「G0 淘汰了 0 条」。说清真实原因。
+        raise ValueError(
+            f"LLM 返回的 proposals 为空数组（0 条提案）；原文前 200 字: {_raw_snippet(raw)!r}"
+        )
+    malformed = 0
+    for it in items:
+        # 结构不可用的条目收进 rejected（带原因），不再用列表推导静默过滤
+        item, bad = _normalize_item(it)
+        if bad is not None:
+            malformed += 1
+            rejected.append({**item, "reason": bad})
+            continue
+        expr = item["expr"]
         gate = g0_static(expr, allowed_fields=fields)
         if gate.passed and len(accepted) < max_proposals:
             accepted.append(item)
         else:
             reason = gate.reason_code if not gate.passed else "超过 max_proposals 上限"
             rejected.append({**item, "reason": reason})
+    if not accepted and malformed == len(items):
+        # 一条都没进过 G0：再报「没有通过 G0」会把排障方向带偏（差的是 LLM
+        # 输出结构，不是表达式质量），这里直接抛出带真实原因与原文片段的错误
+        reasons = "；".join(r["reason"] for r in rejected)
+        raise ValueError(
+            f"LLM 返回的 {len(items)} 条提案全部无法解析（未进入 G0）：{reasons}；"
+            f"原文前 200 字: {_raw_snippet(raw)!r}"
+        )
     return {"accepted": accepted, "rejected": rejected}
 
 

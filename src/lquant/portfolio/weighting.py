@@ -13,6 +13,7 @@ import numpy as np
 import polars as pl
 
 from lquant.portfolio.optimizer import OptimizerError
+from lquant.portfolio.riskmodel import RiskModelError
 
 __all__ = ["equal_weight", "score_weight", "market_cap_weight", "inverse_vol_weight",
            "risk_parity_weight", "min_variance_weight", "hrp_weight",
@@ -270,8 +271,15 @@ def apply_no_trade_band(weights: dict[str, float], prev: dict[str, float],
     """no-trade band：|w_new - w_prev| < band 的标的**不动**，其余照旧。
 
     经典 MVO 缓解高换手的手段：优化输出对输入噪声极敏感，微小偏离驱动的
-    调仓是纯摩擦成本（cost_matrix 已证明）。band 吸收后权重和可能 < 1
-    （差额是现金缓冲）—— 这是特性不是 bug，调用方按现金处理。
+    调仓是纯摩擦成本（cost_matrix 已证明）。band 吸收后权重和**可以 < 1**
+    （差额是现金缓冲），但**永不 > 1**：
+
+    被吸收的标的停在 prev，若这批 prev 之和大于新目标之和，直接拼接会让
+    输出总和 > 1 —— 那是隐含杠杆（没钱的买入），与「权重和 < 1 即现金
+    缓冲」的单边语义相悖。所以 band 之后必须把超额显式再分配：优先从
+    「本次本来就要动」的标的里等比扣减（被吸收的严格停在 prev），只有可动
+    仓位不足以吸收时才整体等比缩小（此时被吸收标的会略低于 prev，但仍是
+    无杠杆组合，说明 prev 与新目标尺度严重不一致，调用方该检查输入）。
 
     返回 (新权重 dict, 改动标的数)。prev 里没有的标的按 0 处理（新调入
     门槛）；新权重里没有的标的同样按 0 对（调出门槛）。band <= 0 raise：
@@ -279,13 +287,16 @@ def apply_no_trade_band(weights: dict[str, float], prev: dict[str, float],
     """
     if not (float(band) > 0):
         raise ValueError(f"band 必须 > 0，收到 {band}")
-    out, n_changed = {}, 0
+    out: dict[str, float] = {}
+    changed: set[str] = set()
+    n_changed = 0
     for s, w_new in weights.items():
         w_prev = float(prev.get(s, 0.0))
         if abs(float(w_new) - w_prev) < float(band):
             out[s] = w_prev
         else:
             out[s] = float(w_new)
+            changed.add(s)
             n_changed += 1
     # prev 独有的持仓：新权重已不含（目标 0）—— |0 - w_prev| < band 说明是
     # 小仓位摩擦性漂移，不卖（保持 w_prev）；够到门槛才清仓
@@ -295,7 +306,20 @@ def apply_no_trade_band(weights: dict[str, float], prev: dict[str, float],
                 out[s] = float(w_prev)
             else:
                 out[s] = 0.0
+                changed.add(s)
                 n_changed += 1
+    # 不产生隐含杠杆：总和 > 1 时把超额显式分配掉（见 docstring）
+    total = float(sum(out.values()))
+    if total > 1.0 + 1e-12:
+        excess = total - 1.0
+        movable = float(sum(out[s] for s in changed))
+        if movable > 0.0 and excess <= movable + 1e-12:
+            k = max(0.0, (movable - excess) / movable)
+            for s in changed:
+                out[s] *= k
+        else:
+            k = 1.0 / total
+            out = {s: v * k for s, v in out.items()}
     return out, n_changed
 
 
@@ -313,22 +337,28 @@ def weights(returns, method: str = "equal", symbols: list[str] | None = None,
 
     ``prev_weights`` 有**两个可能的主人**：band 的锚（与 ``band`` 一起给），
     或被调方法自己的入参（``enhanced_indexing`` 的换手参照点，见
-    ``optimizer.enhanced_indexing_weight``）。所以只在 band 模式下取走它，
+    ``optimizer.enhanced_indexing_weight``）。所以只在方法不收它时取走，
     否则原样透传给方法 —— 否则统一入口反而比直调方法更窄：
     ``weights(..., "enhanced_indexing", max_turnover=…, prev_weights=…)``
-    会被「成对校验」拦下，而那两个参数本来正是配着用的。
+    会被「成对校验」拦下，而那两个参数本来正是配着用的。band 与方法自己的
+    ``prev_weights`` **同给**时两者共用同一个锚（README 就是这么推荐的）。
     """
     band = kw.pop("band", None)
+    prev = kw.get("prev_weights")
+    owns_prev = _accepts(method, "prev_weights")
     if band is None:
         # 非 band 模式：prev_weights 属于方法。方法根本不收这个参数时，
         # 只给 prev_weights 就是「装样子」—— 照旧 raise（不静默吞掉）。
-        prev = kw.get("prev_weights")
-        if prev is not None and not _accepts(method, "prev_weights"):
+        if prev is not None and not owns_prev:
             raise ValueError("band 与 prev_weights 必须成对给：只给一个是装样子")
     else:
-        prev = kw.pop("prev_weights", None)
         if prev is None:
             raise ValueError("band 与 prev_weights 必须成对给：只给一个是装样子")
+        if not owns_prev:
+            kw.pop("prev_weights")
+        # owns_prev 时保留在 kw 里同时透传：band 只做输出层吸收，方法层的
+        # 换手上限（max_turnover）仍需要同一个 prev 作参照点。吞掉它会让
+        # max_turnover 在方法内抛「必须配 prev_weights」—— 两条刹车没法配着用。
     if method not in METHODS:
         w = equal_weight(returns, symbols)
     else:
@@ -364,9 +394,11 @@ def weight_report(returns, symbols: list[str] | None = None,
     for name in (methods or list(METHODS)):
         try:
             w = np.array([weights(M, name, syms, **kw).get(s, 0.0) for s in syms])
-        except (OptimizerError, ValueError) as e:
+        except (OptimizerError, RiskModelError, ValueError) as e:
             # 需要额外输入的方法（enhanced_indexing 要 α 视图）不该让整张报告炸 ——
             # 记一行 note 说明为什么算不出来，报告仍能列全所有注册方法。
+            # RiskModelError 与 OptimizerError 同族（都是 LQuantError）：T<2 行
+            # 或 cov_method 拼错时它从 _cov_for 抛出，漏抓会让整表崩掉。
             rows.append({"method": name, "vol": None, "effective_n": None,
                          "max_weight": None, "n_holdings": None, "note": str(e)})
             continue

@@ -10,7 +10,7 @@
 | EP-6 组合权重 | skfolio estimator | 随功能实现 |
 | EP-7 看板采集器 | collector 注册 | 随功能实现 |
 | EP-8 ML 模型 | Model 接口 | M6c |
-| EP-9 看板→因子 | 表结构先建 | M7b 建表 |
-| EP-10 通知告警 | 仅留接口 | 不做 |
-| EP-11 LLM 挖因子 | 架构预留 | 不做 |
+| EP-9 看板→因子 | 入口 `src/lquant/factors/sources/board.py`（看板数据源） | 已交付（含入口） |
+| EP-10 通知告警 | 入口 `src/lquant/notify/`（渠道 + 规则引擎 + CLI） | 已交付（含入口） |
+| EP-11 LLM 挖因子 | 入口 `src/lquant/research/report_extract.py`（研报提案） | 已交付（含入口） |
 | EP-12 多市场 | 三条硬约束先守 | 不做 |

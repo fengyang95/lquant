@@ -163,27 +163,59 @@ def _sym_col(df, cov: str) -> dict:
 
 
 def test_mf_main_ratio_t_plus_1(board_env):
-    """T 日资金流值出现在 T+1 行；T 日缺行是 null（缺失），不是 0。"""
+    """T 日资金流值出现在 T+1 行；未上榜/当日无流数据按业务语义取 0。
+
+    旧断言 ``got[D6] is None``（T 日缺行 = 缺失留 null）锁的正是缺陷行为：
+    ``money_flow`` 采集按主力净流入降序只取前 200 只，留 null 会让 OLS 中性化的
+    valid_mask 把这些行整行剔除 —— 评价样本被协变量本身截断成「当日前 200 只」，
+    而输出里看不到任何样本量字段。模块 docstring 与 README 写的都是取 0，
+    实现必须跟文档一致。
+    """
     df, _ = _cov_frame(board_env, ["mf_main_ratio"])
     got = _sym_col(df, "cov_mf_main_ratio")
-    assert got[D1] is None  # 窗口首行：shift 无前值
+    assert got[D1] is None  # 窗口首行：shift 无前值（防前视的代价，文档已声明）
     assert got[D2] == pytest.approx(0.1)  # D2 行只看得到 D1 的 0.1
     assert got[D5] == pytest.approx(0.4)  # D5 行 = D4 的 0.4
-    assert got[D6] is None  # D5 起无资金流数据 → 缺失，不填 0
+    assert got[D6] == pytest.approx(0.0)  # D5 起无资金流数据 → 业务语义取 0
+    assert got[D8] == pytest.approx(0.0)
 
 
 def test_mf_main_ratio_3d_rolling_then_shift(board_env):
-    """3 日均值先在 T 日窗口内算好，再整体 shift —— T+1 行看 ≤T 的 3 日均值。"""
+    """3 日均值先在 T 日窗口内算好，再整体 shift —— T+1 行看 ≤T 的 3 日均值。
+
+    无流日按 0 参与滚动（与 mf_main_ratio 同口径），不再被 rolling 跳过。
+    """
     df, _ = _cov_frame(board_env, ["mf_main_ratio_3d"])
     got = _sym_col(df, "cov_mf_main_ratio_3d")
     assert got[D2] == pytest.approx(0.1)  # D1 单日
     assert got[D4] == pytest.approx((0.1 + 0.2 + 0.3) / 3)  # D3 行 = D1..D3 均值
     assert got[D5] == pytest.approx((0.2 + 0.3 + 0.4) / 3)
-    # D5 之后 money_flow 无行：rolling 的 null 不计观测（min_samples=1），
-    # D6 行窗口 D4..D5 → 0.35，D7 行窗口只剩 D4 → 0.4，D8 全空 → null
-    assert got[D6] == pytest.approx(0.35)
-    assert got[D7] == pytest.approx(0.4)
-    assert got[D8] is None
+    # D5 起 money_flow 无行：填 0 后 D5 行窗口 D3..D5 = (0.3+0.4+0)/3，
+    # D6 行窗口 D4..D6 = (0.4+0+0)/3，D7 起全 0
+    assert got[D6] == pytest.approx((0.3 + 0.4 + 0.0) / 3)
+    assert got[D7] == pytest.approx((0.4 + 0.0 + 0.0) / 3)
+    assert got[D8] == pytest.approx(0.0)
+
+
+def test_mf_zero_fill_keeps_neutralization_sample(board_env):
+    """mf 缺流日填 0 后，中性化只剔除 shift 窗口首行，不再截断评价样本。
+
+    修复前 mf 缺流日留 null，OLS 的 ``valid_mask`` 会把缺值行整行剔除 ——
+    样本被协变量自己截断成「当日前 200 只」，而 submit/CLI 的 JSON 里没有任何
+    样本量字段能看到这次截断。
+    """
+    from lquant.factors.mining.submit import _panel_with_covs, prepare_segment
+
+    df, cov_cols = _panel_with_covs(covs=["mf_main_ratio"])
+    assert cov_cols == ["cov_mf_main_ratio"]
+    dates = sorted(df["trade_date"].unique().to_list())
+    with_cov = prepare_segment(df, cov_cols, "$close", dates)
+    without_cov = prepare_segment(df, [], "$close", dates)
+    # 6 票 × 8 日：D8 无前瞻收益（6 行），其余 42 行参与；mf 只多剔窗口首行 6 行
+    assert len(without_cov) == 42
+    assert len(with_cov) == len(without_cov) - 6
+    # 剩余 D2..D7（D1 是 mf 的 shift 窗口首行，D8 无前瞻收益）
+    assert with_cov["trade_date"].n_unique() == 6
 
 
 def test_lhb_on_board_seen_next_day(board_env):
@@ -269,6 +301,37 @@ def test_zt_open_count_20d_rolling_sum(board_env):
     assert got[D8] == pytest.approx(3.0)
 
 
+def test_board_providers_missing_columns_report_unavailable(board_env):
+    """老库/手改库缺 provider 字段 → 与其他看板 provider 一致的 coverage=0 上报。
+
+    修复前只有 ``zt_streak`` 走 ``_limit_up_only`` 的显式检查，``main_net_ratio`` /
+    ``net_buy`` / ``open_count`` 缺列时抛裸 polars ``ColumnNotFoundError`` 穿透
+    ``build_covariates``（CLI 裸 traceback / API 500），而不是模块承诺的显式上报。
+    """
+    import duckdb
+
+    from lquant.core.config import get_settings
+
+    cases = (
+        ("money_flow", "main_net_ratio", "mf_main_ratio"),
+        ("dragon_tiger", "net_buy", "lhb_net_buy_5d"),
+        ("limit_up_pool", "open_count", "zt_open_count_20d"),
+    )
+    for table, column, cov in cases:
+        path = get_settings().duckdb_path
+        con = duckdb.connect(str(path))
+        con.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+        con.close()
+        df, report = _cov_frame(board_env, [cov])
+        r = {x["covariate"]: x for x in report}
+        assert r[cov]["coverage"] == 0.0, f"{cov} 缺列未显式上报"
+        assert column in r[cov]["note"], r[cov]["note"]
+        assert f"cov_{cov}" not in df.columns
+        con = duckdb.connect(str(path))
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {column} DOUBLE")
+        con.close()
+
+
 # ---------------- 语义分界：缺失 vs 业务 0 ----------------
 
 
@@ -303,19 +366,24 @@ def test_empty_window_reports_unavailable(board_env):
 
 
 def test_coverage_reports_zero_fill_vs_missing(board_env):
-    """覆盖率是语义分界的量化体现：填 0 的 lhb/zt 覆盖远高于留 null 的资金流。"""
+    """覆盖率是语义分界的量化体现：缺数据日填 0，只剩 shift 窗口首行是 null。
+
+    旧断言 ``mf_main_ratio coverage < 0.5`` 锁的是缺陷行为（资金流缺行留 null）。
+    资金流表只采了 5 行，若留 null 覆盖会被压到 0.13 —— 那不是「数据可算」，
+    而是评价样本被协变量自己截断（中性化剔除 null 行）的隐蔽来源。
+    """
     from lquant.factors.sources.board import BOARD_COVARIATES, board_cov_names
 
     assert board_cov_names() == list(BOARD_COVARIATES)
     df, report = _cov_frame(board_env, board_cov_names())
     r = {x["covariate"]: x for x in report}
     assert set(r) == set(BOARD_COVARIATES)
-    # 24 行面板：shift 首行 null 之外全有值 → 21/24
+    # 48 行面板（6 票 × 8 日）：只有每股 shift 首行 null → 42/48 = 0.875
     assert r["lhb_on_board"]["coverage"] == pytest.approx(0.875)
     assert r["zt_streak"]["coverage"] == pytest.approx(0.875)
-    # 资金流只采了 5 行且缺行留 null → 覆盖显著更低，但不是 0（数据真的可算）
-    assert 0 < r["mf_main_ratio"]["coverage"] < 0.5
-    assert r["lhb_on_board"]["coverage"] > r["mf_main_ratio"]["coverage"]
+    # 资金流同样只在窗口首行 null：缺流日按业务语义取 0，不再触发中性化截断
+    assert r["mf_main_ratio"]["coverage"] == pytest.approx(0.875)
+    assert r["mf_main_ratio_3d"]["coverage"] == pytest.approx(0.875)
 
 
 # ---------------- symbol 口径防御 ----------------

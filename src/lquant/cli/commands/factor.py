@@ -440,9 +440,11 @@ def series(expr: str, start: str | None) -> None:
     import numpy as np
 
     from lquant.factors.mining.runner import split_dates
-    from lquant.factors.mining.submit import _panel_with_covs, prepare_segment
+    from lquant.factors.mining.submit import prepare_segment
 
-    df, cov_cols = _panel_with_covs(start=start)
+    # 与 audit/_load_segments 同口径：注册过的因子按入库时的 covs 复算，不能因为
+    # 这条命令没有 --cov 就悄悄换成 DEFAULT_COVS（同一因子两套口径）。
+    df, cov_cols = _panel_for_expr(start, expr)
     if not len(df):
         raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")
     tr_d, _val_d, _test_d = split_dates(sorted(df["trade_date"].unique().to_list()))
@@ -522,19 +524,88 @@ def _parse_floats(s: str) -> tuple[float, ...]:
     return tuple(float(x) for x in s.split(",") if x.strip())
 
 
+def _registered_covs(expr: str) -> list[str] | None:
+    """从 factor_def 读回该表达式入库时用的 covs 口径（无记录/老行 → None）。
+
+    submit 用 ``spec.covs`` 做入库重算，audit/report/robust/run 若不读回就会改用
+    ``DEFAULT_COVS``（市值/行业/换手）——「audit 报的 IC 和入库时服务端重算的 IC
+    是同一个数」这条硬不变量会静默失效。老库没有 covs 列、或该行 covs 为 NULL
+    （入库时未声明）时返回 None，行为与修复前一致（走 DEFAULT_COVS）。
+
+    读失败按「无注册口径」降级，但只在**明确的缺列/缺表**上降级：其它异常照旧
+    抛出，避免把真正的库故障伪装成「没登记过 covs」。表达式本身解析不了时也返回
+    None —— 那种表达式随后会在 ``compute_factor_col`` 上以原有的错误面报出来，
+    不该在这里先抛一个口径查询错误把它顶掉。
+    """
+    import json
+
+    import duckdb
+
+    from lquant.core.db import reader
+    from lquant.factors.dsl.printer import canonical_id
+
+    try:
+        fid = canonical_id(expr)
+    except SyntaxError:
+        return None  # 非法表达式：交给下游 compute 路径报错，不改变错误面
+    try:
+        row = None
+        with reader() as con:
+            cols = {r[0] for r in con.execute("DESCRIBE factor_def").fetchall()}
+            if "covs" not in cols:
+                return None  # 老库未迁移：向后兼容，复算走 DEFAULT_COVS
+            row = con.execute(
+                "SELECT covs FROM factor_def WHERE expression = ? OR factor_id = ? "
+                "ORDER BY created_at DESC NULLS LAST LIMIT 1",
+                [expr, fid],
+            ).fetchone()
+    except duckdb.CatalogException:
+        return None  # factor_def 未建表（新环境直接按表达式评价）
+    if row is None or row[0] is None or row[0] == "":
+        return None
+    raw = row[0]
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError as e:
+            raise click.ClickException(
+                f"factor_def.covs 口径损坏（不是合法 JSON: {row[0]!r}）——"
+                "拒绝用错误的中性化口径复算") from e
+    if not isinstance(raw, list):
+        raise click.ClickException(
+            f"factor_def.covs 口径损坏（期望 JSON 数组，实际 {type(raw).__name__}: {raw!r}）——"
+            "拒绝用错误的中性化口径复算")
+    return [str(c) for c in raw]
+
+
+def _panel_for_expr(start: str | None, expr: str):
+    """复算面板：注册过的表达式按 ``factor_def.covs`` 读回口径，读不到才走缺省。
+
+    读不到注册口径时沿用 ``_panel_with_covs(start=...)`` 的既有调用形状：
+    不改变未注册表达式（以及既有调用点/替身）的缺省行为。
+    """
+    from lquant.factors.mining.submit import _panel_with_covs
+
+    covs = _registered_covs(expr)
+    if covs is None:
+        return _panel_with_covs(start=start)
+    return _panel_with_covs(start=start, covs=covs)
+
+
 def _load_segments(start: str | None, expr: str, *, horizons=(1, 5), with_pre: bool = False):
     """读日线 + 协变量 → 70/15/15 切分 → train/val 两段分析就绪面板。
 
     与 submit 重验共用 ``prepare_segment``，所以 audit 报的 IC 和入库时
-    服务端重算的 IC 是同一个数 —— 口径不允许分叉。
+    服务端重算的 IC 是同一个数 —— 口径不允许分叉。协变量清单优先用
+    ``factor_def.covs`` 读回注册时口径（``_registered_covs``），读不到才走缺省。
 
     ``with_pre=True`` 额外返回 train 段**中性化之前**的帧（IC 归因阶梯的基线），
     返回 ``(seg, cov_cols, days, pre)``。
     """
     from lquant.factors.mining.runner import split_dates
-    from lquant.factors.mining.submit import _panel_with_covs, prepare_segment
+    from lquant.factors.mining.submit import prepare_segment
 
-    df, cov_cols = _panel_with_covs(start=start)
+    df, cov_cols = _panel_for_expr(start, expr)
     if not len(df):
         raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")
     dates = sorted(df["trade_date"].unique().to_list())
@@ -1085,6 +1156,9 @@ def ic_sync(names: tuple[str, ...], start: str | None, end: str | None,
 
     每日收盘后跑一次；同窗口重跑幂等（快照替换，不会出现半新半旧行）。
     配 lq factor ic-health 与 ic_below 告警规则组成闭环，示例见 README。
+
+    退出码：**全部因子都同步失败**时非 0（README 把它放进 cron，否则同步停摆
+    没人发现）；部分失败仍退出 0，原因在 stdout 的 ``error`` 字段里。
     """
     import json
     from datetime import date as _date
@@ -1103,6 +1177,17 @@ def ic_sync(names: tuple[str, ...], start: str | None, end: str | None,
         except Exception as e:  # noqa: BLE001 - 单因子失败继续（原因可见）
             out.append({"factor": name, "error": f"{type(e).__name__}: {e}"})
     click.echo(json.dumps(_clean(out), ensure_ascii=False))
+    # 全部因子失败必须用退出码表达失败：monitor 侧的健康度会因为窗口里还留着
+    # 旧 IC 而恒判 ok，ic_below 也永不触发 —— 只靠 stdout 里的 error 字段，
+    # cron / CI 根本无从发现「同步停摆」，整个在线监控闭环静默失效。
+    failed = [r for r in out if isinstance(r, dict) and r.get("error")]
+    if out and len(failed) == len(out):
+        click.echo(
+            "ic-sync 全部失败（"
+            + "; ".join(f"{r.get('factor')}: {r['error']}" for r in failed) + "）",
+            err=True,
+        )
+        raise SystemExit(1)
 
 
 @factor.command("ic-health")
@@ -1110,15 +1195,23 @@ def ic_sync(names: tuple[str, ...], start: str | None, end: str | None,
 @click.option("--window", default=20, show_default=True, help="近 N 个交易日")
 @click.option("--min-ic", "min_ic", default=0.0, show_default=True, help="IC 均值下限")
 @click.option("--min-icir", "min_icir", default=0.0, show_default=True, help="ICIR 下限")
-def ic_health(name: str | None, window: int, min_ic: float, min_icir: float) -> None:
+@click.option("--max-age-days", "max_age_days", default=10, show_default=True,
+              help="末条 IC 落后今天超过 N 个自然日判 stale（同步停摆）；0 关闭时效判定")
+def ic_health(
+    name: str | None, window: int, min_ic: float, min_icir: float, max_age_days: int
+) -> None:
     """因子健康度评估（只读 DryRun）：ok / stale / degraded / no_data。
 
     verdict=degraded 的因子该警惕下线或重构 —— 衰减是常态，装看不见不是。
+    verdict=stale 含两种：末条 IC 太旧（同步停摆）或有效 IC 覆盖不足窗口一半。
     """
     import json
 
     from lquant.factors import monitor
 
     click.echo(json.dumps(_clean(
-        monitor.factor_health(name, window=window, min_ic=min_ic, min_icir=min_icir)
+        monitor.factor_health(
+            name, window=window, min_ic=min_ic, min_icir=min_icir,
+            max_age_days=max_age_days or None,
+        )
     ), ensure_ascii=False))

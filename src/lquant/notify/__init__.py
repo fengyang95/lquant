@@ -22,6 +22,7 @@ from lquant.notify.service import (
     CHANNEL_FACTORY,
     active_channels,
     build_chain,
+    channel_status,
     format_results,
     notify,
     reset_suppress_state,
@@ -30,6 +31,6 @@ from lquant.notify.service import (
     should_suppress,
 )
 
-__all__ = ["notify", "SendResult", "build_chain", "active_channels",
+__all__ = ["notify", "SendResult", "build_chain", "active_channels", "channel_status",
            "format_results", "CHANNEL_FACTORY", "route_channels",
            "severity_rank", "should_suppress", "reset_suppress_state"]

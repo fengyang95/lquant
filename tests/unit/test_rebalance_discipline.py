@@ -99,6 +99,124 @@ def test_prev_weights_accepts_plain_dict_order_insensitive():
     assert res.diagnostics["_fallback"] is False
 
 
+def _true_l1(res, prevd: dict[str, float], syms: list[str]) -> float:
+    """独立口径的真实成交 L1（含清池外腿与现金腿），用于核验诊断字段。
+
+    = Σ|w - w_prev| + Σ_池外 w_prev + |Σw_prev - Σw|
+    """
+    w = np.array([res[s] for s in syms])
+    p = np.array([prevd.get(s, 0.0) for s in syms])
+    off = sum(v for k, v in prevd.items() if k not in syms)
+    return float(np.abs(w - p).sum() + off + abs(sum(prevd.values()) - w.sum()))
+
+
+def test_turnover_reference_keeps_raw_prev_scale_with_cash_buffer():
+    """上期含现金缓冲（Σw_prev < 1）时，换手上限必须计入补现金腿的真实成交。
+
+    修复前 ``w0 = _as_weights(prev_weights, syms)`` 会把上期归一化：6 只各
+    0.1（和 0.6、40% 现金）被当成满仓组合，补 40% 现金腿的买入完全不进
+    ``Σ|w - w_prev|`` —— 声明 0.05 的上限，真实成交 0.8 也照样"满足"。
+    """
+    n = 6
+    syms = _syms(n)
+    prev = {s: 0.1 for s in syms}  # Σ = 0.6 → 40% 现金
+    r = enhanced_indexing_weight(
+        _returns(n_sym=n), syms,
+        scores={s: -i for i, s in enumerate(syms)},
+        max_weight=0.5, max_turnover=0.05, prev_weights=prev,
+    )
+    reported = r.diagnostics["_turnover_from_prev"]
+    # 诊断必须等于独立口径的真实成交 L1（不是「到归一化组合」的距离）
+    assert reported == pytest.approx(_true_l1(r, prev, syms), abs=1e-9)
+    # 补现金腿本身就 > 0.05，不可能有满足上限的满仓解 → 必须显式 fallback
+    # （修复前它反而"成功"返回归一化后的上期组合，并谎报换手 ~0.05）
+    assert r.diagnostics["_fallback"] is True
+
+
+def test_turnover_counts_out_of_universe_liquidation():
+    """上期持有本期符号表之外的票：清仓腿必须计入真实成交 L1。
+
+    修复前 ``prev={"S00".."S04": 0.1, "Z": 0.5}`` 里 Z 被直接丢弃，诊断为
+    0.049974；真实需成交 L1 = 0.5（场内调仓）+ 0.5（清 Z + 现金腿）= 1.0。
+    """
+    n = 6
+    syms = _syms(n)
+    prev = {s: 0.1 for s in syms[:5]}
+    prev["Z"] = 0.5  # 池外持仓
+    r = enhanced_indexing_weight(
+        _returns(n_sym=n), syms,
+        scores={s: -i for i, s in enumerate(syms)},
+        max_weight=0.5, max_turnover=0.05, prev_weights=prev,
+    )
+    reported = r.diagnostics["_turnover_from_prev"]
+    assert reported == pytest.approx(_true_l1(r, prev, syms), abs=1e-9)
+    # 修复前的 0.049974 必然 < 0.5；清 Z 一条腿就不止 0.5
+    assert reported > 0.5
+
+
+def test_leveraged_prev_weights_raise_instead_of_silent_normalize():
+    """Σw_prev > 1（含杠杆）时无法构建现金腿 → 显式报错，不静默归一化。"""
+    n = 6
+    syms = _syms(n)
+    prev = {s: 0.3 for s in syms}  # Σ = 1.8
+    with pytest.raises(OptimizerError, match="杠杆"):
+        enhanced_indexing_weight(
+            _returns(n_sym=n), syms,
+            scores={s: -i for i, s in enumerate(syms)},
+            max_weight=0.5, max_turnover=0.05, prev_weights=prev,
+        )
+
+
+def test_per_element_bound_conflict_falls_back_not_bare_valueerror():
+    """``b_i > max_weight + max_active`` 时 SLSQP 抛裸 ``ValueError``（非
+    ``LQuantError``，调用方 ``except LQuantError`` 抓不住）—— 必须预检 + fallback。
+
+    和式预检（``Σhi ≥ 1 ≥ Σlo``）对这种逐元素矛盾恒放行，所以只加和式判断
+    不够；本用例即修复前实测命中裸 ValueError 的构型。
+    """
+    from lquant.core.errors import LQuantError
+
+    n = 5
+    syms = _syms(n)
+    b = {syms[0]: 0.6, **{s: 0.1 for s in syms[1:]}}  # b0 = 0.6 > 0.2 + 0.05
+    try:
+        r = enhanced_indexing_weight(
+            _returns(n_sym=n), syms,
+            scores={s: -i for i, s in enumerate(syms)},
+            benchmark_weights=b, max_weight=0.2, max_active=0.05,
+        )
+    except LQuantError:
+        pytest.fail("应走 fallback 契约，而不是抛 LQuantError")
+    except ValueError as e:  # 修复前命中这里
+        pytest.fail(f"裸 ValueError 绕过 fallback 契约：{e}")
+    assert r.diagnostics["_fallback"] is True
+    assert "边界" in r.diagnostics["_fallback_reason"]
+    assert isinstance(r.diagnostics["_constraint_violations"], list)
+
+
+def test_fallback_reports_violations_instead_of_claiming_feasible():
+    """``_fallback`` 退回的上期持仓可能超出本次声明的 TE/主动上限 ——
+    必须写进 ``_constraint_violations``，不能谎称"已知可行"。
+
+    修复前 w0 的 TE 实测可达 ``te_target`` 的 19.4 倍，但诊断里没有任何
+    「已违约」的信息，理由却是「退回一个已知可行的权重组合」。
+    """
+    n = 10
+    syms = _syms(n)
+    b = {s: 0.1 for s in syms}
+    prev = {syms[0]: 0.6, syms[1]: 0.4}  # 集中持仓，必然突破 0.1% 的 TE
+    r = enhanced_indexing_weight(
+        _returns(), syms, scores={s: -i for i, s in enumerate(syms)},
+        benchmark_weights=b, max_weight=1.0, te_target=0.001,
+        max_turnover=1e-6, prev_weights=prev,
+    )
+    assert r.diagnostics["_fallback"] is True
+    assert r.diagnostics["_fallback_candidate"] in ("prev", "benchmark")
+    assert r.diagnostics["_constraint_violations"], "fallback 必须报告违约"
+    assert any("tracking_error" in v for v in r.diagnostics["_constraint_violations"])
+    assert "违反" in r.diagnostics["_fallback_reason"]
+
+
 # ---------------- weighting：no-trade band ----------------
 
 
@@ -138,6 +256,80 @@ def test_band_requires_positive():
         apply_no_trade_band({"A": 1.0}, {"A": 0.5}, band=0.0)
     with pytest.raises(ValueError):
         apply_no_trade_band({"A": 1.0}, {"A": 0.5}, band=-0.01)
+
+
+def test_band_never_produces_implicit_leverage():
+    """band 吸收后权重和必须 ≤ 1（差额才是现金缓冲）。
+
+    修复前：被吸收标的停在 prev、未吸收取 w_new，直接拼接会把「prev 比
+    new 多出来的部分」吞进总和。实测 ``new={A:.36,B:.44,C:.20}``、
+    ``prev={A:.40,B:.30,C:.30}``、band=0.06 → 总和 1.04（2 万组随机搜索
+    最大 1.5289），即隐含杠杆，与 README「权重和 < 1 即现金缓冲」的单边
+    说法不符。超额必须从本次可动的标的里显式再分配掉。
+    """
+    from lquant.portfolio.weighting import apply_no_trade_band
+
+    out, _ = apply_no_trade_band(
+        {"A": 0.36, "B": 0.44, "C": 0.20},
+        {"A": 0.40, "B": 0.30, "C": 0.30},
+        band=0.06,
+    )
+    assert sum(out.values()) <= 1.0 + 1e-12
+    assert out["A"] == pytest.approx(0.40)  # 被吸收（|0.36-0.40| < 0.06）严格停在 prev
+    assert out["B"] < 0.44 and out["C"] < 0.20  # 超额从可动标的里扣
+
+
+def test_band_random_search_never_exceeds_one():
+    """随机构型下 band 输出总和恒 ≤ 1（修复前最大 1.5289）。"""
+    from lquant.portfolio.weighting import apply_no_trade_band
+
+    rng = np.random.default_rng(7)
+    worst = 0.0
+    for _ in range(3000):
+        n = int(rng.integers(2, 8))
+        nd = {f"S{i}": float(v) for i, v in enumerate(rng.dirichlet(np.ones(n)))}
+        pd = {f"S{i}": float(v) for i, v in enumerate(rng.dirichlet(np.ones(n)))}
+        out, _ = apply_no_trade_band(nd, pd, band=float(rng.uniform(0.01, 0.2)))
+        worst = max(worst, sum(out.values()))
+    assert worst <= 1.0 + 1e-9, f"band 产生了隐含杠杆：max sum={worst}"
+
+
+def test_band_plus_method_owned_prev_weights_both_brakes_work():
+    """band 与方法自己的 ``prev_weights`` 可以同时给（README 同节推荐）。
+
+    修复前 ``weights()`` 在 band 模式下把 ``prev_weights`` pop 掉，方法层
+    拿不到换手参照点，``max_turnover`` 直接抛「必须配 prev_weights」——
+    两条刹车没法配着用。
+    """
+    from lquant.portfolio.weighting import weights
+
+    syms = _syms()
+    scores = {s: float(-i) for i, s in enumerate(syms)}
+    prev = {s: 0.1 for s in syms}
+    w = weights(
+        _returns(), "enhanced_indexing", syms, scores=scores, max_weight=0.5,
+        max_turnover=0.05, band=0.03, prev_weights=prev,
+    )
+    assert abs(sum(w.values())) <= 1.0 + 1e-9  # 无隐含杠杆
+    # band 不变量：要么停在 prev（不动），要么偏离 >= band
+    for s in syms:
+        d = abs(w[s] - prev[s])
+        assert d == pytest.approx(0.0, abs=1e-12) or d >= 0.03 - 1e-9, f"{s}: d={d}"
+
+
+def test_weight_report_survives_riskmodel_error():
+    """``weight_report`` 必须抓 ``RiskModelError``（与 ``OptimizerError`` 同族）。
+
+    修复前 ``except (OptimizerError, ValueError)`` 漏了它：``cov_method``
+    拼错或 T 太小时整张报告崩掉，而不是记一行 note。
+    """
+    from lquant.portfolio.weighting import weight_report
+
+    df = weight_report(
+        _returns(n_days=5, n_sym=5), methods=["risk_parity"], cov_method="bogus"
+    )
+    assert len(df) == 1
+    assert df["note"][0] and "bogus" in df["note"][0]
 
 
 def test_weights_entry_point_band_pairing():

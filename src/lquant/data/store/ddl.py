@@ -140,7 +140,10 @@ DDL_STATEMENTS: list[str] = [
         expression VARCHAR, description VARCHAR,
         enabled BOOLEAN DEFAULT TRUE, created_at TIMESTAMP,
         source VARCHAR DEFAULT 'manual', source_ref VARCHAR,
-        factor_id VARCHAR, category VARCHAR DEFAULT ''
+        factor_id VARCHAR, category VARCHAR DEFAULT '',
+        -- 入库时的中性化协变量清单（JSON 数组，NULL = 未声明 → 复算走 DEFAULT_COVS）。
+        -- 不落库的话同一因子在 submit 与 audit/run 是两套中性化口径，IC 不可比。
+        covs JSON
     )
     """,
     """
@@ -354,10 +357,26 @@ def ensure_views(con, parquet_dir: str | Path | None = None) -> int:
     return n
 
 
-def ensure_factor_def_columns(con) -> int:
-    """factor_def 增列迁移：source / source_ref / factor_id / category。
+def ensure_factor_def_covs(con) -> int:
+    """factor_def 增列迁移（covs）：入库时的中性化协变量清单（JSON 数组）。
 
-    幂等：列已存在直接跳过。返回是否执行了迁移。
+    audit/run 复算要读回它；老库没有这一列时复算会静默退回 ``DEFAULT_COVS``，
+    与 submit 的口径分叉。单独一条而不并进 ``ensure_factor_def_columns`` 的计数：
+    那条函数的历史契约是「factor_def 的四个结构列加了几条」，很多调用方/测试
+    按 4 计数；covs 属于评价口径，挂在同一条启动 ensure 链路上即可。幂等。
+    """
+    cols = {r[0] for r in con.execute("DESCRIBE factor_def").fetchall()}
+    if "covs" in cols:
+        return 0
+    con.execute("ALTER TABLE factor_def ADD COLUMN covs JSON")
+    return 1
+
+
+def ensure_factor_def_columns(con) -> int:
+    """factor_def 增列迁移：source / source_ref / factor_id / category（+ covs）。
+
+    covs 由 ``ensure_factor_def_covs`` 在同一条启动链路上补齐（单独计数，
+    见该函数说明）。幂等：列已存在直接跳过。返回四个基础列执行了几条 ALTER。
     """
     cols = {r[0] for r in con.execute("DESCRIBE factor_def").fetchall()}
     n = 0
@@ -366,6 +385,7 @@ def ensure_factor_def_columns(con) -> int:
         if col not in cols:
             con.execute(f"ALTER TABLE factor_def ADD COLUMN {col} {typ}")
             n += 1
+    ensure_factor_def_covs(con)
     return n
 
 

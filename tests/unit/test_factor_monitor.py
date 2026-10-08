@@ -14,9 +14,19 @@ import pytest
 _SYMBOLS = ("600000", "000001", "300750", "600036", "000002", "601318", "600519", "000333")
 
 
+def _today() -> date:
+    from lquant.core.types import today_cn
+
+    return today_cn()
+
+
 def _panel_df(n_days: int = 30) -> pl.DataFrame:
-    """每股固定漂移的指数增长价 → mom5 与 fwd_ret_1 截面完全单调（IC=1）。"""
-    d0 = date(2026, 6, 1)
+    """每股固定漂移的指数增长价 → mom5 与 fwd_ret_1 截面完全单调（IC=1）。
+
+    日期贴着今天往前排：factor_health 现在带时效判定，写死的历史日期会把
+    「健康因子」一律判成 stale，掩盖真正要测的 ok/degraded/stale 分支。
+    """
+    d0 = _today() - timedelta(days=n_days - 1)
     rows = []
     for i in range(n_days):
         d = d0 + timedelta(days=i)
@@ -213,8 +223,8 @@ def test_missing_ic_table_self_heals(tmp_path, monkeypatch):
 
 
 def _nan_ic_rows(n: int = 3) -> pl.DataFrame:
-    """全 NaN 的 IC 序列：截面内因子是常数时 pl.corr 的真实返回。"""
-    d0 = date(2026, 6, 1)
+    """全 NaN 的 IC 序列：截面内因子是常数时 pl.corr 的真实返回。日期贴今天。"""
+    d0 = _today() - timedelta(days=n - 1)
     return pl.DataFrame(
         {
             "trade_date": [d0 + timedelta(days=i) for i in range(n)],
@@ -242,9 +252,10 @@ def test_health_all_nan_ic_is_degraded_not_ok(monitor_env):
 
 def test_health_mixed_nan_rows_count_only_finite(monitor_env):
     """有限 + NaN 混合：统计只看有限行，且 staleness 按有限行数判。"""
+    d0 = _today() - timedelta(days=2)
     rows = pl.DataFrame(
         {
-            "trade_date": [date(2026, 6, 1), date(2026, 6, 2), date(2026, 6, 3)],
+            "trade_date": [d0, d0 + timedelta(days=1), d0 + timedelta(days=2)],
             "ic": [0.2, float("nan"), float("nan")],
             "rank_ic": [0.1, float("nan"), float("nan")],
             "n": [8, 8, 8],
@@ -256,6 +267,56 @@ def test_health_mixed_nan_rows_count_only_finite(monitor_env):
     assert h["verdict"] == "stale"
     assert h["n_valid"] == 1 and h["n_days"] == 3
     assert "仅 1 日有有效 IC" in h["detail"]
+
+
+def test_health_stale_when_last_ic_is_old(monitor_env):
+    """同步停摆：窗口里塞满历史 IC，mean_ic/ICIR 都正常，也必须判 stale。
+
+    修复前 verdict 链只看有限 IC 条数、从不比较 ``last_date`` 与今天 ——
+    20 条 400 天前的 IC 今天仍判 ok，ic_below 永不触发。
+    """
+    d0 = _today() - timedelta(days=400)
+    monitor_env.upsert_ic_daily(
+        pl.DataFrame(
+            {
+                "trade_date": [d0 + timedelta(days=i) for i in range(20)],
+                "ic": [0.05] * 20,
+                "rank_ic": [0.04] * 20,
+                "n": [50] * 20,
+            }
+        ),
+        factor="old_demo",
+    )
+    h = {x["factor"]: x for x in monitor_env.factor_health("old_demo")}["old_demo"]
+    assert h["verdict"] == "stale"
+    assert h["data_stale"] is True
+    assert h["lag_days"] > 365
+    assert str(h["last_date"]) in h["detail"] and "同步停摆" in h["detail"]
+    # 统计量本身没坏：时效是独立维度，不是把它误判成 degraded
+    assert h["mean_ic"] == pytest.approx(0.05)
+
+
+def test_health_age_check_can_be_disabled(monitor_env):
+    """max_age_days=None 显式关闭时效判定（长假期/离线复盘的逃生口）。"""
+    d0 = _today() - timedelta(days=400)
+    monitor_env.upsert_ic_daily(
+        pl.DataFrame(
+            {
+                "trade_date": [d0 + timedelta(days=i) for i in range(20)],
+                "ic": [0.05] * 20,
+                "rank_ic": [0.04] * 20,
+                "n": [50] * 20,
+            }
+        ),
+        factor="old_ok",
+    )
+    h = monitor_env.factor_health("old_ok", max_age_days=None)[0]
+    assert h["verdict"] == "ok" and h["data_stale"] is False
+
+
+def test_health_rejects_bad_max_age(monitor_env):
+    with pytest.raises(ValueError):
+        monitor_env.factor_health(max_age_days=-1)
 
 
 # ---------------- run_daily_check 编排 ----------------
@@ -322,6 +383,50 @@ def test_run_daily_check_alerts_on_degenerate_factor(monitor_env):
     assert hits, out["alerts"]
     assert "缺失/非有限" in hits[0]["detail"]
     assert hits[0]["detail"].startswith("flat_demo")
+    assert len(seen) == 1
+
+
+def test_run_daily_check_alerts_when_sync_stalled(monitor_env):
+    """同步停摆必须真的告警：时效 stale 的因子以 ic=None 进规则引擎。
+
+    修复前 20 条 400 天前的有限 IC（mean_ic=0.05）配 ic_below(threshold=0.02)
+    跑 run_daily_check → not_triggered：陈旧数字被当成今天的结论，最常见的
+    故障（定时任务/采集挂了）反而完全静默。
+    """
+    from lquant.notify.rules import TRIGGERED, AlertRule, get_store
+
+    d0 = _today() - timedelta(days=400)
+    monitor_env.upsert_ic_daily(
+        pl.DataFrame(
+            {
+                "trade_date": [d0 + timedelta(days=i) for i in range(20)],
+                "ic": [0.05] * 20,
+                "rank_ic": [0.04] * 20,
+                "n": [50] * 20,
+            }
+        ),
+        factor="stalled_demo",
+    )
+    store = get_store()
+    store.add(
+        AlertRule(
+            name="停摆告警",
+            target="stalled_demo",
+            alert_type="ic_below",
+            parameters={"threshold": 0.02},
+            cooldown_seconds=0,
+        )
+    )
+    seen = []
+    out = monitor_env.run_daily_check(
+        factors=["stalled_demo"], notify_fn=lambda *a, **k: seen.append(a)
+    )
+    hits = [a for a in out["alerts"] if a["status"] == TRIGGERED]
+    assert hits, out["alerts"]
+    assert "缺失/非有限" in hits[0]["detail"]
+    hs = {h["factor"]: h for h in out["health"]}
+    assert hs["stalled_demo"]["verdict"] == "stale"
+    assert hs["stalled_demo"]["last_date"] is not None
     assert len(seen) == 1
 
 

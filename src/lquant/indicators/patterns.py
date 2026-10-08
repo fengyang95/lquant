@@ -3,7 +3,11 @@
 为什么形态走「预计算信号列」而不是因子 DSL：形态是**跨根比较**结构
 （这根 vs 上一根的实体包含、三根星的递进关系），DSL 的窗口化纯函数
 表达不了 —— 见 ``indicators/__init__.py`` 与 ``registry.py`` 的模块注释。
-指标以 0/1 信号列反哺因子层（``lq factor`` 可直接引用信号列做再加工）。
+指标以 0/1 信号列输出，目前**只供图表（``GET /api/data/indicators``）与单票
+分析端点消费**；这些信号列尚未接入因子评价面板与 G0 字段白名单（因子面板字段
+来自 ``read_daily()`` + covariates，``lq factor check pattern_doji`` 会以
+``STATIC_FAIL`` 拒绝），所以别把 ``pattern_*`` / ``cyq_*`` 当成 ``lq factor``
+表达式里能直接引用的字段 —— 接进去是独立的一步工作。
 
 信号语义（所有形态统一）：
 

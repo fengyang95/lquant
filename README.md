@@ -73,7 +73,13 @@ export LQ_FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/..
 # 飞书开了「签名校验」再加（密钥只走 env）：
 export LQ_FEISHU_WEBHOOK_SECRET=..
 # 钉钉加签同理：LQ_DINGTALK_WEBHOOK_URL + LQ_DINGTALK_SECRET
-lq notify status          # 自检：看 env 配置出了哪些通道
+# 其余通道的 env（变量名见 src/lquant/notify/channels.py 各通道 docstring）：
+#   Telegram     LQ_TELEGRAM_BOT_TOKEN + LQ_TELEGRAM_CHAT_ID
+#   ntfy         LQ_NTFY_URL（含 topic，如 https://ntfy.sh/my-topic）[+ LQ_NTFY_TOKEN]
+#   PushPlus     LQ_PUSHPLUS_TOKEN
+#   Server酱³    LQ_SERVERCHAN3_SENDKEY
+#   通用 webhook LQ_GENERIC_WEBHOOK_URL（自建接收端）
+lq notify status          # 自检：逐个通道报告就绪/未就绪与缺失的 env（不真发）
 lq notify test            # 各通道发一条测试消息并逐个回报
 ```
 
@@ -83,9 +89,11 @@ Server酱³ / 通用 webhook（自建接收端）。长消息按各通道上限*
 
 ### 告警规则引擎
 
-`POST /api/notify/rules` 可注册阈值规则（价格/涨跌幅/量比/换手四类），
-命中即推 `alert` 通道，冷却期落 SQLite 防重复轰炸；DryRun 评估接口
-方便前端预览，评估异常显式报 `evaluation_error` 不静默。
+`POST /api/notify/rules` 可注册阈值规则（即 `notify/rules.py` 的 `ALERT_TYPES`
+全集：价格上下限 `price_above`/`price_below`、涨跌幅双向 `pct_change_up`/
+`pct_change_down`、因子 IC 下限 `ic_below`），命中即推 `alert` 通道，冷却期落
+SQLite 防重复轰炸；DryRun 评估接口方便前端预览，评估异常显式报
+`evaluation_error` 不静默。
 
 ### 消息分类与降噪
 
@@ -190,9 +198,13 @@ lq factor eval "cov_lhb_on_board * cov_mf_main_ratio" --cov mf_main_ratio,lhb_on
 ## 技术指标
 
 `src/lquant/indicators` 注册表驱动（趋势/摆动/量能/**形态**/通道五类），
-`GET /api/data/indicators` 自动枚举；形态因子包（十字星/锤头/射击之星/
-看涨看跌吞没/早晨之星）以 0/1 信号列反哺因子层，信号记在确认日、
-全部过 `assert_no_lookahead` 前缀不变性门禁，一字板不误报。
+`GET /api/data/indicators/registry` 自动枚举（`GET /api/data/indicators` 是
+按 `symbol` 算单票指标值的端点，`names` 默认 `ma,macd,rsi,boll`）；形态因子包
+（十字星/锤头/射击之星/看涨看跌吞没/早晨之星）以 0/1 信号列供图表与单票分析
+消费，信号记在确认日、全部过 `assert_no_lookahead` 前缀不变性门禁，一字板不
+误报。这些信号列（含 `cyq_*` 筹码类）**尚未接入因子评价面板与 G0 字段白名单**
+—— 因子面板字段来自 `read_daily()` + covariates，`lq factor check pattern_doji`
+会以 `STATIC_FAIL` 拒绝，接入是独立的一步工作。
 
 ## 仓库地图
 
