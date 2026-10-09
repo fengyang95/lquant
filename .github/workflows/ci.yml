@@ -103,13 +103,15 @@ jobs:
         env:
           PYTHONFAULTHANDLER: "1"
         run: |
-          # -v：卡死时**必须能定位到用例**。已经发生过三次「跑到 97~99% 后无声
+          # -vv：卡死时**必须能定位到用例**。已经发生过三次「跑到 97~99% 后无声
           # 卡住 30+ 分钟直到 job 超时」——`-q` 只打点，SIGABRT 的栈里又只有
           # 事件循环的 select（被挂起的协程帧不在栈上），于是每次都只能靠重跑
           # 撞运气。`-v` 会逐条打印 [gwN] 用例名，最后一个卡住 worker 的末条
           # 输出就是它的下一个用例。日志变长（~5k 行）是这笔买卖值得付的价。
+          # 注意必须 -vv：addopts 里已有 -q，再给一个 -v 净verbosity 为 0，
+          # 只会打「每个文件一行」——第一次加的时候就是这么白干的。
           timeout -s ABRT 2400 .venv/bin/python -m pytest tests \
-            -v -n auto --dist loadgroup \
+            -vv -n auto --dist loadgroup \
             --cov=src/lquant --cov-report=xml:coverage.xml
 
       - name: diff-cover（改动行覆盖率 ≥95%）
