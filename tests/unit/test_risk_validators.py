@@ -336,3 +336,73 @@ def test_paper_broker_rejects_batch_only_rules():
 
     with pytest.raises(ValueError, match="需要整批上下文"):
         PaperBroker(PaperConfig(risk_rules=("sector_exposure",)))
+
+
+# ---------- 行业归属加载（load_sector_map） ----------
+
+class _FakeCon:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def execute(self, *_a, **_k):
+        return self
+
+    def fetchall(self):
+        return self._rows
+
+
+class _FakeReader:
+    def __init__(self, rows=None, boom=False):
+        self._rows = rows or []
+        self._boom = boom
+
+    def __enter__(self):
+        if self._boom:
+            raise RuntimeError("库连不上")
+        return _FakeCon(self._rows)
+
+    def __exit__(self, *_a):
+        return False
+
+
+def _patch_reader(monkeypatch, reader):
+    from lquant.data.store import catalog
+
+    monkeypatch.setattr(catalog, "reader", lambda: reader)
+
+
+def test_load_sector_map_takes_latest_effective(monkeypatch):
+    from datetime import date, timedelta
+
+    from lquant.backtest.security_meta import load_sector_map
+
+    d0 = date.today()
+    rows = [
+        ("600519.SH", "sw1", "801080", "电子", d0 - timedelta(days=10)),
+        ("600519.SH", "sw1", "801780", "银行", d0 - timedelta(days=1)),   # 更新
+        ("000001.SZ", "sw1", "801780", "银行", None),                     # 无生效日
+        ("300750.SZ", "cics", "C25", "电气", d0 - timedelta(days=1)),     # 别的标准
+        ("600030.SH", "sw1", "", "空代码", d0),                           # code 空 → 用 name
+        ("601398.SH", "sw1", "801780", "银行", d0 + timedelta(days=30)),  # 未来生效
+    ]
+    _patch_reader(monkeypatch, _FakeReader(rows))
+    out = load_sector_map()
+    assert out["600519.SH"] == "801780"          # 取生效日最新的那条
+    assert out["000001.SZ"] == "801780"
+    assert out["600030.SH"] == "空代码"
+    assert "300750.SZ" not in out                # std 不匹配
+    assert "601398.SH" not in out                # 未来生效的不用（防事后信息）
+
+
+def test_load_sector_map_degrades_to_empty_on_error(monkeypatch):
+    from lquant.backtest.security_meta import load_sector_map
+
+    _patch_reader(monkeypatch, _FakeReader(boom=True))
+    assert load_sector_map() == {}
+
+
+def test_load_sector_map_skips_rows_without_code_and_name(monkeypatch):
+    from lquant.backtest.security_meta import load_sector_map
+
+    _patch_reader(monkeypatch, _FakeReader([("600519.SH", "sw1", "", "", None)]))
+    assert load_sector_map() == {}
