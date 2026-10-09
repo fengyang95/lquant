@@ -96,5 +96,6 @@ web/playwright-report/
 # 内部工具与临时产物
 /.idea/
 /.tools/
+/.ghcache/
 .tmp_*
 .secret-scan*.json
