@@ -46,6 +46,10 @@ if [ ! -x "$PY" ]; then
 fi
 
 # ---- xdist 可用则并行；不可用（旧环境没装）退化为串行，行为不变 --------------
+# ⚠️ 空数组在 macOS 自带 bash 3.2 + set -u 下，直接展开会报 unbound variable
+#    （bash 4.4 起才修）。本机没装 xdist 时 XDIST_ARGS 就是空的 —— 于是 pre-push
+#    会在「改动相关测试：N 个文件」之后静默中止，钩子却仍以 0 退出，表现为
+#    **「测试没跑却通过」的假绿**。所有引用点统一写成 「有元素才展开」的形式。
 XDIST_ARGS=()
 if [ "$DRY_RUN" != "1" ] && "$PY" -c "import xdist" 2>/dev/null; then
   XDIST_ARGS=(-n auto --dist loadgroup)
@@ -67,7 +71,7 @@ run_pytest() {
 
 if [ "$FULL" = "1" ]; then
   echo "==> 改动相关测试：全量模式（LQ_PUSH_FULL_TEST=1 / --full）"
-  run_pytest tests "${XDIST_ARGS[@]}"
+  run_pytest tests ${XDIST_ARGS[@]+"${XDIST_ARGS[@]}"}
   exit 0
 fi
 
@@ -99,7 +103,7 @@ done <<< "$CHANGED"
 
 if [ "$GLOBAL_TOUCHED" = "1" ]; then
   echo "==> 改动含全局影响面（配置/夹具/核心），回退全量"
-  run_pytest tests "${XDIST_ARGS[@]}"
+  run_pytest tests ${XDIST_ARGS[@]+"${XDIST_ARGS[@]}"}
   exit 0
 fi
 
@@ -150,4 +154,4 @@ FILES=()
 while IFS= read -r f; do
   [ -n "$f" ] && FILES+=("$f")
 done < <(sort -u "$SELECTED")
-run_pytest "${FILES[@]}" "${XDIST_ARGS[@]}"
+run_pytest "${FILES[@]}" ${XDIST_ARGS[@]+"${XDIST_ARGS[@]}"}
