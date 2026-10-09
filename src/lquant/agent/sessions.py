@@ -252,9 +252,16 @@ class SessionStore:
         await con.commit()
 
     async def add_message(self, sid: str, role: str, content: str,
-                          tool_calls: list[dict] | None = None) -> Message:
+                          tool_calls: list[dict] | None = None,
+                          mid: str | None = None) -> Message:
+        """落一条消息。
+
+        ``mid`` 允许调用方**预先指定 id**：取消/超时路径需要在「消息已经在库里」
+        之前就知道它的 id（取消可能正好落在 INSERT 的 await 上，那时拿不到返回
+        值），先登记 id 才能保证后续补文案找得到目标行。
+        """
         con = await self._conn()
-        m = Message(id=uuid.uuid4().hex, session_id=sid, role=role, content=content,
+        m = Message(id=mid or uuid.uuid4().hex, session_id=sid, role=role, content=content,
                     tool_calls=tool_calls or [], created_at=_now())
         await con.execute(
             "INSERT INTO ask_messages "
@@ -269,6 +276,14 @@ class SessionStore:
             "SELECT id,session_id,role,content,tool_calls_json,created_at FROM ask_messages "
             "WHERE session_id=? ORDER BY created_at, rowid", (sid,))
         return [self._row_message(r) for r in await cur.fetchall()]
+
+    async def get_message(self, sid: str, mid: str) -> Message | None:
+        con = await self._conn()
+        cur = await con.execute(
+            "SELECT id,session_id,role,content,tool_calls_json,created_at FROM ask_messages "
+            "WHERE id=? AND session_id=?", (mid, sid))
+        r = await cur.fetchone()
+        return self._row_message(r) if r else None
 
     async def append_assistant_delta(self, sid: str, mid: str, text: str) -> None:
         con = await self._conn()
