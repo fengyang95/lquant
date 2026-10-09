@@ -96,15 +96,23 @@ jobs:
       - name: Run pytest
         # timeout -s ABRT：卡住时用 SIGABRT 触发 faulthandler，把所有线程栈 dump
         # 进日志 —— 哪个用例卡住、卡在哪一行一眼可见，而不是白烧到 6 小时 job
-        # 超时（这次就烧了 3 小时以上还没结束）。2400s 是本地 5'40" 的 ~7 倍余量。
+        # 超时（这次就烧了 3 小时以上还没结束）。1200s ≈ 当前实际耗时（~5 分钟）
+        # 的 4 倍：卡死时 20 分钟就能拿到栈并结束，而不是烧掉 40 分钟。
         # xdist 并行分片（runner 2 核 → -n 2；loadgroup 保证 xdist_group 用例
         # 同 worker 按序）。--cov 两用：全局 fail_under=95 门禁 + diff-cover
         # 增量门禁（原 pre-push 本地门禁，随增量测试改造迁到 CI）。
         env:
           PYTHONFAULTHANDLER: "1"
         run: |
-          timeout -s ABRT 2400 .venv/bin/python -m pytest tests \
-            -n auto --dist loadgroup \
+          # -vv：卡死时**必须能定位到用例**。已经发生过三次「跑到 97~99% 后无声
+          # 卡住 30+ 分钟直到 job 超时」——`-q` 只打点，SIGABRT 的栈里又只有
+          # 事件循环的 select（被挂起的协程帧不在栈上），于是每次都只能靠重跑
+          # 撞运气。`-v` 会逐条打印 [gwN] 用例名，最后一个卡住 worker 的末条
+          # 输出就是它的下一个用例。日志变长（~5k 行）是这笔买卖值得付的价。
+          # 注意必须 -vv：addopts 里已有 -q，再给一个 -v 净verbosity 为 0，
+          # 只会打「每个文件一行」——第一次加的时候就是这么白干的。
+          timeout -s ABRT 1200 .venv/bin/python -m pytest tests \
+            -vv -n auto --dist loadgroup \
             --cov=src/lquant --cov-report=xml:coverage.xml
 
       - name: diff-cover（改动行覆盖率 ≥95%）
