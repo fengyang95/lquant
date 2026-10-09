@@ -14,6 +14,7 @@ import pytest
 
 import lquant.market.collectors.northbound as nb
 from lquant.core.errors import DataUnavailable, SourceSchemaChanged
+from lquant.core.types import today_cn
 from lquant.market.collectors.northbound import (
     NORTHBOUND_NET_LAST_DATE,
     fetch_northbound,
@@ -231,6 +232,7 @@ def test_fetch_top10_demo_deterministic():
 
 
 def test_as_date_variants():
+    assert nb._as_date(None) == today_cn()          # 缺省 = 业务日（今天）
     assert nb._as_date("2026-01-05") == date(2026, 1, 5)
     assert nb._as_date("20260105") == date(2026, 1, 5)
     assert nb._as_date(date(2025, 12, 31)) == date(2025, 12, 31)
@@ -294,3 +296,71 @@ def test_migrate_northbound_idempotent():
     _migrate_northbound(con)
     cols = [r[0] for r in con.execute("DESCRIBE northbound_flow").fetchall()]
     assert cols.count("net_published") == 1
+
+
+def test_report_reraises_schema_changed_from_transport(monkeypatch):
+    """em_get 自己抛 SourceSchemaChanged（例：被 em_client 判为改版）→ 原样冒泡。"""
+    def boom(url, **kw):
+        raise SourceSchemaChanged("eastmoney", "报表被撤")
+
+    monkeypatch.setattr(nb, "em_get", boom)
+    with pytest.raises(SourceSchemaChanged):
+        fetch_northbound(date(2026, 10, 8))
+
+
+def test_report_declared_failure_without_schema_hint_is_unavailable(monkeypatch):
+    """success=false 且消息里没有「不存在/列」→ 源站暂时不可用（可重试）。"""
+    monkeypatch.setattr(nb, "em_get", lambda url, **kw: _Resp(
+        {"success": False, "message": "服务器繁忙", "code": 9701}))
+    with pytest.raises(DataUnavailable, match="不可用"):
+        fetch_northbound(date(2026, 10, 8))
+
+
+def test_deal_rows_skips_unknown_type_and_bad_date(monkeypatch):
+    """脏行（未知 MUTUAL_TYPE / 日期解析不了）跳过，不让整批挂掉。"""
+    payload = {"success": True, "result": {"data": [
+        *[{"TRADE_DATE": "2026-10-08 00:00:00", "MUTUAL_TYPE": t,
+           "DEAL_AMT": v, "DEAL_NUM": 1, "NET_DEAL_AMT": None}
+          for t, v in _DEAL_TYPES.items()],
+        {"TRADE_DATE": "2026-10-08 00:00:00", "MUTUAL_TYPE": "999", "DEAL_AMT": 1},
+        {"TRADE_DATE": "not-a-date", "MUTUAL_TYPE": "001", "DEAL_AMT": 1},
+        {"TRADE_DATE": "", "MUTUAL_TYPE": "003", "DEAL_AMT": 1},
+    ]}}
+    monkeypatch.setattr(nb, "em_get", lambda url, **kw: _Resp(payload))
+    df = fetch_northbound(date(2026, 10, 8))
+    assert df.height == 1
+    assert df["total_deal_amt"][0] == pytest.approx(277155.11 * 1e6)
+
+
+def test_deal_num_missing_is_null_not_zero(monkeypatch):
+    """笔数取不到给 NULL —— 写 0 会被下游当成「当日只有 0 笔」。"""
+    payload = {"success": True, "result": {"data": [
+        {"TRADE_DATE": "2026-10-08 00:00:00", "MUTUAL_TYPE": t,
+         "DEAL_AMT": v, "DEAL_NUM": None, "NET_DEAL_AMT": None}
+        for t, v in _DEAL_TYPES.items()]}}
+    monkeypatch.setattr(nb, "em_get", lambda url, **kw: _Resp(payload))
+    assert fetch_northbound(date(2026, 10, 8))["deal_num"][0] is None
+
+
+def test_top10_skips_rows_with_bad_date(monkeypatch):
+    payload = _top10_payload()
+    payload["result"]["data"].append({
+        "TRADE_DATE": "??", "MUTUAL_TYPE": "001", "RANK": 1,
+        "DERIVE_SECURITY_CODE": "600000.SH"})   # 有代码但日期不可解析
+    monkeypatch.setattr(nb, "em_get", lambda url, **kw: _Resp(payload))
+    assert fetch_northbound_top10(date(2026, 10, 8)).height == 2
+
+
+def test_migrate_northbound_tolerates_empty_describe():
+    """DESCRIBE 返回空（驱动/视图异常）时不炸，交给正常建表路径。"""
+    from lquant.market.schema import _migrate_northbound
+
+    class _Con:
+        def execute(self, *_a, **_k):
+            class _Cur:
+                def fetchall(self):
+                    return []
+
+            return _Cur()
+
+    _migrate_northbound(_Con())

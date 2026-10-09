@@ -241,3 +241,19 @@ async def test_mark_interrupted_is_idempotent(tmp_path):
     svc._ans_id[ses.id] = "mid-half"
     await svc._mark_interrupted(ses.id)
     assert (await svc.store.get_message(ses.id, m2.id)).content == "（Mock 回答（已中断）"
+
+
+async def test_mark_interrupted_swallows_store_errors(tmp_path):
+    """留痕失败不能改写取消语义（不能让取消变成 500）。"""
+    from lquant.agent.mock import MockAgentService
+
+    svc = MockAgentService(SessionStore(str(tmp_path / "ask.db")))
+    ses = await svc.create_session(None)
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("db 挂了")
+
+    svc._ans_id[ses.id] = "whatever"
+    svc.store.get_message = boom          # type: ignore[method-assign]
+    await svc._mark_interrupted(ses.id)   # 不抛
+    assert ses.id not in svc._ans_id

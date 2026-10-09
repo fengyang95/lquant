@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from lquant.data.contract import (
@@ -185,3 +187,32 @@ def test_probe_all_covers_every_contract():
 def test_probe_all_unknown_name_raises():
     with pytest.raises(KeyError, match="未知契约"):
         probe_all(names=["nope.not.here"], fetch=lambda url: _Resp({}))
+
+
+def test_dig_non_container_returns_none():
+    from lquant.data.contract import _dig
+
+    assert _dig({"a": 1}, ("a", "b")) is None          # 中途撞到标量
+    assert _dig({"a": [1]}, ("a", 5)) is None          # 下标越界
+    assert _dig({"a": [1]}, ("a", "x")) is None        # list 用了字符串键
+    assert _dig({"a": {"b": 2}}, ("a", "b")) == 2
+
+
+def test_probe_contract_default_fetch_uses_em_client(monkeypatch):
+    """不注入 fetch 时走 em_client.em_get（覆盖默认分支）。"""
+    import lquant.market.em_client as em
+
+    monkeypatch.setattr(em, "em_get", lambda url, **kw: _Resp(_HSGT_DEAL))
+    assert probe_contract(_c("eastmoney.hsgt_deal_history")) == []
+
+
+def test_probe_contract_json_string_payload(monkeypatch):
+    """极少数情况下源站把整个响应塞进一个 JSON 字符串。"""
+    good = _Resp(json.dumps(_HSGT_DEAL))
+    assert probe_contract(_c("eastmoney.hsgt_deal_history"), fetch=lambda url: good) == []
+
+    def bad(url):
+        return _Resp("{not json")
+
+    issues = probe_contract(_c("eastmoney.hsgt_deal_history"), fetch=bad)
+    assert issues[0].rule == RULE_SHAPE

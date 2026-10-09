@@ -276,3 +276,24 @@ def test_log_one_records_and_swallows(monkeypatch):
     monkeypatch.setattr(cl_mod, "record", boom)
     sched._log_one("job", "2026-01-01", datetime(2026, 1, 1), datetime(2026, 1, 1), 0, "failed")
     assert len(calls) == 1
+
+
+def test_collect_failure_issue_write_failure_is_swallowed(monkeypatch, fake_db, fake_collectors):
+    """留痕写库失败不能把采集主流程带崩。"""
+    from lquant.data.quality import issues as qissues
+
+    meta, get = fake_collectors
+    monkeypatch.setattr(sched, "upsert", lambda table, df: len(df))
+    monkeypatch.setattr(sched, "TABLE_COLUMNS", {"t_c": ["x"]}, raising=False)
+
+    def boom(**kw):
+        raise ValueError("net down")
+
+    def save_boom(*_a, **_k):
+        raise RuntimeError("issue 表坏了")
+
+    monkeypatch.setattr(sched.COLLECTORS, "get",
+                        lambda k: boom if k == "northbound" else get(k))
+    monkeypatch.setattr(qissues, "save_issues", save_boom)
+    out = sched.collect_and_save(schedule="evening")
+    assert out["errors"]["northbound"].startswith("ValueError")   # 采集结果照常返回
