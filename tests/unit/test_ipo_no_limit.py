@@ -306,3 +306,33 @@ def test_engine_prepare_honours_data_layer_column():
     assert bars[days[0]]["301001.SZ"].no_price_limit is False
     assert bars[days[1]]["301001.SZ"].no_price_limit is True
     assert bars[days[2]]["301001.SZ"].no_price_limit is False
+
+
+def test_parse_listing_date_and_board_fallback() -> None:
+    """上市日解析兼容 date/datetime/ISO；板块识别失败时按代码段兜底。"""
+    from datetime import date, datetime
+
+    from lquant.data.quality.tradability import (
+        Board,
+        _board_of,
+        no_limit_window_days,
+        parse_listing_date,
+    )
+
+    assert parse_listing_date(datetime(2023, 1, 1, 9, 30)) == date(2023, 1, 1)
+    assert parse_listing_date(date(2023, 1, 1)) == date(2023, 1, 1)
+    assert parse_listing_date("2023-01-01T09:30:00") == date(2023, 1, 1)
+    assert parse_listing_date("不是日期") is None
+    assert parse_listing_date(None) is None
+
+    # 非法交易所后缀 → parse_symbol 失败 → 走代码段兜底
+    assert _board_of("688001.XX") is Board.STAR
+    assert _board_of("689009.XX") is Board.STAR
+    assert _board_of("300001.XX") is Board.GEM
+    assert _board_of("430001.XX") is Board.BSE
+    assert _board_of("830001.XX") is Board.BSE
+    assert _board_of("600000.XX") is Board.MAIN
+    assert _board_of("000001.XX") is Board.MAIN
+    assert _board_of("XXXXXX") is Board.UNKNOWN
+
+    assert no_limit_window_days("600000.SH", None) == 0  # 无上市日 → 不适用

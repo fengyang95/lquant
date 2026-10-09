@@ -322,3 +322,138 @@ def test_verify_and_record_keeps_progress_history(env) -> None:
     assert [(r[0], bool(r[1])) for r in rows] == [
         (sessions[11], False), (sessions[14], True),
     ]
+
+
+# ── 参数校验 / 辅助函数 / 降级分支（覆盖率补齐） ─────────────────────────
+
+
+def test_condition_and_time_helpers() -> None:
+    from lquant.research import verify as v
+
+    with pytest.raises(ValueError, match="不支持的指标"):
+        v.Condition("price", ">=", 1.0)
+    with pytest.raises(ValueError, match="不支持的操作符"):
+        v.Condition("close", "==", 1.0)
+    with pytest.raises(ValueError, match="有限数"):
+        v.Condition("close", ">=", float("inf"))
+    with pytest.raises(ValueError, match="avg_days"):
+        v.Condition("volume_ratio", ">=", 1.0, avg_days=0)
+    assert v.Condition("close", ">=", 1.0).to_json()["metric"] == "close"
+
+    assert v._as_now(None) is None
+    assert v._as_now(_dt(date(2026, 3, 2), 16, 0)) == _dt(date(2026, 3, 2), 16, 0)
+    assert v._as_now(date(2026, 3, 2)).hour == 15  # date = 该日收盘后
+    with pytest.raises(TypeError, match="只接受 datetime"):
+        v._as_now("2026-03-02")
+
+    assert v._as_date(None) is None
+    assert v._as_date(datetime(2026, 3, 2, 16, 0)) == date(2026, 3, 2)
+    assert v._as_date(date(2026, 3, 2)) == date(2026, 3, 2)
+    assert v._as_date("2026-03-02T16:00:00") == date(2026, 3, 2)
+    with pytest.raises(TypeError, match="只接受 datetime"):
+        v._as_date(12345)
+
+    assert v._match(2.0, ">", 1.0) and v._match(0.0, "<", 1.0)
+    assert v._match(1.0, ">=", 1.0) and v._match(1.0, "<=", 1.0)
+    assert v._sessions_after(date(2026, 3, 2), date(2026, 3, 1)) == []
+
+
+def test_observed_and_revision_reason_branches() -> None:
+    from lquant.research import verify as v
+
+    day = date(2026, 3, 2)
+    prev = date(2026, 3, 1)
+    # 量比基准样本不足 → None（调用方记数据缺口，不当成未命中）
+    c = v.Condition("volume_ratio", ">=", 1.0, avg_days=2)
+    assert v._observed(c, day, {}, {day: 1.0}, [day], {day: 0}) is None
+    # 基准均量为 0 → None（补 0 会让量比虚高）
+    c1 = v.Condition("volume_ratio", ">=", 1.0, avg_days=1)
+    ordered = [prev, day]
+    assert v._observed(c1, day, {}, {prev: 0.0, day: 1.0}, ordered,
+                       {prev: 0, day: 1}) is None
+    assert v._observed(c1, day, {}, {prev: 2.0, day: 3.0}, ordered,
+                       {prev: 0, day: 1}) == 1.5
+
+    # 无重叠指纹 → 明确说明无法排除复权改写
+    fc = v.FrozenCondition(symbol=SYMBOL, as_of=day, anchor=10.0,
+                           conditions=(v.Condition("close", ">=", 1.0),))
+    assert "未携带历史重叠收盘价指纹" in v._revision_reason(fc, {})
+    # 重叠日消失 → 价序被改写
+    fc2 = v.FrozenCondition(symbol=SYMBOL, as_of=day, anchor=10.0,
+                            conditions=(v.Condition("close", ">=", 1.0),),
+                            overlap_closes=((prev, 10.0),))
+    assert "消失" in v._revision_reason(fc2, {})
+    assert v._revision_reason(fc2, {prev: 10.0}) is None
+
+
+def test_verify_rejects_empty_conditions_and_bad_window() -> None:
+    from lquant.research import verify as v
+
+    empty = v.FrozenCondition(symbol=SYMBOL, as_of=date(2026, 3, 2), anchor=10.0,
+                              conditions=())
+    with pytest.raises(ValueError, match="没有任何条件"):
+        v.verify(empty, today=date(2026, 3, 2))
+    bad = v.FrozenCondition(symbol=SYMBOL, as_of=date(2026, 3, 2), anchor=10.0,
+                            conditions=(v.Condition("close", ">=", 1.0),), window_days=0)
+    with pytest.raises(ValueError, match="window_days"):
+        v.verify(bad, today=date(2026, 3, 2))
+
+
+def test_freeze_error_branches(env) -> None:
+    from lquant.research import verify as v
+
+    sessions = _weekdays(date(2026, 3, 2), 5)
+    _seed_calendar(sessions)
+    _seed(sessions, [10, 11, 12, 13, 14], [100.0] * 5)
+    now = _dt(sessions[-1], 16, 0)
+
+    with pytest.raises(ValueError, match="至少要有一个条件"):
+        v.freeze(SYMBOL, [], now=now)
+    with pytest.raises(TypeError, match="必须是 Condition"):
+        v.freeze(SYMBOL, ["不是条件"], now=now)
+    with pytest.raises(ValueError, match="window_days"):
+        v.freeze(SYMBOL, [v.Condition("close", ">=", 1.0)], window_days=0, now=now)
+    with pytest.raises(ValueError, match="晚于最近已完成会话"):
+        v.freeze(SYMBOL, [v.Condition("close", ">=", 1.0)],
+                 as_of=date(2030, 1, 1), now=now)
+    # 湖里没有该标的的 bar → 不编造锚点
+    with pytest.raises(ValueError, match="找不到"):
+        v.freeze("600519.SH", [v.Condition("close", ">=", 1.0)],
+                 as_of=sessions[-1], now=now)
+    # as_of 缺省 = 最近已收盘会话（覆盖 as_of→lcs 缺省分支）
+    cond = v.freeze(SYMBOL, [v.Condition("close", ">=", 1.0)], now=now)
+    assert cond.as_of == sessions[-1] and cond.anchor == 14.0
+
+
+def test_verify_calendar_degradation(env, monkeypatch) -> None:
+    from lquant.research import verify as v
+
+    sessions = _weekdays(date(2026, 3, 2), 5)
+    _seed_calendar(sessions)
+    _seed(sessions, [10, 11, 12, 13, 14], [100.0] * 5)
+    now = _dt(sessions[-1], 16, 0)
+    cond = v.freeze(SYMBOL, [v.Condition("close", ">=", 5.0)],
+                    as_of=sessions[0], now=now)
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("日历表炸了")
+
+    monkeypatch.setattr(v, "_sessions_after", boom)
+    r = v.verify(cond, today=now)
+    assert r.verdict == v.VERDICT_UNAVAILABLE and "交易日历不可用" in r.reason
+
+    monkeypatch.setattr(v, "_sessions_after", lambda *_a, **_kw: [])
+    r2 = v.verify(cond, today=now)
+    assert r2.verdict == v.VERDICT_UNAVAILABLE and "没有任何交易日" in r2.reason
+
+
+def test_verify_volume_ratio_insufficient_base_is_data_gap(env) -> None:
+    from lquant.research import verify as v
+
+    sessions = _weekdays(date(2026, 3, 2), 5)
+    _seed_calendar(sessions)
+    _seed(sessions, [10, 11, 12, 13, 14], [100.0] * 5)
+    cond = v.freeze(SYMBOL, [v.Condition("volume_ratio", ">=", 0.5, avg_days=30)],
+                    as_of=sessions[0], window_days=1, now=_dt(sessions[0], 16, 0))
+    r = v.verify(cond, today=_dt(sessions[-1], 16, 0))
+    assert r.verdict == v.VERDICT_UNAVAILABLE and "量比基准样本不足" in r.reason

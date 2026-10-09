@@ -378,3 +378,228 @@ def test_api_optimize(client):
     body = r.json()
     assert sum(body["weights"].values()) == pytest.approx(1.0)
     assert body["diagnostics"]["constraint_violations"] == []
+
+
+# ---------------------------------------------------------------------------
+# 纯编排函数的分支与退化输入（覆盖率补齐）
+# ---------------------------------------------------------------------------
+
+
+def test_portfolio_parse_helper_error_branches() -> None:
+    from lquant.cli.commands import portfolio as pf
+
+    with pytest.raises(pf.PortfolioError, match="YYYY-MM-DD"):
+        pf._parse_date("不是日期", field="--date")
+    assert pf._parse_date(None, field="--date") is None
+    assert pf._parse_date(date(2026, 1, 1), field="--date") == date(2026, 1, 1)
+
+    assert pf._norm_symbols("  ,  ") is None  # 全是空白 → 视为未限定
+    assert pf._norm_symbols(["600000"]) == ["600000.SH"]
+    with pytest.raises(pf.PortfolioError, match="标的解析失败"):
+        pf._norm_symbols("!!!")
+
+    assert pf._parse_factor_opts(None) == {"mom20": 1.0}
+    assert pf._parse_factor_opts(["mom20:0.6", "vol20"]) == {"mom20": 0.6, "vol20": 1.0}
+    with pytest.raises(pf.PortfolioError, match="缺少因子名"):
+        pf._parse_factor_opts([":0.5"])
+    with pytest.raises(pf.PortfolioError, match="权重不是数字"):
+        pf._parse_factor_opts(["mom20:abc"])
+
+    assert pf._parse_scores(None) is None
+    assert pf._parse_scores({"600000.SH": 1}) == {"600000.SH": 1.0}
+    assert pf._parse_scores("600000.SH=1,,600036.SH=2") == {
+        "600000.SH": 1.0, "600036.SH": 2.0}  # 空块跳过
+    with pytest.raises(pf.PortfolioError, match="SYM=VALUE"):
+        pf._parse_scores("600000.SH")
+    with pytest.raises(pf.PortfolioError, match="分数不是数字"):
+        pf._parse_scores("600000.SH=abc")
+
+    assert pf._derive_factors(pl.DataFrame()).is_empty()  # 空帧原样返回
+    assert pf._weight_metrics({})["n_holdings"] == 0
+
+
+def test_size_position_error_and_degenerate_branches() -> None:
+    from lquant.cli.commands import portfolio as pf
+
+    atr = pf.size_position(model="atr", symbol="600000", close=10.0, atr=0.5)
+    assert atr["symbol"] == "600000.SH" and atr["weight"] > 0
+    with pytest.raises(pf.PortfolioError, match="需要 --close 与 --atr"):
+        pf.size_position(model="atr", close=10.0)
+    with pytest.raises(pf.PortfolioError, match="ATR 仓位参数非法"):
+        pf.size_position(model="atr", close=10.0, atr=0.0)  # atr<=0 非法
+
+    kelly = pf.size_position(model="kelly", win_rate=0.4, win_loss_ratio=1.0)
+    assert kelly["weight"] == 0.0 and "期望劣势" in kelly["note"]  # f*<=0 → 0 仓位
+    with pytest.raises(pf.PortfolioError, match="需要 --win-rate"):
+        pf.size_position(model="kelly", win_rate=0.5)
+    with pytest.raises(pf.PortfolioError, match="Kelly 仓位参数非法"):
+        pf.size_position(model="kelly", win_rate=1.5, win_loss_ratio=1.0)
+
+    with pytest.raises(pf.PortfolioError, match="未知仓位模型"):
+        pf.size_position(model="ghost")
+
+
+def test_portfolio_weights_early_error_branches() -> None:
+    from lquant.cli.commands import portfolio as pf
+
+    with pytest.raises(pf.PortfolioError, match="未知方法"):
+        pf.portfolio_weights(method="ghost")
+    with pytest.raises(pf.PortfolioError, match="score_weight 需要 --score"):
+        pf.portfolio_weights(method="score_weight")
+    with pytest.raises(pf.PortfolioError, match="需要 --symbols"):
+        pf.portfolio_weights(method="equal")
+    with pytest.raises(pf.PortfolioError, match="必须早于"):
+        pf.portfolio_weights(method="equal", symbols="600000.SH",
+                             start="2026-02-01", end="2026-01-01")
+    with pytest.raises(pf.PortfolioError, match="必须配 --prev"):
+        pf.portfolio_weights(method="equal", symbols="600000.SH",
+                             start="2026-01-01", end="2026-02-01", band=0.01)
+    with pytest.raises(pf.PortfolioError, match="只在 --band"):
+        pf.portfolio_weights(method="equal", symbols="600000.SH",
+                             start="2026-01-01", end="2026-02-01",
+                             prev_weights={"600000.SH": 1.0})
+
+
+def test_security_meta_and_resolve_trade_date_degrade(tmp_path, monkeypatch) -> None:
+    from lquant.cli.commands import portfolio as pf
+    from lquant.core.config import get_settings
+
+    monkeypatch.setenv("LQ_ROOT", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    get_settings.cache_clear()
+    try:
+        assert pf._security_meta() is None  # duckdb 文件不存在
+        db = tmp_path / "data" / "duckdb" / "lquant.duckdb"
+        db.parent.mkdir(parents=True)
+        db.write_bytes(b"")
+        assert pf._security_meta() is None  # 库在但 security 表缺失 → 降级
+        with pytest.raises(pf.PortfolioDataError, match="湖为空"):
+            pf._resolve_trade_date(None)  # 空湖拿不到最新交易日
+    finally:
+        get_settings.cache_clear()
+
+
+def test_returns_wide_empty_lake_and_single_day(portfolio_env) -> None:
+    from lquant.cli.commands import portfolio as pf
+
+    with pytest.raises(pf.PortfolioDataError, match="无 .* 的日线"):
+        pf._returns_wide(["999999.SH"], DAYS[0], DAYS[-1])  # 标的都不在湖里
+    with pytest.raises(pf.PortfolioDataError, match="至少需要 2 行"):
+        pf._returns_wide(["600000.SH"], TARGET, TARGET)  # 只有一天 → 协方差不够
+
+
+def test_portfolio_weights_wraps_internal_failures(portfolio_env, monkeypatch) -> None:
+    from lquant.cli.commands import portfolio as pf
+    from lquant.portfolio import weighting
+
+    def boom(*_a, **_kw):
+        raise ValueError("内部算法炸了")
+
+    monkeypatch.setattr(weighting, "weights", boom)
+    with pytest.raises(pf.PortfolioError, match="权重计算失败"):
+        pf.portfolio_weights(method="equal", symbols="600000.SH,600036.SH",
+                             start=DAYS[0].isoformat(), end=TARGET_ISO)
+
+    monkeypatch.undo()
+    from lquant.portfolio import weighting as w2
+
+    def report_boom(*_a, **_kw):
+        raise RuntimeError("报告炸了")
+
+    monkeypatch.setattr(w2, "weight_report", report_boom)
+    out = pf.portfolio_weights(method="equal", symbols="600000.SH,600036.SH",
+                               start=DAYS[0].isoformat(), end=TARGET_ISO)
+    assert out["weights"] and any("weight_report 失败" in w for w in out["warnings"])
+
+
+def test_portfolio_weights_market_cap_uses_float_mv(portfolio_env, monkeypatch) -> None:
+    from lquant.cli.commands import portfolio as pf
+    from lquant.data.store import parquet
+
+    out = pf.portfolio_weights(method="market_cap_weight", symbols="600000.SH,600036.SH",
+                               end=TARGET_ISO, start=DAYS[0].isoformat(), sqrt_cap=True)
+    assert set(out["weights"]) <= {"600000.SH", "600036.SH"}
+
+    # 拿不到市值列 → 显式报错（不是静默等权）
+    real = parquet.read_daily
+
+    def no_mv(*a, **kw):
+        return real(*a, **kw).drop("float_mv")
+
+    monkeypatch.setattr(parquet, "read_daily", no_mv)
+    monkeypatch.setattr(pf, "_read_daily", lambda *a, **kw: no_mv(*a, **kw).collect())
+    with pytest.raises(pf.PortfolioDataError, match="float_mv"):
+        pf.portfolio_weights(method="market_cap_weight", symbols="600000.SH",
+                             end=TARGET_ISO, start=DAYS[0].isoformat())
+
+
+def test_screen_cross_section_branches(portfolio_env, monkeypatch) -> None:
+    from lquant.cli.commands import portfolio as pf
+
+    with pytest.raises(pf.PortfolioError, match="lookback-days 必须为正"):
+        pf.screen_cross_section(trade_date=TARGET_ISO, factors={"mom20": 1.0},
+                                lookback_days=0)
+    with pytest.raises(pf.PortfolioError, match="打分因子"):
+        pf.screen_cross_section(trade_date=TARGET_ISO, factors={})
+    with pytest.raises(pf.PortfolioError, match="top-n 必须为正"):
+        pf.screen_cross_section(trade_date=TARGET_ISO, factors={"mom20": 1.0}, top_n=0)
+
+    monkeypatch.setattr(pf, "_lake_is_empty", lambda: True)
+    with pytest.raises(pf.PortfolioDataError, match="日线湖为空"):
+        pf.screen_cross_section(trade_date=TARGET_ISO, factors={"mom20": 1.0})
+    monkeypatch.undo()
+
+    # cfg 缺省（默认 FilterConfig）也能算出结果
+    out = pf.screen_cross_section(trade_date=TARGET_ISO, factors={"mom20": 1.0}, cfg=None)
+    assert out["trade_date"] == TARGET_ISO
+
+    with pytest.raises(pf.PortfolioDataError, match="当日无日线"):
+        pf.screen_cross_section(trade_date="2026-03-01", factors={"mom20": 1.0})
+    with pytest.raises(pf.PortfolioError, match="因子列不存在"):
+        pf.screen_cross_section(trade_date=TARGET_ISO, factors={"ghost": 1.0})
+
+    # 元数据不可用 → 显式 warning，而不是假装过滤过了
+    monkeypatch.setattr(pf, "_security_meta", lambda: None)
+    degraded = pf.screen_cross_section(trade_date=TARGET_ISO, factors={"mom20": 1.0})
+    assert degraded["meta_available"] is False
+    assert any("元数据不可用" in w for w in degraded["warnings"])
+
+
+def test_portfolio_weights_kw_option_branches(portfolio_env) -> None:
+    from lquant.cli.commands import portfolio as pf
+
+    out = pf.portfolio_weights(
+        method="enhanced_indexing",
+        symbols="600000.SH,600036.SH,601318.SH",
+        scores={"600000.SH": 1.0, "600036.SH": 0.5, "601318.SH": -1.0},
+        benchmark={"600000.SH": 0.5, "600036.SH": 0.5},
+        prev_weights={"600000.SH": 0.4, "600036.SH": 0.3, "601318.SH": 0.3},
+        band=0.05, cov_method="shrink_lw",
+        start=DAYS[0].isoformat(), end=TARGET_ISO,
+    )
+    assert out["method"] == "enhanced_indexing" and out["weights"]
+
+
+def test_emit_and_methods_text_output(portfolio_env, capsys) -> None:
+    from lquant.cli.commands import portfolio as pf
+
+    # _emit 的三种分支：warnings→stderr、picks 表、weights 表
+    pf._emit({"warnings": ["注意 A"], "picks": [{"symbol": "600000.SH", "score": 1.0}]},
+             as_json=False, title="选股")
+    pf._emit({"weights": {"600000.SH": 0.6, "000001.SZ": 0.4}}, as_json=False, title="权重")
+    out = capsys.readouterr()
+    assert "注意 A" in out.err and "选股" in out.out and "权重" in out.out
+
+    r = _invoke(["portfolio", "methods", "--no-json"])
+    assert r.exit_code == 0 and "score_weight" in r.output and "(未注册)" in r.output
+
+
+def test_optimize_error_branches(portfolio_env) -> None:
+    from lquant.cli.commands import portfolio as pf
+
+    with pytest.raises(pf.PortfolioError, match="需要 --symbols"):
+        pf.optimize_portfolio(symbols=None, scores={"600000.SH": 1.0})
+    with pytest.raises(pf.PortfolioError, match="必须配 --prev"):
+        pf.optimize_portfolio(symbols="600000.SH,600036.SH",
+                              scores={"600000.SH": 1.0, "600036.SH": -1.0},
+                              start=DAYS[0].isoformat(), end=TARGET_ISO, band=0.01)

@@ -216,3 +216,21 @@ def test_g1_uses_train_subset_only():
     d = compute_factor_col(train, expr, "f").drop_nulls(["f", "fwd_ret_1"])
     expect = float(ic_series(d, "f", "fwd_ret_1")["ic"].mean())
     assert abs(r.ic - expect) < 1e-9
+
+
+# ── 前瞻期数解析与切分守卫（覆盖率补齐） ────────────────────────────────
+
+
+def test_horizon_from_ret_col_and_split_guards():
+    from lquant.factors.mining.runner import horizon_from_ret_col, split_dates
+
+    assert horizon_from_ret_col("fwd_ret_5") == 5
+    assert horizon_from_ret_col("fwd_ret_0") == 0
+    with pytest.raises(ValueError, match="期望 fwd_ret_"):
+        horizon_from_ret_col("close")
+    with pytest.raises(ValueError, match="不是整数"):
+        horizon_from_ret_col("fwd_ret_abc")
+    with pytest.raises(ValueError, match="不能为负"):
+        horizon_from_ret_col("fwd_ret_-1")
+    with pytest.raises(ValueError, match="不能为负"):
+        split_dates([dt.date(2024, 1, 1)], purge_bars=-1)

@@ -28,6 +28,7 @@ lquant 已有 EP-1..EP-12 的扩展点清单（``docs/EXTENSION_POINTS.md``）�
 from __future__ import annotations
 
 import importlib
+import importlib.machinery
 import importlib.util
 import logging
 import os
@@ -521,8 +522,53 @@ def _purge_extension_modules() -> None:
     """
     for key in [k for k in sys.modules if k.startswith(EXTENSION_MODULE_PREFIX)]:
         sys.modules.pop(key, None)
-    # 文件增删后让子模块 finder 丢掉目录缓存（相对 import 依赖它）。
+    # 文件增删后让子模块 finder（含下面自定义的 FileFinder）丢掉目录缓存。
     importlib.invalidate_caches()
+
+
+class _SourceOnlyLoader(importlib.machinery.SourceFileLoader):
+    """始终从磁盘源码现编译的 loader，判据只有「文件内容」。
+
+    为什么不能用默认 ``SourceFileLoader``：它的字节码缓存以
+    ``(源文件 mtime 整秒, size)`` 判定 ``__pycache__/*.pyc`` 是否有效。
+    同一秒内改写扩展、且新旧源码**等长**（很常见：改一个字符串字面量），
+    旧 ``.pyc`` 会被判为「有效」而直接复用 —— 于是「改代码即时生效」在
+    这一秒内失效，装载结果与磁盘内容脱节（CI 上就复现了这个 flaky）。
+    这里绕开 ``.pyc`` 读路径，直接 ``compile`` 当前源码，使结果确定。
+    """
+
+    def get_code(self, fullname: str):
+        return compile(self.get_data(self.path), self.path, "exec", dont_inherit=True)
+
+
+_EXTENSION_FILE_FINDER = importlib.machinery.FileFinder.path_hook(
+    (_SourceOnlyLoader, importlib.machinery.SOURCE_SUFFIXES),
+    (importlib.machinery.SourcelessFileLoader, importlib.machinery.BYTECODE_SUFFIXES),
+)
+"""扩展目录专用的 FileFinder 工厂（子模块相对 import 也走源码现编译）。"""
+
+_EXTENSION_PACKAGE_DIRS: set[str] = set()
+"""已装载过的包式扩展目录。path hook 只对这些目录生效，不干扰全局 import。"""
+
+
+def _extension_path_hook(path: str):
+    """``sys.path_hooks`` 钩子：仅扩展包目录命中，其余路径抛 ImportError 让位。
+
+    包式扩展的具体子模块（``from . import helpers``）由 import 机制在包的
+    ``__path__`` 上走 ``sys.path_hooks`` 查找。默认 FileFinder 会给子模块配
+    默认 ``SourceFileLoader``（又回到 ``.pyc`` 判据），所以这里必须把扩展目录
+    的 finder 换掉，「整棵扩展目录都现编译」才成立。非扩展路径直接让位，
+    不改变解释器其余部分的 import 行为。
+    """
+    if path in _EXTENSION_PACKAGE_DIRS:
+        return _EXTENSION_FILE_FINDER(path)
+    raise ImportError(path)
+
+
+def _install_extension_path_hook() -> None:
+    """把扩展 path hook 装到最前，幂等（重复调用不会重复插）。"""
+    if _extension_path_hook not in sys.path_hooks:
+        sys.path_hooks.insert(0, _extension_path_hook)
 
 
 def _load_module(name: str, entry: Path) -> Any:
@@ -532,14 +578,22 @@ def _load_module(name: str, entry: Path) -> Any:
     按名字找不到。包式扩展用 ``submodule_search_locations`` 让 ``from . import x``
     这种同目录相对 import 正常工作；先入 ``sys.modules`` 再 exec 是包式 import
     的硬要求（相对 import 会回查父模块缓存）。
+
+    loader 一律用 :class:`_SourceOnlyLoader`（而不是默认来源 loader）：默认的
+    ``.pyc`` 判据会让「同一秒内等长改写」读到旧字节码，装载结果必须只由
+    **磁盘当前内容**决定。
     """
     module_name = EXTENSION_MODULE_PREFIX + name
+    loader = _SourceOnlyLoader(module_name, str(entry))
     if entry.name == "__init__.py":
+        _EXTENSION_PACKAGE_DIRS.add(str(entry.parent))
+        _install_extension_path_hook()
         spec = importlib.util.spec_from_file_location(
-            module_name, entry, submodule_search_locations=[str(entry.parent)]
+            module_name, entry, loader=loader,
+            submodule_search_locations=[str(entry.parent)],
         )
     else:
-        spec = importlib.util.spec_from_file_location(module_name, entry)
+        spec = importlib.util.spec_from_file_location(module_name, entry, loader=loader)
     if spec is None or spec.loader is None:  # pragma: no cover - 扫描层只喂 .py，纯防御
         raise ImportError(f"扩展 {name!r} 无法创建模块规格：{entry}")
     module = importlib.util.module_from_spec(spec)

@@ -528,3 +528,173 @@ def test_outlook_stats_unverified_left_in_coverage_denominator(env) -> None:
     assert st.unverified == 1
     assert st.hit_rate == pytest.approx(2.0 / 3.0)
     assert st.coverage == pytest.approx(70.0 / 90.0)  # 未判定的 20 分权重留在分母里
+
+
+# ── 辅助函数与条件对象的校验分支（覆盖率补齐） ──────────────────────────
+
+
+def test_journal_private_helpers() -> None:
+    from lquant.research import journal as j
+
+    assert j._finite(None) is None
+    assert j._finite("不是数字") is None
+    assert j._finite(float("nan")) is None
+    assert j._finite("1.5") == 1.5
+
+    assert j._norm_symbol("600000") == SYM_A
+    assert j._clock(None) is None
+    assert j._clock(_dt(date(2026, 3, 2), 9, 0)) == _dt(date(2026, 3, 2), 9, 0)
+    assert j._clock(date(2026, 3, 2)).hour == 15  # date → 该日收盘后
+    with pytest.raises(TypeError, match="只接受 datetime"):
+        j._clock("2026-03-02")
+
+    assert j._to_date(datetime(2026, 3, 2, 9, 0)) == date(2026, 3, 2)
+    assert j._to_date("2026-03-02T09:00:00") == date(2026, 3, 2)
+    with pytest.raises(TypeError, match="只接受 date"):
+        j._to_date(12345)
+
+    full = {"market": 1, "scenario": 1, "direction": 1, "stock": 1}
+    assert j._check_weights(full) == full
+    with pytest.raises(ValueError, match="未知维度权重"):
+        j._check_weights({**full, "ghost": 1})
+    with pytest.raises(ValueError, match="缺少维度权重"):
+        j._check_weights({"market": 1})
+    with pytest.raises(ValueError, match="正有限数"):
+        j._check_weights({**full, "market": 0})
+
+    assert j._match(1.0, ">=", 1.0) and j._match(1.0, "<=", 1.0)
+    assert j._match(2.0, ">", 1.0) and j._match(0.0, "<", 1.0)
+
+    assert j._sessions_after(date(2026, 3, 2), date(2026, 3, 1)) == []  # through <= as_of
+
+
+def test_boolean_check_validation_and_roundtrip() -> None:
+    from lquant.research import journal as j
+
+    market = next(iter(j.BOOLEAN_MARKET_METRICS))
+    symbol = next(iter(j.BOOLEAN_SYMBOL_METRICS))
+    ok = j.BooleanCheck(metric=market, op=">=", threshold=1.0)
+    assert j.BooleanCheck.from_json(ok.to_json()).to_json() == ok.to_json()
+
+    sym = j.BooleanCheck(metric=symbol, op=">", threshold=1.0, symbol="600000")
+    assert sym.symbol == SYM_A  # 构造时就归一
+    assert j.BooleanCheck.from_json(sym.to_json()).symbol == SYM_A
+
+    with pytest.raises(ValueError, match="不接受 symbol"):
+        j.BooleanCheck(metric=market, op=">=", threshold=1.0, symbol="600000")
+    with pytest.raises(ValueError, match="必须给 symbol"):
+        j.BooleanCheck(metric=symbol, op=">=", threshold=1.0)
+    with pytest.raises(ValueError, match="不支持的布尔指标"):
+        j.BooleanCheck(metric="ghost", op=">=", threshold=1.0)
+    with pytest.raises(ValueError, match="不支持的操作符"):
+        j.BooleanCheck(metric=market, op="==", threshold=1.0)
+    with pytest.raises(ValueError, match="有限数"):
+        j.BooleanCheck(metric=market, op=">=", threshold=float("inf"))
+    with pytest.raises(ValueError, match="window_days 必须"):
+        j.BooleanCheck(metric=market, op=">=", threshold=1.0, window_days=0)
+
+
+def test_pending_condition_validation() -> None:
+    from lquant.research import journal as j
+    from lquant.research.verify import Condition
+
+    window = j.PendingCondition(symbol="600000", conditions=(Condition("close", ">=", 1.0),))
+    assert window.symbol == SYM_A and window.to_json()["symbol"] == SYM_A
+
+    with pytest.raises(ValueError, match="至少要有一个条件"):
+        j.PendingCondition(symbol="600000", conditions=())
+    with pytest.raises(TypeError, match="必须是 Condition"):
+        j.PendingCondition(symbol="600000", conditions=("不是条件",))
+    with pytest.raises(ValueError, match="window_days 必须"):
+        j.PendingCondition(symbol="600000",
+                           conditions=(Condition("close", ">=", 1.0),), window_days=0)
+
+
+def test_check_json_roundtrip_and_errors():
+    from lquant.research import journal as j
+
+    assert j._check_to_json(None) == {"kind": "none"}
+    assert j._check_from_json({"kind": "none"}) is None
+    with pytest.raises(TypeError, match="未知清单条件类型"):
+        j._check_to_json(42)
+    with pytest.raises(ValueError, match="未知清单条件 kind"):
+        j._check_from_json({"kind": "ghost"})
+
+    market = next(iter(j.BOOLEAN_MARKET_METRICS))
+    boolean = j.BooleanCheck(metric=market, op=">=", threshold=1.0)
+    assert j._check_from_json(j._check_to_json(boolean)).to_json() == boolean.to_json()
+
+    pending = j.PendingCondition(symbol="600000",
+                                 conditions=(j.Condition("close", ">=", 1.0),))
+    restored = j._check_from_json(j._check_to_json(pending))
+    assert restored.symbol == SYM_A and restored.window_days == pending.window_days
+
+
+def test_checklist_item_validation_and_helpers():
+    from lquant.research import journal as j
+
+    market = next(iter(j.BOOLEAN_MARKET_METRICS))
+    ok = j.market_item("市场条目", j.BooleanCheck(metric=market, op=">=", threshold=1.0))
+    assert j.ChecklistItem.from_json(ok.to_json()).text == "市场条目"
+
+    with pytest.raises(ValueError, match="必须有文字"):
+        j.ChecklistItem(text="   ")
+    with pytest.raises(ValueError, match="未知维度"):
+        j.ChecklistItem(text="x", dimension="ghost")
+    with pytest.raises(TypeError, match="check 必须是"):
+        j.ChecklistItem(text="x", check="不是条件")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="权重份额"):
+        j.ChecklistItem(text="x", weight=0)
+
+    up = j.direction_item("600000", "up")
+    down = j.direction_item("600000", "down")
+    flat = j.direction_item("600000", "flat")
+    assert up.dimension == j.DIMENSION_DIRECTION and down.check.op == "<="
+    assert flat.check.metric == "abs_change_pct"
+    with pytest.raises(ValueError, match="view 只支持"):
+        j.direction_item("600000", "sideways")
+    assert j.stock_item("600000").check.op == ">"
+
+
+def test_scenario_direction_and_daily_outlook_guards(env):
+    from lquant.research import journal as j
+    from lquant.research.verify import Condition, FrozenCondition
+
+    with pytest.raises(ValueError, match="情景必须有名字"):
+        j.Scenario(name="  ")
+    with pytest.raises(ValueError, match="概率必须落在"):
+        j.Scenario(name="x", probability=1.5)
+    assert j.Scenario.from_json(j.Scenario(name="x", probability=0.5).to_json()).probability == 0.5
+
+    with pytest.raises(ValueError, match="view 只支持"):
+        j.Direction(symbol="600000", view="sideways")
+    assert j.StockFocus.from_json(j.StockFocus(symbol="600000").to_json()).symbol == SYM_A
+
+    state = next(iter(j.REGIME_STATES))
+    result = j.RegimeResult(state=state, label="x", score=1.0, profit=0.5,
+                            speculation=0.5, resilience=0.5, trend=0.5, neutral=())
+    outlook = j.DailyOutlook(trade_date=date(2026, 3, 2), market_state=result)
+    assert outlook.market_state == state
+    assert dict(outlook.evidence)["regime"]
+
+    with pytest.raises(ValueError, match="已有 'regime' 键"):
+        j.DailyOutlook(trade_date=date(2026, 3, 2), market_state=result,
+                       evidence=(("regime", {}),))
+    with pytest.raises(TypeError, match="只接受 str / RegimeResult / None"):
+        j.DailyOutlook(trade_date=date(2026, 3, 2), market_state=42)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="未知市场状态"):
+        j.DailyOutlook(trade_date=date(2026, 3, 2), market_state="不存在状态")
+    with pytest.raises(TypeError, match="elements|元素必须是"):
+        j.DailyOutlook(trade_date=date(2026, 3, 2), scenarios=("不是情景",))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="缺少维度权重"):
+        j.DailyOutlook(trade_date=date(2026, 3, 2), weights={"market": 1})
+
+    # 已冻结条件必须是同一研判交易日
+    frozen = FrozenCondition(symbol=SYM_A, as_of=date(2026, 3, 1), anchor=10.0,
+                             conditions=(Condition("close", ">=", 1.0),))
+    bad = j.DailyOutlook(
+        trade_date=date(2026, 3, 2),
+        checklist=(j.ChecklistItem(text="错锚点", check=frozen),),
+    )
+    with pytest.raises(ValueError, match="必须就是做判断的那一天"):
+        j._resolve_pending(bad, now=date(2026, 3, 2))

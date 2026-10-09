@@ -497,7 +497,7 @@ def test_risk_parity_normal_path_still_erc() -> None:
 
 
 def test_split_purges_label_horizon_tail() -> None:
-    """修复 40：train 尾部剔除 label_horizon-1 天，防标签读到 valid 段价格。"""
+    """修复 40：train 尾部剔除 label_horizon 天，防标签读到 valid 段价格。"""
     n = 30
     d0 = date(2025, 1, 1)
     dates = [d0 + timedelta(days=i) for i in range(n)]
@@ -510,7 +510,14 @@ def test_split_purges_label_horizon_tail() -> None:
         dates=dates,
     )
     train, valid, _ = ds.split(date(2025, 1, 20), date(2025, 1, 25))
-    assert train["trade_date"].max() == date(2025, 1, 16)   # 回退 4 个交易日
+    # train_end = 01-20 是 dates 里的索引 19（n=30，交易日逐日排）。
+    # 标签是 forward_return = close[i+h]/close[i]-1（见 factors/evaluate/returns.py），
+    # 即样本 i 的标签要读索引 i+h 的价格；valid 首日 = train_end 的下一交易日（索引 20）。
+    # 要完全不碰 valid，必须 i+h <= 19，即样本索引最大到 19-h，
+    # 也就是 train 尾回退 **h=5** 个交易日 → 停在索引 14 = 01-15。
+    # 若只回退 h-1=4 天（停在索引 15 = 01-16），边界那 1 个样本会留在训练集里，
+    # 而它的标签恰好读索引 20 = valid 首日的收盘价 —— 静默泄漏；h=1 时更是一天都不退。
+    assert train["trade_date"].max() == date(2025, 1, 15)   # 回退 horizon=5 个交易日
     assert valid["trade_date"].min() == date(2025, 1, 21)   # valid 边界不变
     train2, _, _ = ds.split(date(2025, 1, 20), date(2025, 1, 25), purge=False)
     assert train2["trade_date"].max() == date(2025, 1, 20)  # 显式关闭 = 旧行为

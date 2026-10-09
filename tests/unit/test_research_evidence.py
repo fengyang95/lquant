@@ -437,3 +437,183 @@ def test_wiring_format_error_triggers_repair_with_fixed_json():
 
     repair.assert_called_once()
     assert res["accepted"][0]["expr"] == GOOD
+
+
+# ── 归一化/压缩/引用/检查点的退化分支（覆盖率补齐） ─────────────────────
+
+
+def test_evidence_coercion_error_branches():
+    from lquant.research import evidence as ev
+
+    with pytest.raises(TypeError, match="必须是 mapping"):
+        ev._coerce_source(42)
+    with pytest.raises(ValueError, match="缺少来源 id"):
+        ev._coerce_source({"title": "x"})
+    assert ev._first_value({}, ("a",), "d") == "d"
+    assert ev._first_value({"a": 5}, ("a",)) == "5"
+
+    with pytest.raises(TypeError, match="必须是 str"):
+        ev.normalize_for_match(42)
+    with pytest.raises(TypeError, match="必须是 mapping"):
+        ev._coerce_card(42)
+    with pytest.raises(TypeError, match="不是 mapping"):
+        ev.coerce_cards({"id": "a"})
+    with pytest.raises(ValueError, match="id 重复"):
+        ev.coerce_cards([src("a", "x"), src("a", "y")])
+
+
+def test_evidence_id_and_quote_coercion():
+    from lquant.research import evidence as ev
+
+    assert ev._as_id_list(None) == ()
+    assert ev._as_id_list("  ") == ()
+    assert ev._as_id_list("a") == ("a",)
+    assert ev._as_id_list({"a": 1, "b": 2}) == ("a", "b")
+    assert ev._as_id_list(["a", " ", {"source_id": "b"}, 42]) == ("a", "b")
+    with pytest.raises(TypeError, match="source_ids 不支持"):
+        ev._as_id_list(42)
+
+    assert ev._as_quotes(None) == ()
+    assert ev._as_quotes("q")[0].quote == "q"
+    assert ev._as_quotes({"source_id": "a", "quote": "q"})[0].source_id == "a"
+    assert len(ev._as_quotes(["q1", "q2"])) == 2
+    with pytest.raises(TypeError, match="quotes 不支持"):
+        ev._as_quotes(42)
+    with pytest.raises(TypeError, match="单条引文"):
+        ev._coerce_quote(42)
+
+
+def test_extract_claims_and_quote_hits_guards():
+    from lquant.research import evidence as ev
+
+    with pytest.raises(TypeError, match="不是 mapping"):
+        ev._coerce_claim("x", 0)
+    with pytest.raises(ValueError, match="缺少 claims"):
+        ev._extract_claims({})
+    with pytest.raises(TypeError, match="必须是带 claims"):
+        ev._extract_claims(42)
+    with pytest.raises(ValueError, match="必须是数组"):
+        ev._extract_claims({"claims": "not-list"})
+    assert ev._quote_hits("abc", "   ") is False
+
+
+def test_validate_citations_failure_branches():
+    from lquant.research import evidence as ev
+
+    cards = [src("a", "公司发布公告，营业总收入同比增长 20%")]
+    codes = lambda v: {f.code for f in v.failures}  # noqa: E731
+
+    v = ev.validate_citations({"claims": [{"text": "x", "source_ids": ["ghost"]}]}, cards)
+    assert not v.ok and "UNKNOWN_SOURCE" in codes(v)
+    assert not ev.validate_citations({"claims": [{"text": "x"}]}, cards).ok
+    v = ev.validate_citations(
+        {"claims": [{"text": "x", "source_ids": ["a"],
+                     "quotes": [{"source_id": "a", "quote": "   "}]}]}, cards)
+    assert "EMPTY_QUOTE" in codes(v)
+    v = ev.validate_citations(
+        {"claims": [{"text": "x", "quotes": [{"quote": "营业总收入"}]}]}, cards)
+    assert "MISSING_SOURCE" in codes(v)
+    v = ev.validate_citations(
+        {"claims": [{"text": "x", "source_ids": ["a"],
+                     "quotes": [{"source_id": "a", "quote": "不存在的句子"}]}]}, cards)
+    assert "QUOTE_NOT_FOUND" in codes(v)
+
+    ok = ev.validate_citations(
+        {"claims": [{"text": "x", "source_ids": ["a"],
+                     "quotes": [{"quote": "营业总收入"}]}]}, cards)
+    assert ok.ok and ok.verified_claims == 1 and ok.fallback is None
+
+
+def test_compress_evidence_guards_and_title_only():
+    from lquant.research import evidence as ev
+
+    for kwargs in ({"max_cards": 0}, {"max_bytes": 0}, {"per_source_bytes": 0}):
+        with pytest.raises(ValueError, match="必须为正整数"):
+            ev.compress_evidence([src("a", "x")], **kwargs)
+
+    titled = ev.compress_evidence([src("a", "", title="只有标题")])
+    assert titled.cards and titled.cards[0].compression.startswith("仅标题")
+    assert any("仅有标题" in n for n in titled.limitations)
+
+    empty = ev.compress_evidence([{"id": "a", "title": "", "content": ""}])
+    assert not empty.cards and empty.dropped  # 无正文且无标题 → 丢弃并可见
+
+
+def test_truncate_score_and_compress_body_helpers():
+    from lquant.research import evidence as ev
+
+    assert ev._truncate_bytes("abc", 0) == ""
+    assert ev._truncate_bytes("abc", 2) == "ab"
+    assert ev._score_sentence("营业总收入同比增长 5%", 0) > ev._score_sentence("普通句子", 5)
+    assert ev._compress_body("   ", 10) == ("", "empty")
+    assert ev._compress_body("短句。", 100)[1] == "no_compression"
+    long = "第一句关于风险与下滑。第二句是营业总收入同比增长。第三句无关内容在这里。"
+    assert ev._compress_body(long, 20)[1] in ("sentence_selection", "head_truncate")
+    assert "…" in ev._join_sentences([(0, "A"), (2, "C")])
+
+
+def test_checkpoint_identity_and_fingerprints():
+    from lquant.research import evidence as ev
+
+    ident = ev.CheckpointIdentity("m", "p", "r", "e")
+    assert ev.CheckpointIdentity.from_dict(ident.to_dict()) == ident
+    with pytest.raises(ValueError, match="缺少字段"):
+        ev.CheckpointIdentity.from_dict({"model_identity": "m"})
+    assert ident.digest and ident.changed_fields(ev.CheckpointIdentity("m2", "p", "r", "e")) == (
+        "model_identity",)
+
+    assert ev.compute_request_fingerprint("x") == ev.content_hash({"request": "x"})
+    assert ev.compute_request_fingerprint({"b": 1, "a": 2}) == ev.compute_request_fingerprint(
+        {"a": 2, "b": 1})
+    assert isinstance(ev.compute_request_fingerprint(42), str)
+
+    pack = ev.compress_evidence([src("a", "x")])
+    assert ev.evidence_digest(pack) == ev.content_hash(pack.to_dict())
+    assert ev.evidence_digest([src("a", "x")])
+
+
+def test_stage_failure_and_final_report_guards():
+    from lquant.research import evidence as ev
+
+    f = ev.StageFailure.build("s", RuntimeError("boom"), "y" * 999)
+    assert "boom" in f.error and repr(f).startswith("StageFailure")
+    assert "diagnostic" not in f.to_dict()  # 对外序列化不带失败原文
+    with pytest.raises(ValueError, match="max_chars"):
+        ev.StageFailure.build("s", "x", max_chars=0)
+
+    ident = ev.CheckpointIdentity("m", "p", "r", "e")
+    good = ev.CitationVerdict(True, 1, 1, ())
+    fr = ev.FinalReport(ident, (), good)
+    with pytest.raises(TypeError, match="不能回写成中间态"):
+        ev.IntermediateStage("s", fr)
+    with pytest.raises(ev.UnvalidatedIntermediateError, match="必须携带"):
+        ev.FinalReport(ident, (), "not-a-verdict")  # type: ignore[arg-type]
+    with pytest.raises(ev.UnvalidatedIntermediateError, match="引用校验未通过"):
+        ev.FinalReport(ident, (), ev.CitationVerdict(False, 1, 0, (), fallback="x"))
+
+
+def test_research_checkpoint_guards_and_roundtrip():
+    from lquant.research import evidence as ev
+
+    ident = ev.CheckpointIdentity("m", "p", "r", "e")
+    cp = ev.ResearchCheckpoint(ident)
+    with pytest.raises(ValueError, match="stage 不能为空"):
+        cp.record("   ", "v")
+    with pytest.raises(KeyError, match="没有阶段"):
+        cp.intermediate("ghost")
+    with pytest.raises(ValueError, match="版本不兼容"):
+        ev.ResearchCheckpoint.from_dict({"version": 999})
+
+    verdict = ev.validate_citations({"claims": [{"text": "x"}]}, [src("a", "x")])
+    with pytest.raises(ev.UnvalidatedIntermediateError, match="引用校验失败"):
+        cp.finalize({"claims": [{"text": "x"}]}, [src("a", "x")])
+    assert cp.public_failures()  # 失败已记账
+
+    cp2 = ev.ResearchCheckpoint(ident, failures={"s": ev.StageFailure.build("s", "e")})
+    restored = ev.ResearchCheckpoint.from_dict(cp2.to_dict())
+    assert restored.public_failures()[0]["stage"] == "s"
+
+    fr = ev.FinalReport(ident, (), verdict if verdict.ok else ev.CitationVerdict(True, 0, 0, ()))
+    bad = {**cp.to_dict(), "stages": {"final": fr}}
+    with pytest.raises(ValueError, match="不允许出现最终报告"):
+        ev.ResearchCheckpoint.from_dict(bad)

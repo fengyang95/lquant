@@ -410,3 +410,31 @@ def test_default_label_kind_is_close_to_close():
     ds = build_dataset(make_panel(30), DatasetConfig(features=["mom"],
                                                      label_horizon=3))
     assert ds.summary()["label_kind"] == "close[t+3]/close[t+0]"
+
+
+# ── 窗口吸附与边界守卫（覆盖率补齐） ────────────────────────────────────
+
+
+def test_purge_embargo_window_error_paths():
+    from lquant.research.ml.dataset import (
+        _first_idx_ge,
+        _first_idx_gt,
+        _last_idx_le,
+        _purge_embargo_window,
+    )
+
+    grid = [date(2024, 1, 1) + timedelta(days=i) for i in range(10)]
+    assert _first_idx_ge(grid, date(2100, 1, 1)) is None
+    assert _first_idx_gt(grid, date(2100, 1, 1)) is None
+    assert _last_idx_le(grid, date(2000, 1, 1)) is None
+
+    # 数据边界与月历边界不匹配 → 取不到完整区间
+    with pytest.raises(ValueError, match="取不到完整区间"):
+        _purge_embargo_window(grid, date(2023, 1, 1), date(2023, 2, 1),
+                              date(2023, 3, 1), date(2023, 4, 1), 0, 0)
+    # purge 把训练段剪空
+    with pytest.raises(ValueError, match="训练段剪空"):
+        _purge_embargo_window(grid, grid[0], grid[1], grid[3], grid[5], 5, 0)
+    # 验证段被剪空
+    with pytest.raises(ValueError, match="验证段剪空"):
+        _purge_embargo_window(grid, grid[0], grid[1], grid[1], grid[5], 0, 0)

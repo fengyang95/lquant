@@ -214,3 +214,84 @@ def test_router_is_mounted_in_create_app(api_env: Path) -> None:
     paths = set(inner.openapi()["paths"])
     assert "/api/ext-data" in paths
     assert "/api/ext-data/{table_id}/rows" in paths
+
+
+# ---------------------------------------------------------------------------
+# 端点错误路径与派生收尾（覆盖率补齐）
+# ---------------------------------------------------------------------------
+
+
+def test_delete_snapshot_coverage_and_sync_factors(client: TestClient) -> None:
+    _create(client)  # timeseries
+    _create(client, id="senti", mode="snapshot",
+            fields=[{"name": "score", "dtype": "float"}])
+    listing = client.get("/api/ext-data").json()
+    snap = next(t for t in listing if t["id"] == "senti")
+    assert snap["coverage"]["has_data"] is False  # snapshot 覆盖语义
+
+    r = client.post("/api/ext-data/heat/sync-factors")
+    assert r.status_code == 200 and r.json()["factors"]
+
+    r = client.delete("/api/ext-data/heat")
+    assert r.status_code == 200 and r.json()["deleted"] == "heat"
+    assert client.get("/api/ext-data/heat/rows").status_code == 404
+
+
+def test_create_blank_label_is_422(client: TestClient) -> None:
+    # 过得了 pydantic、过不了 ExtConfig 校验 → 422（不是 500）
+    r = client.post("/api/ext-data", json={
+        "id": "m", "label": "   ", "mode": "timeseries",
+        "fields": [{"name": "a", "dtype": "float"}],
+    })
+    assert r.status_code == 422
+
+
+def test_upload_empty_and_oversize(client: TestClient) -> None:
+    from lquant.server.api.ext_data import MAX_UPLOAD_BYTES
+
+    _create(client)
+    assert client.post("/api/ext-data/heat/upload?filename=x.csv",
+                       content=b"").status_code == 400
+    big = b"0" * (MAX_UPLOAD_BYTES + 1)
+    assert client.post("/api/ext-data/heat/upload?filename=x.csv",
+                       content=big).status_code == 413
+
+
+def test_backfill_requires_range(client: TestClient) -> None:
+    _create(client)
+    r = client.post("/api/ext-data/heat/backfill", json={"start": "", "end": ""})
+    assert r.status_code == 400
+
+
+def test_rows_values_error_400_and_corrupt_config(client: TestClient, api_env: Path) -> None:
+    _create(client)
+    assert client.get("/api/ext-data/heat/rows?filter=ghost:1").status_code == 400
+    assert client.get("/api/ext-data/heat/rows?date=不是日期").status_code == 400
+    client.post("/api/ext-data/heat/write", json={
+        "date": "2024-03-01",
+        "rows": [{"symbol": "600000", "heat": 1.0, "concepts": "AI"}],
+    })
+    assert client.get("/api/ext-data/heat/values?field=ghost").status_code == 400
+
+    # 配置存在但解析失败 → 422（与「不存在」的 404 语义不同）
+    (api_env / "ext" / "heat" / "config.json").write_text("{ 坏配置", encoding="utf-8")
+    assert client.get("/api/ext-data/heat/rows").status_code == 422
+
+
+def test_after_write_failure_is_logged_not_fatal(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    _create(client)
+    from lquant.data.ext import duckdb as ext_duck
+    from lquant.factors import ext_bridge
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("派生结果炸了")
+
+    monkeypatch.setattr(ext_duck, "sync_view", boom)
+    monkeypatch.setattr(ext_bridge, "sync_ext_factors", boom)
+    r = client.post("/api/ext-data/heat/write", json={
+        "date": "2024-03-01",
+        "rows": [{"symbol": "600000", "heat": 1.0, "concepts": "AI"}],
+    })
+    assert r.status_code == 200  # 数据已落盘，派生失败不改 HTTP 结果
+    assert r.json()["rows"] == 1

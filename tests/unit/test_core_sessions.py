@@ -176,3 +176,10 @@ def test_close_time_boundary_is_closed_at_or_after_1500(fake_calendar):
     assert (sessions.CLOSE_TIME.hour, sessions.CLOSE_TIME.minute) == (15, 0)
     assert sessions.latest_completed_session(_dt(2026, 6, 15, 14, 59)) == date(2026, 6, 12)
     assert sessions.latest_completed_session(_dt(2026, 6, 15, 15, 0)) == date(2026, 6, 15)
+
+
+def test_open_days_inverted_range_is_empty():
+    """hi < lo 直接空列表：不是「日历读不到」（None），两者语义必须分开。"""
+    from lquant.core.sessions import _open_days
+
+    assert _open_days(date(2026, 3, 2), date(2026, 3, 1)) == []

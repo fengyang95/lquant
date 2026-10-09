@@ -379,3 +379,57 @@ def test_snapshot_is_not_trivially_empty():
     expected = json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
     assert len(expected) > 100
     assert set(expected.values()) <= set(auth.SCOPES) | {auth.SCOPE_ANY}
+
+
+# ── 10. 时间/路径/坏文件的退化分支（覆盖率补齐） ─────────────────────────
+
+
+def test_parse_ts_and_data_dir_branches(monkeypatch, tmp_path):
+    assert auth._parse_ts("不是时间") is None
+    assert auth._parse_ts(None) is None
+    assert auth._parse_ts("2026-01-01T00:00:00").tzinfo is not None  # naive 补平台时区
+
+    monkeypatch.setenv("LQ_DATA_DIR", "rel/data")
+    assert auth._data_dir() == auth._root() / "rel/data"  # 相对路径锚定仓库根
+    monkeypatch.setenv("LQ_DATA_DIR", str(tmp_path / "abs"))
+    assert auth._data_dir() == tmp_path / "abs"
+    monkeypatch.delenv("LQ_DATA_DIR", raising=False)
+    assert isinstance(auth._data_dir(), Path)
+
+
+def test_corrupt_token_store_fails_closed(client, tokens_file):
+    """坏 token 文件按「已启用但无任何有效记录」处理 → 全部拒绝，不静默放行。"""
+    tokens_file.write_text("{ 坏 JSON", encoding="utf-8")
+    st = auth.load_store()
+    assert st.enabled is True and st.records == ()
+    assert auth._read_raw() == []
+    assert auth.evaluate(PING_MARKET, "GET", "whatever").status == 401
+
+
+def test_missing_credential_is_401_when_enabled():
+    _new_token("t", ["read:market"])
+    assert auth.evaluate(PING_MARKET, "GET", None).status == 401
+
+
+def test_create_token_rejects_bad_expiry():
+    with pytest.raises(ValueError, match="ISO 8601"):
+        auth.create_token("bad", ["read:market"], expires_at="不是时间")
+
+
+def test_chmod_failure_is_best_effort(monkeypatch):
+    def boom(*_a, **_kw):
+        raise OSError("文件系统不支持 chmod")
+
+    monkeypatch.setattr(auth.os, "chmod", boom)
+    view, plaintext = auth.create_token("chmod", ["read:market"])
+    assert plaintext.startswith(auth.TOKEN_PREFIX) and view["id"]
+
+
+def test_options_preflight_bypasses_auth(client):
+    _new_token("preflight", ["read:market"])
+    assert client.request("OPTIONS", PING_MARKET).status_code != 401
+
+
+def test_create_token_api_422_on_bad_scope(client):
+    r = client.post("/api/auth/tokens", json={"name": "x", "scopes": ["nope"]})
+    assert r.status_code == 422
