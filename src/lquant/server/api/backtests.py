@@ -231,8 +231,6 @@ def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
 
     try:
         return compute_factor_col(df, formula, name=formula.replace("_", ""))
-    except HTTPException:
-        raise
     except (ValueError, KeyError, FactorError) as e:
         raise HTTPException(422, f"暂不支持的因子公式: {formula}") from e
 
