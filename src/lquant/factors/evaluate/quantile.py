@@ -119,13 +119,25 @@ def long_short_nav(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
     )
 
 
+#: 多空绩效的键集合。正常路径与空数据路径**必须用同一份**——两条路径返回
+#: 结构不一致，调用方（server/api/factors.py）就只能在空面板上 KeyError。
+_LS_KEYS = ("total_return", "annual_return", "annual_vol", "sharpe",
+            "max_drawdown", "win_rate", "calmar")
+
+
 def quantile_summary(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
                      n_groups: int = 10, *, date_col: str = "trade_date",
                      periods_per_year: int = 252) -> dict:
-    """分层汇总：每组年化 + 多空绩效 + 单调性。"""
+    """分层汇总：每组年化 + 多空绩效 + 单调性。
+
+    空数据（因子全 null / 样本不足分不出组）时返回**同样的键**，值全为 None：
+    「没有结论」和「没有这个字段」对调用方是两回事，后者会直接炸。
+    """
     g = group_returns(df, factor, ret_col, n_groups, date_col=date_col)
     if not len(g):
-        return {"factor": factor, "n_groups": n_groups, "groups": []}
+        return {"factor": factor, "ret_col": ret_col, "n_groups": n_groups,
+                "groups": [], "long_short": dict.fromkeys(_LS_KEYS),
+                "monotonicity": float("nan"), "top_bottom_spread": float("nan")}
 
     piv = pivot_group_returns(g, n_groups, date_col=date_col)
     groups = []
@@ -163,9 +175,7 @@ def quantile_summary(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1",
         "ret_col": ret_col,
         "n_groups": n_groups,
         "groups": groups,
-        "long_short": {k: ls_perf.get(k) for k in
-                       ("total_return", "annual_return", "annual_vol", "sharpe",
-                        "max_drawdown", "win_rate", "calmar")},
+        "long_short": {k: ls_perf.get(k) for k in _LS_KEYS},
         "monotonicity": mono,
         "top_bottom_spread": spread,
     }

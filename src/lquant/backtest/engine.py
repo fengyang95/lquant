@@ -21,6 +21,7 @@ from lquant.backtest.account import Account
 from lquant.backtest.broker import Broker
 from lquant.backtest.events import Bar, Fill, Order, OrderStatus, Side
 from lquant.backtest.metrics import perf_from_returns, turnover_from_trades
+from lquant.backtest.risk import PreTradeGate, RiskContext
 from lquant.backtest.rules.loader import default_slippage, load_ruleset
 from lquant.backtest.rules.model import InstrumentRules, RuleSet
 from lquant.backtest.security_meta import load_security_meta, merge_meta
@@ -160,6 +161,12 @@ class EngineConfig:
     # 注入基准收盘序列 [(date, close)]，规避 DB 依赖（测试/离线回放）。
     # 给了它就不再查 index_daily；空列表 = 显式声明「没有基准」。
     benchmark_series: list[tuple[date, float]] | None = None
+    # 事前风控校验器链（P1-3）。None = 只开「结构正确性」那几条（默认配置下
+    # 不可能触发）；显式给名单才会启用行业暴露/换手/回撤熔断这些**会改变结果**
+    # 的组合级约束 —— 「事前风控宜松不宜紧」，默认不许悄悄改收益。
+    risk_rules: tuple[str, ...] | None = None
+    # 规则参数：{"max_weight": 0.1} 或 {"sector_exposure": {"max_sector_weight": 0.3}}
+    risk_params: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -167,6 +174,9 @@ class BacktestResult:
     nav: list[tuple[date, float]] = field(default_factory=list)
     trades: list[Fill] = field(default_factory=list)
     rejected: list[tuple[str, str, str]] = field(default_factory=list)   # (date, symbol, reason)
+    # 事前风控拦截：(date, rule, symbol, reason)。与 rejected（撮合失败）分开 ——
+    # 「下单前就被风控拦掉」和「报出去了但没成交」是两回事，混在一起查不出原因。
+    risk_events: list[tuple[str, str, str, str]] = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
     positions: dict[date, dict[str, float]] = field(default_factory=dict)
 
@@ -258,6 +268,10 @@ class Engine:
         self._date_index: dict[date, int] = {}
         self._delisted: set[str] = set()
         self._delist_schedule: dict[str, date] = {}
+        # 事前风控闸门（P1-3）：名单非法在这里就炸，别等回测跑到一半才发现
+        self.gate = PreTradeGate(self.cfg.risk_rules, self.cfg.risk_params)
+        self._sector: dict[str, str] = {}
+        self._peak_nav = 0.0
 
     # ---------- 数据准备 ----------
 
@@ -390,6 +404,12 @@ class Engine:
         self._seq = 0
         self._last_rebal_key = None
         self._pending = []
+        self._peak_nav = 0.0
+        # 行业映射只在真的要用行业暴露约束时才去查库（否则白付一次 IO）
+        if "sector_exposure" in self.gate.names:
+            from lquant.backtest.security_meta import load_sector_map
+
+            self._sector = load_sector_map()
 
         res = BacktestResult()
 
@@ -427,6 +447,7 @@ class Engine:
                     f"{d} NAV={nav:.2f} ≤ 0，账户账目异常，请检查费率/资金约束"
                 )
             res.nav.append((d, nav))
+            self._peak_nav = max(self._peak_nav, nav)
             res.positions[d] = {s: p.qty for s, p in self.account.positions.items() if p.qty}
 
         self._finalize(res)
@@ -640,6 +661,11 @@ class Engine:
                     orders.append(self._order(sym, Side.BUY, qty))
                     planned_buys += qty * px
 
+        # 下单前过一遍事前风控闸门（P1-3）。放在**订单已经成形之后**：
+        # 校验器看到的是最终要发的单子，所以它只能剔除、不能改单，
+        # 责任边界干净（RQAlpha validators 的同一取舍）。
+        orders = self._apply_risk_gate(orders, targets, prices, nav, d, res)
+
         if self.cfg.price_mode in ("next_open", "next_vwap", "next_close"):
             # T 日收盘生成信号，推迟到 T+1 按对应成交价撮合 —— 防未来函数
             self._pending = orders
@@ -676,6 +702,31 @@ class Engine:
                 else:
                     self.account.apply_fill(f)
                     res.trades.append(f)
+
+    def _apply_risk_gate(self, orders: list[Order], targets: list[tuple[str, float]],
+                         prices: dict[str, float], nav: float, d: date,
+                         res: BacktestResult) -> list[Order]:
+        """跑事前风控链；被拦下的单子剔除并留痕（date/rule/symbol/reason）。"""
+        if not orders:
+            return orders
+        ctx = RiskContext(
+            trade_date=d, nav=nav,
+            # 买入可用资金：现金 + 本轮卖出释放（A 股卖出资金当日可用），
+            # 与上面排买单时的口径保持一致
+            cash=max(self.account.cash + sum(
+                o.qty * prices.get(o.symbol, 0.0) for o in orders
+                if o.side == Side.SELL), 0.0) * (1 - self.cfg.cash_buffer),
+            prices=prices, orders=orders,
+            targets=dict(targets),
+            held_qty={s: p.qty for s, p in self.account.positions.items()},
+            sector=self._sector,
+            peak_nav=self._peak_nav,
+            params=self.cfg.risk_params,
+        )
+        result = self.gate.apply(ctx)
+        for v in result.violations:
+            res.risk_events.append((str(d), v.rule, v.symbol, v.reason))
+        return result.orders
 
     def _sell_qty(self, sym: str, want: float, d: date) -> tuple[float, bool]:
         """T+N 约束下能卖的最大数量，以及是否属于「清仓」（允许卖零股）。
@@ -741,6 +792,8 @@ class Engine:
             "final_nav": res.nav[-1][1] if res.nav else self.cfg.initial_cash,
             "n_trades": len(res.trades),
             "n_rejected": len(res.rejected),
+            "n_risk_blocked": len(res.risk_events),
+            "risk_rules": list(self.gate.names),
             "total_fee": sum(f.fee for f in res.trades),
             "turnover": to,
         }

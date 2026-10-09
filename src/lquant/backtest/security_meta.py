@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from datetime import date
 
-__all__ = ["load_security_meta", "merge_meta"]
+__all__ = ["load_security_meta", "load_sector_map", "merge_meta"]
 
 
 def _as_date(v) -> date | None:
@@ -47,6 +47,39 @@ def load_security_meta() -> dict[str, dict]:
             m["name"] = str(name)
         out[str(sym)] = m
     return out
+
+
+def load_sector_map(std: str = "sw1") -> dict[str, str]:
+    """{symbol: 行业代码}，用于事前风控的行业暴露约束。
+
+    口径：同一标的可能有多条带生效日的记录，取 ``std_date <= 今天`` 里最新的
+    一条（**不能用未来的行业归属**，否则调仓时用了事后信息）。
+    ``industry_classify`` 读不到时返回 {} —— 由调用方决定是报错还是跳过：
+    风控侧的选择是**报错**（开了行业约束却没有行业数据 = 检查了个寂寞）。
+    """
+    try:
+        from lquant.data.store import catalog
+        with catalog.reader() as con:
+            rows = con.execute(
+                "SELECT symbol, std, code, name, std_date FROM industry_classify"
+            ).fetchall()
+    except Exception:                      # noqa: BLE001 - 元数据缺失不致命
+        return {}
+    today = date.today()
+    best: dict[str, tuple[date, str]] = {}
+    for sym, row_std, code, name, std_date in rows:
+        if std and row_std and str(row_std) != std:
+            continue
+        d = _as_date(std_date)
+        if d is not None and d > today:      # 未来生效的归属不参与当前判断
+            continue
+        key = code or name
+        if not key:
+            continue
+        cur = best.get(str(sym))
+        if cur is None or (d is not None and (cur[0] is None or d > cur[0])):
+            best[str(sym)] = (d, str(key))
+    return {k: v[1] for k, v in best.items()}
 
 
 def merge_meta(base: dict[str, dict] | None,
