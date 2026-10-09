@@ -57,6 +57,16 @@ def _from_pandas(df: Any) -> pl.DataFrame:
     return pl.from_pandas(df)
 
 
+def _board_of(symbol: str) -> str:
+    """代码段推板性（与 baostock/akshare provider、Symbol.board 同一口径）。"""
+    from lquant.core.types import parse_symbol  # noqa: PLC0415
+
+    try:
+        return parse_symbol(str(symbol)).board.value
+    except Exception:  # noqa: BLE001 - 解析失败按未知，不猜
+        return "unknown"
+
+
 def _to_date_col(df: pl.DataFrame, col: str) -> pl.DataFrame:
     """tushare 日期列 YYYYMMDD → pl.Date。"""
     if col not in df.columns:
@@ -444,7 +454,12 @@ class TushareProvider(MappingProvider):
 
     # ------------------------------------------------------------ 参考数据
     def securities(self) -> pl.DataFrame:
-        """stock_basic：L/D/P 三种 list_status 全拉，天然含退市（防幸存者偏差）。"""
+        """stock_basic：L/D/P 三种 list_status 全拉，天然含退市（防幸存者偏差）。
+
+        board / is_st 从代码段与名称推导（与 baostock/akshare provider 同口径）。
+        此前恒填 None/False 占位：rules 的 ST 涨跌停 5% 判定退回这个静态假值，
+        ST 股被按 10% 判 —— tushare 数据源下涨跌停约束系统性失真。
+        """
         frames = []
         for status in ("L", "D", "P"):
             df = self._call(
@@ -469,8 +484,9 @@ class TushareProvider(MappingProvider):
         return df.select(
             "symbol", "name",
             pl.lit("stock", dtype=pl.Utf8).alias("sec_type"),
-            pl.lit(None, dtype=pl.Utf8).alias("board"),
-            pl.lit(False, dtype=pl.Boolean).alias("is_st"),
+            pl.col("symbol").map_elements(_board_of, return_dtype=pl.Utf8)
+                .alias("board"),
+            pl.col("name").cast(pl.Utf8).str.contains(r"ST").alias("is_st"),
             "list_date", "delist_date",
             pl.lit("tushare").alias("source"),
         )

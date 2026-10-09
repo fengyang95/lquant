@@ -28,7 +28,9 @@ def exposure(df: pl.DataFrame, factor: str, by: str = "industry_sw1",
 
     # 分类未知的行必须剔除：既不能算进行业暴露（未知不是行业 beta），
     # 也会让下面的 sorted(set(dh) | set(dl)) 在 None 与 str 之间比较时直接抛错。
-    d = df.drop_nulls(by)
+    # 因子 NaN 的行同样剔除：polars rank 把 NaN 排在所有有限值之上，
+    # 不过滤的话「因子无效」的股票会顶格进入多头组污染行业暴露。
+    d = df.drop_nulls(by).filter(pl.col(factor).is_finite())
     if not len(d):
         return pl.DataFrame()
 
@@ -140,7 +142,11 @@ def pure_exposure(df: pl.DataFrame, factor: str, covs: list[str] | None = None,
     cols = _style_cols(df, covs)
     if not cols:
         return pl.DataFrame()
-    d = df.drop_nulls([factor, *cols])
+    # 非有限值过滤：NaN 会让 f.abs().sum()=NaN，NaN<=1e-12 恒 False，
+    # 整日权重 w 全 NaN 静默丢样本（与 industry_exposure 同族问题）
+    d = df.drop_nulls([factor, *cols]).filter(
+        pl.col(factor).is_finite()
+        & pl.all_horizontal([pl.col(c).is_finite() for c in cols]))
     if not len(d):
         return pl.DataFrame()
 

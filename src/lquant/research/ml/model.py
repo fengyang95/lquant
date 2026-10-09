@@ -201,9 +201,10 @@ class EnsembleModel(Model):
     def predict(self, X) -> np.ndarray:
         self._check_ready()
         preds = np.vstack([np.asarray(m.predict(X), dtype=float) for m in self.model])
-        # 逐样本均值：单模型预测里若有 NaN，均值会跟着变 NaN —— 这是想要的
-        # （静默忽略会掩盖某个种子训练失败）
-        return np.nanmean(preds, axis=0)
+        # 逐样本均值：单模型预测里若有 NaN，均值必须跟着变 NaN ——
+        # 用 nanmean 静默忽略会掩盖某个种子训练失败，下游把残缺集成
+        # 当成完整结果（注释与实现此前相反：写的是 nanmean，要的是传播）
+        return preds.mean(axis=0)
 
     def predict_all(self, X) -> np.ndarray:
         """返回 (n_seeds, n_samples) 的原始预测矩阵（看种子间分歧用）。"""

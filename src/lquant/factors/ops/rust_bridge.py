@@ -13,8 +13,6 @@
 """
 from __future__ import annotations
 
-from lquant.core.logging import setup_logging
-
 
 def rust_available() -> bool:
     try:
@@ -34,6 +32,12 @@ def register_rust_ops() -> int:
 
         _ = lq_ops.__version__
     except Exception:  # noqa: BLE001
-        setup_logging()
+        # 探测失败不阻断主流程，但必须留痕：「装了但坏了」（ABI/版本属性
+        # 丢失）与「没装」在监控上是两回事；静默吞掉时对拍测试会一直
+        # 跳过而没人知道原因
+        from lquant.core.logging import get_logger
+
+        get_logger(__name__).opt(exception=True).warning(
+            "lq_ops 探测失败，Rust 算子保持降级（Python 实现）")
     # 返回 0：不覆盖 OPS 表达式；Rust 算子正确性由对拍测试背书。
     return 0

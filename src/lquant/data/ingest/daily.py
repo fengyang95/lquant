@@ -164,6 +164,9 @@ def backfill_pool(
     stopped = False
     canceled = False
     attempted: set[str] = set()
+    #: 每个交易日实际写入的标的数（跨批次累加）—— 日级完整性门禁的分母是
+    #: 「本次应写标的数」total，见 quality/coverage.py::day_completeness
+    per_day: dict[date, int] = {}
 
     for i in range(0, total, batch_size):
         if cancel_check is not None and cancel_check():
@@ -203,14 +206,37 @@ def backfill_pool(
                 if len(df):
                     try:
                         if cls == "index":
-                            _write_index_bars(df)
+                            # int(... or 0)：_write_index_bars 可能被替换/吞异常
+                            # 返回 None —— 校验必须对「假成功」稳健
+                            n_written = int(_write_index_bars(df) or 0)
+                            # market.persist 会吞掉 DuckDB 写库异常（返回 0）：
+                            # 不检查返回值的话，指数数据没落库却被标 done，
+                            # 断点/coverage 都不会再补 —— 基准序列静默停更。
+                            if n_written < len(df):
+                                raise RuntimeError(
+                                    f"index_daily 写入不完整（{n_written}/{len(df)} 行，"
+                                    "写库异常被 persist 吞掉）")
                         else:
                             write_daily(_stamp(df, _provider_source(src)))
+                            # 日级完整性记账：按**本次应写标的数**当分母，
+                            # 不看 security 表（那张表本身可能不齐）。见
+                            # quality/coverage.py::day_completeness。
+                            # 列名防御：注入的 provider 可能给的是源列名
+                            # （映射在更上层），没有 trade_date 就跳过记账。
+                            if "trade_date" in df.columns:
+                                for r in (df.group_by("trade_date").len()
+                                          .iter_rows(named=True)):
+                                    d0 = r["trade_date"]
+                                    per_day[d0] = per_day.get(d0, 0) + int(r["len"])
                     except DataQualityError as e:
                         # 质量门禁 fatal 拦批：不入湖，标失败留待重试（H2）
                         logger.error(f"质量门禁拦截（fatal，不入湖）: {e}")
                         for sym in syms:
                             batch_failed.setdefault(sym, f"quality: {e}")
+                    except RuntimeError as e:
+                        logger.error(str(e))
+                        for sym in syms:
+                            batch_failed.setdefault(sym, f"index_write: {e}")
         ok = [s for s, _ in chunk if s not in batch_failed]
         cp.mark(ok)
         done += len(ok)
@@ -250,6 +276,34 @@ def backfill_pool(
                 "early_stopped": True,
             },
         )
+    # ---- 日级完整性门禁 ----
+    # 分级：整日缺失/大面积缺口 → error；最新交易日的缺口 → tip（最典型的形态是
+    # `end=today` 只写了一半，而「任务报 ok」让人以为这天已经齐了）。
+    # 注意这里**不修改** checkpoint（标的级覆盖语义仍然正确），只是把
+    # 「这一天到底齐没齐」显式暴露出来，供调用方决定要不要推进消费水位。
+    day_gaps: list[dict] = []
+    day_status = "ok"
+    if per_day:
+        from lquant.data.quality.coverage import day_completeness, day_gap_issues
+        try:
+            gaps = day_completeness(per_day, total)
+            day_gaps = [{"trade_date": str(g.trade_date), "symbols": g.symbols,
+                         "expected": g.expected, "ratio": round(g.ratio, 4),
+                         "kind": g.kind} for g in gaps]
+            if gaps:
+                day_status = "incomplete"
+                logger.warning(
+                    "日级完整性缺口 %d 天（应写 %d 只）：%s",
+                    len(gaps), total, "；".join(g.detail() for g in gaps[:5]))
+                try:
+                    from lquant.data.quality.issues import save_issues
+
+                    save_issues(day_gap_issues(gaps))
+                except Exception as e:  # noqa: BLE001 - 落库失败不影响回填结果
+                    logger.warning(f"完整性缺口落库失败: {e}")
+        except Exception as e:  # noqa: BLE001 - 门禁自身异常不阻断回填
+            logger.warning(f"日级完整性门禁执行失败: {e}")
+
     return {
         "done": done,
         "failed": failed,
@@ -258,6 +312,9 @@ def backfill_pool(
         "canceled": canceled,
         # 从未尝试的尾部：调用方绝不能把它们标 done（审计 P0-2）
         "unprocessed": [s for s, _ in todo if s not in attempted],
+        # 日级完整性（"ok" / "incomplete"）与逐日缺口明细
+        "day_status": day_status,
+        "day_gaps": day_gaps,
     }
 
 

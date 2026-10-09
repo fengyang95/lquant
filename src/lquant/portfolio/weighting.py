@@ -136,7 +136,16 @@ def risk_parity_weight(returns, symbols: list[str] | None = None, *,
                        options={"maxiter": max_iter, "ftol": tol})
         if not res.success or not np.all(np.isfinite(res.x)):
             raise RuntimeError("risk parity 未收敛")
-        return dict(zip(syms, _clean(res.x), strict=False))
+        w = _clean(res.x)
+        # 事后校验：SLSQP 在奇异/近奇异协方差上会「成功」返回贡献并不
+        # 均衡的伪解（ftol 达标但目标面近乎平坦，res.success=True）。
+        # ERC 的定义就是贡献相等 —— 离散度超阈即降级逆波动率，
+        # 不让静默的非 ERC 解冒名顶替
+        rc = risk_contrib(w)
+        spread = float(np.max(rc) - np.min(rc))
+        if not np.isfinite(spread) or spread > 0.05:
+            raise RuntimeError(f"risk parity 贡献不均衡（max-min={spread:.4f}）")
+        return dict(zip(syms, w, strict=False))
     except Exception:
         return inverse_vol_weight(M, syms)
 

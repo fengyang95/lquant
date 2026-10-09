@@ -26,8 +26,19 @@ def match_order(  # noqa: PLR0917 镜像 Rust 9 参接口
     tax_rate: float,
     lot_size: float,
 ) -> tuple[float, float]:
-    """单笔撮合：返回 (成交数量, 费用)。与 lq_backtest.match_order_py 对拍。"""
+    """单笔撮合：返回 (成交数量, 费用)。与 lq_backtest.match_order_py 对拍。
+
+    脏输入守卫与 Rust 同构（lib.rs 的 dirty_inputs_are_rejected 语义）：
+    价格/数量/费率非有限或非正、lot_size 非正 → 拒绝成交返回 (0.0, 0.0)，
+    绝不产出负费用单或除零崩溃。
+    """
     del symbol  # 参考实现不含符号语义（与 Rust 相同，成交不限手数外的品种差异）
+    # 与 Rust lib.rs 入口校验逐项同构：price 有限且 >0；qty 有限且 >=0；
+    # lot_size 有限且 >0（费率不做校验，Rust 侧同样不查）
+    if (not math.isfinite(price) or price <= 0.0
+            or not math.isfinite(qty) or qty < 0.0
+            or not math.isfinite(lot_size) or lot_size <= 0.0):
+        return (0.0, 0.0)
     lots = math.floor(qty / lot_size)
     filled = lots * lot_size
     if filled <= 0:

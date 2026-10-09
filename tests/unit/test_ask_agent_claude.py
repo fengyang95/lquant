@@ -123,7 +123,17 @@ async def test_cancel_leaves_marker_in_assistant_message(tmp_path, fake_script):
         return None
 
     task = asyncio.ensure_future(svc.send_message(ses.id, "慢慢想", on_event))
-    await asyncio.sleep(0.5)
+    # 等到 assistant 占位消息落库再取消：占位消息在子进程起来后的 _consume 里建，
+    # 固定 sleep(0.5) 在 xdist 并行、CPU 争抢时会跑输 —— 取消早于占位消息创建，
+    # 取消路径就没地方写「已中断」，断言随机变红。
+    for _ in range(200):
+        if any(m.role == "assistant" for m in await svc.get_messages(ses.id)):
+            break
+        await asyncio.sleep(0.05)
+    # 占位消息可见 ≠ 服务端协程已从 add_message 返回（aiosqlite 在 worker 线程
+    # 里提交，提交可见先于原协程被唤醒）。再让出一次事件循环，等 _consume 进入
+    # 带 CancelledError 处理的 try —— 否则取消落在 await 里，标记无处可写。
+    await asyncio.sleep(0.1)
     await svc.cancel(ses.id)
     with contextlib.suppress(TimeoutError, asyncio.CancelledError):
         await asyncio.wait_for(asyncio.shield(task), timeout=10)

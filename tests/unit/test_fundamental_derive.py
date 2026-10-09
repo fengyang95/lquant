@@ -171,13 +171,18 @@ def test_non_finite_result_is_dropped():
 # ---------- 逐条口径 ----------
 
 def test_turnover_days_formulas():
+    """den 年化（Q1×4）：周转天数分子统一 360 天。
+
+    ar_turn 是累计口径周转率（Q1 营收/AR）：360/(ar_turn×4) = 90/ar_turn，
+    与「按 90 天季度天数」等价；旧公式不年化 = Q1 系统性高估 4 倍。
+    """
     out = derive_pit(_panel([
         ("600000.SH", Q1, PUB_Q1, "indicator.ar_turn", 4.0),
         ("600000.SH", Q1, PUB_Q1, "balancesheet.inventories", 50.0),
         ("600000.SH", Q1, PUB_Q1, "income.oper_cost", 100.0),
     ]))
-    assert _value(out, "derived.ar_turn_days")["value"] == pytest.approx(90.0)
-    assert _value(out, "derived.inv_turn_days")["value"] == pytest.approx(180.0)
+    assert _value(out, "derived.ar_turn_days")["value"] == pytest.approx(22.5)
+    assert _value(out, "derived.inv_turn_days")["value"] == pytest.approx(45.0)
 
 
 def test_empty_and_bad_input():

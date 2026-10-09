@@ -49,6 +49,7 @@ from datetime import date, datetime
 from datetime import time as dtime
 
 import polars as pl
+from loguru import logger
 
 from lquant.backtest.account import Account
 from lquant.backtest.broker import Broker
@@ -327,7 +328,14 @@ class _JQPosition:
         rules = self._r._rules.get(self._s)
         if p is None or rules is None:
             return 0.0
-        return self._r._round_lot(self._s, p.available_at(self._r._today, rules))
+        # 必须传 date_index：T+N 可卖按交易日算。漏传会退回自然日口径，
+        # 策略看到的可卖量（T+2 买入遇周末提前「到期」）与撮合层不一致。
+        # 不做整手截断：聚宽语义返回原始可卖股数（如 1030），整手纪律由
+        # 下单层保证（_submit 卖出 floor、清仓豁免零股）。若在这里截成
+        # 1000，order(-closeable_amount) 会因 qty<pos.qty 走 floor，残余
+        # 零股永远清不掉。
+        return p.available_at(self._r._today, rules,
+                              self._r._date_index)
 
     @property
     def price(self) -> float:
@@ -451,7 +459,8 @@ class JQRunner:
                  factor_formulas: list[str] | None = None,
                  security_meta: dict[str, dict] | None = None,
                  timeout_s: float | None = None,
-                 delist_recovery: float = 0.0) -> None:
+                 delist_recovery: float = 0.0,
+                 strict_adj: bool | None = None) -> None:
         self.code = code
         self.initial_cash = initial_cash
         # 用户代码墙钟预算（秒）。None = 不限；服务端入口必须设置（防死循环 DoS）。
@@ -466,6 +475,10 @@ class JQRunner:
         self._delist_recovery = float(delist_recovery)
         self._jf_state: JQFundamentalsState = JQFundamentalsState()
         self._security_meta_resolved: dict[str, dict] = {}
+        # 严格复权（缺 adj_factor 时抛错而不是静默按 1.0 顶替）。
+        # None = 跟随 app.yaml data.strict_adj / LQ_STRICT_ADJ。
+        self._strict_adj_opt = strict_adj
+        self._adj_warned: set[str] = set()
 
         # 运行期状态
         self.account = Account(cash=initial_cash)
@@ -886,6 +899,18 @@ class JQRunner:
             return bar.volume
         return float(getattr(bar, f, float("nan")))
 
+    @property
+    def _strict_adj(self) -> bool:
+        """严格复权开关：显式参数优先，否则跟随 app.yaml data.strict_adj。"""
+        if self._strict_adj_opt is not None:
+            return bool(self._strict_adj_opt)
+        try:
+            from lquant.core.config import get_settings
+
+            return bool(get_settings().strict_adj)
+        except Exception:  # noqa: BLE001 - 配置不可用时退回宽松口径
+            return False
+
     def _fq_ref(self, sym: str) -> float:
         """pre 复权的归一基准 = 今日复权因子；今日无 bar 时退回最近可见因子。"""
         bar = self._bars_today.get(sym)
@@ -895,11 +920,25 @@ class JQRunner:
         return f if f and f > 0 else 1.0
 
     def _bar_field_fq(self, sym: str, bar: Bar, f: str, fq, f_now: float):
-        """取 bar 字段并按 fq 复权。"""
+        """取 bar 字段并按 fq 复权。
+
+        复权因子缺失时**不再静默按因子=1.0 顶替**：那会让复权序列里混入原始价，
+        收益率凭空跳变。``strict_adj``（app.yaml ``data.strict_adj`` / ``LQ_STRICT_ADJ``）
+        打开时抛错，否则每只标的最多告警一次。
+        """
         raw = self._bar_field(bar, f)
         if fq in (None, "none") or f not in _FQ_PRICE_FIELDS:
             return raw
-        fday = bar.adj_factor if bar.adj_factor and bar.adj_factor > 0 else f_now
+        fday = bar.adj_factor if bar.adj_factor and bar.adj_factor > 0 else None
+        if fday is None:
+            msg = (f"复权缺因子：{sym} 在 {bar.trade_date} 没有有效 adj_factor"
+                   f"（fq={fq}），该日按原始价参与复权序列")
+            if self._strict_adj:
+                raise ValueError(msg)
+            if sym not in self._adj_warned:
+                self._adj_warned.add(sym)
+                logger.warning(msg + "；同类标的只告警一次，可用 LQ_STRICT_ADJ=1 改为报错")
+            fday = f_now
         if not math.isfinite(raw):
             return raw
         return raw * fday / f_now if fq == "pre" else raw * fday
@@ -1075,18 +1114,25 @@ class JQRunner:
             pos = self.account.positions.get(sym)
             avail = pos.available_at(self._today, rules, self._date_index) if pos else 0.0
             qty = min(qty, avail)
+            # 清仓意图（卖量覆盖全部持仓）允许零股：A 股规则是「不足一手的
+            # 零股必须一次性全部卖出」，floor 整手会让每次清仓都留个尾巴，
+            # 持仓永远归不了零（送转股/零股买入后必然出现非整手余量）
+            close_all = pos is not None and qty >= pos.qty - 1e-9
         else:
-            # 资金约束：按参考价 + 粗略费用能买多少买多少
+            # 资金约束：按参考价 + 粗略费用能买多少买多少（0.001 是含税费的
+            # 粗口径缓冲；精确校验在 broker 撮合层，这里偏松时由 broker 兜底）
             afford = self.account.cash / (px * (1 + rules.commission.rate + 0.001))
             qty = min(qty, afford)
-        qty = self._round_lot(sym, qty)
+            close_all = False
+        if not close_all:
+            qty = self._round_lot(sym, qty)
         if qty <= 0:
             self.res.rejected.append((str(self._today), sym,
                                       "可卖不足一手或资金不足" if side == Side.SELL else "资金不足一手"))
             return None
         self._touched.add(sym)
         o = Order(order_id=f"jq{self._seq}", symbol=sym, side=side, qty=qty,
-                  limit_price=limit_price)
+                  limit_price=limit_price, allow_odd_lot=close_all)
         self._seq += 1
         bar = self._bars_today.get(sym)
         if bar is None:
@@ -1177,17 +1223,26 @@ class JQRunner:
 
     def _get_factor_values(self, formula: str, security_list=None,
                            count: int = 1) -> dict[str, list[float]]:
-        """聚宽 get_factor_values：{security: [值...]}，严格截至当日（无未来函数）。"""
+        """聚宽 get_factor_values：{security: [值...]}，严格截至决策时点可见的最后一天。
+
+        因子面板第 i 行是**用当日收盘价算出的**因子值（如 pct_change_5 含
+        当日 close）。open 桶（handle_data / run_daily(time='open')）的委托
+        按当日开盘价撮合，若把第 i 行给它，等于开盘决策用当日收盘 ——
+        未来函数，与同文件 _history「严格截到上一交易日」的口径矛盾。
+        因此 open 桶截到 i-1；close/after_close 桶才允许含当日。
+        """
         f = str(formula).upper()
         panel = self._factor_panels.get(f)
         if panel is None:
             raise ValueError(f"因子 {formula} 未注册（回测请求需带 factor_formulas）")
         secs = [str(s) for s in (security_list or sorted(self._bars_today))]
         i = self._day_index
+        # open 桶决策点当日收盘尚未发生：可见窗口到前一交易日为止
+        last = i if self._bucket == "close" else i - 1
         out: dict[str, list[float]] = {}
         for s in secs:
             out[s] = [panel[(self._dates[j], s)]
-                      for j in range(max(0, i - int(count) + 1), i + 1)
+                      for j in range(max(0, last - int(count) + 1), last + 1)
                       if (self._dates[j], s) in panel]
         return out
 

@@ -40,6 +40,18 @@ def _require_window(n: int | float, least: int, name: str) -> None:
         raise FactorError(f"{name} 的窗口必须 ≥ {least}（{least} 是矩估计的最低样本数），收到 {n}")
 
 
+def _require_positive(n: int | float, name: str) -> None:
+    """位移类算子窗口校验：n ≥ 1。
+
+    shift(n) 对负 n 取**未来值**（shift(-1) = 明天的数据），polars 不拦截。
+    DSL 防前视门禁（analyzer）只查算子名黑名单，负数经 UnaryOp 包装后
+    窗口估计也被静默跳过 —— 所以必须在算子构造期挡住，双保险。
+    """
+    if isinstance(n, (int, float)) and not isinstance(n, bool) and n < 1:
+        raise FactorError(
+            f"{name} 的窗口必须 ≥ 1（负窗口 = 引用未来数据，防前视禁止），收到 {n}")
+
+
 @op("Ts_Mean", "TS", 1, "时序均值")
 def ts_mean(x: pl.Expr, n: int) -> pl.Expr:
     return x.rolling_mean(n).over("symbol")
@@ -57,11 +69,13 @@ def ts_var(x: pl.Expr, n: int) -> pl.Expr:
 
 @op("Ts_Return", "TS", 1, "N 期收益率")
 def ts_return(x: pl.Expr, n: int) -> pl.Expr:
+    _require_positive(n, "Ts_Return")
     return (x / x.shift(n).over("symbol") - 1).over("symbol")
 
 
 @op("Ts_Delay", "TS", 1, "N 期前值")
 def ts_delay(x: pl.Expr, n: int) -> pl.Expr:
+    _require_positive(n, "Ts_Delay")
     return x.shift(n).over("symbol")
 
 
@@ -115,6 +129,7 @@ def ts_rank(x: pl.Expr, n: int) -> pl.Expr:
 
 @op("Ts_Delta", "TS", 1, "N 期差分")
 def ts_delta(x: pl.Expr, n: int) -> pl.Expr:
+    _require_positive(n, "Ts_Delta")
     return (x - x.shift(n).over("symbol")).over("symbol")
 
 
@@ -150,9 +165,12 @@ def ts_ema(x: pl.Expr, n: int) -> pl.Expr:
     return x.ewm_mean(span=n, adjust=False).over("symbol")
 
 
-@op("Ts_Quantile", "TS", 1, "时序分位数（q=0.8 时即 QTLU 口径）")
+@op("Ts_Quantile", "TS", 1, "时序分位数（q=0.8 时即 QTLU 口径；线性插值，与 qlib/pandas 一致）")
 def ts_quantile(x: pl.Expr, n: int, q: float = 0.8) -> pl.Expr:
-    return x.rolling_quantile(quantile=q, window_size=n).over("symbol")
+    # polars 默认 interpolation="nearest"（取窗口内最近邻分位），
+    # qlib/pandas 默认线性插值 —— 不显式指定会对不上
+    return x.rolling_quantile(quantile=q, interpolation="linear",
+                              window_size=n).over("symbol")
 
 
 @op("Ts_Slope", "TS", 1, "时序回归斜率")

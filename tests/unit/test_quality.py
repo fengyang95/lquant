@@ -385,6 +385,37 @@ def test_adj_factor_checks():
     assert check_adj_factor(_good_bars(adj_factor=1.0)) == []
 
 
+def test_adj_factor_missing_coverage_reported():
+    """缺有效复权因子必须报出来：它会让 fq 复权静默退回原始价。
+
+    真实湖里有 1480 行 ETF（akshare-sina 源）就是这个状态 —— 以前没有任何
+    检查项覆盖它，只有把 fq 请求打开才会发现价格口径不对。
+    """
+    from lquant.data.quality.validators import check_adj_factor
+
+    # 少数行缺因子（<5%）→ warn，并带上受影响标的
+    df = _good_bars(n_days=100, adj_factor=1.0).with_columns(
+        adj_factor=pl.when(pl.arange(0, 100) == 0).then(None)
+        .otherwise(pl.col("adj_factor")))
+    issues = check_adj_factor(df)
+    miss = [i for i in issues if i.rule == "ADJ_MISSING"]
+    assert len(miss) == 1 and miss[0].severity == "warn"
+    assert miss[0].extra["symbols"] == ["000001.SZ"]
+
+    # 大比例缺因子（≥5%）→ error，别让它藏在 warn 里
+    df_bad = _good_bars(n_days=100, adj_factor=1.0).with_columns(
+        adj_factor=pl.when(pl.arange(0, 100) > 89).then(None)
+        .otherwise(pl.col("adj_factor")))
+    miss_bad = [i for i in check_adj_factor(df_bad) if i.rule == "ADJ_MISSING"]
+    assert len(miss_bad) == 1 and miss_bad[0].severity == "error"
+
+    # 非正因子同样算缺失（0 / 负数不能当有效因子用）
+    df_zero = _good_bars(adj_factor=1.0).with_columns(
+        adj_factor=pl.when(pl.arange(0, 5) == 1).then(0.0)
+        .otherwise(pl.col("adj_factor")))
+    assert any(i.rule == "ADJ_MISSING" for i in check_adj_factor(df_zero))
+
+
 # ---------- 落库部分（隔离 tmp duckdb）----------
 
 def _ensure_cwd():

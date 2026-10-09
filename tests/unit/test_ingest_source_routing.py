@@ -347,7 +347,12 @@ def test_index_symbols_route_to_index_capable_source(fake_settings, no_lake, mon
     index_src = _IndexCapableProvider()
     _patch_chain(monkeypatch, _Chain([stock_head, index_src]))
     written: list = []
-    monkeypatch.setattr(daily_mod, "_write_index_bars", written.append)
+
+    def _write(df):                      # 桩需匹配新契约：返回写入行数
+        written.append(df)
+        return len(df)
+
+    monkeypatch.setattr(daily_mod, "_write_index_bars", _write)
 
     res = backfill_pool([("600000.SH", D), ("000300.SH", D)], START,
                         provider=None, cp_name="route-index1")

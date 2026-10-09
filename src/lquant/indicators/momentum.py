@@ -20,10 +20,14 @@ def add_rsi(df: pl.DataFrame, n: int = 14, col: str = "close") -> pl.DataFrame:
         loss.ewm_mean(alpha=1 / n, adjust=False).alias("_l"),
     )
     # 首行 _g=_l=0 → 100*0/0=NaN；null 与 NaN 在 polars 是两回事，
-    # drop_nulls 过滤不掉 NaN，必须在这里显式归 null
+    # drop_nulls 过滤不掉 NaN，必须在这里显式归 null。
+    # 长期平盘（连续一字板/无波动的 vintage）同样 _g=_l=0 → 0/0，一并归 null：
+    # RSI 此时无方向信息，输出 NaN 会顺着下游 zscore/rank 污染整列
+    denom = pl.col("_g") + pl.col("_l")
+    bad = (chg.is_null() | denom.is_null() | denom.is_nan() | (denom <= 0))
     df = df.with_columns(
-        pl.when(chg.is_null()).then(None)
-        .otherwise(100 * pl.col("_g") / (pl.col("_g") + pl.col("_l")))
+        pl.when(bad).then(None)
+        .otherwise(100 * pl.col("_g") / denom)
         .alias(f"rsi{n}")
     ).drop(["_g", "_l"])
     return df

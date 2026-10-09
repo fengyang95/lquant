@@ -62,6 +62,13 @@ quality:
   crosscheck_sample: 200
   index_sentinels: ["000001.SH", "000300.SH", "000905.SH", "000852.SH", "399006.SZ"]
 
+data:
+  # 严格复权：请求 fq 复权但行情缺 adj_factor 时**抛错**，而不是静默按
+  # factor=1.0 顶替（后者会在复权序列里混入原始价，收益率凭空跳变）。
+  # 默认 false —— 真实湖里有 1480 行 ETF（akshare-sina 源）没有因子，
+  # 硬失败会让这些标的的 fq 请求全部报错；研究/回测要严谨时打开它。
+  strict_adj: ${LQ_STRICT_ADJ:false}
+
 logging:
   level: INFO
   file: ${LQ_DATA_DIR:./data}/logs/lquant.log

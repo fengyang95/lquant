@@ -92,6 +92,30 @@ def test_transfer_fee_both_sides():
     assert abs(f.fee - 2.6) < 1e-6
 
 
+def test_transfer_fee_uses_trade_date_schedule():
+    """Broker 按**成交日**取过户费率，而不是规则表里的现行常数。
+
+    2022-04-29 前后各成交一笔，费率应分别为 0.00002 / 0.00001。
+    佣金最低额设为 0，让费用里只剩过户费，断言可以直接对齐数字。
+    """
+    from lquant.backtest.rules.model import TransferFeeSchedule
+
+    r = _rules_full(tax=0.0, min_comm=0.0)
+    r.transfer_fee_schedule = TransferFeeSchedule([
+        (date(2015, 8, 1), date(2022, 4, 28), 0.00002),
+        (date(2022, 4, 29), date(9999, 12, 31), 0.00001),
+    ])
+    b = Broker({"600000.SH": r})
+    bar_old = Bar("600000.SH", date(2022, 4, 28), 10.0, 10.5, 9.5, 10.0, 10.0, 1e6, 1e7)
+    bar_new = Bar("600000.SH", date(2022, 4, 29), 10.0, 10.5, 9.5, 10.0, 10.0, 1e6, 1e7)
+    f_old = b.match(Order("tf1", "600000.SH", Side.BUY, 1000), bar_old, date(2022, 4, 28))
+    f_new = b.match(Order("tf2", "600000.SH", Side.BUY, 1000), bar_new, date(2022, 4, 29))
+    # 佣金 10000*0.00025=2.5，剩下的差额就是过户费
+    assert abs((f_old.fee - 2.5) - 10000 * 0.00002) < 1e-6
+    assert abs((f_new.fee - 2.5) - 10000 * 0.00001) < 1e-6
+    assert abs(f_old.fee - f_new.fee - 0.1) < 1e-6
+
+
 def test_next_vwap_fill_price():
     """next_vwap 撮合价 = amount/volume。"""
     from lquant.backtest.slippage import NoSlippage

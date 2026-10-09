@@ -15,19 +15,26 @@ FROZEN_TODAY = date(2026, 9, 11)
 
 @pytest.fixture(scope="module", autouse=True)
 def _frozen_today():
-    """把 scan_coverage 读到的业务日钉死在 FROZEN_TODAY。
+    """把 scan_coverage 读到的业务日与墙钟钉死在 FROZEN_TODAY。
 
-    ``coverage`` 是 ``from lquant.core.types import today_cn``，读的是它自己的
-    模块级名字，所以必须打在 ``lquant.data.quality.coverage`` 上。
+    ``coverage`` 是 ``from lquant.core.types import today_cn/now_cn``，读的是
+    它自己的模块级名字，所以必须打在 ``lquant.data.quality.coverage`` 上。
+    ``now_cn`` 也要钉：窗口右端在「北京时间 < 16:00」时会自动退到昨日 ——
+    只冻结 today_cn 的话，这些用例每天 16:00 前都会随钟点变红。
     模块级 fixture 拿不到 monkeypatch（pytest 9 仍限函数级），故用
     ``MonkeyPatch.context()`` 自带撤销。
     """
+    from datetime import datetime
+
     from lquant.core import types
+    from lquant.core.types import TZ
     from lquant.data.quality import coverage
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(types, "today_cn", lambda: FROZEN_TODAY)
         mp.setattr(coverage, "today_cn", lambda: FROZEN_TODAY)
+        mp.setattr(coverage, "now_cn",
+                    lambda: datetime(2026, 9, 11, 18, 0, tzinfo=TZ))
         yield
 
 
@@ -198,3 +205,49 @@ def test_basic_empty_lake_info_no_repair(env) -> None:
                for i in issues if i["dataset"] == "daily_basic")
     assert rep["repair"]["reason"] == "no_gap"
     assert rep["repair"]["created"] is False
+
+
+# ---------- 日级完整性门禁（day_completeness）----------
+
+def test_day_completeness_flags_partial_days():
+    """某日覆盖不足阈值 → 报缺口；达标的日子不报。"""
+    from lquant.data.quality.coverage import day_completeness
+
+    d1, d2, d3 = date(2026, 9, 1), date(2026, 9, 2), date(2026, 9, 3)
+    gaps = day_completeness({d1: 100, d2: 50, d3: 95}, expected=100, min_ratio=0.7)
+    assert [g.trade_date for g in gaps] == [d2]
+    assert gaps[0].symbols == 50 and gaps[0].expected == 100
+    assert gaps[0].ratio == 0.5
+    assert "只有 50/100 只" in gaps[0].detail()
+
+
+def test_day_completeness_flags_sparse_tip():
+    """最新交易日只写了一半 → kind=tip（水位前移门禁主要防这个形态）。"""
+    from lquant.data.quality.coverage import day_completeness
+
+    d1, d2 = date(2026, 9, 1), date(2026, 9, 2)
+    gaps = day_completeness({d1: 100, d2: 10}, expected=100)
+    assert [g.kind for g in gaps] == ["tip"]
+    assert "疑似只写了一半" in gaps[0].detail()
+
+
+def test_day_completeness_edge_cases():
+    """expected<=0 不报（没有分母就谈不了覆盖率）；全空的日子也要报。"""
+    from lquant.data.quality.coverage import day_completeness
+
+    assert day_completeness({date(2026, 9, 1): 0}, expected=0) == []
+    gaps = day_completeness({date(2026, 9, 1): 0}, expected=100)
+    assert len(gaps) == 1 and gaps[0].ratio == 0.0
+
+
+def test_day_gap_issues_shape():
+    """缺口 → issue：规则名/严重度/明细字段齐备（落库后前端要能读）。"""
+    from lquant.data.quality.coverage import DayGap, day_gap_issues
+
+    g = DayGap(trade_date=date(2026, 9, 2), symbols=30, expected=100)
+    issues = day_gap_issues([g])
+    assert len(issues) == 1
+    i = issues[0]
+    assert i.rule == "DAY_INCOMPLETE" and i.severity == "error"
+    assert i.trade_date == date(2026, 9, 2) and i.count == 70
+    assert i.extra["kind"] == "day" and i.extra["ratio"] == 0.3

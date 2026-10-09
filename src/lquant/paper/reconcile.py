@@ -36,9 +36,11 @@ def reconcile(name: str, d: date | str) -> dict:
     stale: list[str] = []
     n_covered = 0
     official_nav = broker.cash
+    n_held = 0
     for p in broker.positions.values():
         if p.qty <= 0:
             continue
+        n_held += 1
         px = closes.get(p.symbol)
         if px is None or px <= 0:
             stale.append(p.symbol)          # 停牌/未覆盖：沿用盯市价
@@ -62,17 +64,34 @@ def reconcile(name: str, d: date | str) -> dict:
         "verdict": "ok",
         "detail": "",
     }
+    # stale 感知：官方日线未同步/停牌时，这条「official」其实全部或部分由
+    # 盯市价捏造 —— 沉默的话官方净值口径被整体架空（dev≈0 假 ok）。
+    if held and len(stale) == n_held:
+        # 全量 stale：拒绝以盯市价冒充官方净值落库，等日线同步后重跑
+        report["verdict"] = "critical"
+        report["detail"] = (
+            f"全部 {n_held} 只持仓缺官方收盘价（未同步或停牌）——"
+            "本次不写 official 净值，日线同步后请重跑 day_close/reconcile")
+        return report
+    if held and stale:
+        report["verdict"] = "warning"
+        report["detail"] = (f"{len(stale)} 只持仓缺官方收盘价（{', '.join(stale[:5])}"
+                            f"{'…' if len(stale) > 5 else ''}），按盯市价计入")
     if intraday is not None and official_nav:
         dev = abs(official_nav - intraday) / abs(official_nav)
         report["rel_dev"] = round(dev, 6)
         if dev <= _TOL_OK:
-            report["verdict"], report["detail"] = "ok", f"偏差 {dev:.3%} 在容忍度内"
+            if report["verdict"] != "warning":
+                report["verdict"], report["detail"] = "ok", f"偏差 {dev:.3%} 在容忍度内"
         elif dev <= _TOL_WARN:
-            report["verdict"] = "warning"
-            report["detail"] = f"偏差 {dev:.3%} 偏高 —— 检查行情源延迟/滑点假设"
+            if report["verdict"] != "critical":
+                report["verdict"] = "warning"
+            report["detail"] = (report["detail"] + "；" if report["detail"] else "")
+            report["detail"] += f"偏差 {dev:.3%} 偏高 —— 检查行情源延迟/滑点假设"
         else:
             report["verdict"] = "critical"
-            report["detail"] = f"偏差 {dev:.3%} 严重超阈 —— 模拟盘盯市可能有 bug"
+            report["detail"] = (report["detail"] + "；" if report["detail"] else "")
+            report["detail"] += f"偏差 {dev:.3%} 严重超阈 —— 模拟盘盯市可能有 bug"
 
     store.record_nav(name, d, official_nav, broker.cash,
                      sum(1 for p in broker.positions.values() if p.qty > 0),

@@ -78,9 +78,14 @@ def perf_from_returns(returns, *, dates: list[date] | None = None,
     ann_ret = _annualize(total, n, periods_per_year)
     vol = float(np.std(r, ddof=1) * math.sqrt(periods_per_year)) if n > 1 else float("nan")
 
-    # 标准下行偏差：所有周期计入分母（正收益贡献 0），MAR 默认 0。
+    # 标准下行偏差：所有周期计入分母（正收益贡献 0）。
     # 只对负收益求 std 会系统性高估 Sortino。
-    downside_dev = float(np.sqrt(np.mean(np.minimum(r - risk_free, 0.0) ** 2)) * math.sqrt(periods_per_year))
+    # rf 参数口径是**年化**（与 sharpe 分子 ann_ret - risk_free 一致），
+    # 下行偏差是每期量 —— 必须折成每期 rf 再减，直接 r - risk_free 会在
+    # rf≠0 时每期多减一整个年化值，Sortino 被系统性压低
+    rf_period = ((1.0 + risk_free) ** (1.0 / periods_per_year) - 1.0
+                 if risk_free > -1.0 else risk_free)
+    downside_dev = float(np.sqrt(np.mean(np.minimum(r - rf_period, 0.0) ** 2)) * math.sqrt(periods_per_year))
 
     sharpe = ((ann_ret - risk_free) / vol) if vol and vol > 1e-12 and math.isfinite(vol) else float("nan")
     sortino = ((ann_ret - risk_free) / downside_dev) if downside_dev > 1e-12 and math.isfinite(downside_dev) else float("nan")

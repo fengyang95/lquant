@@ -34,9 +34,14 @@ def _pearson_expr(x: str, y: str) -> pl.Expr:
 
 def _daily_spearman(d: pl.DataFrame, factor_col: str, style_col: str,
                     date_col: str) -> pl.DataFrame:
-    """逐日 Spearman：截面 rank（average 处理并列）→ 逐日 Pearson of ranks。"""
+    """逐日 Spearman：截面 rank（average 处理并列）→ 逐日 Pearson of ranks。
+
+    rank 前过滤非有限值：polars rank 把 NaN 顶格排在所有有限值之上，
+    不过滤的话中性化体检的 |ρ| 会被「因子无效」的股票污染甚至翻转结论。
+    """
     dd = d.select([date_col, factor_col, style_col]).drop_nulls().rename(
         {style_col: "_s"})
+    dd = dd.filter(pl.col(factor_col).is_finite() & pl.col("_s").is_finite())
     dd = dd.with_columns([
         pl.col(factor_col).rank("average").over(date_col).alias("_rf"),
         pl.col("_s").rank("average").over(date_col).alias("_rs"),
@@ -46,9 +51,14 @@ def _daily_spearman(d: pl.DataFrame, factor_col: str, style_col: str,
 
 def _daily_eta(d: pl.DataFrame, factor_col: str, group_col: str,
                date_col: str) -> pl.DataFrame:
-    """逐日相关比 eta = sqrt(1 - SS_within / SS_total)：因子均值在组间的离散度。"""
+    """逐日相关比 eta = sqrt(1 - SS_within / SS_total)：因子均值在组间的离散度。
+
+    同 _daily_spearman：先过滤非有限值，一个 NaN 会把整日 ss_tot 染成 NaN
+    （该日样本静默蒸发）。
+    """
     dd = d.select([date_col, factor_col, group_col]).drop_nulls().rename(
         {group_col: "_g"})
+    dd = dd.filter(pl.col(factor_col).is_finite())
     tot = dd.group_by(date_col).agg(
         (pl.col(factor_col) - pl.col(factor_col).mean()).pow(2).sum().alias("ss_tot"))
     dd = dd.with_columns(

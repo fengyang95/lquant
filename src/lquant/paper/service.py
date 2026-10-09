@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from datetime import date
 
 from lquant.core.types import today_cn
 from lquant.paper import store
@@ -79,8 +80,10 @@ def submit_order(name: str, symbol: str, side: str, qty: int, price: float | Non
     """人工下单。price 缺省取实时快照最新价（停牌则拒收，要求显式限价）。"""
     if side not in ("buy", "sell"):
         raise ValueError(f"side 须为 buy/sell，收到: {side}")
+    explicit_price = price is not None
     with store.account_lock(name):
         broker = store.load_broker(name)
+        q_name, q_is_st = None, None
         if price is None:
             from lquant.paper.quotes import fetch_snapshot
 
@@ -89,7 +92,12 @@ def submit_order(name: str, symbol: str, side: str, qty: int, price: float | Non
             if not px:
                 raise ValueError(f"{symbol} 无有效最新价（可能停牌），请显式指定价格")
             price = px
-        o = broker.submit(symbol, side, int(qty), float(price))
+            # 快照顺手带出 name/is_st：名称决定 ETF 的 T+0/T+1，is_st 决定
+            # 涨跌停档 —— 缺了会退化成「一律 T+1 + 非 ST」
+            q_name = snaps[0].get("name") if snaps else None
+            q_is_st = ("ST" in (q_name or "").upper()) if q_name else None
+        o = broker.submit(symbol, side, int(qty), float(price),
+                          name=q_name, is_st=q_is_st, limit=explicit_price)
         store.save_broker(name, broker)
     return {
         "order_id": o.order_id,
@@ -136,9 +144,19 @@ def tick(name: str) -> dict:
         for q in quotes:
             if q["suspended"]:
                 continue
+            q_name = q.get("name") or ""
+            # name/is_st 必须透传（与 engine.push 同一要求）：名称决定 ETF 的
+            # T+0/T+1（黄金/债券/货币/QDII），is_st 决定 5% 涨跌停档；丢了就
+            # 退化成「一律 T+1 + 非 ST」，T+0 ETF 当日卖出被错误拒单
+            q_is_st = ("ST" in q_name.upper()) if q_name else None
             for od in strategy.signals(broker, q):
+                has_px = od.get("price") is not None
                 broker.submit(
-                    od["symbol"], od["side"], int(od["qty"]), float(od.get("price") or q["price"])
+                    od["symbol"], od["side"], int(od["qty"]),
+                    float(od["price"] if has_px else q["price"]),
+                    name=q_name or od.get("name"),
+                    is_st=q_is_st,
+                    limit=has_px,
                 )
             touched += len(broker.on_quote(q["symbol"], q["price"], q["limit_up"], q["limit_down"]))
             pos = broker.positions.get(q["symbol"])
@@ -186,20 +204,44 @@ def _is_trading_day(d) -> bool:
 def day_close(name: str, d=None) -> dict:
     """日终：解冻 T+N → 官方日线对账重算 official 净值。
 
+    两道防线（2026-10-08 审计修复）：
+    - **交易日门禁**：周末/节假日调用（cron 配错、UI 误点）会把「交易日
+      已过」的 T+N 冻结提前解冻，还会给非交易日写一条官方净值 —— tick 的
+      intraday 净值有门禁，这里此前没有。
+    - **幂等标记**：同一交易日重复调用会把 frozen 台账再减一天（T+1 买入
+      当日即解冻，T+N 约束被击穿）。以 broker.last_day_close 持久化记账，
+      日期不前进就不重复递减。
+
     对账 verdict 非 ok、**或本次对账没有可信基准**（缺 intraday 快照 /
     全部持仓取不到官方收盘价 —— 见 ``_notify_reconcile``）时顺手发通知：
     等第二天看板才发现就晚了。通知旁路永不抛异常、未配置
     LQ_NOTIFY_CHANNELS 时零开销 —— 详见 lquant/notify。
     """
     d = d or today_cn()
+    d = date.fromisoformat(d) if isinstance(d, str) else d
+    # 账户存在性先于交易日门禁：否则「不存在账户 + 非交易日」会返回
+    # skipped(200)，API 的 404 契约被门禁短路
+    frozen_released = True
     with store.account_lock(name):
         broker = store.load_broker(name)
-        broker.on_day_close(d)
-        store.save_broker(name, broker)
+        if not _is_trading_day(d):
+            return {"account": name, "trade_date": str(d),
+                    "skipped": "非交易日（T+N 冻结只在交易日递减，官方净值不写）"}
+        if broker.last_day_close is not None and str(d) <= broker.last_day_close:
+            # 幂等：该日已日结（或更早），不再递减冻结台账；对账仍可重跑
+            frozen_released = False
+        else:
+            broker.on_day_close(d)
+            broker.last_day_close = str(d)
+            store.save_broker(name, broker)
 
     from lquant.paper.reconcile import reconcile
 
     rep = reconcile(name, d)
+    rep["frozen_released"] = frozen_released
+    if not frozen_released:
+        rep["detail"] = (rep.get("detail", "") +
+                         "（重复 day_close：T+N 冻结未重复递减）").strip()
     _notify_reconcile(name, d, rep)
     return {"account": name, "trade_date": str(d), "reconcile": rep}
 
