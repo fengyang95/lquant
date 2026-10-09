@@ -35,6 +35,14 @@ def test_accepts_complete_verdict():
     assert json.loads(payload["payload_json"])["claims"][0]["source"] == "northbound_flow"
 
 
+def test_parse_verdict_passthrough_for_model_instance():
+    """已经是 AgentVerdict 就原样返回（调用方不必先 dump 再 parse）。"""
+    v = AgentVerdict(ticker="600519.SH", as_of="2026-10-08", direction="中性",
+                     confidence=0.5,
+                     evidence=[{"source": "s", "as_of": "2026-10-08"}])
+    assert parse_verdict(v) is v
+
+
 def test_accepts_json_string_and_wrapper_key():
     assert parse_verdict(json.dumps(_ok())).ticker == "600519.SH"
     assert parse_verdict({"verdict": _ok()}).ticker == "600519.SH"

@@ -36,6 +36,7 @@ def test_extract_meta_as_of_from_explicit_and_trade_date():
     # 纯日期串
     assert extract_meta("2026-10-08") == ("2026-10-08", None)
     assert extract_meta("2026-10-08 09:30:00") == ("", None)
+    assert extract_meta("[1, 2, 3]") == ("", None)      # JSON 数组不是对象
 
 
 def test_extract_meta_degraded_only_when_explicit():

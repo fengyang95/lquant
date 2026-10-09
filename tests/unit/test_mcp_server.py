@@ -1,6 +1,7 @@
 """内置 stdio MCP server 的 JSON-RPC 分发单测（不拉真数据）。"""
 from __future__ import annotations
 
+import datetime
 import json
 
 import pytest
@@ -372,3 +373,79 @@ def test_tools_without_as_of_keep_returning_plain_rows(monkeypatch):
         __import__("polars").DataFrame({"trade_date": [], "symbol": []})))
     monkeypatch.setattr(market, "limit_up", lambda limit=50: [{"symbol": "600519.SH"}])
     assert mcp_server._tool_limit_up(limit=1) == [{"symbol": "600519.SH"}]
+
+
+def test_dated_tools_use_snapshot_when_as_of_given(monkeypatch):
+    """三个日期型工具传 as_of 时必须走快照，而不是回落到「最新一天」。"""
+    import polars as pl
+
+    from lquant.server.api import market
+
+    df = pl.DataFrame({
+        "trade_date": [datetime.date(2026, 9, 30), datetime.date(2026, 10, 8)],
+        "symbol": ["600519.SH", "600519.SH"],
+        "first_limit_time": ["09:30:00", "10:00:00"],
+        "main_net_inflow": [1.0, 2.0],
+    })
+    monkeypatch.setattr(market, "_read", _fake_market_read(df))
+    monkeypatch.setattr(market, "limit_up", lambda limit=50: "REAL")
+    monkeypatch.setattr(market, "dragon_tiger", lambda limit=50: "REAL")
+    monkeypatch.setattr(market, "money_flow", lambda **kw: "REAL")
+
+    for fn in (lambda: mcp_server._tool_limit_up(limit=5, as_of="2026-09-30"),
+               lambda: mcp_server._tool_dragon_tiger(limit=5, as_of="2026-09-30"),
+               lambda: mcp_server._tool_money_flow(top=5, as_of="2026-09-30")):
+        out = fn()
+        assert out["unavailable"] is False and out["as_of"] == "2026-09-30"
+        assert len(out["rows"]) == 1
+
+    # 不传 as_of → 原行为（走 market 路由函数）
+    assert mcp_server._tool_limit_up(limit=5) == "REAL"
+    assert mcp_server._tool_dragon_tiger(limit=5) == "REAL"
+    assert mcp_server._tool_money_flow(top=5) == "REAL"
+
+
+def test_dated_snapshot_filters_symbol(monkeypatch):
+    """as_of + symbol 同时给：在快照内按标的过滤，而不是忽略 symbol。"""
+    import polars as pl
+
+    from lquant.server.api import market
+
+    df = pl.DataFrame({
+        "trade_date": [datetime.date(2026, 10, 8)] * 2,
+        "symbol": ["600519.SH", "000001.SZ"],
+        "main_net_inflow": [1.0, 2.0],
+    })
+    monkeypatch.setattr(market, "_read", _fake_market_read(df))
+    out = mcp_server._dated_snapshot("money_flow", "2026-10-08", symbol="600519")
+    assert out["unavailable"] is False and len(out["rows"]) == 1
+    assert out["rows"][0]["symbol"] == "600519.SH"
+
+    # 该标的没有数据 → unavailable，且不退回别的标的
+    miss = mcp_server._dated_snapshot("money_flow", "2026-10-08", symbol="300750.SZ")
+    assert miss["unavailable"] is True and "rows" not in miss
+    assert "300750.SZ" in miss["reason"]
+
+    # symbol 解析不了时按原样比较（不抛）
+    raw = mcp_server._dated_snapshot("money_flow", "2026-10-08", symbol="abc")
+    assert raw["unavailable"] is True
+
+
+def test_dated_snapshot_symbol_filter_skipped_without_symbol_column(monkeypatch):
+    import polars as pl
+
+    from lquant.server.api import market
+
+    monkeypatch.setattr(market, "_read", _fake_market_read(pl.DataFrame({
+        "trade_date": [datetime.date(2026, 10, 8)], "name": ["x"]})))
+    out = mcp_server._dated_snapshot("dragon_tiger", "2026-10-08", symbol="600519")
+    assert out["unavailable"] is False and len(out["rows"]) == 1
+
+
+def test_submit_verdict_requires_db_binding(monkeypatch):
+    monkeypatch.setenv("LQ_AGENT_SESSION_ID", "sid-9")
+    monkeypatch.delenv("LQ_ASK_DB", raising=False)
+    resp = mcp_server.handle_request(_req(
+        "tools/call", {"name": "submit_verdict", "arguments": _verdict_ok()}))
+    assert resp["error"]["code"] == -32000
+    assert "LQ_ASK_DB" in resp["error"]["message"]
