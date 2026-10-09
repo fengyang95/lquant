@@ -142,7 +142,7 @@ if [ "$MAPPED" = "0" ] || [ ! -s "$SELECTED" ]; then
 fi
 
 SELECTED_COUNT="$(sort -u "$SELECTED" | wc -l | tr -d ' ')"
-echo "==> 改动相关测试：$SELECTED_COUNT 个测试文件（改动 $(echo "$CHANGED" | wc -l | tr -d ' ') 个文件，基线 $BASE）"
+echo "==> 改动相关测试：$SELECTED_COUNT 个测试文件（改动 $(echo "$CHANGED" | wc -l | tr -d ' ') 个文件，基线 ${BASE}）"
 # 不用 mapfile：macOS 自带的 bash 3.2 没有它（readarray 同理），而本仓的
 # 开发机就是 macOS —— 上一版在这里直接 `mapfile: command not found`，
 # 让 push 以「测试失败」的名目被拦下来，真实原因却与测试无关。
