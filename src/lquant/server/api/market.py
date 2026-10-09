@@ -15,9 +15,24 @@ from pydantic import BaseModel
 from lquant.core.db import reader
 from lquant.core.types import now_cn_naive
 from lquant.market.collectors import list_collectors
+from lquant.market.collectors.northbound import NORTHBOUND_NET_LAST_DATE
 from lquant.server.deps import resolve_symbol
 
 router = APIRouter(prefix="/market", tags=["market"])
+
+
+def _latest_day(table: str, limit: int = 200) -> pl.DataFrame:
+    """按 trade_date 取表；同日多次采集只留最新一条。
+
+    northbound_flow 的主键是 (trade_date, ts) —— ts 是为「盘中有更新」设计的，
+    而北向自 2024-05 起取消盘中实时，一天采两次就会留两行同日记录。
+    看板要的是「每日一行」，重复行会把近 N 日窗口挤掉。
+    """
+    df = _read(table, limit)
+    if not len(df) or "trade_date" not in df.columns or "ts" not in df.columns:
+        return df
+    return df.sort("ts").unique(subset=["trade_date"], keep="last",
+                                maintain_order=True).sort("trade_date", descending=True)
 
 
 def _read(table: str, limit: int = 200) -> pl.DataFrame:
@@ -33,7 +48,7 @@ def _read(table: str, limit: int = 200) -> pl.DataFrame:
 def overview() -> dict:
     """大盘总览：情绪分 + 涨跌停 + 北向，一个接口给看板首屏。"""
     senti = _read("sentiment_daily", 30)
-    nb = _read("northbound_flow", 30)
+    nb = _latest_day("northbound_flow", 90)
     latest = senti.row(0, named=True) if len(senti) else {}
     return {
         "sentiment": {
@@ -112,6 +127,22 @@ def dragon_tiger(limit: int = Query(default=50, le=500)) -> list[dict]:
     latest_date = df["trade_date"].max()
     return (df.filter(pl.col("trade_date") == latest_date)
               .head(limit).to_dicts())
+
+
+@router.get("/northbound")
+def northbound(days: int = Query(default=30, le=250)) -> dict:
+    """北向资金数据面。
+
+    `flow`：成交额/笔数（净买额 2024-08-19 起停发，那之后 `*_net_inflow` 恒为
+    null 且 `net_published=false`）；`top10`：最新交易日前十大成交活跃证券。
+    """
+    flow = _latest_day("northbound_flow", max(days * 3, 30))
+    top10 = _read("northbound_top10", 40)
+    return {
+        "flow": flow.head(days).to_dicts() if len(flow) else [],
+        "top10": top10.to_dicts() if len(top10) else [],
+        "net_last_date": NORTHBOUND_NET_LAST_DATE.isoformat(),
+    }
 
 
 @router.get("/collectors")

@@ -138,16 +138,23 @@ def _real_db_items() -> set[str] | None:
             time.sleep(0.5)
             continue
         try:
-            rows = con.execute("SELECT DISTINCT item FROM financial_pit").fetchall()
+            rows = con.execute(
+                "SELECT DISTINCT item, source FROM financial_pit").fetchall()
         except Exception:  # noqa: BLE001 - 表未建
             return None
         finally:
             con.close()
-        items = {r[0] for r in rows}
         # **空表必须当成「无法校验」而不是「校验失败」**：CI 会建出空的
-        # ``financial_pit``（scripts/init_db.py + demo 数据），此时键集合为空，
-        # 若照常断言就会把「没有数据可查」误报成「目录里的键全都不存在」——
-        # 那正是这个文件最该避免的假警报。
+        # ``financial_pit``（scripts/init_db.py），此时键集合为空，若照常断言就会
+        # 把「没有数据可查」误报成「目录里的键全都不存在」—— 那正是这个文件
+        # 最该避免的假警报。
+        #
+        # 演示数据（``source='demo'``）同样不算「可校验的真实数据」：
+        # ``generate_demo`` 只合成行业/趋势分析需要的少数几个键（roe / or_yoy /
+        # netprofit_yoy …），拿它校验「目录里的每个键都存在」必然失败，而失败
+        # 的原因不是键名错了，是演示环境本来就没打算覆盖全部键。所以这里只挑
+        # 非演示行；一条都没有就回到「无法校验」。
+        items = {r[0] for r in rows if (r[1] or "") != "demo"}
         return items or None
     return None
 

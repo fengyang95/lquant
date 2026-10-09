@@ -23,6 +23,7 @@ from lquant.server.api import (
     factors,
     fundamental,
     health,
+    industry,
     market,
     ml,
     monitor,
@@ -73,6 +74,7 @@ def create_app() -> FastAPI:
               watchlist,
               strategies, analyses, sync, etf, ext_data, news, settings, ask, agent,
               qlib, task_center, monitor, fundamental, ml, security,
+              industry,
               notify):
         app.include_router(r.router, prefix="/api")
     app.include_router(ws.router)  # /ws/jobs/{id}，无 /api 前缀（与前端代理一致）

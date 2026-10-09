@@ -286,3 +286,47 @@ def test_dictionary(client):
         assert name in body, f"字典缺表 {name}"
         missing = set(SCHEMAS[name]) - set(body[name]["fields"])
         assert not missing, f"字典 {name} 缺字段 {missing}"
+
+
+# ---------- 7. 源站契约探针 ----------
+
+def test_contracts_list(client):
+    body = client.get("/api/data/contracts").json()
+    names = {c["name"] for c in body}
+    assert "eastmoney.hsgt_deal_history" in names
+    assert all(c["required"] for c in body)
+
+
+def test_contracts_probe_saves_drift_issue(client, monkeypatch):
+    """探针把字段漂移落成 data_quality_issue（打桩，不联网）。"""
+    from lquant.data import contract as ct
+    from lquant.data.quality.issues import Issue
+
+    def fake_probe(contract, **kw):
+        if contract.name != "eastmoney.hsgt_deal_history":
+            return []
+        return [Issue(rule=ct.RULE_DRIFT, severity="error",
+                      dataset=contract.dataset,
+                      detail=f"{contract.name}：缺字段 ['DEAL_AMT']",
+                      extra={"contract": contract.name, "source": contract.source})]
+
+    monkeypatch.setattr(ct, "probe_contract", fake_probe)
+    r = client.post("/api/data/contracts/probe")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["checked"] == len(ct.CONTRACTS)
+    assert body["saved"] >= 1
+    assert any("DEAL_AMT" in d for d in body["drift"])
+
+    issues = client.get("/api/data/issues", params={"dataset": "northbound_flow"}).json()
+    assert any(i["rule_code"] == ct.RULE_DRIFT for i in issues)
+
+
+def test_contracts_probe_single_and_unknown(client, monkeypatch):
+    from lquant.data import contract as ct
+
+    monkeypatch.setattr(ct, "probe_contract", lambda contract, **kw: [])
+    ok = client.post("/api/data/contracts/probe", params={"name": "eastmoney.hsgt_top10"})
+    assert ok.status_code == 200 and ok.json()["checked"] == 1
+    bad = client.post("/api/data/contracts/probe", params={"name": "nope"})
+    assert bad.status_code == 404

@@ -14,3 +14,4 @@
 | EP-10 通知告警 | 入口 `src/lquant/notify/`（渠道 + 规则引擎 + CLI） | 已交付（含入口） |
 | EP-11 LLM 挖因子 | 入口 `src/lquant/research/report_extract.py`（研报提案） | 已交付（含入口） |
 | EP-12 多市场 | 三条硬约束先守 | 不做 |
+| EP-13 分析角度 | 入口 `src/lquant/core/report.py`（报告契约原语）+ `security/contract.py` / `industry/contract.py` 的角度注册表 | 已交付（含入口） |

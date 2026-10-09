@@ -1,7 +1,7 @@
 ---
 name: lquant-market
-description: 查询 lquant 本地数据湖的 A 股行情与市场数据——大盘概览、涨跌家数、板块、资金流、涨停池、龙虎榜、热榜、指数、ETF、数据覆盖度与日线。走 lquant 本机 HTTP API / MCP 工具，只读。回答必须标注数据时点。
-tags: [lquant, a-stock, market-data, quotes, etf, money-flow, market-breadth, local]
+description: 查询 lquant 本地数据湖的 A 股行情与市场数据——大盘概览、涨跌家数、板块、行业轮动与行业多角度分析、资金流、涨停池、龙虎榜、热榜、指数、ETF、数据覆盖度与日线。走 lquant 本机 HTTP API / MCP 工具，只读。回答必须标注数据时点。
+tags: [lquant, a-stock, market-data, quotes, etf, money-flow, market-breadth, industry-rotation, local]
 ---
 
 # lquant-market — lquant 本地数据湖
@@ -24,6 +24,8 @@ tags: [lquant, a-stock, market-data, quotes, etf, money-flow, market-breadth, lo
 | `get_market_overview` | `/api/market/overview` |
 | `get_market_breadth` | `/api/market/breadth` |
 | `get_sectors` | `/api/market/sectors` |
+| `get_industry_rotation` | `/api/industry/rotation` |
+| `get_industry_analysis` | `/api/industry/{identifier}/analysis` |
 | `get_money_flow` | `/api/market/money-flow` |
 | `get_limit_up` | `/api/market/limit-up` |
 | `get_dragon_tiger` | `/api/market/dragon-tiger` |
@@ -39,7 +41,10 @@ tags: [lquant, a-stock, market-data, quotes, etf, money-flow, market-breadth, lo
 |---|---|---|
 | 大盘概览（情绪分/涨跌停/北向） | `GET /api/market/overview` | |
 | 涨跌家数（市场宽度） | `GET /api/market/breadth` | |
-| 板块/行业/概念/地域表现 | `GET /api/market/sectors?kind=industry\|concept\|area` | |
+| 板块/行业/概念/地域表现（当日快照） | `GET /api/market/sectors?kind=industry\|concept\|area` | |
+| 行业轮动榜（区间收益 + 排名，历史口径） | `GET /api/industry/rotation?window=20&std=SW` | |
+| 单个行业多角度分析（趋势与 RRG / 景气度 / 估值 / 拥挤度 / 宽度） | `GET /api/industry/{identifier}/analysis`（identifier 可为 `801780.SI` 或中文名「银行」） | |
+| 行业清单（代码/名称/成员数） | `GET /api/industry/list` | ✔ |
 | 资金流（全市场 Top / 单票历史） | `GET /api/market/money-flow?top=20&symbol=600519` | |
 | 涨停池 | `GET /api/market/limit-up` | |
 | 龙虎榜（最新交易日） | `GET /api/market/dragon-tiger` | |
@@ -59,7 +64,10 @@ tags: [lquant, a-stock, market-data, quotes, etf, money-flow, market-breadth, lo
 3. **空数据**：非交易日或数据缺失时如实说明「暂无数据」，**不编造数字**。
    注意端点读不到 DuckDB 表时会返回空结构而不是报错 —— 空不等于「市场真的没有」。
 4. **复权口径**：历史价格默认不复权；如需复权口径请说明。
-5. 股票代码 6 位数字（内部统一成 `600519.SH` 这类带后缀格式）；
+5. **行业口径**：行业指数是**成分股等权合成**（不是申万/交易所官方指数），
+   引用行业收益时必须同时说明这一点；行业分析报告里 `available=false` 的角度
+   是**数据缺失**，要如实说明缺什么，不要把缺失当成「中性」。
+6. 股票代码 6 位数字（内部统一成 `600519.SH` 这类带后缀格式）；
    指数可用常见代码（如 000001 上证）。
 
 ## 回答结构建议

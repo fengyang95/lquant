@@ -174,6 +174,36 @@ SCHEMAS = {
     "market_snapshot": MARKET_SNAPSHOT,
 }
 
+# ---- curated schema 演进纪律 ----
+#
+# curated 列是**对外契约**：落湖的 parquet、`SCHEMAS`、字段映射 yaml、
+# 因子 DSL 白名单、看板列全都在读它。经验是「悄悄删一列」比「悄悄加一列」
+# 危险得多 —— 删列会让历史 parquet 与读取代码对不上，而加列基本无害。
+#
+# 所以：**只增不改**。任何一次改动（加/删/改类型）都必须同时
+#   1) 调整 DATASET_SCHEMA_VERSION：加列 +1，删列/改类型 +1 并注明破坏性；
+#   2) 更新 SCHEMA_FINGERPRINT（`schema_fingerprint()` 的输出）。
+# `tests/unit/test_schema_contract.py` 会盯着这两者是否同步 —— 改列的人
+# 一定会看到一条要求他显式确认的失败，而不是在 code review 里被漏掉。
+DATASET_SCHEMA_VERSION = 1
+
+# 最近一次「删列 / 改类型」的说明；只增列时保持上一版说明不动。
+DATASET_SCHEMA_BREAKING_NOTE = "初始版本（建立指纹纪律时的基线）"
+
+
+def schema_fingerprint() -> str:
+    """curated schema 的稳定指纹（表 → 有序 (列, 类型) 的 sha256）。"""
+    import hashlib
+
+    payload = "\n".join(
+        f"{table}:" + ",".join(f"{c}:{dt}" for c, dt in SCHEMAS[table].items())
+        for table in sorted(SCHEMAS)
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+SCHEMA_FINGERPRINT = "a4c35ef693b48fe133c713b2a7402bbaac651da5b5e65c4f79582939d05f7881"
+
 
 def empty(name: str) -> pl.DataFrame:
     return pl.DataFrame(schema=SCHEMAS[name])

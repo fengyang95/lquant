@@ -112,42 +112,40 @@ class _Resp:
         return self._p
 
 
-def test_northbound_parses_main_kamt(monkeypatch):
-    from lquant.market.collectors import money_flow as mf
+def test_northbound_no_longer_reads_kamt_net_inflow(monkeypatch):
+    """回归：北向已换到数据中心报表，不再读 kamt 的「净买额」。
 
-    def fake_em_get(url):
-        assert "kamt.rtmin" not in url  # 主接口命中则不应打兜底
-        return _Resp({"data": {"hk2sh": ["2026-09-17,123400.0,1,1"],
-                               "hk2sz": ["2026-09-17,-5600.5,2,2"]}})
+    旧实现解析 kamt/get 的净买额，源站停发后它把 0.0 当真值写库；
+    这条测试钉住「不再调 kamt」这件事，防止有人改回去。
+    """
+    from lquant.market.collectors import northbound as nb
 
-    monkeypatch.setattr(mf, "em_get", fake_em_get)
-    df = mf.fetch_northbound(date(2026, 9, 17))
-    assert df["sh_net_inflow"][0] == 123400.0
-    assert df["sz_net_inflow"][0] == -5600.5
+    urls: list[str] = []
 
+    def fake_em_get(url, **kw):
+        urls.append(url)
+        return _Resp({"success": True, "result": {"data": [
+            {"TRADE_DATE": "2026-09-17 00:00:00", "MUTUAL_TYPE": t,
+             "DEAL_AMT": amt, "DEAL_NUM": 5, "NET_DEAL_AMT": None}
+            for t, amt in (("001", 3000.0), ("003", 2000.0), ("005", 5000.0))
+        ]}})
 
-def test_northbound_falls_back_to_rtmin(monkeypatch):
-    from lquant.market.collectors import money_flow as mf
-
-    def fake_em_get(url):
-        if "kamt.rtmin" in url:
-            return _Resp({"data": {"s2n": [
-                "17:00,SH,900.0,1234.5", "17:00,SZ,700.0,-800.0"]}})
-        return _Resp({"data": None})
-
-    monkeypatch.setattr(mf, "em_get", fake_em_get)
-    df = mf.fetch_northbound(date(2026, 9, 17))
-    assert df["sh_net_inflow"][0] == 1234.5
-    assert df["sz_net_inflow"][0] == -800.0
+    monkeypatch.setattr(nb, "em_get", fake_em_get)
+    df = nb.fetch_northbound(date(2026, 9, 17))
+    assert all("kamt" not in u for u in urls)
+    assert "RPT_MUTUAL_DEAL_HISTORY" in urls[0]
+    # 停发后净买额为 NULL（不是 0）
+    assert df["total_net_inflow"][0] is None
+    assert df["net_published"][0] is False
 
 
 def test_northbound_all_empty_raises(monkeypatch):
     from lquant.core.errors import DataUnavailable
-    from lquant.market.collectors import money_flow as mf
+    from lquant.market.collectors import northbound as nb
 
-    monkeypatch.setattr(mf, "em_get", lambda url: _Resp({"data": None}))
+    monkeypatch.setattr(nb, "em_get", lambda url, **kw: _Resp({"data": None}))
     with pytest.raises(DataUnavailable):
-        mf.fetch_northbound(date(2026, 9, 17))
+        nb.fetch_northbound(date(2026, 9, 17))
 
 
 # ---------- collect 非法日期 → 422 ----------

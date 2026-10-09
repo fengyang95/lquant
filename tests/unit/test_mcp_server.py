@@ -87,6 +87,41 @@ def test_etf_list_uses_meta_rows(monkeypatch):
     assert mcp_server._tool_etf_list(limit=5) == [{"symbol": "510300.SH", "limit": 5}]
 
 
+def test_industry_tools_forward_blank_strings_as_none(monkeypatch):
+    """MCP 的字符串参数默认是空串 —— 空串不能被当成「指定了该参数」。"""
+    import lquant.industry as ind
+
+    seen: list[tuple] = []
+
+    def fake_rotation(asof=None, std=None, window=20):
+        seen.append(("rotation", asof, std, window))
+        return {"rows": []}
+
+    def fake_analysis(identifier, asof=None, std=None):
+        seen.append(("analysis", identifier, asof, std))
+        return {"industry": identifier}
+
+    monkeypatch.setattr(ind, "industry_rotation", fake_rotation)
+    monkeypatch.setattr(ind, "analyze_industry", fake_analysis)
+
+    mcp_server._tool_industry_rotation()
+    mcp_server._tool_industry_analysis("银行")
+    mcp_server._tool_industry_rotation(window=60, std="CICS", asof="2026-09-30")
+    mcp_server._tool_industry_analysis("801780.SI", std="SW", asof="2026-09-30")
+
+    assert seen[0] == ("rotation", None, None, 20)
+    assert seen[1] == ("analysis", "银行", None, None)
+    assert seen[2] == ("rotation", "2026-09-30", "CICS", 60)
+    assert seen[3] == ("analysis", "801780.SI", "2026-09-30", "SW")
+
+
+def test_industry_tools_declare_schema():
+    specs = {t["name"]: t for t in mcp_server.TOOLS_SPEC}
+    assert "get_industry_rotation" in specs
+    assert "get_industry_analysis" in specs
+    assert specs["get_industry_analysis"]["inputSchema"]["required"] == ["industry"]
+
+
 def test_unknown_tool_returns_minus_32602():
     resp = mcp_server.handle_request(
         _req("tools/call", {"name": "nope", "arguments": {}}))

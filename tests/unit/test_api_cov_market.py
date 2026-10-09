@@ -312,3 +312,72 @@ def test_collect_demo_round(client):
     """手动触发一轮 demo 采集（endpoint 返回采集健康度）。"""
     r = client.post("/api/market/collect", json={"demo": True})
     assert r.status_code == 200, r.text
+
+
+def test_northbound_endpoint(client):
+    """/market/northbound 返回成交额口径 + 前十大活跃 + 净买额停发边界。"""
+    r = client.get("/api/market/northbound", params={"days": 10})
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"flow", "top10", "net_last_date"}
+    assert body["net_last_date"] == "2024-08-16"
+    assert body["flow"], "演示采集应写入 northbound_flow"
+    row = body["flow"][0]
+    assert "total_deal_amt" in row and "net_published" in row
+
+
+def test_northbound_dedupes_same_day_reruns(client):
+    """同日多次采集只留最新一条（主键含 ts，重复行会挤掉近 N 日窗口）。"""
+    import datetime as _dt
+
+    from lquant.core.db import writer
+    from lquant.market.schema import ensure_market_tables
+
+    d = _dt.date(2026, 3, 2)
+    with writer() as con:
+        ensure_market_tables(con)
+        con.execute("DELETE FROM northbound_flow WHERE trade_date = ?", [d])
+        for ts, amt in (("2026-03-02 18:00:00", 1.0e11), ("2026-03-02 20:00:00", 2.0e11)):
+            con.execute(
+                "INSERT INTO northbound_flow (trade_date, ts, sh_deal_amt, "
+                "sz_deal_amt, total_deal_amt, deal_num, net_published, collected_at) "
+                "VALUES (?, ?, 0, 0, ?, 1, false, NULL)", [d, ts, amt])
+    flow = client.get("/api/market/northbound", params={"days": 250}).json()["flow"]
+    same = [r for r in flow if r["trade_date"] == d.isoformat()]
+    assert len(same) == 1
+    assert same[0]["total_deal_amt"] == 2.0e11      # 保留最新 ts 那条
+
+
+def test_latest_day_dedupes_and_passthrough(monkeypatch):
+    """_latest_day：同日多条留最新；没有 ts 列时原样返回。"""
+    from lquant.server.api import market as api
+
+    def fake_read(table, limit=200):
+        import polars as pl
+
+        if table != "northbound_flow":
+            return pl.DataFrame()
+        return pl.DataFrame({
+            "trade_date": [_dt_date("2026-03-02"), _dt_date("2026-03-02")],
+            "ts": [_dt_dt("2026-03-02 18:00:00"), _dt_dt("2026-03-02 20:00:00")],
+            "total_deal_amt": [1.0, 2.0],
+        })
+
+    monkeypatch.setattr(api, "_read", fake_read)
+    out = api._latest_day("northbound_flow", 30)
+    assert out.height == 1 and out["total_deal_amt"][0] == 2.0
+    # 没有 ts 列时原样返回（老库/别的表不强制去重）
+    monkeypatch.setattr(api, "_read", lambda t, limit=200: __import__("polars").DataFrame({"x": [1]}))
+    assert api._latest_day("northbound_flow", 30).height == 1
+
+
+def _dt_date(s):
+    import datetime
+
+    return datetime.date.fromisoformat(s)
+
+
+def _dt_dt(s):
+    import datetime
+
+    return datetime.datetime.fromisoformat(s)

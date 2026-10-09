@@ -148,6 +148,28 @@ def _tool_sectors(kind: str = "industry") -> list[dict]:
     return _market().sectors(kind=kind)
 
 
+def _tool_industry_rotation(window: int = 20, std: str = "",
+                            asof: str = "") -> dict:
+    """行业轮动榜（横截面）：区间收益 / 成员数 / 成交额 / 估值中位数 + 排名。"""
+    from lquant.industry import industry_rotation
+
+    return industry_rotation(_blank_to_none(asof), _blank_to_none(std), window)
+
+
+def _tool_industry_analysis(industry: str, std: str = "",
+                            asof: str = "") -> dict:
+    """单个行业的多角度分析报告（趋势与 RRG / 景气度 / 估值 / 资金拥挤 / 宽度）。"""
+    from lquant.industry import analyze_industry
+
+    return analyze_industry(industry, _blank_to_none(asof), _blank_to_none(std))
+
+
+def _blank_to_none(v: str | None) -> str | None:
+    """MCP 的字符串参数默认是空串；空串不能当成「指定了该参数」。"""
+    s = (v or "").strip()
+    return s or None
+
+
 def _tool_money_flow(top: int = 20, symbol: str = "") -> list[dict]:
     return _market().money_flow(top=top, symbol=symbol.strip() or None)
 
@@ -182,6 +204,8 @@ TOOL_HANDLERS: dict[str, Callable[..., Any]] = {
     "get_market_overview": _tool_market_overview,
     "get_market_breadth": _tool_market_breadth,
     "get_sectors": _tool_sectors,
+    "get_industry_rotation": _tool_industry_rotation,
+    "get_industry_analysis": _tool_industry_analysis,
     "get_money_flow": _tool_money_flow,
     "get_limit_up": _tool_limit_up,
     "get_dragon_tiger": _tool_dragon_tiger,
@@ -234,7 +258,7 @@ TOOLS_SPEC: list[dict] = [
     },
     {
         "name": "get_market_overview",
-        "description": "大盘概览：情绪分 + 涨跌停家数 + 破板率 + 北向资金（看板首屏）",
+        "description": "大盘概览：情绪分 + 涨跌停家数 + 破板率 + 北向成交额（看板首屏）",
         "inputSchema": _input_schema({}, []),
     },
     {
@@ -253,6 +277,34 @@ TOOLS_SPEC: list[dict] = [
             {"kind": {"type": "string", "enum": ["industry", "concept", "area"],
                       "default": "industry", "description": "板块类型"}},
             [],
+        ),
+    },
+    {
+        "name": "get_industry_rotation",
+        "description": ("行业轮动榜：各行业的区间收益、成员数、成交额、估值中位数与排名。"
+                        "回答「哪个行业在领跑 / 资金流向哪里 / 估值贵不贵」用这个。"),
+        "inputSchema": _input_schema(
+            {"window": {"type": "integer", "default": 20, "minimum": 5,
+                        "maximum": 250, "description": "排名用的区间窗口（交易日）"},
+             "std": {"type": "string", "default": "",
+                     "description": "行业分类标准（SW/CICS/em），留空自动挑"},
+             "asof": {"type": "string", "default": "",
+                      "description": "观察日 YYYY-MM-DD，留空取湖内最新交易日"}},
+            [],
+        ),
+    },
+    {
+        "name": "get_industry_analysis",
+        "description": ("单个行业的多角度分析报告（趋势与 RRG 相对旋转图 / 景气度 / 估值分位 / "
+                        "资金与拥挤度 / 宽度与情绪）。industry 可为代码 801780.SI 或中文名 银行。"),
+        "inputSchema": _input_schema(
+            {"industry": {"type": "string",
+                          "description": "行业代码（801780.SI）或中文名（银行）"},
+             "std": {"type": "string", "default": "",
+                     "description": "行业分类标准，留空自动挑"},
+             "asof": {"type": "string", "default": "",
+                      "description": "观察日 YYYY-MM-DD，留空取湖内最新交易日"}},
+            ["industry"],
         ),
     },
     {
