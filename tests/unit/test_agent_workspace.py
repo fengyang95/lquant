@@ -210,11 +210,45 @@ def test_enabled_skills_cannot_escape_source_dir(root: Path) -> None:
 
 
 def test_mcp_server_spec_carries_enabled_tools(root: Path) -> None:
-    from lquant.agent.workspace import mcp_server_spec
+    from lquant.agent.workspace import VERDICT_TOOL, mcp_server_spec
 
     spec = mcp_server_spec(root, enabled_tools={"get_quotes", "get_daily"})
-    assert spec["env"]["LQ_MCP_ENABLED_TOOLS"] == "get_daily,get_quotes"
-    # 空集要写成**存在但为空**：缺失 = 全开，空串 = 一个都不开，两者语义不同
-    assert mcp_server_spec(root, enabled_tools=set())["env"]["LQ_MCP_ENABLED_TOOLS"] == ""
+    # submit_verdict 永远在名单里：它是一条输出通道，不是数据访问权限
+    assert spec["env"]["LQ_MCP_ENABLED_TOOLS"] == f"get_daily,get_quotes,{VERDICT_TOOL}"
+    # 空集要写成**存在但非全开**：缺失 = 全开，名单 = 只开名单里那几个，
+    # 两者语义不同，不能合并成一个空值（结论通道除外，理由同上）
+    assert mcp_server_spec(root, enabled_tools=set())["env"]["LQ_MCP_ENABLED_TOOLS"] \
+        == VERDICT_TOOL
     # 不传 = 不注入该变量（老调用方行为不变）
     assert "LQ_MCP_ENABLED_TOOLS" not in mcp_server_spec(root)["env"]
+
+
+def test_mcp_spec_injects_session_binding(root: Path) -> None:
+    """MCP 子进程要能落结论：会话 id 与 ask.db 路径都靠环境变量传。"""
+    from lquant.agent.workspace import mcp_server_spec
+
+    spec = mcp_server_spec(root, session_id="sid-7")
+    assert spec["env"]["LQ_AGENT_SESSION_ID"] == "sid-7"
+    assert spec["env"]["LQ_ASK_DB"] == str(root / "data" / "ask.db")
+    # 不传会话时保持旧形态（不回退到"猜一个"）
+    assert "LQ_AGENT_SESSION_ID" not in mcp_server_spec(root)["env"]
+
+
+def test_whitelist_always_allows_submit_verdict(root: Path) -> None:
+    """白名单裁的是数据访问；结论通道被裁掉只会让 agent 退回自由文本。"""
+    from lquant.agent.workspace import mcp_server_spec
+
+    spec = mcp_server_spec(root, enabled_tools={"get_daily"})
+    assert spec["env"]["LQ_MCP_ENABLED_TOOLS"] == "get_daily,submit_verdict"
+    # 空集也是合法配置（一个数据工具都不给），但结论通道仍在
+    empty = mcp_server_spec(root, enabled_tools=set())
+    assert empty["env"]["LQ_MCP_ENABLED_TOOLS"] == "submit_verdict"
+    # None = 不裁剪，不注入该变量
+    assert "LQ_MCP_ENABLED_TOOLS" not in mcp_server_spec(root)["env"]
+
+
+def test_workspace_mcp_json_carries_session_binding(root: Path) -> None:
+    ws = ensure_workspace("ws-bind", root, session_id="sid-7")
+    cfg = json.loads((ws / ".claude" / "mcp.json").read_text(encoding="utf-8"))
+    env = cfg["mcpServers"]["lquant"]["env"]
+    assert env["LQ_AGENT_SESSION_ID"] == "sid-7"

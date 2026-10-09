@@ -83,6 +83,11 @@ testpaths = ["tests"]
 # 于是这里的 --strict-markers 与 slow/rust 两个 marker 声明全被静默忽略。
 addopts = "-q --strict-markers"
 asyncio_mode = "auto"
+# 卡住时**在跑的过程中**就把所有线程栈打出来（默认关）。CI 那边还有
+# `timeout -s ABRT 2400` 兜底，但那是 40 分钟后、而且只说明「整个 job 挂了」；
+# 这里是 10 分钟无进展就 dump，配合 xdist 能直接指出是哪个用例卡在哪一行。
+# 历史上已经烧过一次 3 小时（见 .github/workflows/ci.yml 的注释）。
+faulthandler_timeout = 600
 markers = ["slow: 需要网络或大数据", "rust: 依赖 Rust 扩展",
     "integration: 集成测试（需要本机 Redis）"]
 

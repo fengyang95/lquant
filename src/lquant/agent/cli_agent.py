@@ -167,7 +167,8 @@ class CliAgentService(AgentService):
         return ensure_workspace(
             str(self._workspace_base / sid), self._root,
             enabled_skills=_name_set(cfg.get("skills")),
-            enabled_tools=_name_set(cfg.get("mcp_tools")))
+            enabled_tools=_name_set(cfg.get("mcp_tools")),
+            session_id=sid)
 
     # ---- 子类钩子 ---------------------------------------------------------
 
@@ -314,6 +315,7 @@ class CliAgentService(AgentService):
     async def _consume(self, sid: str, proc: SpawnedChild, on_event: Emit,
                        cfg: dict | None = None) -> None:
         cfg = cfg or {}
+        on_event = self.trace_emitter(sid, on_event)   # 工具调用留痕（P0-7）
         timeout = self._timeout_for(cfg)  # 会话级 > 构造参数 > 运行时全局
         stderr_lines: list[str] = []
 
@@ -376,7 +378,8 @@ class CliAgentService(AgentService):
                             type="tool_result",
                             name=ev.get("name") or tool_names.pop(
                                 ev.get("tool_use_id", ""), ""),
-                            text=ev["text"], summary=ev["summary"]))
+                            text=ev["text"], summary=ev["summary"],
+                            data=ev.get("data") or {}))   # is_error 等结构化标记
                     elif kind == "session":
                         # CLI 侧会话 id 可能先于正文到达（codex 的 thread.started）
                         if ev.get("session_id"):

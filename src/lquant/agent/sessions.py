@@ -42,6 +42,40 @@ CREATE TABLE IF NOT EXISTS a2a_tasks (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_a2a_tasks_ctx ON a2a_tasks(context_id, created_at);
+CREATE TABLE IF NOT EXISTS ask_tool_trace (
+    id          TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL,
+    message_id  TEXT NOT NULL DEFAULT '',
+    run_id      TEXT NOT NULL DEFAULT '',
+    seq         INTEGER NOT NULL DEFAULT 0,
+    name        TEXT NOT NULL DEFAULT '',
+    args_json   TEXT NOT NULL DEFAULT '{}',
+    status      TEXT NOT NULL DEFAULT 'running',
+    summary     TEXT NOT NULL DEFAULT '',
+    detail      TEXT NOT NULL DEFAULT '',
+    as_of       TEXT NOT NULL DEFAULT '',
+    degraded    INTEGER,
+    error       TEXT NOT NULL DEFAULT '',
+    started_at  TEXT NOT NULL DEFAULT '',
+    finished_at TEXT NOT NULL DEFAULT '',
+    duration_ms INTEGER,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ask_tool_trace_sid ON ask_tool_trace(session_id, seq);
+CREATE TABLE IF NOT EXISTS ask_verdict (
+    id            TEXT PRIMARY KEY,
+    session_id    TEXT NOT NULL,
+    ticker        TEXT NOT NULL DEFAULT '',
+    as_of         TEXT NOT NULL DEFAULT '',
+    direction     TEXT NOT NULL DEFAULT '',
+    confidence    REAL NOT NULL DEFAULT 0,
+    abstain       INTEGER NOT NULL DEFAULT 0,
+    summary       TEXT NOT NULL DEFAULT '',
+    payload_json  TEXT NOT NULL DEFAULT '{}',
+    withheld_json TEXT NOT NULL DEFAULT '[]',
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ask_verdict_sid ON ask_verdict(session_id, created_at);
 """
 
 
@@ -117,6 +151,44 @@ def render_briefing(messages: list[Message],
         head = f"{who}：…（前文略）"
         parts.append(head + text[-(max_chars - len(head)):])
     return "\n\n".join(reversed(parts))
+
+
+def verdict_db_path() -> str | None:
+    """MCP 子进程用的 ask.db 路径（由工作区脚手架经环境变量注入）。
+
+    返回 ``None`` 表示当前进程没有绑定会话（例如手工起 MCP server 调试），
+    此时 submit_verdict 会明确报错而不是静默丢结论。
+    """
+    import os
+
+    p = (os.environ.get("LQ_ASK_DB") or "").strip()
+    return p or None
+
+
+def write_verdict_sync(db_path: str, session_id: str, payload: dict) -> str:
+    """同步写一条结论。
+
+    MCP server 是 stdio 同步进程（见 agent/mcp_server.py），拿不到 aiosqlite；
+    它和主服务写的是**同一个 SQLite 文件**，靠 sqlite3 自身的文件锁互斥。
+    表结构用同一份 `_DDL`，避免两边各自建表长得不一样。
+    """
+    import sqlite3
+
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    vid = payload.get("id") or uuid.uuid4().hex
+    with sqlite3.connect(db_path, timeout=10.0) as con:
+        con.executescript(_DDL)
+        con.execute(
+            "INSERT OR REPLACE INTO ask_verdict (id,session_id,ticker,as_of,direction,"
+            "confidence,abstain,summary,payload_json,withheld_json,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (vid, session_id, payload.get("ticker", ""), payload.get("as_of", ""),
+             payload.get("direction", ""), float(payload.get("confidence") or 0),
+             int(payload.get("abstain") or 0), payload.get("summary", ""),
+             payload.get("payload_json", "{}"), payload.get("withheld_json", "[]"),
+             _now()))
+        con.commit()
+    return vid
 
 
 class SessionStore:
@@ -276,6 +348,60 @@ class SessionStore:
             "SELECT id,session_id,role,content,tool_calls_json,created_at FROM ask_messages "
             "WHERE session_id=? ORDER BY created_at, rowid", (sid,))
         return [self._row_message(r) for r in await cur.fetchall()]
+
+    # ---- P0-7：工具调用留痕与结构化结论 ----
+
+    async def add_tool_trace(self, row: dict) -> str:
+        """落一条工具调用留痕（见 agent/trace.py）。"""
+        con = await self._conn()
+        tid = row.get("id") or uuid.uuid4().hex
+        await con.execute(
+            "INSERT OR REPLACE INTO ask_tool_trace (id,session_id,message_id,run_id,seq,"
+            "name,args_json,status,summary,detail,as_of,degraded,error,started_at,"
+            "finished_at,duration_ms,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (tid, row["session_id"], row.get("message_id", ""), row.get("run_id", ""),
+             int(row.get("seq") or 0), row.get("name", ""), row.get("args_json", "{}"),
+             row.get("status", "running"), row.get("summary", ""), row.get("detail", ""),
+             row.get("as_of", ""), row.get("degraded"),
+             row.get("error", ""), row.get("started_at", ""), row.get("finished_at", ""),
+             row.get("duration_ms"), _now()))
+        await con.commit()
+        return tid
+
+    async def list_tool_trace(self, sid: str, limit: int = 200) -> list[dict]:
+        con = await self._conn()
+        cur = await con.execute(
+            "SELECT id,session_id,message_id,run_id,seq,name,args_json,status,summary,"
+            "detail,as_of,degraded,error,started_at,finished_at,duration_ms,created_at "
+            "FROM ask_tool_trace WHERE session_id=? ORDER BY seq, created_at LIMIT ?",
+            (sid, int(limit)))
+        cols = ["id", "session_id", "message_id", "run_id", "seq", "name", "args_json", "status", "summary", "detail", "as_of", "degraded", "error", "started_at", "finished_at", "duration_ms", "created_at"]
+        return [dict(zip(cols, r, strict=True)) for r in await cur.fetchall()]
+
+    async def add_verdict(self, sid: str, payload: dict) -> str:
+        """落一条结构化结论（见 agent/verdict.py）。"""
+        con = await self._conn()
+        vid = payload.get("id") or uuid.uuid4().hex
+        await con.execute(
+            "INSERT OR REPLACE INTO ask_verdict (id,session_id,ticker,as_of,direction,"
+            "confidence,abstain,summary,payload_json,withheld_json,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (vid, sid, payload.get("ticker", ""), payload.get("as_of", ""),
+             payload.get("direction", ""), float(payload.get("confidence") or 0),
+             int(payload.get("abstain") or 0), payload.get("summary", ""),
+             payload.get("payload_json", "{}"), payload.get("withheld_json", "[]"),
+             _now()))
+        await con.commit()
+        return vid
+
+    async def list_verdicts(self, sid: str, limit: int = 50) -> list[dict]:
+        con = await self._conn()
+        cur = await con.execute(
+            "SELECT id,ticker,as_of,direction,confidence,abstain,summary,payload_json,"
+            "withheld_json,created_at FROM ask_verdict WHERE session_id=? "
+            "ORDER BY created_at DESC LIMIT ?", (sid, int(limit)))
+        cols = ["id", "ticker", "as_of", "direction", "confidence", "abstain", "summary", "payload_json", "withheld_json", "created_at"]
+        return [dict(zip(cols, r, strict=True)) for r in await cur.fetchall()]
 
     async def get_message(self, sid: str, mid: str) -> Message | None:
         con = await self._conn()
