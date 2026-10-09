@@ -544,10 +544,15 @@ def get_attribution(run_id: str, top: int = Query(default=15, ge=3, le=50)) -> d
     """
     from lquant.backtest.attribution import (
         brinson_by_group,
+        brinson_monthly,
+        build_styles,
+        cost_drag,
         group_of_symbol,
         industry_map_from_db,
+        portfolio_profile,
         risk_vs_benchmark,
         stock_contribution,
+        style_return_attribution,
     )
 
     with reader() as con:
@@ -559,6 +564,9 @@ def get_attribution(run_id: str, top: int = Query(default=15, ge=3, le=50)) -> d
         pos_rows = con.execute(
             "SELECT trade_date, symbol, qty FROM backtest_position "
             "WHERE run_id = ? ORDER BY trade_date", [run_id]).fetchall()
+        order_rows = con.execute(
+            "SELECT ts, fee FROM backtest_order WHERE run_id = ? AND fee != 0",
+            [run_id]).fetchall()
         industry = industry_map_from_db(con)
 
     if not pos_rows:
@@ -589,6 +597,17 @@ def get_attribution(run_id: str, top: int = Query(default=15, ge=3, le=50)) -> d
     stocks, residual = stock_contribution(positions, prices, nav)
     group_map = {s: industry.get(s) or group_of_symbol(s) for s in set(universe) | need}
     brinson = brinson_by_group(positions, prices, nav, universe, group_map)
+    brinson_m = brinson_monthly(positions, prices, nav, universe, group_map)
+
+    # 成本拖累：逐笔费用 / 前日净值（residual 里混着的费用部分在这里显式化）
+    cost = cost_drag([{"ts": r[0], "fee": r[1]} for r in order_rows], nav)
+
+    # 持仓画像：行业权重 / 集中度 / 风格暴露（只对持仓标的，面板过滤省内存）
+    profile = portfolio_profile(positions, prices, nav, group_map,
+                                styles=build_styles(px_df, sorted(need)))
+
+    # 风格收益归因：全市场截面回归（因子收益）→ 因子贡献 vs 特异 alpha
+    style_attr = style_return_attribution(positions, prices, nav, px_df)
 
     # α/β/IR/TE：策略日收益 vs 基准日收益（基准净值差分，不能用累计值）
     _, bench_label, bench_map = _benchmark_nav_aligned(set(dates), nav_map)
@@ -612,6 +631,10 @@ def get_attribution(run_id: str, top: int = Query(default=15, ge=3, le=50)) -> d
                                "n_stocks": len(stocks)},
         "residual_by_day": residual,
         "brinson": brinson,
+        "brinson_monthly": brinson_m,
+        "cost": cost,
+        "profile": profile,
+        "style_attr": style_attr,
         "risk": risk,
     }
 

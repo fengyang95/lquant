@@ -16,7 +16,7 @@ import { Panel, Stat } from '@/components/Panel';
 import PageHeader from '@/components/PageHeader';
 import { ErrorNote, Loading } from '@/components/States';
 import { get } from '@/lib/api';
-import { C, axes, legend, tooltip } from '@/lib/chart';
+import { C, SERIES_COLORS, axes, legend, tooltip } from '@/lib/chart';
 import {
   customChartOption,
   partitionCustomAnalysis,
@@ -44,9 +44,26 @@ type Detail = {
   logs?: string[];
   custom_analysis?: CustomRawItem[];
 };
+type BrinsonGroups = { group: string; alloc: number; select: number; interact: number; total: number }[];
 type Attribution = {
   stock_contribution: { top: { symbol: string; contribution: number }[]; bottom: { symbol: string; contribution: number }[]; n_stocks: number };
-  brinson: { groups: { group: string; alloc: number; select: number; interact: number; total: number }[]; excess_total: number; note: string };
+  residual_by_day: { date: string; residual: number; return: number }[];
+  brinson: { groups: BrinsonGroups; excess_total: number; note: string };
+  brinson_monthly: { months: { month: string; groups: BrinsonGroups; excess_total: number }[]; note: string };
+  cost: { fee_by_day: { date: string; fee: number; drag: number }[]; total_fee: number; total_drag: number };
+  profile: {
+    industry: { dates: string[]; series: Record<string, number[]> };
+    style: { dates: string[]; series: Record<string, number[]> };
+    concentration: { date: string; hhi: number; top5: number; top10: number; n_pos: number }[];
+    note: string;
+  };
+  style_attr: {
+    dates: string[]; factors: string[];
+    factor_cum: Record<string, number[]>;
+    common_cum: number[]; specific_cum: number[];
+    totals: Record<string, number>;
+    note: string;
+  };
   risk: Record<string, number | string | null>;
 };
 type HoldingsIdx = { dates: { date: string; nav: number; day_return: number | null }[] };
@@ -70,6 +87,7 @@ export default function BacktestDetailPage() {
   const { runId } = useParams<{ runId: string }>();
   const [tab, setTab] = useState<TabId>('overview');
   const [holdDay, setHoldDay] = useState<string>('');
+  const [brinsonMonth, setBrinsonMonth] = useState<string>('');
 
   // 主数据必须带错误分支：404/500 时给出明确提示，而不是永远"加载中"
   const { data: d, error: mainError } = useSWR<Detail>(runId ? `/backtests/${runId}` : null, get);
@@ -194,9 +212,18 @@ export default function BacktestDetailPage() {
     };
   }, [att]);
 
-  const brinsonOption = useMemo(() => {
-    if (!att?.brinson?.groups?.length) return null;
-    const gs = att.brinson.groups.slice(0, 15);
+  // Brinson 图表（全区间 or 选定月份，与表格共用数据）
+  const activeBrinson = useMemo(() => {
+    if (!att?.brinson) return null;
+    if (!brinsonMonth || !att.brinson_monthly?.months?.length) return att.brinson;
+    const m = att.brinson_monthly.months.find((x) => x.month === brinsonMonth);
+    return m ? { groups: m.groups, excess_total: m.excess_total, note: `${m.month} · ${att.brinson_monthly.note}` }
+             : att.brinson;
+  }, [att, brinsonMonth]);
+
+  const brinsonView = useMemo(() => {
+    if (!activeBrinson?.groups?.length) return null;
+    const gs = activeBrinson.groups.slice(0, 15);
     return {
       tooltip: { ...tooltip, valueFormatter: (v: number) => `${(v * 100).toFixed(2)}%` },
       legend: legend({ data: ['配置', '选股', '交互'], top: 0 }),
@@ -210,6 +237,130 @@ export default function BacktestDetailPage() {
         { name: '选股', type: 'bar', stack: 'b', itemStyle: { color: C.up }, data: gs.map((g) => +g.select.toFixed(4)) },
         { name: '交互', type: 'bar', stack: 'b', itemStyle: { color: C.gold }, data: gs.map((g) => +g.interact.toFixed(4)) },
       ],
+    };
+  }, [activeBrinson]);
+
+  // 择时残差：每日收益中个股解释不掉的部分（费用/滑点/开盘成交择时）
+  const residualOption = useMemo(() => {
+    if (!att?.residual_by_day?.length) return null;
+    return {
+      tooltip: { ...tooltip, valueFormatter: (v: number) => `${(v * 100).toFixed(3)}%` },
+      grid: { left: 55, right: 20, top: 10, bottom: 30 },
+      ...axes(
+        { data: att.residual_by_day.map((r) => r.date) },
+        { axisLabel: { color: C.inkDim, fontSize: 10, formatter: (v: number) => `${(v * 100).toFixed(1)}%` } },
+      ),
+      series: [{ type: 'bar', data: att.residual_by_day.map((r) => ({
+        value: r.residual,
+        itemStyle: { color: r.residual >= 0 ? C.up : C.down },
+      })) }],
+    };
+  }, [att]);
+
+  // 成本拖累：费用/前日净值的逐日累计（残差里费用部分的显式拆出）
+  const costOption = useMemo(() => {
+    if (!att?.cost?.fee_by_day?.length) return null;
+    let acc = 0;
+    const cum = att.cost.fee_by_day.map((r) => { acc += r.drag; return +acc.toFixed(6); });
+    return {
+      tooltip: { ...tooltip, valueFormatter: (v: number) => `${(v * 100).toFixed(3)}%` },
+      grid: { left: 55, right: 20, top: 10, bottom: 30 },
+      ...axes(
+        { data: att.cost.fee_by_day.map((r) => r.date) },
+        { axisLabel: { color: C.inkDim, fontSize: 10, formatter: (v: number) => `${(v * 100).toFixed(1)}%` } },
+      ),
+      series: [{ type: 'line', data: cum, showSymbol: false,
+        lineStyle: { color: C.down, width: 1.4 }, areaStyle: { color: 'rgba(30,124,85,0.10)' }, itemStyle: { color: C.down } }],
+    };
+  }, [att]);
+
+  // 行业暴露时序：按平均权重取前 8，堆叠面积（占比口径）
+  const industryOption = useMemo(() => {
+    const ind = att?.profile?.industry;
+    if (!ind?.dates?.length || !Object.keys(ind.series).length) return null;
+    const keys = Object.keys(ind.series).slice(0, 8);
+    return {
+      tooltip: { ...tooltip, valueFormatter: (v: number) => `${(v * 100).toFixed(1)}%` },
+      legend: legend({ data: keys, top: 0, type: 'scroll' }),
+      grid: { left: 50, right: 20, top: 30, bottom: 30 },
+      xAxis: { type: 'category', data: ind.dates, axisLine: { lineStyle: { color: C.line } }, axisTick: { show: false }, axisLabel: { color: C.inkDim, fontSize: 10 } },
+      yAxis: { type: 'value', max: 1, axisLine: { show: false }, splitLine: { lineStyle: { color: C.line } }, axisLabel: { color: C.inkDim, fontSize: 10, formatter: (v: number) => `${(v * 100).toFixed(0)}%` } },
+      series: keys.map((k, i) => ({
+        name: k, type: 'line', stack: 'ind', showSymbol: false,
+        lineStyle: { width: 0.6, color: SERIES_COLORS[i % SERIES_COLORS.length] },
+        areaStyle: { opacity: 0.55, color: SERIES_COLORS[i % SERIES_COLORS.length] },
+        itemStyle: { color: SERIES_COLORS[i % SERIES_COLORS.length] },
+        data: ind.series[k],
+      })),
+    };
+  }, [att]);
+
+  // 集中度：Top5/Top10 权重 + HHI
+  const concOption = useMemo(() => {
+    const c = att?.profile?.concentration;
+    if (!c?.length) return null;
+    return {
+      tooltip,
+      legend: legend({ data: ['Top5 权重', 'Top10 权重', 'HHI'], top: 0 }),
+      grid: { left: 50, right: 20, top: 30, bottom: 30 },
+      xAxis: { type: 'category', data: c.map((x) => x.date), axisLine: { lineStyle: { color: C.line } }, axisTick: { show: false }, axisLabel: { color: C.inkDim, fontSize: 10 } },
+      yAxis: { type: 'value', axisLine: { show: false }, splitLine: { lineStyle: { color: C.line } }, axisLabel: { color: C.inkDim, fontSize: 10, formatter: (v: number) => `${(v * 100).toFixed(0)}%` } },
+      series: [
+        { name: 'Top5 权重', type: 'line', data: c.map((x) => x.top5), showSymbol: false, lineStyle: { color: C.indigo, width: 1.2 }, itemStyle: { color: C.indigo } },
+        { name: 'Top10 权重', type: 'line', data: c.map((x) => x.top10), showSymbol: false, lineStyle: { color: C.gold, width: 1.2 }, itemStyle: { color: C.gold } },
+        { name: 'HHI', type: 'line', data: c.map((x) => x.hhi), showSymbol: false, lineStyle: { color: C.inkFaint, width: 1, type: 'dashed' }, itemStyle: { color: C.inkFaint } },
+      ],
+    };
+  }, [att]);
+
+  // 风格暴露漂移：时序 z 分数标准化（量纲不同，只看漂移方向与幅度）
+  const styleExposureOption = useMemo(() => {
+    const st = att?.profile?.style;
+    if (!st?.dates?.length || !Object.keys(st.series).length) return null;
+    const keys = Object.keys(st.series);
+    const zOf = (vals: number[]) => {
+      const mean = vals.reduce((s, v) => s + v, 0) / vals.length;
+      const sd = Math.sqrt(vals.reduce((s, v) => s + (v - mean) ** 2, 0) / vals.length);
+      return sd > 1e-12 ? vals.map((v) => +((v - mean) / sd).toFixed(4)) : vals.map(() => 0);
+    };
+    return {
+      tooltip,
+      legend: legend({ data: keys, top: 0, type: 'scroll' }),
+      grid: { left: 45, right: 20, top: 30, bottom: 30 },
+      xAxis: { type: 'category', data: st.dates, axisLine: { lineStyle: { color: C.line } }, axisTick: { show: false }, axisLabel: { color: C.inkDim, fontSize: 10 } },
+      yAxis: { type: 'value', axisLine: { show: false }, splitLine: { lineStyle: { color: C.line } }, axisLabel: { color: C.inkDim, fontSize: 10 } },
+      series: keys.map((k, i) => ({
+        name: k, type: 'line', showSymbol: false,
+        lineStyle: { color: SERIES_COLORS[i % SERIES_COLORS.length], width: 1.2 },
+        itemStyle: { color: SERIES_COLORS[i % SERIES_COLORS.length] },
+        data: zOf(st.series[k]),
+      })),
+    };
+  }, [att]);
+
+  // 风格收益归因：逐日截面回归的因子累计贡献 vs 特异收益（alpha）
+  const styleAttrOption = useMemo(() => {
+    const sa = att?.style_attr;
+    if (!sa?.dates?.length) return null;
+    const names = [...sa.factors, '特异收益(Alpha)'];
+    const series = sa.factors.map((k, i) => ({
+      name: k, type: 'line', showSymbol: false,
+      lineStyle: { color: SERIES_COLORS[i % SERIES_COLORS.length], width: 1.2 },
+      itemStyle: { color: SERIES_COLORS[i % SERIES_COLORS.length] },
+      data: sa.factor_cum[k],
+    }));
+    series.push({
+      name: '特异收益(Alpha)', type: 'line', showSymbol: false,
+      lineStyle: { color: C.up, width: 1.8 }, itemStyle: { color: C.up },
+      data: sa.specific_cum,
+    });
+    return {
+      tooltip: { ...tooltip, valueFormatter: (v: number) => `${(v * 100).toFixed(2)}%` },
+      legend: legend({ data: names, top: 0, type: 'scroll' }),
+      grid: { left: 55, right: 20, top: 30, bottom: 30 },
+      xAxis: { type: 'category', data: sa.dates, axisLine: { lineStyle: { color: C.line } }, axisTick: { show: false }, axisLabel: { color: C.inkDim, fontSize: 10 } },
+      yAxis: { type: 'value', axisLine: { show: false }, splitLine: { lineStyle: { color: C.line } }, axisLabel: { color: C.inkDim, fontSize: 10, formatter: (v: number) => `${(v * 100).toFixed(1)}%` } },
+      series,
     };
   }, [att]);
 
@@ -383,13 +534,31 @@ export default function BacktestDetailPage() {
                 <span className="tag">基准 {String(att.risk.benchmark ?? d.benchmark_label)}</span>
                 <span className="tag">跟踪误差 {pct(typeof att.risk.tracking_error === 'number' ? att.risk.tracking_error : null)}</span>
                 <span className="tag">参与个股 {att.stock_contribution.n_stocks}</span>
+                {att.cost && (
+                  <span className="tag">费用拖累 <span className="text-down">{pct(att.cost.total_drag)}</span>（¥{num(att.cost.total_fee, 0)}）</span>
+                )}
+                {att.style_attr?.totals && (
+                  <span className="tag">特异 α <span className={retCls(att.style_attr.totals.specific)}>{pct(att.style_attr.totals.specific)}</span></span>
+                )}
               </div>
               <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
                 <Panel title="个股收益贡献" meta="正 / 负 前 12">
                   {contribOption ? <Chart option={contribOption} height={420} /> : <div className="text-sm text-ink-faint">无持仓数据</div>}
                 </Panel>
-                <Panel title="分组 Brinson 归因" meta={att.brinson.note}>
-                  {brinsonOption && <Chart option={brinsonOption} height={260} />}
+                <Panel
+                  title="分组 Brinson 归因"
+                  meta={activeBrinson?.note}
+                  actions={att.brinson_monthly?.months?.length ? (
+                    <select className="input text-xs" value={brinsonMonth}
+                      onChange={(e) => setBrinsonMonth(e.target.value)}>
+                      <option value="">全区间</option>
+                      {[...att.brinson_monthly.months].reverse().map((m) => (
+                        <option key={m.month} value={m.month}>{m.month}</option>
+                      ))}
+                    </select>
+                  ) : undefined}
+                >
+                  {brinsonView && <Chart option={brinsonView} height={260} />}
                   <table className="table-dense mt-3 text-xs">
                     <thead>
                       <tr>
@@ -398,7 +567,7 @@ export default function BacktestDetailPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {att.brinson.groups.map((g) => (
+                      {(activeBrinson?.groups ?? []).map((g) => (
                         <tr key={g.group} className="hover:bg-white">
                           <td>{g.group}</td>
                           <td className={`text-right ${retCls(g.alloc)}`}>{pct(g.alloc)}</td>
@@ -410,14 +579,79 @@ export default function BacktestDetailPage() {
                       <tr className="font-semibold">
                         <td>合计</td>
                         <td colSpan={3} />
-                        <td className={`text-right ${retCls(att.brinson.excess_total)}`}>
-                          {pct(att.brinson.excess_total)}
+                        <td className={`text-right ${retCls(activeBrinson?.excess_total ?? null)}`}>
+                          {pct(activeBrinson?.excess_total ?? null)}
                         </td>
                       </tr>
                     </tbody>
                   </table>
                 </Panel>
               </div>
+              <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+                <Panel title="择时残差" meta="个股解释不掉的日收益（费用/滑点/择时）">
+                  {residualOption ? <Chart option={residualOption} height={220} />
+                    : <div className="text-sm text-ink-faint">无残差数据</div>}
+                </Panel>
+                <Panel title="成本拖累（累计）"
+                  meta={att.cost ? `合计 ¥${num(att.cost.total_fee, 0)} · 拖累 ${pct(att.cost.total_drag)}` : undefined}>
+                  {costOption ? <Chart option={costOption} height={220} />
+                    : <div className="text-sm text-ink-faint">无费用记录（零费率运行）</div>}
+                </Panel>
+              </div>
+              <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+                <Panel title="行业暴露时序" meta={att.profile?.note}>
+                  {industryOption ? <Chart option={industryOption} height={280} />
+                    : <div className="text-sm text-ink-faint">无行业映射数据</div>}
+                </Panel>
+                <Panel title="持仓集中度" meta="Top5 / Top10 权重与 HHI">
+                  {concOption ? <Chart option={concOption} height={280} />
+                    : <div className="text-sm text-ink-faint">无持仓数据</div>}
+                </Panel>
+              </div>
+              <Panel title="风格暴露漂移" meta="时序 z 分数标准化（量纲不同，只看漂移方向）">
+                {styleExposureOption ? <Chart option={styleExposureOption} height={260} />
+                  : <div className="text-sm text-ink-faint">无风格数据（日线缺估值/市值列）</div>}
+              </Panel>
+              <Panel title="风格收益归因" meta={att.style_attr?.note}>
+                {styleAttrOption ? (
+                  <>
+                    <Chart option={styleAttrOption} height={300} />
+                    <table className="table-dense mt-3 text-xs">
+                      <thead>
+                        <tr>
+                          <th className="text-left">来源</th><th className="text-right">累计贡献</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {att.style_attr.factors.map((k) => (
+                          <tr key={k} className="hover:bg-white">
+                            <td>{k}</td>
+                            <td className={`text-right ${retCls(att.style_attr.totals[k])}`}>
+                              {pct(att.style_attr.totals[k])}
+                            </td>
+                          </tr>
+                        ))}
+                        <tr className="hover:bg-white">
+                          <td>共同因子合计</td>
+                          <td className={`text-right ${retCls(att.style_attr.totals.common)}`}>
+                            {pct(att.style_attr.totals.common)}
+                          </td>
+                        </tr>
+                        <tr className="font-semibold">
+                          <td>特异收益（Alpha）</td>
+                          <td className={`text-right ${retCls(att.style_attr.totals.specific)}`}>
+                            {pct(att.style_attr.totals.specific)}
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </>
+                ) : (
+                  <div className="text-sm text-ink-faint">
+                    {att.style_attr?.note ?? '风格归因不可用'}
+                  </div>
+                )}
+              </Panel>
             </>
           )}
         </>
