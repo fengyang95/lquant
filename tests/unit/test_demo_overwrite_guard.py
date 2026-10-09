@@ -187,3 +187,40 @@ def test_generate_demo_still_works_on_empty_lake(lake_env):
     assert len(lake) > 0
     assert set(lake["source"].to_list()) == {"demo"}
     assert lake["symbol"].n_unique() == 30      # 20 股 + 10 ETF
+
+
+def test_generate_demo_is_self_consistent_for_downstream(lake_env):
+    """演示环境必须自带下游要用的**全部**输入。
+
+    缺 `daily_basic` / `financial_pit` / `index_daily` 的表现不是报错，而是
+    个股与行业分析的估值 / 景气度 / 相对强度角度**安静地**变成
+    ``available=false`` —— 从页面上分不出「演示环境没有这个数据」还是
+    「代码坏了」。这是 float_mv / industry_classify 当初被补进来的同一个理由。
+    """
+    from lquant.core.db import reader
+    from lquant.data.ingest.demo import generate_demo
+    from lquant.data.store.parquet import read_daily_basic
+
+    out = generate_demo(start="2024-01-01", end="2024-03-31")
+    assert out["daily_basic_rows"] > 0
+    assert out["financial_rows"] > 0
+    assert out["index_rows"] > 0
+
+    basic = read_daily_basic()
+    assert basic.height > 0
+    # 估值列必须像真实 provider 一样可正可算，而不是全 NULL
+    assert basic["pe_ttm"].drop_nulls().len() > 0
+    assert basic["pb_mrq"].drop_nulls().len() > 0
+
+    with reader() as con:
+        items = {r[0] for r in con.execute(
+            "SELECT DISTINCT item FROM financial_pit").fetchall()}
+        assert "indicator.roe" in items
+        assert "indicator.netprofit_yoy" in items
+        # PIT 语义：每条财务都有公告日，否则前视门禁形同虚设
+        assert con.execute(
+            "SELECT count(*) FROM financial_pit WHERE pub_date IS NULL"
+        ).fetchone()[0] == 0
+        assert con.execute(
+            "SELECT count(*) FROM index_daily WHERE symbol = '000300.SH'"
+        ).fetchone()[0] > 0

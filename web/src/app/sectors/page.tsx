@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import Link from 'next/link';
 import useSWR from 'swr';
 import PageHeader from '@/components/PageHeader';
 import { Panel } from '@/components/Panel';
@@ -40,7 +41,16 @@ export default function SectorsPage() {
 
   return (
     <div className="space-y-5">
-      <PageHeader title="板块" sub={<>板块涨跌与主力净流入 · {latestDate ?? '暂无数据'}</>} />
+      <PageHeader
+        title="板块"
+        sub={
+          <>
+            当日快照：板块涨跌与主力净流入 · {latestDate ?? '暂无数据'}
+            {' '}· 需要历史比较与景气/估值分析请用
+            <Link href="/industry" className="ml-1 underline hover:text-ink">行业分析</Link>
+          </>
+        }
+      />
 
       <div className="flex gap-2">
         {KINDS.map((k) => (

@@ -16,4 +16,12 @@ describe('Sidebar', () => {
     render(<Sidebar />);
     expect(screen.queryByText('策略编辑')).not.toBeInTheDocument();
   });
+
+  it('个股分析与行业分析成对出现在「市场」组', () => {
+    render(<Sidebar />);
+    expect(screen.getByRole('link', { name: '个股分析' }))
+      .toHaveAttribute('href', '/security');
+    expect(screen.getByRole('link', { name: '行业分析' }))
+      .toHaveAttribute('href', '/industry');
+  });
 });

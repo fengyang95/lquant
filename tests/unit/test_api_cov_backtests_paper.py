@@ -57,7 +57,9 @@ def api_env(tmp_path_factory):
     })
     with writer() as con:
         con.register("_idx", idx)
-        con.execute("INSERT INTO index_daily SELECT *, NULL FROM _idx")
+        # OR REPLACE：generate_demo 现在也会补一段演示指数日线（基准相关角度
+        # 需要它），与本用例要固定的基准值有日期重叠 —— 用本用例的值覆盖。
+        con.execute("INSERT OR REPLACE INTO index_daily SELECT *, NULL FROM _idx")
     yield base
     os.chdir(prev_cwd)
     get_settings.cache_clear()

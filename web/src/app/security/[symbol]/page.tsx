@@ -131,6 +131,10 @@ export default function SecurityPage() {
     ? quote.change_pct / 100
     : price && prev?.close ? price / prev.close - 1 : null;
   const name = quote?.name;
+  // 个股分析报告里带了所属行业（PIT 归属）—— 拿它做个股 ↔ 行业 的互链，
+  // 不用再单独请求一次行业接口。
+  const industryName = (analysis as { overview?: { industry?: string } } | undefined)
+    ?.overview?.industry;
 
   const lastV = (k: string) => (last ? (last[k] as number | null) ?? null : null);
 
@@ -179,9 +183,20 @@ export default function SecurityPage() {
         title="多角度分析"
         meta="技术 · 基本面 · 估值 · 资金 · 相对强度 · 消息面"
         actions={
-          <button className="btn text-xs" onClick={() => router.push('/security')}>
-            换一个代码
-          </button>
+          <div className="flex items-center gap-2">
+            {/* 个股 ↔ 行业 互链：行业分析按名称解析，不用另取代码 */}
+            {industryName ? (
+              <Link
+                href={`/industry/${encodeURIComponent(industryName)}`}
+                className="btn text-xs"
+              >
+                所属行业：{industryName}
+              </Link>
+            ) : null}
+            <button className="btn text-xs" onClick={() => router.push('/security')}>
+              换一个代码
+            </button>
+          </div>
         }
       >
         {analysisLoading

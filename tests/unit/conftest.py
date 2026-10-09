@@ -15,6 +15,19 @@ def _isolate_fundamentals_cache():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_industry_cache():
+    """行业分析的全市场面板缓存也是进程级、键不含数据源身份
+    （``(asof, std, lookback_days)``）。不清的话，一个「合成演示湖」用例的结果
+    会被另一个用不同 tmp 湖、但同一观察日的用例命中 —— 表现为「换个库结论不变」，
+    查起来非常费劲。与 ``_isolate_fundamentals_cache`` 同一个理由。"""
+    from lquant.industry.loader import clear_industry_cache
+
+    clear_industry_cache()
+    yield
+    clear_industry_cache()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_report_dir(tmp_path, monkeypatch):
     """把报告目录指到 tmp —— 用例不许往真实的 ``data/reports`` 写文件。
 

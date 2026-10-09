@@ -19,6 +19,7 @@ from datetime import date
 
 import polars as pl
 
+from lquant.core import report as _report
 from lquant.security.contract import (
     BEARISH,
     BULLISH,
@@ -29,6 +30,14 @@ from lquant.security.contract import (
     to_score,
     unavailable,
 )
+
+# 通用原语以短名复用（``core.report`` 是指标构造 / 方向映射 / 数值清洗的
+# 唯一实现源，个股与行业分析共用）。保留 ``_f`` / ``_pct`` / ``_sig`` /
+# ``_tanh_norm`` 这些本模块内部惯用名，调用点不必改写。
+_f = _report.safe_float
+_pct = _report.pct_text
+_sig = _report.signal_of
+_tanh_norm = _report.tanh_norm
 
 #: 技术指标集合（注册名，见 /data/indicators/registry）。
 _TECH_INDICATORS = ("ma", "macd", "rsi", "boll", "kdj", "volume_ratio", "turnover_ma")
@@ -47,41 +56,6 @@ _MIN_PEERS = 5
 
 #: 估值自身历史分位所需的最少数据点。
 _MIN_VALUATION_HISTORY = 60
-
-
-def _sig(direction: float, signal: str | None = None) -> str:
-    """方向值 → 信号标签。"""
-    if signal:
-        return signal
-    if direction > 0.15:
-        return BULLISH
-    if direction < -0.15:
-        return BEARISH
-    return NEUTRAL_SIGNAL
-
-
-def _f(v) -> float | None:
-    """安全转 float（None/NaN/非数 → None）。"""
-    if v is None:
-        return None
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return None
-    return None if (math.isnan(f) or math.isinf(f)) else f
-
-
-def _tanh_norm(x: float | None, scale: float) -> float | None:
-    """把无界量（收益、比率）压到 -1..1。``scale`` 是「算作满分」的量级。"""
-    if x is None or scale <= 0:
-        return None
-    return math.tanh(x / scale)
-
-
-def _pct(v: float | None, digits: int = 2, suffix: str = "%") -> str | None:
-    if v is None:
-        return None
-    return f"{v:.{digits}f}{suffix}"
 
 
 def _ret(close: list[float], n: int) -> float | None:
