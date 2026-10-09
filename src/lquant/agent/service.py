@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
@@ -37,6 +38,18 @@ class AgentService(ABC):
         #: ``add_message`` 的 await 上，那时拿不到返回值，只能靠预先登记的 id
         #: 找到目标行补文案（见 ``_mark_interrupted``）。
         self._ans_id: dict[str, str] = {}
+
+    def trace_emitter(self, sid: str, on_event: Emit) -> Emit:
+        """把 on_event 包成「带留痕」的版本（见 agent/trace.py）。
+
+        放在基类、由 provider 在跑之前包一次：留痕是**过程数据的一次落库**，
+        不该由调用方（HTTP / A2A / 测试）各自记得去挂 —— 那样迟早有一条路径漏掉。
+        """
+        from lquant.agent.trace import TracedEmitter  # noqa: PLC0415
+
+        return TracedEmitter(sid, run_id=uuid.uuid4().hex, emit=on_event,
+                             sink=self.store.add_tool_trace,
+                             msg_id=lambda: self._ans_id.get(sid, ""))
 
     async def _mark_interrupted(self, sid: str) -> None:
         """取消留痕：给本轮的 assistant 消息补一句「（已中断）」。

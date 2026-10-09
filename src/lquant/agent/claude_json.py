@@ -115,8 +115,10 @@ def _parse_user(obj: dict[str, Any]) -> list[dict[str, Any]]:
         else:
             text = json.dumps(content, ensure_ascii=False, default=str)
         summary = text[:_SUMMARY_LEN]
+        data = {"is_error": True} if block.get("is_error") else None
         events.append(_event("tool_result", text=text, summary=summary,
-                             tool_use_id=str(block.get("tool_use_id") or "")))
+                             tool_use_id=str(block.get("tool_use_id") or ""),
+                             data=data))
     return events
 
 

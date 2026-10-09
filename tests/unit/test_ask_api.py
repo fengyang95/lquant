@@ -298,3 +298,37 @@ async def test_update_config_unknown_session_404(client):
     r = await client.patch("/api/ask/sessions/nope/config", json={"skills": ["alpha"]})
     assert r.status_code == 404, r.text
     assert "会话不存在" in r.json()["message"]
+
+
+
+# ---- P0-7：留痕与结论读取端点 ----
+
+async def test_trace_and_verdicts_empty(client):
+    r = await client.post("/api/ask/sessions", json=None)
+    sid = r.json()["data"]["id"]
+    r = await client.get(f"/api/ask/sessions/{sid}/trace")
+    assert r.status_code == 200 and r.json()["data"] == []
+    r = await client.get(f"/api/ask/sessions/{sid}/verdicts")
+    assert r.status_code == 200 and r.json()["data"] == []
+
+
+async def test_trace_and_verdicts_404_on_unknown_session(client):
+    assert (await client.get("/api/ask/sessions/nope/trace")).status_code == 404
+    assert (await client.get("/api/ask/sessions/nope/verdicts")).status_code == 404
+
+
+async def test_trace_and_verdicts_return_persisted_rows(client):
+    svc = await get_agent_service()
+    sid = (await client.post("/api/ask/sessions", json=None)).json()["data"]["id"]
+    await svc.store.add_tool_trace({
+        "session_id": sid, "name": "get_daily", "seq": 1, "args_json": "{}",
+        "status": "ok", "summary": "60 根", "as_of": "2026-10-08"})
+    await svc.store.add_verdict(sid, {
+        "ticker": "600519.SH", "as_of": "2026-10-08", "direction": "看多",
+        "confidence": 0.6, "abstain": 0, "summary": "s",
+        "payload_json": "{}", "withheld_json": "[]"})
+    rows = (await client.get(f"/api/ask/sessions/{sid}/trace")).json()["data"]
+    assert len(rows) == 1 and rows[0]["name"] == "get_daily"
+    assert rows[0]["as_of"] == "2026-10-08" and rows[0]["status"] == "ok"
+    vs = (await client.get(f"/api/ask/sessions/{sid}/verdicts")).json()["data"]
+    assert len(vs) == 1 and vs[0]["ticker"] == "600519.SH"

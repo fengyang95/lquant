@@ -65,6 +65,7 @@ class MockAgentService(AgentService):
         return user_msg
 
     async def _run(self, sid, content, context, on_event) -> None:
+        on_event = self.trace_emitter(sid, on_event)   # 与 cli provider 同口径
         rows = []
         symbol = _extract_symbol(content, context)
         tc = {"name": "market_overview", "args": {}}
