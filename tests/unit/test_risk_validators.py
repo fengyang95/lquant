@@ -293,3 +293,46 @@ def test_risk_rules_endpoint_lists_and_filters():
             "duplicate_side", "insufficient_cash", "valid_order", "drawdown_breaker"}
         assert c.get("/api/backtests/risk-rules",
                      params={"scope": "nope"}).status_code == 422
+
+
+def test_gate_result_dropped_and_describe():
+    orders = [_order("o1", "600519.SH", Side.BUY, 0)]
+    gate = PreTradeGate(["valid_order"])
+    res = gate.apply(_ctx(orders))
+    assert res.dropped == ["600519.SH"]
+    assert gate.describe() == [RISK_RULES.meta("valid_order")]
+
+
+def test_sector_rule_noop_without_buys_and_under_cap():
+    """只有卖单 → 没有建仓可评估；行业在上限内 → 不动。"""
+    gate = PreTradeGate(["sector_exposure"], {"max_sector_weight": 0.1})
+    sells = [_order("o1", "600519.SH", Side.SELL, 100)]
+    assert gate.apply(_ctx(sells, sector={"600519.SH": "801080"})).violations == []
+    # 一个行业超限、另一个远低于上限：只动超的那个
+    orders = [_order("o1", "600519.SH", Side.BUY, 10_000),   # 100 万 → 1.0
+              _order("o2", "000001.SZ", Side.BUY, 100)]      # 5000 元 → 0.005
+    ctx = _ctx(orders, sector={"600519.SH": "801080", "000001.SZ": "801780"})
+    res = gate.apply(ctx)
+    assert [o.order_id for o in res.orders] == ["o2"]
+    assert [v.symbol for v in res.violations] == ["600519.SH"]
+
+
+# ---------- 模拟盘接线 ----------
+
+def test_paper_broker_applies_per_order_risk_chain():
+    from lquant.paper.engine import PaperBroker, PaperConfig
+
+    broker = PaperBroker(PaperConfig(initial_cash=1_000_000.0))
+    assert broker.gate.names == ["duplicate_side", "insufficient_cash", "valid_order"]
+    # valid_order 在模拟盘同样生效：价格为 0 → 风控拒单（带规则名与可读原因）
+    o = broker.submit("600519.SH", "buy", 100, 0.0, name="贵州茅台")
+    assert o.status == "rejected" and o.rule == "valid_order"
+    assert o.reason.startswith("风控: ")
+
+
+def test_paper_broker_rejects_batch_only_rules():
+    """模拟盘逐单场景点名整批规则 → 构造时就报错，不许静默少跑。"""
+    from lquant.paper.engine import PaperBroker, PaperConfig
+
+    with pytest.raises(ValueError, match="需要整批上下文"):
+        PaperBroker(PaperConfig(risk_rules=("sector_exposure",)))
