@@ -53,6 +53,7 @@ class MLResult:
 
 
 def train_and_predict(ds: Dataset, train_end, valid_end, *, test_end=None,
+                      window: dict | None = None,
                       kind: str = "auto", n_seeds: int = 1,
                       signal_col: str = "ml_signal", **params) -> MLResult:
     """按日期切分训练，输出测试集的预测信号。
@@ -65,10 +66,20 @@ def train_and_predict(ds: Dataset, train_end, valid_end, *, test_end=None,
     数据末端，早期窗口的"样本外"指标会把后面所有窗口的数据都算进来，
     越早的窗口看起来越好（未来信息泄漏进评估）。
 
+    ``window``：``walk_forward_splits(..., purge_bars/embargo_bars)`` 返回的
+    带缺口区间。给了它就走 :meth:`Dataset.split_window`（缺口如实跳过），
+    否则退回连续边界切分。滚动重训带了 purge/embargo 时必须给 —— 用连续的
+    ``split`` 重建会把隔离带并回训练段，purge 白做。
+
     ``n_seeds > 1`` 时训 N 个种子取均值（``EnsembleModel``），
     压低单次训练对随机种子的敏感性；代价是训练时间 ×N。
     """
-    train_raw, _, test_raw = ds.split(train_end, valid_end, test_end)
+    if window is not None:
+        train_raw, _, test_raw = ds.split_window(window)
+        if test_end is None:
+            test_end = window["test"][1]
+    else:
+        train_raw, _, test_raw = ds.split(train_end, valid_end, test_end)
     if not len(train_raw) or not len(test_raw):
         raise ValueError("训练集或测试集为空，检查切分日期")
 

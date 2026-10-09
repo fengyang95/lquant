@@ -323,6 +323,78 @@ DDL_STATEMENTS: list[str] = [
         updated_at  TIMESTAMP DEFAULT now()
     )
     """,
+    # B5 条件级事后核验：冻结的研究判断 + 逐次核验结果。
+    # 拆两张表而不是一张带状态列的表：条件本身**不可变**（锚点/阈值/历史指纹
+    # 一旦冻结就不许改写，否则事后对账失去意义），核验结果则随窗口推进**多版本**
+    # 累积。混在一张表里，「同条件重复核验幂等」就得先擦掉旧结果 —— 那正好把
+    # 「窗口未走完时怎么判、走完后怎么判」的演进过程抹掉了。
+    """
+    CREATE TABLE IF NOT EXISTS research_condition (
+        condition_id   VARCHAR PRIMARY KEY,   -- 内容哈希：同条件重冻结不新增行
+        symbol         VARCHAR,
+        as_of          DATE,                  -- 做出判断的交易日（锚点所在日）
+        anchor         DOUBLE,                -- 冻结时的收盘价锚点，程序算出，不许事后编造
+        conditions     JSON,                  -- [{metric,op,threshold,avg_days}, ...]
+        window_days    INTEGER,               -- 「未来 N 个交易日内」
+        note           VARCHAR,
+        overlap_closes JSON,                  -- as_of 前的重叠收盘价指纹，用于检测复权/修订
+        created_at     TIMESTAMP DEFAULT now()
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS research_verify_result (
+        condition_id    VARCHAR,
+        checked_through DATE,                 -- 本次核验用到的最近已完成交易日
+        verdict         VARCHAR,              -- triggered / not_triggered / unavailable / unverifiable
+        window_complete BOOLEAN,              -- 窗口是否已走完（与「未命中」是两件事）
+        checked_days    INTEGER,
+        missing_days    JSON,                 -- 窗口内缺日线的会话（停牌/采集缺失，不跳过）
+        evidence        JSON,                 -- 逐日逐条件：实际值 / 阈值 / 是否命中
+        reason          VARCHAR,
+        created_at      TIMESTAMP DEFAULT now(),
+        PRIMARY KEY (condition_id, checked_through)
+    )
+    """,
+    # B4 研判闭环：不可变研判快照 + 逐次对账结果。
+    # 拆表理由同 B5：研判快照**落库即不可改**（改判只能另起一个交易日的新研判），
+    # 而「窗口推进到哪一天、当时怎么判」必须多版本累积。合成一张带状态列的表，
+    # 就会为了更新状态而重写快照 —— 那正好把「当时写了什么」抹掉。
+    #
+    # `UNIQUE (trade_date)`：一个交易日**只允许一条**研判快照。应用层已经会对
+    # 「同内容重复记录」幂等返回、对「同交易日不同内容」显式报错，这里再加一道
+    # 数据库约束：并发写入也绝不会悄无声息地多出一行「改判版本」。
+    """
+    CREATE TABLE IF NOT EXISTS research_outlook (
+        outlook_id   VARCHAR PRIMARY KEY,   -- 内容哈希：同内容重复记录不新增行
+        trade_date   DATE,                  -- 做出研判的交易日（收盘后）
+        market_state VARCHAR,
+        evidence     JSON,                  -- 冻结的当时证据（regime 全量输出等）
+        scenarios    JSON,
+        directions   JSON,
+        focus_next   JSON,
+        checklist    JSON,                  -- 冻结后的可核验清单（含 FrozenCondition 全文）
+        notes        VARCHAR,
+        weights      JSON,                  -- 记录时使用的维度权重口径
+        created_at   TIMESTAMP DEFAULT now(),
+        UNIQUE (trade_date)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS research_outlook_validation (
+        outlook_id      VARCHAR,
+        checked_through DATE,               -- 本次对账用到的最近已完成交易日
+        final           BOOLEAN,            -- 是否全部清单项窗口已走完
+        score           DOUBLE,             -- 0~100；分母**只含已判定项**，未判定不拉低分数
+        coverage        DOUBLE,             -- 已判定权重 / 全部权重（未判定留在分母里，不消失）
+        counts          JSON,
+        dimensions      JSON,
+        items           JSON,
+        lessons         JSON,
+        realized_risks  JSON,
+        created_at      TIMESTAMP DEFAULT now(),
+        PRIMARY KEY (outlook_id, checked_through)
+    )
+    """,
 ]
 
 # 注意：daily_bar / minute_bar 两张 DuckDB 表是**遗留占位**。
@@ -473,6 +545,30 @@ def ensure_factor_ic_daily(con) -> int:
     在老库上都撞到过裸的 ``CatalogException``。返回 1 = 本次建了表。
     """
     return _ensure_table(con, "factor_ic_daily")
+
+
+def ensure_research_verify_tables(con) -> int:
+    """按需补建条件核验两张表（research_condition / research_verify_result）。
+
+    这两张表只进了 ``DDL_STATEMENTS``（init_db / 服务启动才执行）：老库或
+    隔离测试库上直接写核验记录会撞裸 ``CatalogException`` —— 而「冻结了却
+    没记下来」正是本功能要消灭的静默失败（下次没人知道当时判断的是什么）。
+    惰性补建让老库自愈。返回本次建表数（0~2），幂等。
+    """
+    return (_ensure_table(con, "research_condition")
+            + _ensure_table(con, "research_verify_result"))
+
+
+def ensure_research_journal_tables(con) -> int:
+    """按需补建研判闭环两张表（research_outlook / research_outlook_validation）。
+
+    同 ``ensure_research_verify_tables``：这两张表只进了 ``DDL_STATEMENTS``，
+    老库/隔离测试库上直接写研判快照会撞裸 ``CatalogException`` —— 而「判断
+    说了却没留痕」正是本功能要消灭的静默失败。惰性补建让老库自愈。
+    返回本次建表数（0~2），幂等。
+    """
+    return (_ensure_table(con, "research_outlook")
+            + _ensure_table(con, "research_outlook_validation"))
 
 
 def ensure_ml_run_columns(con) -> int:

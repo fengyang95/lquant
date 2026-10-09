@@ -53,7 +53,12 @@ from loguru import logger
 
 from lquant.backtest.account import Account
 from lquant.backtest.broker import Broker
-from lquant.backtest.engine import Engine, build_rules
+from lquant.backtest.engine import (
+    Engine,
+    _annotate_no_price_limit,
+    _listing_dates_from_meta,
+    build_rules,
+)
 from lquant.backtest.events import Bar, Fill, Order, Side
 from lquant.backtest.jq_fundamentals import JQFundamentalsState
 from lquant.backtest.metrics import perf_from_returns, turnover_from_trades
@@ -248,8 +253,15 @@ class _SecData:
             # 涨跌停价必须与撮合口径同源（含 tick 取整与 ST 分板规则）：
             # 此前硬编码 ±10%，ST 股显示 11.0/9.0 而撮合实际按 10.5/9.5 拒单，
             # 策略看到的上限与真实可成交边界不一致。
-            up = rules.limit_up(base, is_st=bar.is_st) if rules is not None else None
-            down = rules.limit_down(base, is_st=bar.is_st) if rules is not None else None
+            # no_price_limit 必须一并透传：否则注册制新股上市前 5 个交易日
+            # （无涨跌幅）在策略眼里仍是 ±10/20%，策略看到的上限与真实
+            # 可成交边界不一致 —— 与上面 ST 分板同源的同一类错误。
+            up = (rules.limit_up(base, is_st=bar.is_st,
+                                 no_price_limit=bar.no_price_limit)
+                  if rules is not None else None)
+            down = (rules.limit_down(base, is_st=bar.is_st,
+                                     no_price_limit=bar.no_price_limit)
+                    if rules is not None else None)
             self.high_limit = up if up is not None else round(base * 1.1, 2)
             self.low_limit = down if down is not None else round(base * 0.9, 2)
         self.name = name
@@ -1143,7 +1155,8 @@ class JQRunner:
         return Bar(symbol=bar.symbol, trade_date=bar.trade_date, open=ref, high=bar.high,
                    low=bar.low, close=bar.close, pre_close=bar.pre_close,
                    volume=bar.volume, amount=bar.amount, halted=bar.halted,
-                   suspended=bar.suspended, no_volume=bar.no_volume, is_st=bar.is_st)
+                   suspended=bar.suspended, no_volume=bar.no_volume, is_st=bar.is_st,
+                   no_price_limit=bar.no_price_limit)
 
     # ---- 调度 ----
 
@@ -1304,6 +1317,12 @@ class JQRunner:
         # fund_type→T+0、ETF 跟踪指数涨跌幅、退市核销。
         self._security_meta_resolved = merge_meta(
             _load_security_meta(), self._security_meta)
+        # 逐日「上市初期无涨跌幅」标记：与原生 Engine 路径同源同函数 ——
+        # bars 在 prepare() 时就已构建，此处按 security 表的上市日补标
+        # （只填 None，数据层显式给过的值优先）。缺了这一步，JQ 方言策略
+        # 会把注册制新股上市前 5 个交易日的无涨跌幅日当成普通涨跌停日。
+        _annotate_no_price_limit(
+            bars_by_day, _listing_dates_from_meta(self._security_meta_resolved))
         self._rules = build_rules(symbols, ruleset, self._security_meta_resolved,
                                   with_db_meta=False)
         self._broker = Broker(self._rules, self._slippage)

@@ -99,9 +99,12 @@ def test_slice_by_str_dates():
 def test_split_three_parts_disjoint():
     ds = build_dataset(make_panel(), DatasetConfig(features=["mom"]))
     tr, va, te = ds.split(date(2024, 1, 20), date(2024, 1, 28))
-    # 标签 fwd_ret_5 读 4 个交易日后的价格：train 尾回退 horizon-1=4 天
-    # （purge），否则 train 末 4 天的样本用 valid 段价格算标签 —— 泄漏
-    assert tr["trade_date"].max() == date(2024, 1, 16)
+    # 标签 fwd_ret_5 = close[t+5]/close[t]-1：训练样本 i 会读到索引 i+5 的价格。
+    # 要完全不碰 valid（首日 01-21），需要 i+5 <= (train_end 的索引)，
+    # 即 train 尾回退 **horizon=5** 天 → 停在 01-15。
+    # 回退 horizon-1=4 天（停在 01-16）会漏掉边界那 1 个样本：01-16 的标签
+    # 恰好读 01-21（valid 首日）—— 静默泄漏，已修正。
+    assert tr["trade_date"].max() == date(2024, 1, 15)
     assert va["trade_date"].min() == date(2024, 1, 21)
     assert va["trade_date"].max() == date(2024, 1, 28)
     assert te["trade_date"].min() == date(2024, 1, 29)
@@ -172,6 +175,122 @@ def test_walk_forward_basic():
 def test_walk_forward_short_data():
     dates = [date(2024, 1, 1), date(2024, 2, 1)]
     assert walk_forward_splits(dates) == []
+
+
+def test_walk_forward_default_matches_frozen_baseline():
+    """回归保护：默认参数（purge=embargo=0）必须与改动前**逐元素一致**。
+
+    期望值是加 purge/embargo **之前**跑出来的原始输出，逐字冻结在此。
+    只要默认路径被动过，这条就会红。
+    """
+    dates = [date(2020, 1, 1) + timedelta(days=i * 30) for i in range(48)]
+    out = walk_forward_splits(dates, train_months=12, valid_months=3,
+                              test_months=3, step_months=3)
+    expected = [
+        {'train': ('2020-01-01', '2021-01-01'), 'valid': ('2021-01-01', '2021-04-01'),
+         'test': ('2021-04-01', '2021-07-01')},
+        {'train': ('2020-04-01', '2021-04-01'), 'valid': ('2021-04-01', '2021-07-01'),
+         'test': ('2021-07-01', '2021-10-01')},
+        {'train': ('2020-07-01', '2021-07-01'), 'valid': ('2021-07-01', '2021-10-01'),
+         'test': ('2021-10-01', '2022-01-01')},
+        {'train': ('2020-10-01', '2021-10-01'), 'valid': ('2021-10-01', '2022-01-01'),
+         'test': ('2022-01-01', '2022-04-01')},
+        {'train': ('2021-01-01', '2022-01-01'), 'valid': ('2022-01-01', '2022-04-01'),
+         'test': ('2022-04-01', '2022-07-01')},
+        {'train': ('2021-04-01', '2022-04-01'), 'valid': ('2022-04-01', '2022-07-01'),
+         'test': ('2022-07-01', '2022-10-01')},
+        {'train': ('2021-07-01', '2022-07-01'), 'valid': ('2022-07-01', '2022-10-01'),
+         'test': ('2022-10-01', '2023-01-01')},
+        {'train': ('2021-10-01', '2022-10-01'), 'valid': ('2022-10-01', '2023-01-01'),
+         'test': ('2023-01-01', '2023-04-01')},
+        {'train': ('2022-01-01', '2023-01-01'), 'valid': ('2023-01-01', '2023-04-01'),
+         'test': ('2023-04-01', '2023-07-01')},
+        {'train': ('2022-04-01', '2023-04-01'), 'valid': ('2023-04-01', '2023-07-01'),
+         'test': ('2023-07-01', '2023-10-01')},
+    ]
+    got = [{k: (str(v[0]), str(v[1])) for k, v in o.items()} for o in out]
+    assert got == expected
+
+
+def test_walk_forward_purge_embargo_creates_gap_by_index():
+    """purge/embargo 生效后，用具体索引证明段落之间确实留了缺口。"""
+    grid = [date(2024, 1, 1) + timedelta(days=7 * i) for i in range(60)]
+    w = walk_forward_splits(grid, train_months=6, valid_months=2, test_months=2,
+                            step_months=3, purge_bars=3, embargo_bars=1)[0]
+    idx = {d: i for i, d in enumerate(grid)}
+    # purge=3 剪训练尾：base train end 2024-07-01(idx 26) → 前移 3 根
+    assert w["train"][1] == date(2024, 6, 10) and idx[w["train"][1]] == 23
+    # embargo=1 再推验证头：base 验证首根 = 2024-07-08(idx 27)，再 +1
+    assert w["valid"][0] == date(2024, 7, 15) and idx[w["valid"][0]] == 28
+    # 训练末端与验证起点之间恰好 3+1 根「谁都不属于」的隔离带
+    assert idx[w["valid"][0]] - idx[w["train"][1]] - 1 == 3 + 1
+    # 验证末端与测试起点之间同样是 3+1 根
+    assert idx[w["test"][0]] - idx[w["valid"][1]] - 1 == 3 + 1
+
+
+def test_walk_forward_negative_purge_embargo_raises():
+    grid = [date(2024, 1, 1) + timedelta(days=7 * i) for i in range(60)]
+    with pytest.raises(ValueError, match="不能为负"):
+        walk_forward_splits(grid, purge_bars=-1)
+    with pytest.raises(ValueError, match="不能为负"):
+        walk_forward_splits(grid, embargo_bars=-2)
+
+
+def test_walk_forward_purge_that_empties_segment_raises():
+    grid = [date(2024, 1, 1) + timedelta(days=7 * i) for i in range(60)]
+    with pytest.raises(ValueError, match="剪空"):
+        walk_forward_splits(grid, train_months=1, valid_months=1, test_months=1,
+                            step_months=1, purge_bars=999)
+
+
+# ---------- purged/embargoed CV：与前瞻标签结合 ----------
+
+def test_purged_training_label_ends_before_test_start():
+    """标签是前瞻 h 日收益：purge=h 后训练样本的标签终点必须早于测试起点。
+
+    这是 A2 的核心断言 —— 不加 purge 时训练段最后一根的标签会落在验证/测试
+    首日，训练集「提前看到」测试期收益。
+    """
+    h = 5
+    ds = build_dataset(make_panel(n_days=400),
+                       DatasetConfig(features=["mom"], label_horizon=h))
+    grid = ds.dates
+    idx = {d: i for i, d in enumerate(grid)}
+    win = walk_forward_splits(grid, train_months=6, valid_months=2, test_months=2,
+                              step_months=3, purge_bars=h, embargo_bars=1)[0]
+    tr, va, te = ds.split_window(win)
+    assert len(tr) and len(va) and len(te)
+    tr_end = tr["trade_date"].max()
+    va_start = va["trade_date"].min()
+    te_start = te["trade_date"].min()
+    # 训练段最后一根的标签取的是 grid[tr_end + h] 的收盘价 —— 必须落在验证段之前
+    assert tr_end == win["train"][1]
+    assert grid[idx[tr_end] + h] < va_start
+    # 验证段最后一根的标签终点同样早于测试段起点
+    va_end = va["trade_date"].max()
+    assert grid[idx[va_end] + h] < te_start
+
+
+def test_purge_removes_exactly_h_train_bars_and_split_window_skips_gap():
+    """purge=h 恰好剪掉训练段尾部 h 根；缺口用 split_window 才不会被吞回。"""
+    h = 5
+    ds = build_dataset(make_panel(n_days=400),
+                       DatasetConfig(features=["mom"], label_horizon=h))
+    grid = ds.dates
+    idx = {d: i for i, d in enumerate(grid)}
+    common = dict(train_months=6, valid_months=2, test_months=2, step_months=3)
+    base = walk_forward_splits(grid, **common)[0]
+    purged = walk_forward_splits(grid, **common, purge_bars=h, embargo_bars=1)[0]
+    assert idx[base["train"][1]] - idx[purged["train"][1]] == h
+
+    # split_window 两个端点都用：验证段正好从隔离带之后开始
+    _, va_purged, _ = ds.split_window(purged)
+    assert va_purged["trade_date"].min() == purged["valid"][0]
+    # 而连续边界的 split() 会把隔离带（purged 验证头之前的缺口）并回后段
+    _, va_naive, _ = ds.split(purged["train"][1], purged["valid"][1])
+    assert va_naive["trade_date"].min() < purged["valid"][0]
+    assert va_naive["trade_date"].min() == grid[idx[purged["train"][1]] + 1]
+
 
 
 def test_add_months_edge():
@@ -291,3 +410,31 @@ def test_default_label_kind_is_close_to_close():
     ds = build_dataset(make_panel(30), DatasetConfig(features=["mom"],
                                                      label_horizon=3))
     assert ds.summary()["label_kind"] == "close[t+3]/close[t+0]"
+
+
+# ── 窗口吸附与边界守卫（覆盖率补齐） ────────────────────────────────────
+
+
+def test_purge_embargo_window_error_paths():
+    from lquant.research.ml.dataset import (
+        _first_idx_ge,
+        _first_idx_gt,
+        _last_idx_le,
+        _purge_embargo_window,
+    )
+
+    grid = [date(2024, 1, 1) + timedelta(days=i) for i in range(10)]
+    assert _first_idx_ge(grid, date(2100, 1, 1)) is None
+    assert _first_idx_gt(grid, date(2100, 1, 1)) is None
+    assert _last_idx_le(grid, date(2000, 1, 1)) is None
+
+    # 数据边界与月历边界不匹配 → 取不到完整区间
+    with pytest.raises(ValueError, match="取不到完整区间"):
+        _purge_embargo_window(grid, date(2023, 1, 1), date(2023, 2, 1),
+                              date(2023, 3, 1), date(2023, 4, 1), 0, 0)
+    # purge 把训练段剪空
+    with pytest.raises(ValueError, match="训练段剪空"):
+        _purge_embargo_window(grid, grid[0], grid[1], grid[3], grid[5], 5, 0)
+    # 验证段被剪空
+    with pytest.raises(ValueError, match="验证段剪空"):
+        _purge_embargo_window(grid, grid[0], grid[1], grid[1], grid[5], 0, 0)

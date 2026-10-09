@@ -191,7 +191,7 @@ def _ml_panel(n_days: int = 20, n_syms: int = 12) -> pl.DataFrame:
 
 
 def test_dataset_split_purge_window_shorter_than_leak() -> None:
-    """训练段短于泄漏窗（label_horizon-1）→ 训练集置空，不静默放弃 purge。"""
+    """训练段短于泄漏窗（label_horizon）→ 训练集置空，不静默放弃 purge。"""
     ds = build_dataset(_ml_panel(), DatasetConfig(features=["mom"],
                                                   label_horizon=5))
     assert len(ds.dates) >= 7

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from lquant.indicators import (  # noqa: F401  触发注册
     chip,
+    levels,
     momentum,
     patterns,
     tiandao,
@@ -34,6 +35,13 @@ from lquant.indicators.future import (
     LookaheadViolation,
     assert_no_lookahead,
     check_prefix_invariance,
+)
+from lquant.indicators.levels import (
+    LEVEL_TYPES,
+    LevelSet,
+    PriceLevel,
+    add_levels,
+    compute_levels,
 )
 from lquant.indicators.momentum import add_kdj, add_rsi
 from lquant.indicators.patterns import (
@@ -69,7 +77,10 @@ __all__ = [
     "CYQ_PROXY_NOTE",
     "CYQ_TURNOVER_NOTE",
     "INDICATORS",
+    "LEVEL_TYPES",
+    "LevelSet",
     "PANES",
+    "PriceLevel",
     "TIANDAO_DEFAULT_N",
     "LookaheadViolation",
     "WARMUP",
@@ -82,6 +93,7 @@ __all__ = [
     "add_ema",
     "add_hammer",
     "add_kdj",
+    "add_levels",
     "add_ma",
     "add_macd",
     "add_morning_star",
@@ -94,6 +106,7 @@ __all__ = [
     "assert_no_lookahead",
     "check_prefix_invariance",
     "compute",
+    "compute_levels",
     "compute_many",
     "cost_distribution",
     "min_window",

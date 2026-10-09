@@ -90,9 +90,13 @@ class Broker:
         # 涨跌停不可成交（PriceLimit 规则：ST 主板 5%，创业板/科创板 ST 20%，
         # 板块值 gem/star 20%、bse 30%，ETF 按跟踪指数）。取整到挂牌价。
         # is_st 用**当日** bar 上的真实戴帽状态（bar.is_st），None 才退回规则静态值。
+        # no_price_limit 同形：用**当日** bar 上的免涨跌停标记（bar.no_price_limit，
+        # IPO 上市初期窗口 / 复牌首日 / ST 变更日），None 才退回静态值 ——
+        # 这些窗口是「某一天」的事实，静态 per-instrument 布尔表达不了。
         day_st = bar.is_st
-        up = r.limit_up(bar.pre_close, is_st=day_st)
-        down = r.limit_down(bar.pre_close, is_st=day_st)
+        day_no_limit = bar.no_price_limit
+        up = r.limit_up(bar.pre_close, is_st=day_st, no_price_limit=day_no_limit)
+        down = r.limit_down(bar.pre_close, is_st=day_st, no_price_limit=day_no_limit)
         if bar.halted:
             order.status = OrderStatus.REJECTED
             order.reason = "停牌"
