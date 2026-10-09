@@ -17,6 +17,7 @@ from lquant.portfolio.riskmodel import RiskModelError
 
 __all__ = ["equal_weight", "score_weight", "market_cap_weight", "inverse_vol_weight",
            "risk_parity_weight", "min_variance_weight", "hrp_weight",
+           "cvar_weight", "cdar_weight",
            "weights", "METHODS", "weight_report", "apply_no_trade_band"]
 
 
@@ -179,6 +180,63 @@ def min_variance_weight(returns, symbols: list[str] | None = None, *,
         return inverse_vol_weight(M, syms)
 
 
+def _tail_risk_weight(kind: str, returns, symbols, *, level: float = 0.95,
+                      max_weight: float = 1.0,
+                      min_return: float | None = None, **kw) -> dict[str, float]:
+    """CVaR / CDaR 的公共入口（LP 求解，见 portfolio/tailrisk.py）。
+
+    **与 min_variance_weight 的失败语义刻意不同**：那边算不出来就退回逆波动，
+    这里直接抛 OptimizerError。理由：尾风险优化的输入（观测数、level、
+    权重上限）都是调用方显式给的，算不出来通常是输入不对；静默换成另一个
+    风险口径，用户会以为自己拿到的是 CVaR 最优组合。
+    """
+    M, syms = _returns_matrix(returns, symbols)
+    n = len(syms)
+    if n < 2:
+        raise OptimizerError(f"{kind} 至少需要 2 个标的，收到 {n}")
+    try:
+        from lquant.portfolio import tailrisk
+
+        if kind == "cvar":
+            w = tailrisk.cvar_weight_lp(M, level=level, max_weight=max_weight,
+                                        min_return=min_return)
+        else:
+            w = tailrisk.cdar_weight_lp(M, level=level, max_weight=max_weight,
+                                        min_return=min_return,
+                                        lookback=int(kw.get("lookback", 252)))
+    except ValueError as e:
+        raise OptimizerError(f"{kind} 输入不合法: {e}") from e
+    except Exception as e:  # noqa: BLE001  求解器异常统一转成可读错误
+        raise OptimizerError(f"{kind} 求解失败: {type(e).__name__}: {e}") from e
+    return dict(zip(syms, _clean(w), strict=False))
+
+
+def cvar_weight(returns, symbols: list[str] | None = None, *, level: float = 0.95,
+                max_weight: float = 1.0, min_return: float | None = None,
+                **kw) -> dict[str, float]:
+    """最小化 CVaR（条件尾部期望 / Expected Shortfall）的多头组合。
+
+    ``level``：置信度（0.95 = 关注最差 5% 的日子）。``min_return``：可选的
+    最低期望收益约束 —— 只求稳的最优解常常退化成一只债券，加上它能把解拉回
+    「有收益的稳」。
+    """
+    return _tail_risk_weight("cvar", returns, symbols, level=level,
+                             max_weight=max_weight, min_return=min_return, **kw)
+
+
+def cdar_weight(returns, symbols: list[str] | None = None, *, level: float = 0.95,
+                max_weight: float = 1.0, min_return: float | None = None,
+                **kw) -> dict[str, float]:
+    """最小化 CDaR（回撤的条件尾部期望）的多头组合。
+
+    与 CVaR 的区别：CVaR 看的是**单期尾部**，CDaR 看的是**回撤路径的尾部** ——
+    后者更贴近「连续阴跌」这种真正让人赎回的形态。``lookback`` 截断观测
+    （默认 252 期），因为回撤约束是 T²/2 条。
+    """
+    return _tail_risk_weight("cdar", returns, symbols, level=level,
+                             max_weight=max_weight, min_return=min_return, **kw)
+
+
 def hrp_weight(returns, symbols: list[str] | None = None, *,
                link: str = "single", **kw) -> dict[str, float]:
     """层次风险平价（de Prado）。不做矩阵求逆，对估计误差最稳健。
@@ -262,6 +320,9 @@ METHODS = {
     "risk_parity": risk_parity_weight,
     "min_variance": min_variance_weight,
     "hrp": hrp_weight,
+    # 尾部风险（LP，需要 scipy：`pip install -e '.[factors]'`）
+    "cvar": cvar_weight,
+    "cdar": cdar_weight,
     # 需要 benchmark_weights（见 portfolio/optimizer.py）
     "enhanced_indexing": _enhanced_indexing,
 }
