@@ -93,6 +93,184 @@ def test_securities_filters(client):
         data_mod.reader = real_reader
 
 
+def test_securities_search_is_case_insensitive(client):
+    """带交易所后缀的代码小写也应命中（LIKE → ILIKE）。"""
+    r = client.get("/api/data/securities", params={"q": "600519.sh"})
+    assert [it["symbol"] for it in r.json()] == ["600519.SH"]
+
+
+# ---------------- 全量标的清单（/securities/universe） ----------------
+
+def test_securities_universe_lists_all_by_default(client):
+    """默认（无筛选）返回全量清单 + 总数 + 行业归属。"""
+    body = client.get("/api/data/securities/universe",
+                      params={"limit": 200}).json()
+    assert body["total"] == 30
+    assert len(body["items"]) == 30
+    assert body["std"] == "SW"
+    assert body["asof"]
+
+    by_symbol = {it["symbol"]: it for it in body["items"]}
+    # 演示数据给 20 只股票铺了 6 个申万行业；ETF 没有分类 → 行业列为空
+    assert by_symbol["600519.SH"]["industry"] == "食品饮料"
+    assert by_symbol["600519.SH"]["industry_code"] == "801120.SI"
+    assert by_symbol["510300.SH"]["industry"] is None
+    # 行业下拉是「全量行业清单」，不随证券过滤收缩
+    assert len(body["industries"]) == 6
+    assert {i["name"] for i in body["industries"]} >= {"银行", "食品饮料"}
+
+
+def test_securities_universe_filters(client):
+    # 代码（大小写不敏感）
+    r = client.get("/api/data/securities/universe", params={"q": "600519.sh"})
+    assert [it["symbol"] for it in r.json()["items"]] == ["600519.SH"]
+    # 名称包含
+    r2 = client.get("/api/data/securities/universe", params={"q": "茅台"})
+    assert [it["symbol"] for it in r2.json()["items"]] == ["600519.SH"]
+    # 类型
+    r3 = client.get("/api/data/securities/universe", params={"sec_type": "etf"})
+    assert r3.json()["total"] == 10
+    # 板块（演示数据：股票 main / ETF unknown）
+    r4 = client.get("/api/data/securities/universe", params={"board": "main"})
+    assert r4.json()["total"] == 20
+
+
+def test_securities_universe_industry_filter(client):
+    body = client.get("/api/data/securities/universe",
+                      params={"industry": "银行"}).json()
+    assert body["total"] == 4
+    assert {it["industry"] for it in body["items"]} == {"银行"}
+    # 行业代码与名称等价
+    code = next(i["code"] for i in body["industries"] if i["name"] == "银行")
+    same = client.get("/api/data/securities/universe",
+                      params={"industry": code}).json()
+    assert same["total"] == body["total"]
+    assert [it["symbol"] for it in same["items"]] == [it["symbol"] for it in body["items"]]
+
+
+def test_securities_universe_unknown_industry_is_empty_not_error(client):
+    body = client.get("/api/data/securities/universe",
+                      params={"industry": "不存在的行业"}).json()
+    assert body["total"] == 0 and body["items"] == []
+    # 下拉清单不受影响，否则用户改不回别的行业
+    assert len(body["industries"]) == 6
+    assert any("未匹配" in n for n in body["notes"])
+
+
+def test_securities_universe_pagination(client):
+    first = client.get("/api/data/securities/universe",
+                       params={"limit": 10, "offset": 0}).json()
+    second = client.get("/api/data/securities/universe",
+                        params={"limit": 10, "offset": 10}).json()
+    assert first["total"] == second["total"] == 30
+    assert len(first["items"]) == len(second["items"]) == 10
+    syms = [it["symbol"] for it in first["items"]]
+    assert syms == sorted(syms)  # 稳定按代码序
+    assert not ({it["symbol"] for it in first["items"]}
+                & {it["symbol"] for it in second["items"]})
+
+
+def test_securities_universe_param_validation(client):
+    assert client.get("/api/data/securities/universe",
+                      params={"limit": 500}).status_code == 422
+    assert client.get("/api/data/securities/universe",
+                      params={"offset": -1}).status_code == 422
+
+
+def test_securities_universe_include_delisted(client):
+    """默认剔除退市股；include_delisted=true 才放进来（幸存者偏差防护）。"""
+    from lquant.core.db import writer
+
+    with writer() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO security "
+            "(symbol, name, sec_type, board, list_date, delist_date, is_st, source) "
+            "VALUES ('999999.SZ', '退市测试', 'stock', 'main', "
+            "DATE '2000-01-01', DATE '2001-01-01', FALSE, 'test')")
+    try:
+        assert client.get("/api/data/securities/universe",
+                          params={"q": "999999"}).json()["total"] == 0
+        kept = client.get("/api/data/securities/universe",
+                          params={"q": "999999", "include_delisted": True}).json()
+        assert [it["symbol"] for it in kept["items"]] == ["999999.SZ"]
+    finally:
+        with writer() as con:
+            con.execute("DELETE FROM security WHERE symbol = '999999.SZ'")
+
+
+def test_securities_universe_std_fallback_note(client):
+    body = client.get("/api/data/securities/universe",
+                      params={"std": "CICS", "limit": 1}).json()
+    assert body["std"] == "SW"
+    assert any("回退" in n for n in body["notes"])
+
+
+def test_securities_universe_without_industry_data(client):
+    """industry_classify 读不到时降级：清单照常出，行业列/下拉为空并给出 note。"""
+    from contextlib import contextmanager
+
+    from lquant.server.api import data as data_mod
+
+    class _Proxy:
+        def __init__(self, con):
+            self._con = con
+
+        def execute(self, sql, *a, **k):
+            if "industry_classify" in sql:
+                raise RuntimeError("no classify table")
+            return self._con.execute(sql, *a, **k)
+
+    real_reader = data_mod.reader
+
+    @contextmanager
+    def fake():
+        with real_reader() as con:
+            yield _Proxy(con)
+
+    data_mod.reader = fake
+    try:
+        body = client.get("/api/data/securities/universe").json()
+    finally:
+        data_mod.reader = real_reader
+
+    assert body["total"] == 30
+    assert all(it["industry"] is None for it in body["items"])
+    assert body["industries"] == []
+    assert body["std"] is None
+    assert any("行业分类数据为空" in n for n in body["notes"])
+
+
+def test_securities_universe_degrades_on_read_error(client):
+    from contextlib import contextmanager
+
+    from lquant.server.api import data as data_mod
+
+    class _Proxy:
+        def __init__(self, con):
+            self._con = con
+
+        def execute(self, sql, *a, **k):
+            if "FROM security" in sql:
+                raise RuntimeError("boom")
+            return self._con.execute(sql, *a, **k)
+
+    real_reader = data_mod.reader
+
+    @contextmanager
+    def fake():
+        with real_reader() as con:
+            yield _Proxy(con)
+
+    data_mod.reader = fake
+    try:
+        body = client.get("/api/data/securities/universe").json()
+    finally:
+        data_mod.reader = real_reader
+
+    assert body["total"] == 0 and body["items"] == []
+    assert any("读取失败" in n for n in body["notes"])
+
+
 def test_daily_and_indicators(client):
     r = client.get("/api/data/daily", params={"symbol": "600519.SH", "limit": 5})
     assert r.status_code == 200 and len(r.json()) <= 5

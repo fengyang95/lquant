@@ -39,6 +39,7 @@
   "GET /api/data/ping": "read:market",
   "GET /api/data/quote": "read:market",
   "GET /api/data/securities": "read:market",
+  "GET /api/data/securities/universe": "read:market",
   "GET /api/data/tasks": "read:market",
   "GET /api/data/tasks/{task_id}": "read:market",
   "GET /api/data/version/latest": "read:market",

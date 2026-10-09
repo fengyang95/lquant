@@ -270,6 +270,36 @@ def repair_gaps(req: GapsRepairIn = GapsRepairIn()) -> dict:
     return {"created": True, "task_id": task["task_id"], "reason": None}
 
 
+def _security_where(
+    q: str = "",
+    sec_type: str | None = None,
+    board: str | None = None,
+    include_delisted: bool = False,
+) -> tuple[str, list]:
+    """``security`` 表的 WHERE 片段与绑定参数。
+
+    ``/securities``（搜索框）与 ``/securities/universe``（全量清单）共用同一套
+    过滤口径 —— 各写一遍 SQL 迟早出现「搜索能搜到、列表筛不到」的不一致。
+    代码/名称都走 ILIKE：用户输入 ``600519.sh`` 或 ``tcl`` 也应该命中。
+    """
+    clauses: list[str] = []
+    params: list = []
+    if not include_delisted:
+        # 退市股默认不进清单；研究幸存者偏差时显式 include_delisted=true
+        clauses.append("(delist_date IS NULL OR delist_date > current_date)")
+    if q:
+        clauses.append("(symbol ILIKE ? OR name ILIKE ?)")
+        params += [f"%{q}%", f"%{q}%"]
+    if sec_type:
+        clauses.append("sec_type = ?")
+        params.append(sec_type)
+    if board:
+        clauses.append("board = ?")
+        params.append(board)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    return where, params
+
+
 @router.get("/securities")
 def securities(
     q: str = Query(default="", max_length=20, description="代码/名称关键字"),
@@ -277,16 +307,9 @@ def securities(
     limit: int = Query(default=50, le=500),
 ) -> list[dict]:
     """标的搜索：代码前缀或名称包含，自选股/个股页搜索框用。"""
-    sql = ("SELECT symbol, name, sec_type, board, list_date, is_st FROM security "
-           "WHERE (delist_date IS NULL OR delist_date > current_date)")
-    params: list = []
-    if q:
-        sql += " AND (symbol LIKE ? OR name LIKE ?)"
-        params += [f"%{q}%", f"%{q}%"]
-    if sec_type:
-        sql += " AND sec_type = ?"
-        params.append(sec_type)
-    sql += f" ORDER BY symbol LIMIT {int(limit)}"
+    where, params = _security_where(q=q, sec_type=sec_type)
+    sql = ("SELECT symbol, name, sec_type, board, list_date, is_st FROM security"
+           f"{where} ORDER BY symbol LIMIT {int(limit)}")
     try:
         with reader() as con:
             rows = con.execute(sql, params).fetchall()
@@ -294,6 +317,134 @@ def securities(
         return []
     return [{"symbol": r[0], "name": r[1], "sec_type": r[2], "board": r[3],
              "list_date": str(r[4]) if r[4] else None, "is_st": r[5]} for r in rows]
+
+
+#: 全量清单单页上限。比搜索框的 500 小：这是给页面翻页用的，一次拉几千行
+#: 只会让浏览器渲染大量不可见的行。
+_UNIVERSE_MAX_LIMIT = 200
+
+
+@router.get("/securities/universe")
+def securities_universe(
+    q: str = Query(default="", max_length=20, description="代码/名称关键字"),
+    industry: str | None = Query(default=None, max_length=40,
+                                 description="行业名称或代码（如 银行 / 801780.SI）"),
+    sec_type: str | None = Query(default=None, description="stock/etf/lof/index"),
+    board: str | None = Query(default=None, max_length=16,
+                              description="main/gem/star/bse/unknown"),
+    include_delisted: bool = Query(default=False, description="是否含已退市标的"),
+    std: str | None = Query(default=None, max_length=16,
+                            description="行业分类标准 SW/CICS/em，缺省自动挑"),
+    limit: int = Query(default=50, ge=1, le=_UNIVERSE_MAX_LIMIT),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    """全量标的清单：默认返回全部（分页），支持行业 / 代码 / 名称 / 类型 / 板块筛选。
+
+    与 ``/securities`` 的分工：那个是搜索框的轻量关键字搜索，返回裸列表；这个是
+    「全量清单」页面的取数口 —— 需要**总数**（翻页）、**行业归属**（列 + 下拉）
+    和**分页**，所以返回 ``{items,total,limit,offset,industries,notes}`` 信封。
+
+    行业归属走 PIT（``industry_classify.std_date <= asof``，每只取生效日最晚的
+    一条），与行业分析 / 因子中性化同一口径。``industries`` 是**不随 q/类型/板块
+    过滤收缩**的全量行业清单 —— 否则筛完一个行业后下拉框自己就空了。
+    """
+    from lquant.core.types import today_cn
+    from lquant.industry.loader import (
+        load_membership,
+        resolve_asof,
+        resolve_industry,
+        resolve_std,
+    )
+
+    def _envelope(**extra) -> dict:
+        return {"asof": None, "std": None, "total": 0, "limit": limit,
+                "offset": offset, "items": [], "industries": [],
+                "notes": [], **extra}
+
+    where, params = _security_where(q=q, sec_type=sec_type, board=board,
+                                    include_delisted=include_delisted)
+    sql = ("SELECT symbol, name, sec_type, board, list_date, is_st FROM security"
+           f"{where} ORDER BY symbol")
+    try:
+        with reader() as con:
+            sec = con.execute(sql, params).pl()
+            try:
+                day = resolve_asof(None)
+            except Exception:  # noqa: BLE001 - 日历/湖缺失时退回自然日
+                day = today_cn()
+            used_std, fell_back = resolve_std(con, day, std)
+            # used_std=None 表示没有可用的分类标准：此时不能再按 std=None 读
+            # membership（那会退化成「不过滤 std」，把 std 为空的行也当归属用）
+            mem = (load_membership(con, day, used_std) if used_std is not None
+                   else pl.DataFrame())
+    except Exception as e:  # noqa: BLE001 - 空湖/空表是常态，不 500
+        from loguru import logger
+
+        logger.warning(f"全量标的清单读取失败（降级为空）: {e}")
+        return _envelope(notes=[f"标的列表读取失败：{type(e).__name__}"])
+
+    notes: list[str] = []
+    if used_std is None:
+        notes.append("行业分类数据为空（industry_classify）—— 行业列与行业筛选不可用，"
+                     "先执行 `lq data reference` / `lq data industry`")
+    elif fell_back:
+        notes.append(f"请求的行业标准 {std!r} 不可用，已回退到 {used_std!r}")
+
+    if mem.is_empty():
+        sec = sec.with_columns(
+            pl.lit(None, dtype=pl.String).alias("industry_code"),
+            pl.lit(None, dtype=pl.String).alias("industry_name"),
+        )
+        industries: list[dict] = []
+    else:
+        # 显式再排一次：polars join 不承诺保持左表行序，而分页必须稳定
+        sec = (sec.join(mem.select(["symbol", "industry_code", "industry_name"]),
+                        on="symbol", how="left")
+                  .sort("symbol"))
+        industries = [
+            {"code": r["industry_code"], "name": r["industry_name"],
+             "n_members": int(r["n_members"])}
+            for r in (mem.drop_nulls("industry_name")
+                         .group_by(["industry_code", "industry_name"])
+                         .agg(pl.len().alias("n_members"))
+                         .sort(["n_members", "industry_code"],
+                               descending=[True, False])
+                         .to_dicts())
+        ]
+
+    if industry and industry.strip():
+        key = industry.strip()
+        try:
+            with reader() as con:
+                hit = resolve_industry(con, key, day, used_std)
+        except Exception as e:  # noqa: BLE001 - 分类表缺失按无匹配处理
+            from loguru import logger
+
+            logger.warning(f"行业筛选解析失败（按无匹配处理）: {e}")
+            hit = None
+        if hit is None:
+            return _envelope(asof=day.isoformat(), std=used_std,
+                             industries=industries,
+                             notes=[*notes, f"行业 {key!r} 未匹配到任何分类，列表为空"])
+        sec = sec.filter(pl.col("industry_code") == hit[0])
+
+    total = sec.height
+    items = [
+        {
+            "symbol": r["symbol"],
+            "name": r["name"],
+            "sec_type": r["sec_type"],
+            "board": r["board"],
+            "list_date": str(r["list_date"]) if r["list_date"] else None,
+            "is_st": r["is_st"],
+            "industry": r["industry_name"],
+            "industry_code": r["industry_code"],
+        }
+        for r in sec.slice(offset, limit).iter_rows(named=True)
+    ]
+    return {"asof": day.isoformat(), "std": used_std, "total": total,
+            "limit": limit, "offset": offset, "items": items,
+            "industries": industries, "notes": notes}
 
 
 @router.get("/daily")

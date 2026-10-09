@@ -1,12 +1,14 @@
 'use client';
 
 /**
- * 个股分析入口页：输入一个股票代码 → 进入该标的的多角度分析。
+ * 个股分析入口页：默认展示**全量标的清单**（分页），可按行业 / 代码 / 名称 /
+ * 类型 / 板块筛选，点任意一行进入 `/security/{symbol}` 的多角度分析。
  *
- * 为什么单独做一个入口页：`/security/{symbol}` 是详情页，只能从自选/看板点进来，
- * **没有一个「我就想看这只票」的输入口**。这一页补的就是这个动作。
+ * 为什么要有全量清单：原来这一页只有「输入代码」搜索框 + 自选列表 —— 不记得
+ * 代码的用户没有入口。清单默认加载，行业归属走后端 PIT 口径
+ * （`industry_classify.std_date <= asof`），与行业分析 / 因子中性化一致。
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import useSWR from 'swr';
@@ -16,7 +18,29 @@ import { Empty, ErrorNote, Loading } from '@/components/States';
 import { Pct, fmtNum } from '@/components/QuoteTable';
 import { fetcher } from '@/lib/api';
 
-type SecRow = { symbol: string; name: string | null; sec_type: string | null };
+type UniverseItem = {
+  symbol: string;
+  name: string | null;
+  sec_type: string | null;
+  board: string | null;
+  list_date: string | null;
+  is_st: boolean | null;
+  industry: string | null;
+  industry_code: string | null;
+};
+
+type IndustryFacet = { code: string | null; name: string | null; n_members: number };
+
+type UniverseResp = {
+  asof: string | null;
+  std: string | null;
+  total: number;
+  limit: number;
+  offset: number;
+  items: UniverseItem[];
+  industries: IndustryFacet[];
+  notes: string[];
+};
 
 type WatchRow = {
   symbol: string;
@@ -28,82 +52,267 @@ type WatchRow = {
 
 type AngleRow = { id: string; label: string; weight: number; desc: string };
 
+/** 每页行数。后端单页上限 200，50 行足够翻页又不至于让浏览器渲染太多不可见行 */
+const PAGE_SIZE = 50;
+
 /** 裸 6 位或带交易所后缀都接受（后端会做统一归一） */
 const LOOKS_LIKE_CODE = /^\d{6}(\.(SH|SZ|BJ))?$/i;
+
+const SEC_TYPES = [
+  { value: '', label: '全部类型' },
+  { value: 'stock', label: '股票' },
+  { value: 'etf', label: 'ETF' },
+  { value: 'lof', label: 'LOF' },
+  { value: 'index', label: '指数' },
+];
+
+const BOARDS = [
+  { value: '', label: '全部板块' },
+  { value: 'main', label: '主板' },
+  { value: 'gem', label: '创业板' },
+  { value: 'star', label: '科创板' },
+  { value: 'bse', label: '北交所' },
+];
+
+const BOARD_LABEL: Record<string, string> = {
+  main: '主板', gem: '创业板', star: '科创板', bse: '北交所', unknown: '—',
+};
+
+const SEC_TYPE_LABEL: Record<string, string> = {
+  stock: '股票', etf: 'ETF', lof: 'LOF', index: '指数',
+};
 
 export default function SecurityIndexPage() {
   const router = useRouter();
   const [q, setQ] = useState('');
   const [debouncedQ, setDebouncedQ] = useState('');
+  const [industry, setIndustry] = useState('');
+  const [secType, setSecType] = useState('');
+  const [board, setBoard] = useState('');
+  const [page, setPage] = useState(0);
 
-  // 输入防抖 300ms 再发搜索（与自选页同口径）
+  // 输入防抖 300ms 再发请求（与自选页同口径）
   useEffect(() => {
     const t = setTimeout(() => setDebouncedQ(q), 300);
     return () => clearTimeout(t);
   }, [q]);
 
-  const { data: suggestions } = useSWR<SecRow[]>(
-    debouncedQ.trim().length >= 2
-      ? `/data/securities?q=${encodeURIComponent(debouncedQ.trim())}&limit=8`
-      : null,
-    fetcher,
-  );
-  const { data: watch, isLoading, error } = useSWR<WatchRow[]>('/watchlist', fetcher);
+  // 筛选一变就回第一页：否则筛完只剩 1 页却停在第 5 页会看到空表
+  useEffect(() => {
+    setPage(0);
+  }, [debouncedQ, industry, secType, board]);
+
+  const params = new URLSearchParams();
+  if (debouncedQ.trim()) params.set('q', debouncedQ.trim());
+  if (industry) params.set('industry', industry);
+  if (secType) params.set('sec_type', secType);
+  if (board) params.set('board', board);
+  params.set('limit', String(PAGE_SIZE));
+  params.set('offset', String(page * PAGE_SIZE));
+  const universeKey = `/data/securities/universe?${params.toString()}`;
+
+  const { data: universe, isLoading: uniLoading, error: uniError } =
+    useSWR<UniverseResp>(universeKey, fetcher);
+  const { data: watch, isLoading: watchLoading, error: watchError } =
+    useSWR<WatchRow[]>('/watchlist', fetcher);
   const { data: angleMeta } = useSWR<{ angles: AngleRow[] }>('/security/angles', fetcher);
+
+  const items = universe?.items ?? [];
+  const total = universe?.total ?? 0;
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const filtered = !!(debouncedQ.trim() || industry || secType || board);
 
   const go = (symbol: string) => {
     const s = symbol.trim();
-    if (!s) return;
-    router.push(`/security/${encodeURIComponent(s)}`);
+    if (s) router.push(`/security/${encodeURIComponent(s)}`);
+  };
+
+  const onSubmit = (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    // 只有「看起来是代码」才直达详情页；名称关键字已在实时筛选下方清单
+    if (LOOKS_LIKE_CODE.test(q.trim())) go(q);
+  };
+
+  const reset = () => {
+    setQ('');
+    setDebouncedQ('');
+    setIndustry('');
+    setSecType('');
+    setBoard('');
+    setPage(0);
   };
 
   return (
     <div className="space-y-5">
       <PageHeader
         title="个股分析"
-        sub="输入一个股票代码，从技术面 · 基本面 · 估值 · 资金面 · 相对强度 · 消息面多角度分析"
+        sub="全量标的清单 · 可按行业 / 代码 / 名称 / 类型 / 板块筛选；点「分析」进入多角度分析"
       />
 
-      <Panel title="输入股票代码" meta="支持裸 6 位，如 600519 / 000001">
-        <form
-          onSubmit={(e) => { e.preventDefault(); go(q); }}
-          className="flex flex-wrap items-center gap-2"
-        >
-          <input
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="输入代码或名称搜索，如 600519 / 贵州茅台"
-            aria-label="股票代码"
-            className="input w-full max-w-md"
-          />
-          <button type="submit" className="btn-primary" disabled={!q.trim()}>
-            开始分析
+      <Panel
+        title="筛选"
+        meta={universe
+          ? `${universe.asof ?? '—'} · 行业标准 ${universe.std ?? '—'}`
+          : undefined}
+      >
+        <form onSubmit={onSubmit} className="flex flex-wrap items-end gap-3">
+          <label className="text-sm">
+            <div className="mb-1 text-xs text-ink-faint">代码 / 名称</div>
+            <input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="600519 / 贵州茅台"
+              aria-label="代码或名称"
+              className="input input-mono w-56"
+            />
+          </label>
+          <label className="text-sm">
+            <div className="mb-1 text-xs text-ink-faint">行业</div>
+            <select
+              value={industry}
+              onChange={(e) => setIndustry(e.target.value)}
+              aria-label="行业"
+              className="input w-48"
+            >
+              <option value="">全部行业</option>
+              {(universe?.industries ?? []).map((i) => (
+                <option key={i.code ?? i.name ?? ''} value={i.code ?? i.name ?? ''}>
+                  {i.name ?? i.code}（{i.n_members}）
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="text-sm">
+            <div className="mb-1 text-xs text-ink-faint">类型</div>
+            <select
+              value={secType}
+              onChange={(e) => setSecType(e.target.value)}
+              aria-label="类型"
+              className="input w-28"
+            >
+              {SEC_TYPES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
+            </select>
+          </label>
+          <label className="text-sm">
+            <div className="mb-1 text-xs text-ink-faint">板块</div>
+            <select
+              value={board}
+              onChange={(e) => setBoard(e.target.value)}
+              aria-label="板块"
+              className="input w-28"
+            >
+              {BOARDS.map((b) => <option key={b.value} value={b.value}>{b.label}</option>)}
+            </select>
+          </label>
+          <button type="button" className="btn" onClick={reset}>重置</button>
+          <button
+            type="submit"
+            className="btn btn-primary"
+            disabled={!LOOKS_LIKE_CODE.test(q.trim())}
+          >
+            分析该代码
           </button>
         </form>
-        {q.trim() && !LOOKS_LIKE_CODE.test(q.trim()) && (!suggestions || suggestions.length === 0) && (
+        {q.trim() && !LOOKS_LIKE_CODE.test(q.trim()) && (
           <p className="mt-2 text-xs text-ink-faint">
-            代码形如 6 位数字（可带 .SH/.SZ）；也可按名称搜索后从下方结果进入。
+            代码形如 6 位数字（可带 .SH/.SZ/.BJ）；名称关键字会实时筛选下方清单。
           </p>
         )}
+      </Panel>
 
-        {suggestions && suggestions.length > 0 && (
-          <div className="mt-3 max-w-md divide-y divide-line border border-line bg-white">
-            {suggestions.map((s) => (
-              <button
-                key={s.symbol}
-                type="button"
-                onClick={() => go(s.symbol)}
-                className="flex w-full items-center justify-between px-3 py-2 text-left text-sm hover:bg-paper"
-              >
-                <span>
-                  <span className="font-medium">{s.name || '—'}</span>
-                  <span className="ml-2 font-mono text-xs text-ink-faint">{s.symbol}</span>
-                </span>
-                <span className="text-xs text-ink-faint">分析 →</span>
-              </button>
-            ))}
+      <Panel
+        title="全量标的"
+        meta={universe ? `共 ${total} 只 · 第 ${page + 1}/${pageCount} 页` : undefined}
+        bodyClass=""
+      >
+        {uniLoading ? (
+          <Loading />
+        ) : uniError ? (
+          <ErrorNote>加载失败：{String(uniError)}</ErrorNote>
+        ) : !items.length ? (
+          <div className="p-4">
+            <Empty>
+              {filtered
+                ? '没有匹配的标的 —— 换个筛选条件，或点「重置」'
+                : '标的库为空 —— 先同步标的清单：lq data reference'}
+            </Empty>
           </div>
+        ) : (
+          <>
+            <div className="overflow-x-auto">
+              <table className="table-dense w-full">
+                <thead>
+                  <tr>
+                    <th className="pl-4 text-left">代码</th>
+                    <th className="text-left">名称</th>
+                    <th className="text-left">行业</th>
+                    <th className="text-left">板块</th>
+                    <th className="text-left">类型</th>
+                    <th className="text-left">上市日</th>
+                    <th className="pr-4 text-right">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {items.map((it) => (
+                    <tr key={it.symbol} className="hover:bg-white">
+                      <td className="pl-4 font-mono text-xs">{it.symbol}</td>
+                      <td>
+                        <span className="font-medium">{it.name || '—'}</span>
+                        {it.is_st && (
+                          <span className="ml-1.5 border border-up px-1 text-[10px] text-up">
+                            ST
+                          </span>
+                        )}
+                      </td>
+                      <td className="text-xs">{it.industry || '—'}</td>
+                      <td className="text-xs">
+                        {BOARD_LABEL[it.board ?? ''] ?? it.board ?? '—'}
+                      </td>
+                      <td className="text-xs">
+                        {SEC_TYPE_LABEL[it.sec_type ?? ''] ?? it.sec_type ?? '—'}
+                      </td>
+                      <td className="text-xs text-ink-faint">{it.list_date ?? '—'}</td>
+                      <td className="pr-4 text-right">
+                        <Link
+                          href={`/security/${encodeURIComponent(it.symbol)}`}
+                          className="btn text-xs"
+                        >
+                          分析
+                        </Link>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="flex items-center justify-between border-t border-line px-4 py-2 text-xs text-ink-faint">
+              <span>第 {page + 1} / {pageCount} 页 · 共 {total} 只</span>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  className="btn text-xs"
+                  disabled={page <= 0}
+                  onClick={() => setPage((p) => Math.max(0, p - 1))}
+                >
+                  上一页
+                </button>
+                <button
+                  type="button"
+                  className="btn text-xs"
+                  disabled={page + 1 >= pageCount}
+                  onClick={() => setPage((p) => p + 1)}
+                >
+                  下一页
+                </button>
+              </div>
+            </div>
+          </>
         )}
+        {universe?.notes?.length ? (
+          <ul className="space-y-1 border-t border-line px-4 py-2 text-xs text-ink-faint">
+            {universe.notes.map((n, i) => <li key={i}>· {n}</li>)}
+          </ul>
+        ) : null}
       </Panel>
 
       <Panel title="分析覆盖的角度" meta="每个角度取不到数会明确标注，不会用默认值填充">
@@ -127,13 +336,15 @@ export default function SecurityIndexPage() {
       </Panel>
 
       <Panel title="从自选进入" meta={watch?.length ? `${watch.length} 只` : undefined}>
-        {isLoading ? (
+        {watchLoading ? (
           <Loading />
-        ) : error ? (
-          <ErrorNote>加载失败：{String(error)}</ErrorNote>
+        ) : watchError ? (
+          <ErrorNote>加载失败：{String(watchError)}</ErrorNote>
         ) : !watch?.length ? (
           <Empty>
-            自选为空 —— 先去 <Link href="/watchlist" className="text-indigo hover:underline">自选页</Link> 添加标的
+            自选为空 —— 先去{' '}
+            <Link href="/watchlist" className="text-indigo hover:underline">自选页</Link>{' '}
+            添加标的
           </Empty>
         ) : (
           <table className="table-dense">
