@@ -15,6 +15,9 @@ from httpx import ASGITransport, AsyncClient
 from lquant.agent.service import get_service_for_session
 from lquant.server.main import app
 
+# 与 test_ask_api 共享同一个 aiosqlite 会话库（<root>/data/ask.db），同组串行。
+pytestmark = pytest.mark.xdist_group("ask_store")
+
 
 @pytest.fixture()
 async def client():

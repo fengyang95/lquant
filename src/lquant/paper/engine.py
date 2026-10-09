@@ -64,6 +64,11 @@ class PaperOrder:
     reason: str = ""
     filled_qty: int = 0
     filled_price: float = 0.0
+    # True=限价单（成交价不得越过 o.price）；False=市价单（o.price 只是下单
+    # 时的参考报价，成交价 = 最新报价 ± 滑点）。此前不区分：service.tick 用
+    # 「当前报价」下的默认单被 min/max 限价帽完整吞掉滑点，模拟盘与回测的
+    # 成本模型系统性差 slippage_pct。
+    limit: bool = True
 
 
 class PaperBroker:
@@ -80,18 +85,23 @@ class PaperBroker:
         self.orders: list[PaperOrder] = []
         self._seq = 0
         self._ruleset = load_ruleset()
+        # 最近一次 day_close 的交易日（ISO 字符串）：日终幂等标记，
+        # 重复 day_close 会把 T+N 冻结台账多减一天（T+1 当日即解冻）
+        self.last_day_close: str | None = None
 
     def submit(self, symbol: str, side: str, qty: int, price: float,
                ts: datetime | None = None, *, is_st: bool | None = None,
-               name: str | None = None) -> PaperOrder:
+               name: str | None = None, limit: bool = True) -> PaperOrder:
         """提交委托。数量/整手/资金/可卖合法性在这里检查。
 
         name / is_st 来自行情快照：名称用于推断 fund_type（决定 T+0/T+1），
         is_st 决定当日涨跌幅。二者都要落到持仓上，否则每次重算规则都会丢。
+        limit=False 表示市价单（price 仅为参考报价，不构成限价帽）。
         """
         self._seq += 1
         o = PaperOrder(order_id=f"P{self._seq:06d}", ts=ts or now_cn(),
-                       symbol=symbol, side=side, qty=qty, price=price)
+                       symbol=symbol, side=side, qty=qty, price=price,
+                       limit=bool(limit))
         if is_st is not None or name:
             pos0 = self.positions.setdefault(symbol, PaperPosition(symbol=symbol))
             if is_st is not None:
@@ -210,21 +220,30 @@ class PaperBroker:
                 o.status, o.reason = "rejected", "跌停无法卖出"
                 touched.append(o)
                 continue
-            # 限价未触达 → 继续挂单等待（不是拒单）
-            if o.side == "buy" and price > o.price:
-                continue
-            if o.side == "sell" and price < o.price:
-                continue
+            # 限价未触达 → 继续挂单等待（不是拒单）。
+            # 市价单不受此限：o.price 只是下单时的参考报价，报价上行不应
+            # 让市价买单永远挂着（真实市价单按对手价立即成交）。
+            if o.limit:
+                if o.side == "buy" and price > o.price:
+                    continue
+                if o.side == "sell" and price < o.price:
+                    continue
             self._fill(o, price, ts)
             touched.append(o)
         return touched
 
     def _fill(self, o: PaperOrder, px: float, ts: datetime | None) -> None:
         slip = px * self.cfg.slippage_pct
-        # 成交价不得越过限价：买价压到限价内、卖价抬到限价上，
-        # 否则 quote==limit 时滑点会击穿刚检查过的限价约束
-        price = min(px + slip, o.price) if o.side == "buy" \
-            else max(px - slip, o.price)
+        if not o.limit:
+            # 市价单：成交价 = 最新报价 ± 滑点（此前被 min/max 限价帽完整
+            # 吞掉 —— 报价下默认单的 o.price 就是当前报价，滑点恒为 0，
+            # 模拟盘与回测对账出现系统性 5bp/边偏差）
+            price = px + slip if o.side == "buy" else px - slip
+        else:
+            # 限价单：成交价不得越过限价（买价压到限价内、卖价抬到限价上），
+            # 否则 quote==limit 时滑点会击穿刚检查过的限价约束
+            price = min(px + slip, o.price) if o.side == "buy" \
+                else max(px - slip, o.price)
         o.filled_price = round(price, 4)
         o.filled_qty = o.qty
 
@@ -329,10 +348,13 @@ class PaperEngine:
         """
         orders = self.strategy.signals(self.broker, quote)
         for od in orders:
-            self.broker.submit(od["symbol"], od["side"], od["qty"],
-                               od.get("price", quote["price"]),
-                               name=quote.get("name") or od.get("name"),
-                               is_st=quote.get("is_st"))
+            has_px = od.get("price") is not None
+            self.broker.submit(
+                od["symbol"], od["side"], od["qty"],
+                od["price"] if has_px else quote["price"],
+                name=quote.get("name") or od.get("name"),
+                is_st=quote.get("is_st"),
+                limit=has_px)
         self.broker.on_quote(quote["symbol"], quote["price"],
                              quote.get("limit_up"), quote.get("limit_down"))
         pos = self.broker.positions.get(quote["symbol"])
@@ -379,7 +401,9 @@ class PaperEngine:
         if len(navs) > 1:
             import numpy as np
             rets = np.diff(navs) / np.asarray(navs[:-1])
-            out["daily_vol"] = float(np.std(rets))
+            # ddof=1（样本口径）：与 backtest.metrics 的波动率估计一致，
+            # 此前总体口径在样本少时低估波动
+            out["daily_vol"] = float(np.std(rets, ddof=1))
             peak, mdd = -np.inf, 0.0
             for v in navs:
                 peak = max(peak, v)

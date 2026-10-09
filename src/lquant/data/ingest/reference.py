@@ -272,15 +272,22 @@ def sync_reference(skip_details: bool = False, detail_limit: int | None = None) 
 
 
 def _merge_existing_details(df: pl.DataFrame, *, keep_existing: bool = False) -> pl.DataFrame:
-    """保留库里已有的 list_date / delist_date，避免快路径把它们冲成 NULL。
+    """保留库里已有的 list_date / delist_date / board / is_st，防整行覆盖冲掉真值。
 
     注意：INSERT OR REPLACE 是整行覆盖，不合并就会丢失慢路径的成果。
     keep_existing=True（退市名单等官方口径与库内已有值冲突时以库内为准）：
     旧值非空则完全保留，新值只补空缺。
+
+    board / is_st 的口径：新值非 NULL 正常覆盖（ST 戴帽/摘帽、板性修正要能
+    更新），新值为 NULL（provider 不提供该列/未知占位）时保库内旧值 ——
+    tushare securities 曾恒输出 is_st=False/board=None 占位，不保护就会把
+    baostock/akshare 写入的真值冲掉，ST 5% 涨跌停判定随之失真。
     """
     try:
         with reader() as con:
-            old = con.execute("SELECT symbol, list_date, delist_date FROM security").pl()
+            old = con.execute(
+                "SELECT symbol, list_date, delist_date, board, is_st FROM security"
+            ).pl()
     except Exception:  # noqa: BLE001 - 表不存在等情况，直接跳过
         return df
     if not len(old):
@@ -300,6 +307,13 @@ def _merge_existing_details(df: pl.DataFrame, *, keep_existing: bool = False) ->
             drops.append(f"{col}_right")
         else:
             exprs[col] = pl.col(col).cast(pl.Date, strict=False)
+    for col in ("board", "is_st"):
+        # 只有当「新帧带这列 且 join 带回了旧值列」才需要合并；
+        # 新帧没这列时旧值随 join 自然带入；旧库没这列时新值即最终值。
+        if col in df.columns and f"{col}_right" in joined.columns:
+            new_c, old_c = (f"{col}_right", col) if keep_existing else (col, f"{col}_right")
+            exprs[col] = pl.coalesce(pl.col(new_c), pl.col(old_c))
+            drops.append(f"{col}_right")
     out = joined.with_columns(**exprs)
     return out.drop(drops) if drops else out
 

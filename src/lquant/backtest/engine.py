@@ -267,8 +267,11 @@ class Engine:
             for s, b in bars.items():
                 if b.adj_factor > 0:
                     self._last_factor[s] = b.adj_factor
-                # 停牌估值口径：记录每只股票最近一次有 bar 的 close
-                self._last_close[s] = b.close
+                # 停牌估值口径：记录每只股票最近一次有 bar 的 close。
+                # close<=0 属脏数据（源数据错误/复权异常），记进去会把持仓
+                # 估成 0 并可能以 0 价撮合 —— 只认正价，坏价视同无 bar。
+                if b.close > 0:
+                    self._last_close[s] = b.close
 
             # 0b) 退市核销：退市日当天把持仓按残值率变现，不再按最后收盘价冻结
             self._apply_delistings(d, res)
@@ -478,6 +481,7 @@ class Engine:
         # 后买：现金 + 卖出释放的预期资金（A 股卖出资金当日可用，
         # 与聚宽「先卖后买」撮合语义一致）。买与卖都在 T+1 开盘成交，
         # 两边按同一开盘价缩放，预估缺口只在「现金残余 × 跳空幅度」量级。
+        planned_buys = 0.0        # 已排出的买单名义金额（顺序预留，防末位买单超资）
         if targets:
             for sym, w in targets:
                 pos = self.account.positions.get(sym)
@@ -490,11 +494,17 @@ class Engine:
                 delta_value = want_value - have_value
                 if delta_value <= self.cfg.min_order_value:
                     continue
-                cash = (self.account.cash + planned_proceeds) * (1 - self.cfg.cash_buffer)
+                # 每个买单只能用「资金池 - 已排出的买单」：此前各单独立对着
+                # 全额池计算，Σ目标权重≈1 时实际成交额（含滑点+费用）必然
+                # 超出 cash_buffer 余量，最后一个买单在 T+1 整单被拒
+                # （insufficient_cash=reject），边际标的一个调仓周期欠配。
+                cash = max((self.account.cash + planned_proceeds)
+                           * (1 - self.cfg.cash_buffer) - planned_buys, 0.0)
                 qty = min(delta_value, cash) / px
                 qty = self._round_lot(sym, qty, floor=True)
                 if qty > 0:
                     orders.append(self._order(sym, Side.BUY, qty))
+                    planned_buys += qty * px
 
         if self.cfg.price_mode in ("next_open", "next_vwap", "next_close"):
             # T 日收盘生成信号，推迟到 T+1 按对应成交价撮合 —— 防未来函数

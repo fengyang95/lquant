@@ -107,12 +107,16 @@ fn ts_regbeta(
 }
 
 /// 入口校验：两序列必须等长、窗口 n > 0。脏输入直接报错而非越界 panic。
-fn validate_xy(x: &[Option<f64>], y: &[Option<f64>], n: usize) -> PyResult<()> {
-    if x.len() != y.len() {
+///
+/// 参数用中性命名 a/b：ts_corr 传 (&x,&y)、ts_regbeta 传 (&y,&x)（correlation
+/// 对称、beta 有向），校验本身对两参等价 —— 若参数带 x/y 标号，错误消息
+/// 会把 y 标成 x，误导排查。
+fn validate_xy(a: &[Option<f64>], b: &[Option<f64>], n: usize) -> PyResult<()> {
+    if a.len() != b.len() {
         return Err(PyValueError::new_err(format!(
-            "x/y 长度不一致: {} vs {}",
-            x.len(),
-            y.len()
+            "两序列长度不一致: {} vs {}",
+            a.len(),
+            b.len()
         )));
     }
     if n == 0 {

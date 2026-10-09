@@ -155,14 +155,17 @@ class Broker:
                 price = max(price, lp)
 
         # 资金充足性：买单成交额+费用不得超过可用现金。
+        # 费用含印花税（按当日税档）：cn_a_share.yaml 里 2008-09-19 前
+        # side="both" 双边征收，买入同样有税 —— 预检漏掉这项时，早期回测
+        # truncate 模式下实际扣款会超出预算（成交额约 0.1%~0.4%），
+        # 现金变负 = 隐性杠杆。
         # reject（默认）：整单作废 —— 与 backtrader / 真实券商（开盘集合竞价
         #   资金不足废单）语义一致；绝不能让现金悄悄变负（隐性杠杆）。
         # truncate：按可用资金截量成交 —— 与聚宽 order_value 语义一致，
         #   由 JQRunner 显式选择，两条路径的口径差异因此是**显式配置**而非偶然。
         if order.side == Side.BUY and cash is not None:
-            a = qty * price
-            c = max(r.commission.min, a * r.commission.rate)
-            if a + c + a * r.transfer_fee_rate_on(d) > cash:
+            buy_cost = self._buy_cost(r, qty, price, d)
+            if buy_cost > cash:
                 if self.insufficient_cash == "reject":
                     order.status = OrderStatus.REJECTED
                     order.reason = "资金不足"
@@ -178,6 +181,20 @@ class Broker:
                     order.status = OrderStatus.REJECTED
                     order.reason = "涨停不可买"
                     return None
+                # 滑点随成交量变化的模型下，截量时的单价与重算单价可能不同，
+                # 截量结果可能仍超预算 —— 按新价格再截一轮；两轮后仍超就整单
+                # 作废：宁可拒单，绝不让现金透支。
+                if self._buy_cost(r, qty, price, d) > cash:
+                    qty = self._affordable_qty(r, qty, price, cash, d)
+                    if qty <= 0:
+                        order.status = OrderStatus.REJECTED
+                        order.reason = "数量不足一手或资金不足"
+                        return None
+                    price = self._price(bar, order.side, qty=qty)
+                    if self._buy_cost(r, qty, price, d) > cash:
+                        order.status = OrderStatus.REJECTED
+                        order.reason = "资金不足"
+                        return None
 
         amount = qty * price
         transfer = amount * r.transfer_fee_rate_on(d)
@@ -201,13 +218,29 @@ class Broker:
         order.status = OrderStatus.FILLED if order.filled_qty >= order.qty - 1e-9 else OrderStatus.PARTIAL
         return Fill(order.order_id, order.symbol, order.side, qty, price, fee, d)
 
-    def _affordable_qty(self, r: InstrumentRules, qty: float,
-                        price: float, cash: float, d: date) -> float:
-        """资金不足时能买的最大数量（按含费口径反解，再按整手向下取整）。"""
+    def _buy_cost(self, r: InstrumentRules, qty: float, price: float,
+                  d: date) -> float:
+        """买单含费总额：成交额 + 佣金(含最低) + 印花税(当日税档) + 过户费(当日档)。
+
+        预检与截量复查共用，保证「按多少现金封顶」和「实际扣多少」是同一套
+        公式 —— 两处口径一旦漂移，truncate 模式就会静默透支。
+        """
+        a = qty * price
+        c = max(r.commission.min, a * r.commission.rate)
+        return a + c + a * (r.tax_rate(d, Side.BUY) + r.transfer_fee_rate_on(d))
+
+    def _affordable_qty(self, r: InstrumentRules, qty: float, price: float,
+                        cash: float, d: date) -> float:
+        """资金不足时能买的最大数量（按含费口径反解，再按整手向下取整）。
+
+        含费含税：印花税按当日税档取买入方向（2008-09-19 前双边征收），
+        过户费同样按当日档取，与 account.apply_fill 的实际扣款公式一致。
+        """
         if price <= 0:
             return 0.0
-        # 反解：q*price*(1 + comm_rate + transfer) + min_comm <= cash
-        unit = price * (1.0 + r.commission.rate + r.transfer_fee_rate_on(d))
+        # 反解：q*price*(1 + comm_rate + tax_rate + transfer) + min_comm <= cash
+        tax = r.tax_rate(d, Side.BUY)
+        unit = price * (1.0 + r.commission.rate + tax + r.transfer_fee_rate_on(d))
         budget = cash - r.commission.min
         q = min(qty, max(budget, 0.0) / unit)
         if q >= qty - 1e-9:              # 反解已够，不需要截量

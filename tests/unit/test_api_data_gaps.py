@@ -26,19 +26,26 @@ FROZEN_TODAY = date(2026, 9, 11)
 
 @pytest.fixture(scope="module", autouse=True)
 def _frozen_today():
-    """把 gaps 链路读到的业务日钉死在 FROZEN_TODAY。
+    """把 gaps 链路读到的业务日与墙钟钉死在 FROZEN_TODAY。
 
     两处读取点都要打：``coverage`` 是模块级 ``from ... import today_cn``；
     ``server.api.data`` 的 repair 分支在函数内 import，走的是 ``core.types``。
+    ``coverage.now_cn`` 同样要钉：窗口右端在北京时间 16:00 前会退到昨日，
+    只冻结 today_cn 会让用例在每天 16:00 前随钟点变红。
     模块级 fixture 拿不到 monkeypatch（pytest 9 仍限函数级），故用
     ``MonkeyPatch.context()`` 自带撤销。
     """
+    from datetime import datetime
+
     from lquant.core import types
+    from lquant.core.types import TZ
     from lquant.data.quality import coverage
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(types, "today_cn", lambda: FROZEN_TODAY)
         mp.setattr(coverage, "today_cn", lambda: FROZEN_TODAY)
+        mp.setattr(coverage, "now_cn",
+                    lambda: datetime(2026, 9, 11, 18, 0, tzinfo=TZ))
         yield
 
 

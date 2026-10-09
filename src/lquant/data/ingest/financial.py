@@ -72,8 +72,10 @@ def backfill_financial(
     Returns:
         {"done": 本次实际拉取的标的数, "skipped_covered": 被覆盖区间跳过的
          标的数, "groups": 增量段个数, "start"/"end": 请求窗口, "rows": 表内
-         总行数}。「全被跳过」与「拉了一遍但源零返回」必须能区分 ——
-        前者是断点命中，后者是数据缺口。
+         总行数, "checkpoint": 实际写入的 checkpoint 名}。「全被跳过」与
+        「拉了一遍但源零返回」必须能区分 —— 前者是断点命中，后者是数据缺口。
+        checkpoint 名随实际生效的源变化（financial_pit_{provider.name}），
+        调用方做后置完备性检查时必须用这个名，不能猜。
     """
     from loguru import logger
 
@@ -131,7 +133,7 @@ def backfill_financial(
                 f"累计 {repo.count()} 条记录")
     return {"done": done, "skipped_covered": skipped, "groups": len(groups),
             "start": start_d.isoformat(), "end": end_d.isoformat(),
-            "rows": repo.count()}
+            "rows": repo.count(), "checkpoint": cp_name}
 
 
 __all__ = ["backfill_financial"]

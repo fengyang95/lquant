@@ -85,7 +85,12 @@ def _load_financial(con, asof: date, items: tuple[str, ...],
       全表排序，实测 28s；哈希聚合 1.8s，结果等价。
     """
     placeholders = ",".join("?" * len(items))
-    start = date(asof.year - lookback_years, asof.month, asof.day)
+    # 闰年 2/29 往前推 N 年落在平年会 ValueError（2/29 不存在）→ 接口 500；
+    # 回退到 2/28（对 5 年回看窗口，差一天不改变「陈旧性闸门」的语义）
+    try:
+        start = date(asof.year - lookback_years, asof.month, asof.day)
+    except ValueError:
+        start = date(asof.year - lookback_years, asof.month, 28)
     sql = (
         "SELECT symbol, stat_date, item, max(pub_date) AS pub_date,"
         "       arg_max(value, pub_date) AS value"
@@ -519,6 +524,18 @@ _RECONCILE_CUMULATIVE: frozenset[str] = frozenset({
 })
 
 
+def _adjacent_period(cur: date, prev: date) -> bool:
+    """prev 是否 cur 的**上一个报告期**（同年前一季，或 Q1 的上年 Q4）。
+
+    勾稽的单季化与变动都假设两期相邻。中间缺一期（某季报漏采/未披露）
+    时拿「相隔两季的累计值」相减，得到的差额被当成单季参与勾稽，
+    会凭空制造出巨额勾稽差异 —— 必须显式校验。
+    """
+    if cur.year == prev.year:
+        return (cur.month - prev.month) == 3
+    return cur.year == prev.year + 1 and cur.month == 3 and prev.month == 12
+
+
 def _quarterly_value(field: str, cur: float | None, prev: float | None,
                      cur_period: date, prev_period: date | None) -> float | None:
     """把累计口径科目折算成**当期单期**值；时点科目原样返回。"""
@@ -562,7 +579,10 @@ def _auto_reconcile_inputs(con, symbol: str, asof: date) -> tuple[dict, dict]:
 
     periods = sorted(set(rows["stat_date"].to_list()), reverse=True)
     cur_period = periods[0]
-    prev_period = periods[1] if len(periods) > 1 else None
+    # 上期必须与本期相邻才可用于单季化/求变动；缺期时降级为「无上期」
+    # （Q1 累计即单季仍可勾稽，其余期该字段记未检查），绝不用隔季数据硬算
+    prev_period = (periods[1] if len(periods) > 1
+                   and _adjacent_period(periods[0], periods[1]) else None)
     latest = rows.filter(pl.col("stat_date") == cur_period)
     by_item = dict(zip(latest["item"].to_list(), latest["value"].to_list(),
                        strict=True))
@@ -597,6 +617,7 @@ def _auto_reconcile_inputs(con, symbol: str, asof: date) -> tuple[dict, dict]:
     meta = {
         "latest_stat_date": cur_period.isoformat(),
         "previous_stat_date": prev_period.isoformat() if prev_period else None,
+        "previous_adjacent": prev_period is not None,
         "period_basis": "quarterly",
         "filled": sorted(inputs),
     }

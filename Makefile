@@ -1,5 +1,5 @@
 .PHONY: help setup hooks db-init db-reset bootstrap dev api worker web \
-        test coverage diff-cov lint fmt type rust-build rust-test \
+        test test-changed test-full coverage diff-cov lint fmt type rust-build rust-test \
         docker-up docker-down clean smoke start stop status logs bundle \
         secrets secrets-history secrets-dir secrets-install public-ready \
         xval-sentinel
@@ -21,8 +21,10 @@ help:
 	@echo "  make web         仅前端"
 	@echo "  make bundle      生产构建 + 打发行包（等价 ./lquant.sh build）"
 	@echo "  make smoke       ABI 冒烟：确认 Rust 扩展可加载"
-	@echo "  make test / lint / fmt / type"
-	@echo "  make coverage    全量覆盖率报告（coverage.xml/json）"
+	@echo "  make test        全量 pytest（xdist 并行；~3585 用例按 CPU 数分片）"
+	@echo "  make test-changed  只跑本次改动相关的测试（scripts/test_changed.sh）"
+	@echo "  make test-full   全量串行（xdist 出问题时兜底 / -s 调试用）"
+	@echo "  make coverage    全量覆盖率报告（coverage.xml/json，xdist 并行）"
 	@echo "  make diff-cov    改动行覆盖率门禁（vs origin/main，≥95%）"
 	@echo "  make rust-build  编译 Rust 扩展（maturin develop）"
 	@echo "  make docker-up   启动 Redis"
@@ -113,12 +115,26 @@ rust-build:
 rust-test:
 	cd crates && cargo test --workspace
 
+# 全量并行（xdist）。曾用 -m "not slow" 过滤，但全仓没有任何用例带 slow 标记
+# （CI 日志证实 selected == all），该过滤是空操作还误导人，已删。
+# --dist loadgroup：把带 xdist_group 标记的用例（如 test_task_center，文件内
+# 有顺序依赖）钉在同一个 worker 里按序执行，其余用例自由分配。
 test:
-	$(PY) -m pytest tests -m "not slow"
+	$(PY) -m pytest tests -n auto --dist loadgroup
 
-# 覆盖率报告：出 term-missing + xml（diff-cover 用）+ json
+# 日常快速反馈：只跑改动相关的测试文件（文件名启发式映射 + 全局面兜底），
+# pre-push 钩子默认也走这条路。映射不准时 --full 全量兜底。
+test-changed:
+	bash scripts/test_changed.sh
+
+# 串行全量：xdist 下 -s/--pdb 失效或怀疑并行污染时用。
+test-full:
+	$(PY) -m pytest tests
+
+# 覆盖率报告：出 term-missing + xml（diff-cover 用）+ json。
+# xdist 与 pytest-cov 自动合并各 worker 的覆盖数据，并行不丢精度。
 coverage:
-	$(PY) -m pytest tests -m "not slow" \
+	$(PY) -m pytest tests -n auto --dist loadgroup \
 	  --cov=src/lquant --cov-report=term-missing \
 	  --cov-report=xml:coverage.xml --cov-report=json:coverage.json -q
 

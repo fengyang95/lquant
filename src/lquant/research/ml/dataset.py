@@ -85,9 +85,27 @@ class Dataset:
             d = d.filter(pl.col(self.cfg.date_col) <= _as_date(end))
         return d
 
-    def split(self, train_end, valid_end, test_end=None):
-        """按日期切成 (train, valid, test)。"""
-        return (self.slice(end=train_end),
+    def split(self, train_end, valid_end, test_end=None, *, purge: bool = True):
+        """按日期切成 (train, valid, test)。
+
+        purge=True（默认）：train 尾部剔除 label_horizon-1 个交易日。
+        标签是 forward_return —— 靠近 train_end 的样本要读 train_end 之后
+        的价格才能定标签，不剔除就等于用 valid 段的价格算 train 的标签
+        （标签泄漏），验证指标被系统性高估。
+        """
+        te = _as_date(train_end)
+        if purge and self.cfg.label_horizon > 1:
+            k = self.cfg.label_horizon - 1
+            dd = [x for x in self.dates if x <= te]
+            if len(dd) > k:
+                te = dd[-1 - k]          # 回退 k 个交易日（dates 本身是交易日序列）
+            else:
+                # 窗口比泄漏窗还短：训练段为空（head(0)），由下游显式报错，
+                # 不能悄悄退回不 purge —— 那是静默泄漏
+                return (self.df.head(0),
+                        self.slice(start=_next_day(train_end), end=valid_end),
+                        self.slice(start=_next_day(valid_end), end=test_end))
+        return (self.slice(end=te),
                 self.slice(start=_next_day(train_end), end=valid_end),
                 self.slice(start=_next_day(valid_end), end=test_end))
 

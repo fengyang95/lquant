@@ -69,6 +69,9 @@ class DerivedSpec:
     denominator: str
     scale: float = 1.0
     denominator_positive: bool = False
+    # True：分母是「报告期累计」口径（利润表科目/周转率），按报告期年化后再除。
+    # Q1 的营业成本只覆盖 3 个月，不年化会把周转天数高估 4 倍
+    annualize_denominator: bool = False
 
     @property
     def inputs(self) -> tuple[str, ...]:
@@ -89,10 +92,12 @@ DERIVED_METRICS: dict[str, DerivedSpec] = {
         DerivedSpec("derived.cfo_to_op", "经营现金流/营业利润",
                     "cashflow.n_cashflow_act", "income.operate_profit"),
         DerivedSpec("derived.ar_turn_days", "应收周转天数",
-                    360.0, "indicator.ar_turn", denominator_positive=True),
+                    360.0, "indicator.ar_turn", denominator_positive=True,
+                    annualize_denominator=True),
         DerivedSpec("derived.inv_turn_days", "存货周转天数",
                     "balancesheet.inventories", "income.oper_cost",
-                    scale=360.0, denominator_positive=True),
+                    scale=360.0, denominator_positive=True,
+                    annualize_denominator=True),
         DerivedSpec("derived.ebit_to_interest", "利息保障倍数",
                     "indicator.ebit", "income.fin_exp_int_exp",
                     denominator_positive=True),
@@ -123,6 +128,18 @@ def _latest_slice(panel: pl.DataFrame, key: str) -> pl.DataFrame:
     )
 
 
+def _annualize_factor_expr() -> pl.Expr:
+    """报告期累计 → 年度口径的系数：Q1×4 / H1×2 / Q1-3×(4/3) / FY×1。
+
+    按报告期月份推断覆盖天数占比（Q1=3/12 年、H1=6/12、Q1-3=9/12）。
+    """
+    m = pl.col("stat_date").dt.month()
+    return (pl.when(m == 3).then(4.0)
+            .when(m == 6).then(2.0)
+            .when(m == 9).then(4.0 / 3.0)
+            .otherwise(1.0))
+
+
 def _derive_one(panel: pl.DataFrame, spec: DerivedSpec) -> pl.DataFrame:
     """单个派生指标 → 长表行（``item`` 为逻辑键）。"""
     den = _latest_slice(panel, spec.denominator).rename(
@@ -143,6 +160,10 @@ def _derive_one(panel: pl.DataFrame, spec: DerivedSpec) -> pl.DataFrame:
         )
 
     # 任一输入缺失 / 分母为 0（或要求正但非正）→ 整条置空，不兜底
+    if spec.annualize_denominator:
+        # 分母年化到年度口径再做比率（tushare 财务口径是报告期累计）
+        joined = joined.with_columns(
+            (pl.col("den") * _annualize_factor_expr()).alias("den"))
     ok = (pl.col("den") > 0) if spec.denominator_positive else (pl.col("den") != 0)
     ok = ok & pl.col("den").is_not_null() & pl.col("num").is_not_null()
 

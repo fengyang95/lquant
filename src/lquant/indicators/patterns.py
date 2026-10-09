@@ -246,8 +246,13 @@ def add_morning_star(
     d2_small = _body().shift(1) <= small_body_ratio * _body().shift(2)
     d2_gap = pl.max_horizontal("open", "close").shift(1) < pl.col("close").shift(2)
     d3_bull = pl.col("close") > pl.col("open")
+    # 收复第一根实体 recover_ratio 以上：锚点 C₁ + r·(O₁−C₁) = r·O₁ + (1−r)·C₁。
+    # 阴线 O₁>C₁（实体顶是 O₁），(O₁+C₁)·r 在 r≠0.5 时偏出实体区间
+    # （r=0.8 时算出 0.8·(O₁+C₁) 可远高于 O₁，信号永远不触发）
     d3_recover = (
-        pl.col("close") > (pl.col("open").shift(2) + pl.col("close").shift(2)) * recover_ratio
+        pl.col("close")
+        > recover_ratio * pl.col("open").shift(2)
+        + (1.0 - recover_ratio) * pl.col("close").shift(2)
     )
     cond = d1_bear & d2_small & d2_gap & d3_bull & d3_recover
     return df.with_columns(_signal(cond, "pattern_morning_star"))

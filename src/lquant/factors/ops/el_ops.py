@@ -12,8 +12,15 @@ def el_abs(x: pl.Expr) -> pl.Expr:
     return x.abs()
 
 
-@op("Log", "EL", 1, "自然对数（log1p 口径，与 Alpha158 的 Log($v+1) 一致）")
+@op("Log", "EL", 1, "自然对数 ln(x)（qlib 口径 Log($v)=ln(v)；非正值置 null。ln(1+x) 请用 Log1p）")
 def el_log(x: pl.Expr) -> pl.Expr:
+    # qlib 的 Log 是普通 ln（qlib_source _PASSTHROUGH 一致）。此前误用 log1p，
+    # Alpha158 的 Log($volume+1) 经两层叠加会算成 ln(v+2)——量纲系统性偏移
+    return pl.when(x > 0).then(x.log()).otherwise(None)
+
+
+@op("Log1p", "EL", 1, "ln(1+x)（收益率/比率类安全取对数；等价手写 Log(x+1) 的数值）")
+def el_log1p(x: pl.Expr) -> pl.Expr:
     return x.log1p()
 
 

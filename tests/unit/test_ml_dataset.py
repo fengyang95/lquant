@@ -99,10 +99,21 @@ def test_slice_by_str_dates():
 def test_split_three_parts_disjoint():
     ds = build_dataset(make_panel(), DatasetConfig(features=["mom"]))
     tr, va, te = ds.split(date(2024, 1, 20), date(2024, 1, 28))
-    assert tr["trade_date"].max() == date(2024, 1, 20)
+    # 标签 fwd_ret_5 读 4 个交易日后的价格：train 尾回退 horizon-1=4 天
+    # （purge），否则 train 末 4 天的样本用 valid 段价格算标签 —— 泄漏
+    assert tr["trade_date"].max() == date(2024, 1, 16)
     assert va["trade_date"].min() == date(2024, 1, 21)
     assert va["trade_date"].max() == date(2024, 1, 28)
     assert te["trade_date"].min() == date(2024, 1, 29)
+    assert tr["trade_date"].max() < va["trade_date"].min() < te["trade_date"].min()
+
+
+def test_split_purge_false_keeps_boundary():
+    """purge=False 显式关闭回退（保留旧边界，仅限无标签泄漏风险场景）。"""
+    ds = build_dataset(make_panel(), DatasetConfig(features=["mom"]))
+    tr, va, te = ds.split(date(2024, 1, 20), date(2024, 1, 28), purge=False)
+    assert tr["trade_date"].max() == date(2024, 1, 20)
+    assert va["trade_date"].min() == date(2024, 1, 21)
 
 
 def test_xy_values():

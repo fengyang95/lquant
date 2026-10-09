@@ -4,12 +4,15 @@
 当天不采，这笔数据就永远消失了 —— 所以它是整个看板里唯一
 "失败必须告警"的采集任务，且要在收盘后尽快跑（15:05 左右）。
 
-字段口径（东财 getTopicZTPool）：
+字段口径（东财 getTopicZTPool，已按 akshare 源码与真实返回对账）：
 - p     价格，放大 1000 倍
 - zdp   涨跌幅，已是百分数
+- amount 成交额（元）—— fund 是**封板资金**（封住涨停所需买单金额），
+         两者量级常差 10 倍以上，混用会系统性歪曲「封板强度 vs 热度」
+- fund  封板资金（元）→ 本采集器落 seal_amount 列
+- fbt/lbt 首次/最后封板时间，HHMMSS 整数（92503 = 09:25:03），不是时间戳
 - lbc   连板数
 - zbc   炸板次数
-- fbt   首次封板时间戳（秒）
 - hs    换手率，放大 100 倍
 """
 from __future__ import annotations
@@ -43,27 +46,60 @@ def _parse_ymd(s: str) -> date:
 
 
 def _fetch_pool(kind: str, trade_date: date | str | None = None,
-                pagesize: int = 300) -> list[dict]:
-    """kind: ZT(涨停) / ZB(炸板) / DT(跌停)"""
-    url = (f"{_BASE}/getTopic{kind}Pool?ut={_UT}&dpt=wz.ztzt"
-           f"&Pageindex=0&pagesize={pagesize}&sort=fbt%3Aasc&date={_ymd(trade_date)}")
-    resp = em_get(url)
-    try:
-        payload = resp.json()
-    except Exception as e:  # noqa: BLE001
-        raise DataUnavailable("eastmoney", f"涨停池响应非 JSON: {e}") from e
-    if not payload or not payload.get("data"):
-        return []
-    return payload["data"].get("pool", []) or []
+                pagesize: int = 500) -> list[dict]:
+    """kind: ZT(涨停) / ZB(炸板) / DT(跌停)。
+
+    翻页取全：接口默认单页，2015 年级别的大行情单日涨停家数超过 1000，
+    单页固定 pagesize 会静默截断 —— 涨停家数/炸板率等情绪统计直接失真。
+    """
+    all_rows: list[dict] = []
+    page = 0
+    while True:
+        url = (f"{_BASE}/getTopic{kind}Pool?ut={_UT}&dpt=wz.ztzt"
+               f"&Pageindex={page}&pagesize={pagesize}&sort=fbt%3Aasc"
+               f"&date={_ymd(trade_date)}")
+        resp = em_get(url)
+        try:
+            payload = resp.json()
+        except Exception as e:  # noqa: BLE001
+            raise DataUnavailable("eastmoney", f"涨停池响应非 JSON: {e}") from e
+        if not payload or not payload.get("data"):
+            break
+        data = payload["data"]
+        pool = data.get("pool") or []
+        all_rows.extend(pool)
+        # 终止：本页不满（最后一页）/ 已取满接口给的 total（tc）/ 兜底页数上限
+        if len(pool) < pagesize:
+            break
+        tc = data.get("tc")
+        if tc is not None and len(all_rows) >= int(tc):
+            break
+        page += 1
+        if page >= 20:                 # 20 页 = 1 万条，纯防御
+            break
+    return all_rows
 
 
 def _ts_to_hhmmss(v) -> str:
-    if not v:
+    """东财 fbt/lbt 是 HHMMSS 整数（92503 = 09:25:03），不是时间戳。
+
+    原实现 fromtimestamp(int(v)) 把它当 Unix 秒：92503 秒落在 1970-01-02，
+    经本机时区换算产出 09:41:43 这类似是而非的垃圾值 —— 格式完全正常，
+    数值全错，比崩溃隐蔽得多。
+    """
+    if v in (None, "", 0, "0"):
         return ""
     try:
-        return datetime.fromtimestamp(int(v)).strftime("%H:%M:%S")
-    except Exception:  # noqa: BLE001
+        n = int(v)
+    except (TypeError, ValueError):
         return str(v)
+    if n <= 0:
+        return ""
+    hh, rem = divmod(n, 10000)
+    mm, ss = divmod(rem, 100)
+    if hh > 23 or mm > 59 or ss > 59:
+        return str(v)                  # 非法值原样透传，便于发现口径变化
+    return f"{hh:02d}:{mm:02d}:{ss:02d}"
 
 
 def _norm_symbol(code: str) -> str:
@@ -89,7 +125,8 @@ def fetch_limit_up_pool(trade_date: date | str | None = None, *,
             "name": it.get("n"),
             "close": float(it.get("p", 0)) / 1000.0,
             "change_pct": float(it.get("zdp", 0)),
-            "amount": float(it.get("fund", 0) or 0),
+            "amount": float(it.get("amount", 0) or 0),
+            "seal_amount": float(it.get("fund", 0) or 0),
             "turnover_rate": float(it.get("hs", 0) or 0) / 100.0,
             "first_limit_time": _ts_to_hhmmss(it.get("fbt")),
             "last_limit_time": _ts_to_hhmmss(it.get("lbt")),
@@ -99,8 +136,8 @@ def fetch_limit_up_pool(trade_date: date | str | None = None, *,
             "collected_at": now_cn(),
         })
     cols = ["trade_date", "symbol", "name", "close", "change_pct", "amount",
-            "turnover_rate", "first_limit_time", "last_limit_time", "open_count",
-            "limit_up_type", "industry", "collected_at"]
+            "seal_amount", "turnover_rate", "first_limit_time", "last_limit_time",
+            "open_count", "limit_up_type", "industry", "collected_at"]
     return pl.DataFrame(rows, schema={c: None for c in cols}, orient="row") if not rows \
         else pl.DataFrame(rows)
 
@@ -127,7 +164,8 @@ def fetch_broken_pool(trade_date: date | str | None = None, *,
     rows = [{"trade_date": d, "symbol": _norm_symbol(it.get("c")), "name": it.get("n"),
              "close": float(it.get("p", 0)) / 1000.0,
              "change_pct": float(it.get("zdp", 0)),
-             "amount": float(it.get("fund", 0) or 0),
+             "amount": float(it.get("amount", 0) or 0),
+             "seal_amount": float(it.get("fund", 0) or 0),
              "first_limit_time": _ts_to_hhmmss(it.get("fbt")),
              "open_count": int(it.get("zbc", 0) or 0),
              "industry": it.get("hybk"),
@@ -136,6 +174,7 @@ def fetch_broken_pool(trade_date: date | str | None = None, *,
     return pl.DataFrame(rows) if rows else pl.DataFrame(
         schema={"trade_date": pl.Date, "symbol": pl.Utf8, "name": pl.Utf8,
                 "close": pl.Float64, "change_pct": pl.Float64, "amount": pl.Float64,
+                "seal_amount": pl.Float64,
                 "first_limit_time": pl.Utf8, "open_count": pl.Int64,
                 "industry": pl.Utf8, "collected_at": pl.Datetime("us")})
 
@@ -149,12 +188,14 @@ def fetch_limit_down_pool(trade_date: date | str | None = None, *,
     rows = [{"trade_date": d, "symbol": _norm_symbol(it.get("c")), "name": it.get("n"),
              "close": float(it.get("p", 0)) / 1000.0,
              "change_pct": float(it.get("zdp", 0)),
-             "amount": float(it.get("fund", 0) or 0),
+             "amount": float(it.get("amount", 0) or 0),
+             "seal_amount": float(it.get("fund", 0) or 0),
              "industry": it.get("hybk"), "collected_at": now_cn()}
             for it in _fetch_pool("DT", trade_date)]
     return pl.DataFrame(rows) if rows else pl.DataFrame(
         schema={"trade_date": pl.Date, "symbol": pl.Utf8, "name": pl.Utf8,
                 "close": pl.Float64, "change_pct": pl.Float64, "amount": pl.Float64,
+                "seal_amount": pl.Float64,
                 "industry": pl.Utf8, "collected_at": pl.Datetime("us")})
 
 
@@ -174,6 +215,7 @@ def _demo_pool(d: date, kind: str) -> pl.DataFrame:
             "change_pct": 10.0 if kind == "up" else (-10.0 if kind == "down"
                                                      else round(random.uniform(2, 9), 2)),
             "amount": round(random.uniform(1e7, 3e9), 2),
+            "seal_amount": round(random.uniform(5e6, 5e8), 2),
             "turnover_rate": round(random.uniform(0.5, 25), 2),
             "first_limit_time": f"{random.randint(9, 14):02d}:{random.randint(0, 59):02d}:00",
             "last_limit_time": "15:00:00",

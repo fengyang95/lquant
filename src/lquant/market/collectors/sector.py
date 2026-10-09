@@ -22,9 +22,9 @@ __all__ = ["fetch_sectors", "fetch_concepts", "fetch_areas", "SECTOR_FS"]
 _PUSH2 = "https://push2.eastmoney.com/api/qt/clist/get"
 SECTOR_FS = {"industry": "m:90+t:2", "concept": "m:90+t:3", "area": "m:90+t:1"}
 
-# f12 代码 f14 名称 f3 涨跌幅 f8 换手率 f62 主力净流入
-# f128 领涨股名称 f136 领涨股涨跌幅 f207 领涨股代码 f222 上涨家数?（接口不稳定）
-_FIELDS = "f12,f14,f3,f8,f62,f128,f136,f207,f104,f105"
+# f12 代码 f14 名称 f3 涨跌幅 f6 成交额（元）f8 换手率 f62 主力净流入
+# f128 领涨股名称 f136 领涨股涨跌幅 f207 领涨股代码 f104/f105 上涨/下跌家数
+_FIELDS = "f12,f14,f3,f6,f8,f62,f128,f136,f207,f104,f105"
 
 
 def _norm(code: str) -> str:
@@ -76,7 +76,7 @@ def fetch_sectors(trade_date=None, kind: str = "industry", *, top: int = 100,
             "kind": kind,
             "change_pct": _num(it.get("f3")),
             "turnover_rate": _num(it.get("f8")),
-            "amount": 0.0,
+            "amount": _num(it.get("f6")),   # f6 = 板块成交额（元），此前硬编码 0.0
             "main_net_inflow": _num(it.get("f62")),
             "leader_symbol": _norm(it.get("f207")) if it.get("f207") else None,
             "leader_name": it.get("f128"),

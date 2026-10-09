@@ -13,6 +13,20 @@ from lquant.factors.ops.registry import OPS
 FUTURE_MARKERS = {"future", "lead", "next", "forward"}
 
 
+def _num_value(a: Node) -> float | None:
+    """提取常量参数的数值：Num 直取；UnaryOp(-Num)（如 -1）取负值。
+
+    负窗口（Ts_Delay($close, -1)）经 parser 解析成 UnaryOp，此前既不参与
+    窗口估计、也没有任何数值校验 —— 编译成 shift(-1) 直接引用未来数据。
+    """
+    if isinstance(a, Num):
+        return float(a.value)
+    if isinstance(a, UnaryOp) and getattr(a, "op", "") in ("-", "USub", "neg") \
+            and isinstance(a.arg, Num):
+        return -float(a.arg.value)
+    return None
+
+
 def analyze(node: Node) -> tuple[int, set[str], set[str]]:
     """返回 (min_window, fields, op_names)。"""
     if isinstance(node, Field):
@@ -40,10 +54,20 @@ def analyze(node: Node) -> tuple[int, set[str], set[str]]:
             ops |= ao
         meta = OPS.meta(node.name)
         required = int(meta.get("min_window", 0))
-        # 窗口参数通常是最后一个 int 参数
+        # 负常量拦截仅对 **TS 类**算子生效：TS 算子里负数值参数只可能是
+        # 负窗口（shift(-n) 引用未来数据）；正的小数参数是合法的
+        # （如 Ts_Quantile 的 q=0.8）。EL 类数值参数是数学常量
+        # （如 Power(x, -2)），负值合法。位移类窗口 ≥1 由算子构造期
+        # _require_positive 精确拦截。
+        is_ts = meta.get("category") == "TS"
         for a in node.args:
-            if isinstance(a, Num):
-                required = max(required, int(a.value))
+            v = _num_value(a)
+            if v is None:
+                continue
+            if is_ts and v < 0:
+                raise LookaheadError(
+                    f"时序算子 {node.name} 的参数 {v:g} 为负 —— 负窗口引用未来数据")
+            required = max(required, int(v))
         return max(w, required), fields, ops
     raise TypeError(f"未知节点 {type(node)}")
 
