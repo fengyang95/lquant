@@ -165,12 +165,16 @@ def cdar_weight_lp(returns: np.ndarray, *, level: float = 0.95,
                    min_return: float | None = None) -> np.ndarray:
     """最小化 CDaR 的多头权重（Chekhlov–Uryasev–Zabarankin LP）。
 
-    变量 ``[w(n), y(T), z(T), alpha, u(T)]``：``y_t`` 是累计收益，
-    ``z_t`` 是回撤，``alpha`` 是 VaR-like 分位，``u_t`` 是尾部超出量。
+    变量 ``[w(n), y(T), m(T), z(T), alpha, u(T)]``：``y_t`` 累计收益、
+    ``m_t`` 累计收益的**运行峰值**、``z_t`` 回撤、``alpha`` 分位、``u_t`` 尾部超出量。
 
-    回撤约束 ``z_t >= y_s - y_t`` 对**所有 s <= t** 成立 —— 这是 T²/2 条约束，
-    所以用 ``lookback`` 截断观测（默认最近 252 期）。截断会改变口径，因此
-    报告与调用方必须看得到实际用了多少期（返回值旁的 ``res`` 里带 T）。
+    **峰值用递推建模，而不是「对所有 s<=t 写 z_t >= y_s - y_t」**：
+    后者是 T²/2 条约束（T=252 时 3 万条，`weight_report` 跑一遍要 8 秒以上），
+    前者只要 3T 条 —— 因为在最小化目标里 m 会被压到刚好等于运行峰值，
+    z 也就刚好等于回撤。口径完全一致，规模差一个数量级。
+
+    ``lookback`` 截断观测（默认 252 期 ≈ 一年）：回撤口径对窗口敏感，窗口
+    本身要显式，不能悄悄用全样本。
     """
     level = _check_level(level)
     R = np.asarray(returns, dtype=float)
@@ -184,41 +188,39 @@ def cdar_weight_lp(returns: np.ndarray, *, level: float = 0.95,
     T = R.shape[0]
     linprog = _require_scipy()
 
-    # w(0..n-1), y(n..n+T-1), z(n+T..n+2T-1), alpha(n+2T), u(n+2T+1..)
-    nv = n + 2 * T + 1 + T
+    # 变量布局：w(0..n-1), y, m, z 各 T 个, alpha, u(T)
+    iy, im, iz = n, n + T, n + 2 * T
+    ia, iu = n + 3 * T, n + 3 * T + 1
+    nv = n + 3 * T + 1 + T
     c = np.zeros(nv)
-    c[n + 2 * T] = 1.0
-    c[n + 2 * T + 1:] = 1.0 / (T * (1.0 - level))
+    c[ia] = 1.0
+    c[iu:] = 1.0 / (T * (1.0 - level))
 
     rows: list[np.ndarray] = []
     rhs: list[float] = []
 
-    # 等式约束两条：y_t - Σ_{s<=t} r_s·w = 0，以及 Σw = 1
+    # y_t - Σ_{s<=t} r_s·w = 0
     A_eq = np.zeros((T + 1, nv))
     for t in range(T):
         A_eq[t, :n] = -R[:t + 1].sum(axis=0)
-        A_eq[t, n + t] = 1.0
+        A_eq[t, iy + t] = 1.0
     A_eq[T, :n] = 1.0
     b_eq = np.zeros(T + 1)
     b_eq[T] = 1.0
 
-    # 回撤定义 z_t >= y_s - y_t（对所有 s <= t）→ y_s - y_t - z_t <= 0
-    for t in range(T):
-        for s in range(t + 1):
-            row = np.zeros(nv)
-            row[n + s] += 1.0          # +y_s
-            row[n + t] -= 1.0          # -y_t
-            row[n + T + t] -= 1.0      # -z_t
-            rows.append(row)
-            rhs.append(0.0)
-    # u_t - z_t + alpha >= 0  →  -u_t + z_t - alpha <= 0
-    for t in range(T):
+    def _add(coeffs: dict[int, float]) -> None:
         row = np.zeros(nv)
-        row[n + 2 * T + 1 + t] = -1.0
-        row[n + T + t] = 1.0
-        row[n + 2 * T] = -1.0
+        for idx, v in coeffs.items():
+            row[idx] = v
         rows.append(row)
         rhs.append(0.0)
+
+    for t in range(T):
+        _add({im + t: -1.0, iy + t: 1.0})                    # m_t >= y_t
+        # m_t >= m_{t-1}（t=0 时以 0 为基准：累计收益从 0 起步）
+        _add({im + t: -1.0, **({im + t - 1: 1.0} if t else {})})
+        _add({iz + t: -1.0, im + t: 1.0, iy + t: -1.0})      # z_t >= m_t - y_t
+        _add({iu + t: -1.0, iz + t: 1.0, ia: -1.0})          # u_t >= z_t - alpha
 
     A_ub = np.array(rows)
     b_ub = np.array(rhs)
@@ -229,8 +231,9 @@ def cdar_weight_lp(returns: np.ndarray, *, level: float = 0.95,
         b_ub = np.concatenate([b_ub, [-float(min_return)]])
 
     bounds = ([(0.0, float(max_weight))] * n
-              + [(None, None)] * T          # y 无界（累计收益可正可负）
-              + [(0.0, None)] * T           # z >= 0（回撤非负）
+              + [(None, None)] * T          # y
+              + [(None, None)] * T          # m（峰值，与 y 同量纲）
+              + [(0.0, None)] * T           # z >= 0
               + [(None, None)]              # alpha
               + [(0.0, None)] * T)          # u >= 0
     res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds,
