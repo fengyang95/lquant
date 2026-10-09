@@ -190,3 +190,21 @@ def test_excess_nav_marks_incomplete_group_as_null():
         assert new[f"ex_q{q}"].null_count() == new.height, f"ex_q{q} 应为全 null"
     for q in (2, 4, 6, 8, 10):
         assert new[f"ex_q{q}"].null_count() == 0, f"ex_q{q} 不应有 null"
+
+
+def test_quantile_summary_empty_panel_has_same_keys():
+    """空数据路径必须返回**同样的键**（值全 None）。
+
+    调用方（server/api/factors.py）无条件读 ``res["quantile"]["long_short"]``：
+    早退分支少一个键，空面板就会把报表端点打成 500（KeyError）。「没有结论」
+    和「没有这个字段」对调用方是两回事。
+    """
+    empty = pl.DataFrame({"trade_date": [], "symbol": [], "f": [], "fwd_ret_1": []},
+                         schema_overrides={"trade_date": pl.Date, "f": pl.Float64,
+                                           "fwd_ret_1": pl.Float64})
+    out = quantile_summary(empty, "f", "fwd_ret_1", n_groups=5)
+    full = quantile_summary(_panel(), "factor", "fwd_ret_1", n_groups=5)
+    assert set(out) == set(full)
+    assert set(out["long_short"]) == set(full["long_short"])
+    assert all(v is None for v in out["long_short"].values())
+    assert out["groups"] == []
