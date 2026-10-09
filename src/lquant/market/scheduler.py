@@ -2,7 +2,7 @@
 
 时点设计取决于数据源的**可回溯性**：
 - 15:05 close   涨停池 / 跌停池 / 炸板池 / 资金流 / 板块 —— 盘中数据收盘后很快被覆盖
-- 18:00 evening 龙虎榜 / 北向资金 —— 交易所盘后才发布
+- 18:00 evening 龙虎榜 / 北向成交额 / 北向十大活跃 —— 交易所盘后才发布
 - 09:00 preopen 当日基础信息校验、昨日数据补齐
 
 注意涨停池这类不可回溯的数据，采集失败等同于数据永久丢失，
@@ -124,6 +124,7 @@ def collect_and_save(schedule: str | None = "close", trade_date=None, *,
                 raise RuntimeError(f"关键采集器 {k} 失败（数据不可回溯）: {e}") from e
             errors[k] = errs
             _log_one(k, d, t0, now_cn_naive(), 0, "failed", errs)
+            _record_failure_issue(k, d, errs, demo=demo)
             continue
         ok_jobs.append((k, t0, len(frames[k])))
 
@@ -141,6 +142,28 @@ def collect_and_save(schedule: str | None = "close", trade_date=None, *,
         _log_one(k, d, t0, now_cn_naive(), persisted, status)
     return {"collected": {k: len(v) for k, v in frames.items()},
             "persisted": counts, "errors": errors}
+
+
+def _record_failure_issue(job: str, d, errs: str, *, demo: bool) -> None:
+    """采集失败同时进 data_quality_issue。
+
+    collect_log 记的是「这次跑失败了」，属**运行视角**；数据质量页看的是
+    `data_quality_issue`，属**数据视角**。北向那次事故的教训是：只落在运行
+    日志里的失败，看数据的人看不到（源站停发字段后采集器把 0 当值写库，
+    collect_log 全程 "ok"，直到源站改结构才变成 KeyError）。
+    demo 跑出来的失败是离线链路噪音，不入质量问题表。
+    """
+    if demo:
+        return
+    try:
+        from lquant.data.quality.issues import Issue, save_issues
+
+        save_issues([Issue(rule="COLLECTOR_FAILED", severity="error",
+                           dataset=job, trade_date=d,
+                           detail=f"采集器 {job} 失败：{errs}",
+                           extra={"job": job})])
+    except Exception:  # noqa: BLE001  记录失败绝不影响采集主流程
+        log.exception(f"采集失败 issue 落库失败 job={job}")
 
 
 def _log_one(job: str, trade_date, started_at: datetime, finished_at: datetime,

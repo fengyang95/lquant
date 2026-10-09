@@ -75,6 +75,7 @@ FIELD_NOTES: dict[str, dict[str, str]] = {
         "amount": "成交额（元）",
         "adj_factor": "复权因子",
         "source": "数据来源",
+        "ingested_at": "入库时间",
     },
     "financial_pit": {
         "symbol": "标的代码",
@@ -85,6 +86,7 @@ FIELD_NOTES: dict[str, dict[str, str]] = {
         "value": "值",
         "unit": "单位",
         "source": "数据来源",
+        "ingested_at": "入库时间",
     },
     "security": {
         "symbol": "标的代码",

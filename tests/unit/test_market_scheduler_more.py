@@ -204,6 +204,37 @@ def test_collect_and_save_non_critical_error(monkeypatch, fake_db, fake_collecto
     assert out["collected"]["northbound"] == 0
 
 
+def test_collect_failure_also_lands_in_quality_issues(monkeypatch, fake_db, fake_collectors):
+    """采集失败要同时进 data_quality_issue。
+
+    只落在 collect_log（运行视角）里的失败，看数据的人看不到 —— 北向那次
+    源站停发字段后采集器把 0 当值写库，collect_log 全程 "ok"。
+    """
+    from lquant.data.quality import issues as qissues
+
+    meta, get = fake_collectors
+    monkeypatch.setattr(sched, "upsert", lambda table, df: len(df))
+    monkeypatch.setattr(sched, "TABLE_COLUMNS", {"t_c": ["x"]}, raising=False)
+
+    def boom(**kw):
+        raise ValueError("net down")
+
+    monkeypatch.setattr(sched.COLLECTORS, "get",
+                        lambda k: boom if k == "northbound" else get(k))
+    seen = []
+    monkeypatch.setattr(qissues, "save_issues", lambda items, *a, **k: seen.extend(items))
+
+    sched.collect_and_save(schedule="evening")
+    rule = [i.rule for i in seen if i.dataset == "northbound"]
+    assert rule == ["COLLECTOR_FAILED"]
+    assert seen[0].severity == "error"
+
+    # demo 跑出来的失败不入质量问题表
+    seen.clear()
+    sched.collect_and_save(schedule="evening", demo=True)
+    assert seen == []
+
+
 def test_status_rows(monkeypatch, fake_db):
     def execute(sql):
         return SimpleNamespace(fetchone=lambda: (5, "2024-01-02", "2026-06-30"))
