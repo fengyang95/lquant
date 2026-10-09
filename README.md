@@ -41,6 +41,8 @@
 - **cargo 缺失**：自动安装 rustup（国内走 rsproxy 镜像，可用 `LQ_RUSTUP_DIST_SERVER` 覆盖）；
   装不上才降级为纯 Python 参考实现（`src/lquant/_rust/*.py`）
 - 脚本默认走清华 PyPI 镜像 + npmmirror，可用 `LQ_PYPI_INDEX` / `LQ_NPM_REGISTRY` 覆盖
+- **部署前 git 守卫**：`./lquant.sh update` 要求当前在 `main` 分支且工作树干净（含未跟踪文件），
+  否则拒绝执行，避免静默部署旧代码；`LQ_DEPLOY_BRANCH` 可指定其他分支，`LQ_ALLOW_DIRTY=1` 可跳过干净校验
 
 ## 数据层速览
 

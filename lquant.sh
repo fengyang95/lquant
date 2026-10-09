@@ -15,6 +15,8 @@
 #   后端为 editable 安装，代码改动天然生效，但 pyproject 依赖变化需重装；
 #   前端需 npm install 同步依赖、next build 刷新生产构建；
 #   运行中的服务是启动时加载的旧代码，最后自动重启使其吃到新代码。
+#   部署前校验：必须在 main 分支且工作树干净（LQ_DEPLOY_BRANCH / LQ_ALLOW_DIRTY
+#   可覆盖）；git pull --ff-only 失败即停，不再静默用旧代码继续。
 #
 # 特性：
 #   - 国内镜像加速（清华 PyPI / npmmirror），可用环境变量覆盖
@@ -49,6 +51,20 @@ info()  { echo -e "${C_GREEN}==> ${C_OFF}$*"; }
 warn()  { echo -e "${C_YELLOW}==> ${C_OFF}$*"; }
 fail()  { echo -e "${C_RED}==> ${C_OFF}$*"; exit 1; }
 dim()   { echo -e "${C_DIM}    $*${C_OFF}"; }
+
+# ---- git 守卫：部署前防回归（core.bare 自愈 + 分支/干净树校验）--------------
+# 主仓 core.bare 曾被外部工具误置为 true，导致主目录无法切分支/部署。这里
+# 在任何子命令前先自愈 core.bare；拉取代码前再硬校验分支与工作树状态。
+if [ -f scripts/lib/git_guard.sh ]; then
+  # shellcheck source=scripts/lib/git_guard.sh
+  source scripts/lib/git_guard.sh
+else
+  # 不硬停：stop/logs/status 等应急命令仍需可用；只有部署路径拒绝在未校验下继续
+  warn "缺少 scripts/lib/git_guard.sh（仓库不完整）——已跳过启动自愈"
+  ensure_git_worktree() { :; }
+  require_deploy_branch() { fail "git 守卫不可用（缺 scripts/lib/git_guard.sh），拒绝在未校验状态下部署"; }
+fi
+ensure_git_worktree
 
 # ----------------------------- 工具函数 ------------------------------------
 py()    { .venv/bin/python "$@"; }
@@ -374,10 +390,14 @@ cmd_update() {
   info "同步更新前后端代码"
 
   # 0) git 仓库且有远程时先拉最新代码
-  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  #    部署前硬校验：必须在期望分支且工作树干净，否则会静默部署旧代码。
+  #    pull 失败直接停下（而非 warn 后继续），避免带着旧代码重启服务。
+  if [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = "true" ]; then
     if [ -n "$(git remote 2>/dev/null | head -1)" ]; then
-      info "拉取最新代码 (git pull)"
-      git pull --ff-only || warn "git pull 失败（本地改动冲突？），继续基于当前代码更新"
+      require_deploy_branch
+      info "拉取最新代码 (git pull --ff-only)"
+      git pull --ff-only \
+        || fail "git pull --ff-only 失败：请先处理本地改动/分叉后重试（当前分支需能快进到 origin）"
     else
       dim "git 仓库无远程，跳过代码拉取"
     fi
