@@ -48,34 +48,6 @@ export type DataIssue = {
   created_at: string;
 };
 
-/** 同步作业（GET /sync/jobs）—— lquant.sync.manager */
-export type SyncJob = {
-  sync_id: string;
-  name: string;
-  kind: string; // collect | daily | adj_factor
-  schedule_time: string;
-  weekdays: string;
-  params: Record<string, unknown>;
-  enabled: boolean;
-  last_run?: {
-    status: string | null;
-    finished_at: string | null;
-    rows: number | null;
-  } | null;
-};
-
-/** 运行历史（GET /sync/history） */
-export type SyncRunRecord = {
-  sync_id: string;
-  name?: string | null;
-  kind: string;
-  status: string; // ok/partial/failed/running
-  started_at: string | null;
-  finished_at: string | null;
-  rows: number | null;
-  error: string | null;
-};
-
 /** 数据清理（POST /data/purge） */
 export type PurgeResult = {
   dry_run: boolean;

@@ -251,6 +251,12 @@ def test_task_not_found_404(client):
 
 
 def test_tasks_list(client):
+    # 自带前置状态：本模块共享 module 级 duckdb，原先这里断言的是「前面用例 POST
+    # 出来的任务」，于是单独跑 / 被 xdist 分到别的 worker（各 worker 各有自己的
+    # module 夹具与临时库）时拿到的就是空列表 —— CI 的 `-n auto --dist loadgroup`
+    # 正是这么红的（本地整文件串行却过，极难复现）。改为自己种一行再断言，
+    # 这样用例与执行顺序/分片方式无关。
+    _seed_task("news_list_x", "ok", {})
     rows = client.get("/api/news/tasks").json()["data"]
     assert isinstance(rows, list) and rows
     assert {"task_id", "kind", "status", "rows_written"} <= set(rows[0])

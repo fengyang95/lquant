@@ -139,3 +139,54 @@ describe('DataPanel', () => {
     expect(screen.getByText(/✓ 重试任务已创建（12345678…）/)).toBeInTheDocument();
   });
 });
+
+// 数据任务取消 —— 与 ml/backtest/qlib/factor 四个兄弟面板对齐的能力
+// （原先只有 /data 的 TasksPanel 有，已合并进本面板）
+describe('DataPanel 任务取消', () => {
+  beforeEach(() => {
+    postMock.mockReset();
+  });
+
+  const runningTask = {
+    task_id: 'cccccccc-0000-0000-0000-000000000000',
+    kind: 'full_backfill',
+    params: { start: '2016-01-01', end: '2026-09-12' },
+    status: 'running',
+    phase: 'fetch',
+    total_symbols: 100,
+    done_symbols: 40,
+    failed_symbols: [],
+    failed_detail: [],
+    rows_written: 4000,
+    started_at: null,
+    finished_at: null,
+    message: null,
+  } as unknown as DataTask;
+
+  it('running 任务显示「取消」按钮，点击 POST /tasks/data/{id}/cancel', async () => {
+    postMock.mockResolvedValue({ canceled: true });
+    setup([runningTask]);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: /取消任务 cccccccc/ }));
+    await waitFor(() => {
+      expect(postMock).toHaveBeenCalledWith(
+        '/tasks/data/cccccccc-0000-0000-0000-000000000000/cancel',
+        {},
+      );
+    });
+    expect(screen.getByText(/✓ 已请求取消（cccccccc…）/)).toBeInTheDocument();
+  });
+
+  it('409 竞态（任务已结束）→ 友好提示而非报错', async () => {
+    postMock.mockRejectedValue(new Error('409 Conflict: 任务已结束，无法取消'));
+    setup([runningTask]);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: /取消任务 cccccccc/ }));
+    expect(await screen.findByText(/任务已结束，无需取消（cccccccc…）/)).toBeInTheDocument();
+  });
+
+  it('failed 任务无取消按钮', () => {
+    setup([failedTask]);
+    expect(screen.queryByRole('button', { name: /取消任务/ })).not.toBeInTheDocument();
+  });
+});

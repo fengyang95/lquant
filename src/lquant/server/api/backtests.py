@@ -239,23 +239,21 @@ class BacktestIn(BaseModel):
     benchmark: str | None = DEFAULT_BENCHMARK
 
 
-def _parse_formula_n(formula: str) -> int:
-    """从公式尾段解析窗口参数 n；解析失败按 422 语义抛 HTTPException。"""
-    try:
-        return int(formula.rsplit("_", 1)[1])
-    except (IndexError, ValueError) as e:
-        raise HTTPException(422, f"因子公式窗口参数非法: {formula}") from e
-
-
 def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
-    if formula.startswith("pct_change_"):
-        n = _parse_formula_n(formula)
-        return df.with_columns(pl.col("close").pct_change(n).over("symbol").alias(formula.replace("_", "")))
-    if formula.startswith("rolling_std_"):
-        n = _parse_formula_n(formula)
-        return df.with_columns(pl.col("close").pct_change().over("symbol")
-                               .rolling_std(n).alias(formula.replace("_", "")))
-    raise HTTPException(422, f"暂不支持的因子公式: {formula}")
+    """现算因子列 —— 委托规范实现 ``factors.analysis.compute_factor_col``。
+
+    本文件与 ``paper.py`` 曾各有一份裁剪副本，只认 ``pct_change_`` / ``rolling_std_``
+    两种快捷公式，漏了 ``turnover`` / Qlib Alpha158 内置名 / ``$`` DSL —— 同一个公式
+    在回测链路 422、在因子评价链路却能算。收敛到单一实现后三条分支一并可用；
+    解析失败仍按 422 语义抛出（FactorError 不是 ValueError，必须显式接住）。
+    """
+    from lquant.core.errors import FactorError
+    from lquant.factors.analysis import compute_factor_col
+
+    try:
+        return compute_factor_col(df, formula, name=formula.replace("_", ""))
+    except (ValueError, KeyError, FactorError) as e:
+        raise HTTPException(422, f"暂不支持的因子公式: {formula}") from e
 
 
 class SweepIn(BaseModel):
