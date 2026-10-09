@@ -1,7 +1,7 @@
 """归因分析测试：贡献守恒、Brinson 加总=超额、风险指标。"""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -244,7 +244,7 @@ def test_style_return_attribution_conserves():
 
     # 持有 5 只等量，价格取自面板
     held = panel.filter(pl.col("symbol").is_in(
-        panel["symbol"].unique().to_list()[:5]))
+        sorted(panel["symbol"].unique().to_list())[:5]))
     prices: dict[str, dict] = {}
     for r in held.iter_rows(named=True):
         prices.setdefault(r["symbol"], {})[r["trade_date"]] = r["close"]
@@ -257,8 +257,9 @@ def test_style_return_attribution_conserves():
 
     out = style_return_attribution(positions, prices, nav, panel)
     assert out.get("dates"), out
+    # totals 各值经 round(6) 再求和，Σ因子 与 common 最多差 (n_factors+1)*5e-7
     fsum = sum(out["totals"][k] for k in out["factors"])
-    assert fsum == pytest.approx(out["totals"]["common"], abs=1e-6)
+    assert fsum == pytest.approx(out["totals"]["common"], abs=1e-5)
     assert out["totals"]["common"] + out["totals"]["specific"] == pytest.approx(
         out["totals"]["ret_arith"], abs=1e-5)
     # 累计序列长度一致且单调记录
@@ -273,7 +274,7 @@ def test_style_return_attribution_insufficient_sample():
     dates = sorted(panel["trade_date"].unique().to_list())
     import polars as pl
 
-    held = panel.filter(pl.col("symbol").is_in(panel["symbol"].unique().to_list()[:3]))
+    held = panel.filter(pl.col("symbol").is_in(sorted(panel["symbol"].unique().to_list())[:3]))
     prices = {}
     for r in held.iter_rows(named=True):
         prices.setdefault(r["symbol"], {})[r["trade_date"]] = r["close"]
@@ -332,3 +333,174 @@ def test_style_return_attribution_guards():
     # 持仓标的完全不在面板/价格里 → 全部跳过 → note
     empty_pos = {d1: {"999999.SH": 100.0}}
     assert "note" in style_return_attribution(empty_pos, {}, nav, panel)
+
+
+# ---------------- 回撤期归因 ----------------
+
+def test_drawdown_periods_identifies_recovered_and_open():
+    """收复段与未收复段都要识别；<阈值的小波动不进列表。"""
+    from lquant.backtest.attribution import drawdown_periods
+
+    days = [date(2026, 1, 5) + timedelta(days=i) for i in range(8)]
+    nav = [(days[0], 100), (days[1], 110), (days[2], 104), (days[3], 99),
+           (days[4], 108), (days[5], 111), (days[6], 100), (days[7], 92.4)]
+    ps = drawdown_periods(nav, 0.05)
+    assert len(ps) == 2
+    # 未收复段更深，排前面
+    deep, rec = ps
+    assert deep["start"] == days[5] and deep["end"] is None
+    assert deep["drawdown"] == pytest.approx(1 - 92.4 / 111, abs=1e-9)
+    assert rec["start"] == days[1] and rec["end"] == days[5]
+    assert rec["drawdown"] == pytest.approx(0.10, abs=1e-9)
+    assert rec["ret"] == pytest.approx(111 / 110 - 1, abs=1e-9)
+    # 阈值抬高后只剩深的那段
+    assert len(drawdown_periods(nav, 0.15)) == 1
+    assert drawdown_periods(nav, 0.5) == []
+
+
+def test_drawdown_attribution_splits_factors_and_stocks():
+    """回撤窗口内：个股贡献与因子拆分口径与全期一致（守恒）。"""
+    import polars as pl
+
+    from lquant.backtest.attribution import drawdown_attribution, style_regression
+
+    panel = _synthetic_panel()
+    dates = sorted(panel["trade_date"].unique().to_list())
+    import polars as pl  # noqa: F401  已导入
+
+    held = panel.filter(pl.col("symbol").is_in(
+        sorted(panel["symbol"].unique().to_list())[:5]))
+    prices: dict[str, dict] = {}
+    for r in held.iter_rows(named=True):
+        prices.setdefault(r["symbol"], {})[r["trade_date"]] = r["close"]
+    positions = {d: {s: 100.0 for s in prices} for d in dates}
+    first = next(iter(prices))
+    nav = [(dates[0], 500.0 * prices[first][dates[0]])]
+    for i in range(1, len(dates)):
+        nav.append((dates[i], sum(100.0 * prices[s][dates[i]] for s in prices)))
+
+    reg = style_regression(panel)
+    out = drawdown_attribution(positions, prices, nav, reg=reg, threshold=0.05)
+    assert out["periods"], out
+    nav_map = dict(nav)
+    for p in out["periods"]:
+        # 守恒：Σ因子 = common；common+specific = Σ日收益
+        # （注意≠累计 ret——算术日收益不 telescoping，差值是波动拖累）
+        if "common" in p:
+            assert sum(p["factors"].values()) == pytest.approx(p["common"], abs=1e-5)
+            d0 = date.fromisoformat(p["start"])
+            d1 = date.fromisoformat(p["end"] or str(nav[-1][0]))
+            wd = sorted(d for d in nav_map if d0 <= d <= d1)
+            ret_daily = sum(nav_map[wd[i]] / nav_map[wd[i - 1]] - 1
+                            for i in range(1, len(wd)))
+            assert p["common"] + p["specific"] == pytest.approx(ret_daily, abs=1e-6)
+        assert p["days"] >= 2
+
+
+# ---------------- 风险归因（方差分解） ----------------
+
+def test_risk_attribution_variance_additivity():
+    """var_total = var_common + var_specific + cross（加法性）。"""
+    from lquant.backtest.attribution import risk_attribution, style_regression
+
+    panel = _synthetic_panel(t=70)
+    dates = sorted(panel["trade_date"].unique().to_list())
+    import polars as pl
+
+    held = panel.filter(pl.col("symbol").is_in(
+        sorted(panel["symbol"].unique().to_list())[:5]))
+    prices: dict[str, dict] = {}
+    for r in held.iter_rows(named=True):
+        prices.setdefault(r["symbol"], {})[r["trade_date"]] = r["close"]
+    positions = {d: {s: 100.0 for s in prices} for d in dates}
+    first = next(iter(prices))
+    nav = [(dates[0], 500.0 * prices[first][dates[0]])]
+    for i in range(1, len(dates)):
+        nav.append((dates[i], sum(100.0 * prices[s][dates[i]] for s in prices)))
+
+    reg = style_regression(panel)
+    ra = risk_attribution(positions, prices, nav, reg)
+    assert ra.get("n_days", 0) >= 20, ra
+    assert ra["var_total"] == pytest.approx(
+        ra["var_common"] + ra["var_specific"] + ra["cross_term"], rel=1e-9, abs=1e-12)
+    assert ra["vol_total"] > 0
+    # Σ因子方差贡献 = systematic_var_barra
+    assert sum(f["var_contrib"] for f in ra["factors"]) == pytest.approx(
+        ra["systematic_var_barra"], rel=1e-9, abs=1e-8)
+    # pct 归一
+    pcts = [f["pct"] for f in ra["factors"] if f["pct"] is not None]
+    assert pcts and sum(pcts) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_risk_attribution_insufficient_days():
+    from lquant.backtest.attribution import risk_attribution
+
+    d1, d2 = date(2026, 1, 5), date(2026, 1, 6)
+    reg = {"factors": ["size"], "f_map": {d2: [0.1]},
+           "exp_map": {d1: {"600000.SH": [1.0]}}}
+    out = risk_attribution({d1: {"600000.SH": 100.0}},
+                           {"600000.SH": {d1: 10.0, d2: 11.0}},
+                           [(d1, 1000.0), (d2, 1100.0)], reg)
+    assert "note" in out and "20" in out["note"]
+
+
+# ---------------- HTML 报告 ----------------
+
+def test_render_attribution_html_self_contained():
+    """报告含关键章节、无外部资源引用、note 缺失时也不断链。"""
+    from lquant.backtest.attribution_report import render_attribution_html
+
+    data = {
+        "run_id": "r-1",
+        "risk": {"benchmark": "hs300", "alpha_annual": 0.12,
+                 "information_ratio": 0.8, "tracking_error": 0.05,
+                 "excess_return": 0.1},
+        "style_attr": {"dates": ["2026-01-05", "2026-01-06"],
+                       "factors": ["size"],
+                       "factor_cum": {"size": [0.01, 0.02]},
+                       "common_cum": [0.01, 0.02],
+                       "specific_cum": [0.0, -0.005],
+                       "totals": {"size": 0.02, "common": 0.02,
+                                  "specific": -0.005, "ret_arith": 0.015},
+                       "note": "口径"},
+        "risk_attr": {"factors": [{"factor": "size", "var_contrib": 1.0,
+                                   "pct": 1.0, "avg_exposure": 0.5}],
+                      "vol_total": 0.15, "vol_common": 0.1,
+                      "vol_specific": 0.11, "cross_term": -0.002,
+                      "var_total": 0.0225, "var_common": 0.01,
+                      "var_specific": 0.0121, "systematic_var_barra": 0.01,
+                      "note": "年化"},
+        "brinson": {"groups": [{"group": "创业板", "alloc": 0.01, "select": 0.02,
+                                "interact": 0.0, "total": 0.03}],
+                    "excess_total": 0.03, "note": "算术口径"},
+        "brinson_monthly": {"months": [{"month": "2026-01", "groups": [], "excess_total": 0.03}]},
+        "cost": {"fee_by_day": [{"date": "2026-01-05", "fee": 30.0, "drag": 3e-5}],
+                 "total_fee": 30.0, "total_drag": 3e-5},
+        "drawdown": {"periods": [{"start": "2026-01-05", "trough": "2026-01-06",
+                                  "end": None, "recovered": False,
+                                  "drawdown": 0.08, "days": 2, "ret": -0.08,
+                                  "stock_top": [{"symbol": "600000.SH",
+                                                 "contribution": 0.01}],
+                                  "stock_bottom": [],
+                                  "common": -0.05, "specific": -0.03,
+                                  "factors": {"size": -0.05}}],
+                     "note": "口径"},
+        "stock_contribution": {"top": [{"symbol": "600000.SH", "contribution": 0.01}],
+                               "bottom": [], "n_stocks": 1},
+        "profile": {"concentration": [{"date": "2026-01-05", "hhi": 1.0, "top5": 1.0,
+                                       "top10": 1.0, "n_pos": 1}],
+                    "industry": {"dates": ["2026-01-05"],
+                                 "series": {"沪市主板": [1.0]}},
+                    "note": "口径"},
+    }
+    doc = render_attribution_html(data)
+    assert doc.startswith("<!DOCTYPE html>")
+    for kw in ("回撤期归因", "风格收益归因", "风险归因", "Brinson", "成本拖累",
+               "持仓画像", "个股收益贡献"):
+        assert kw in doc, kw
+    doc_no_ns = doc.replace('xmlns="http://www.w3.org/2000/svg"', "")
+    assert "http" not in doc_no_ns   # 零外部依赖（SVG xmlns 除外）
+    assert "<svg" in doc
+    # 关键块全缺失 → 仍出骨架，不抛异常
+    minimal = render_attribution_html({"run_id": "r-2"})
+    assert "回测归因报告" in minimal and "—</p>" not in minimal
