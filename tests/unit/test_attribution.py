@@ -172,7 +172,8 @@ def test_portfolio_profile_concentration_and_industry():
     p = portfolio_profile(positions, prices, nav, group_map)
 
     assert p["industry"]["dates"] == [str(d1), str(d2)]
-    ind_d1 = dict(zip(p["industry"]["dates"], p["industry"]["series"]["沪市主板"]))
+    ind_d1 = dict(zip(p["industry"]["dates"], p["industry"]["series"]["沪市主板"],
+                     strict=False))
     assert ind_d1[str(d1)] == pytest.approx(0.5, abs=1e-9)
     assert ind_d1[str(d2)] == pytest.approx(1.0, abs=1e-9)
     # 创业板 day2 无持仓 → 0

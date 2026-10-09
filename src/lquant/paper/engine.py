@@ -19,6 +19,8 @@ from datetime import date, datetime
 
 import polars as pl
 
+from lquant.backtest.events import Order, Side
+from lquant.backtest.risk import PreTradeGate, RiskContext
 from lquant.backtest.rules.loader import load_ruleset
 from lquant.core.types import now_cn, parse_symbol
 
@@ -28,6 +30,11 @@ class PaperConfig:
     initial_cash: float = 1_000_000.0
     slippage_pct: float = 0.001          # 模拟盘固定滑点（真实盘用盘口）
     max_positions: int = 10
+    #: 事前风控（与回测同一套规则，P1-3）。None = 只开结构正确性那几条。
+    #: 需要整批上下文的规则（换手/行业暴露/单票目标权重）在逐单场景下**不允许
+    #: 启用** —— 显式点名会直接报错，而不是静默少跑一条。
+    risk_rules: tuple[str, ...] | None = None
+    risk_params: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -69,6 +76,8 @@ class PaperOrder:
     # 「当前报价」下的默认单被 min/max 限价帽完整吞掉滑点，模拟盘与回测的
     # 成本模型系统性差 slippage_pct。
     limit: bool = True
+    #: 被事前风控拦截时记下规则名（"资金不足/T+N" 这类领域拒单留空）
+    rule: str = ""
 
 
 class PaperBroker:
@@ -85,6 +94,10 @@ class PaperBroker:
         self.orders: list[PaperOrder] = []
         self._seq = 0
         self._ruleset = load_ruleset()
+        # 事前风控（逐单场景）：与回测同一套规则与同一份参数
+        self.gate = PreTradeGate(self.cfg.risk_rules, self.cfg.risk_params,
+                                 scope="order")
+        self._peak_nav = float(self.cfg.initial_cash)
         # 最近一次 day_close 的交易日（ISO 字符串）：日终幂等标记，
         # 重复 day_close 会把 T+N 冻结台账多减一天（T+1 当日即解冻）
         self.last_day_close: str | None = None
@@ -155,8 +168,41 @@ class PaperBroker:
             if avail < qty + pending_sell:
                 o.status, o.reason = "rejected", (
                     f"可卖不足 avail={avail} 已挂卖单={pending_sell} (T+N)")
+        if o.status == "pending":
+            violations = self._risk_violations(o)
+            if violations:
+                o.status = "rejected"
+                o.rule = violations[0].rule
+                o.reason = "风控: " + "；".join(v.reason for v in violations)
         self.orders.append(o)
         return o
+
+    def _risk_violations(self, candidate: PaperOrder) -> list:
+        """把候选单和**已挂未成交**的单子一起交给事前风控链。
+
+        批上下文 = 挂单 + 候选单：这样「已经挂了同标的卖单又要买」这类
+        同批冲突在模拟盘也能被抓到，而不是等成交后才发现自成交。
+        """
+        pending = [self._as_order(x) for x in self.orders
+                   if x.status == "pending" and x is not candidate]
+        orders = [*pending, self._as_order(candidate)]
+        ctx = RiskContext(
+            trade_date=(candidate.ts or now_cn()).date(),
+            nav=self.nav(), cash=self.cash,
+            # 逐单场景只有候选单带价格；挂单按候选价近似（同一标的/同一时刻）
+            prices={o.symbol: candidate.price for o in orders},
+            orders=orders,
+            held_qty={sym: p.qty for sym, p in self.positions.items()},
+            peak_nav=self._peak_nav,
+            params=self.cfg.risk_params,
+        )
+        return self.gate.apply(ctx).violations
+
+    @staticmethod
+    def _as_order(o: PaperOrder) -> Order:
+        return Order(order_id=o.order_id, symbol=o.symbol,
+                     side=Side.BUY if o.side == "buy" else Side.SELL,
+                     qty=float(o.qty))
 
     def _rules(self, symbol: str):
         """当日撮合规则：ST 以持仓/最近行情带进来的逐日标记为准，名称用于
