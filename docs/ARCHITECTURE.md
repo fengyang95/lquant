@@ -140,7 +140,7 @@ lquant/
 │
 ├── web/                          # ── Next.js 15 App Router
 │   ├── package.json / next.config.mjs / tailwind.config.ts（涨红跌绿）
-│   └── src/app/{dashboard,watchlist,security,factors,backtests,sectors,data}
+│   └── src/app/{dashboard,watchlist,security,industry,factors,backtests,sectors,data}
 │
 ├── scripts/
 │   ├── setup.sh                  # ✅ 装依赖 + 建库 + 编 Rust + 装前端

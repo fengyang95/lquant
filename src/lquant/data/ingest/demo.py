@@ -17,17 +17,21 @@
 """
 from __future__ import annotations
 
+import math
+from datetime import date, timedelta
+
 import numpy as np
 import polars as pl
 
 from lquant.core.types import now_cn, today_cn
 from lquant.data.store.catalog import (
     EtfMetaRepo,
+    FinancialRepo,
     IndustryClassifyRepo,
     SecurityRepo,
     TradeCalendarRepo,
 )
-from lquant.data.store.parquet import write_daily
+from lquant.data.store.parquet import write_daily, write_daily_basic
 
 STOCK_CODES = [
     ("600000.SH", "浦发银行"), ("600036.SH", "招商银行"), ("600519.SH", "贵州茅台"),
@@ -207,9 +211,160 @@ def generate_demo(start: str = "2024-01-01", end: str | None = None) -> dict:
     )
     write_daily(daily)
 
+    # 估值列（daily_basic）与 PIT 财务（financial_pit）
+    #
+    # 为什么演示环境必须有这两张表：个股分析的「估值」角度、行业分析的
+    # 「估值 / 景气度」角度、以及基本面排名页，全都以它们为输入。缺失的表现
+    # **不是报错**，而是那几个角度安静地变成 ``available=false`` —— 从页面上
+    # 分不出「演示环境本来就没有这个数据」还是「代码写坏了」。这与 float_mv /
+    # industry_classify 当初被补进演示数据是同一个理由。
+    basic = _synth_daily_basic(daily)
+    write_daily_basic(basic)
+    fin_rows = _synth_financial(start, dates[-1] if dates else None)
+    n_fin = FinancialRepo().upsert(fin_rows) if len(fin_rows) else 0
+
+    # 指数日线（基准）。个股的「行业与相对强度」、行业的「相对基准超额 / RRG
+    # 相对旋转图」都以它为分母；缺了会让这些角度整体不可用。演示环境用同一段
+    # 交易日合成，保证 asof 当天确实查得到基准。
+    n_idx = _seed_index_daily(start, (dates[-1] if dates else today_cn()).isoformat())
+
     logger.info(
         f"演示数据就绪: 日历 {n_cal} 天 / 标的 {n_sec} 只 / 行业 {n_ind} 条 / "
-        f"日线 {len(daily)} 行"
+        f"日线 {len(daily)} 行 / 估值 {len(basic)} 行 / 财务 {n_fin} 行 / "
+        f"指数 {n_idx} 行"
     )
     return {"calendar": n_cal, "securities": n_sec, "industries": n_ind,
-            "daily_rows": len(daily)}
+            "daily_rows": len(daily), "daily_basic_rows": len(basic),
+            "financial_rows": n_fin, "index_rows": n_idx}
+
+
+def _seed_index_daily(start: str, end: str) -> int:
+    """把演示指数日线写进 ``index_daily``（失败不阻断演示环境搭建）。"""
+    try:
+        from lquant.market.collectors.index_daily import fetch_index_daily
+        from lquant.market.scheduler import persist
+
+        df = fetch_index_daily(start=start, end=end, demo=True)
+        counts = persist({"index_daily": df})
+        return int(counts.get("index_daily", 0))
+    except Exception as e:  # noqa: BLE001 - 指数只是基准，缺了不该挡住演示环境
+        from loguru import logger
+
+        logger.warning(f"演示指数日线写入失败（基准相关角度将不可用）: {e}")
+        return 0
+
+
+#: 每股收益 / 每股净资产 的演示生成参数。用固定基准价换算，保证 PE / PB 落在
+#: A 股常见区间（PE 8~45、PB 0.8~8），而不是随机数 —— 随机 PE 会让「行业估值
+#: 分位」在演示环境里毫无参考性。
+_PE_BASE_RANGE = (8.0, 45.0)
+_PB_BASE_RANGE = (0.8, 8.0)
+_FREE_FLOAT_RANGE = (0.3, 0.8)
+
+
+def _synth_daily_basic(daily: pl.DataFrame) -> pl.DataFrame:
+    """由日线派生演示估值列（``daily_basic``）。
+
+    恒等式与真实 provider 一致：``float_share = float_mv / close``、
+    ``total_share = float_share / 自由流通比例``、``total_mv = close × total_share``。
+    PE/PB 由「每股收益 / 每股净资产」反推，估值只会因为价格波动而变化 ——
+    这正是「估值分位」要度量的东西。
+    """
+    if daily is None or daily.is_empty() or "float_mv" not in daily.columns:
+        return pl.DataFrame()
+    syms = sorted(set(daily["symbol"].to_list()))
+    eps, bps, ff = {}, {}, {}
+    for i, s in enumerate(syms):
+        rng = np.random.default_rng(9000 + i)
+        pe = float(rng.uniform(*_PE_BASE_RANGE))
+        pb = float(rng.uniform(*_PB_BASE_RANGE))
+        base = float(daily.filter(pl.col("symbol") == s)["close"][0] or 10.0)
+        eps[s], bps[s] = base / pe, base / pb
+        ff[s] = float(rng.uniform(*_FREE_FLOAT_RANGE))
+
+    out = (daily.select(["trade_date", "symbol", "close", "float_mv",
+                         "turnover_rate"])
+           .with_columns(
+               pl.col("symbol").replace_strict(eps, default=None).alias("_eps"),
+               pl.col("symbol").replace_strict(bps, default=None).alias("_bps"),
+               pl.col("symbol").replace_strict(ff, default=None).alias("_ff"),
+           )
+           .with_columns(
+               (pl.col("close") / pl.col("_eps")).round(2).alias("pe_ttm"),
+               (pl.col("close") / pl.col("_bps")).round(3).alias("pb_mrq"),
+               (pl.col("close") / pl.col("_eps") * 0.6).round(2).alias("ps_ttm"),
+               (pl.col("close") / pl.col("_bps") * 0.5).round(2).alias("dv_ttm"),
+               (pl.col("float_mv") / pl.col("close")).round(0).alias("float_share"),
+           )
+           .with_columns(
+               (pl.col("float_share") / pl.col("_ff")).round(0).alias("total_share"),
+           )
+           .with_columns(
+               (pl.col("close") * pl.col("total_share")).round(0).alias("total_mv"),
+               pl.lit("demo").alias("source"),
+           ))
+    return out.select(["symbol", "trade_date", "close", "turnover_rate",
+                       "pe_ttm", "pb_mrq", "ps_ttm", "total_mv", "float_mv",
+                       "dv_ttm", "total_share", "float_share", "source"])
+
+
+#: 演示财务指标（物理键 → (基准值, 波动, 每期趋势)）。键名与真实 provider
+#: 的命名一致，否则演示环境跑通、真实环境静默取不到数。
+_FIN_ITEMS: tuple[tuple[str, float, float, float], ...] = (
+    ("indicator.roe", 12.0, 4.0, 0.15),
+    ("indicator.grossprofit_margin", 32.0, 8.0, 0.10),
+    ("indicator.netprofit_margin", 12.0, 5.0, 0.10),
+    ("indicator.debt_to_assets", 45.0, 12.0, -0.20),
+    ("indicator.or_yoy", 8.0, 12.0, 0.60),
+    ("indicator.netprofit_yoy", 10.0, 18.0, 0.80),
+)
+
+
+def _quarter_ends(start: str, end: date | None) -> list[date]:
+    """演示区间内（含前推一年预热）的季度报告期。
+
+    末尾**多带一个季度**：区间常常止于季度中（如 3 月 29 日），严格按
+    ``q <= end`` 过滤会让短区间一条财务都生不出来 —— 演示环境随即「静默」
+    少了景气度角度。多出的那个报告期公告日晚于区间末尾，会被 PIT 门禁
+    正确挡在 ``asof`` 之外，正好顺带验证门禁有效。
+    """
+    d0 = date.fromisoformat(start)
+    d1 = end or today_cn()
+    limit = d1 + timedelta(days=100)
+    out: list[date] = []
+    for y in range(d0.year - 1, d1.year + 2):
+        for m, day in ((3, 31), (6, 30), (9, 30), (12, 31)):
+            q = date(y, m, day)
+            if d0 <= q <= limit:
+                out.append(q)
+    return out
+
+
+def _synth_financial(start: str, end: date | None) -> pl.DataFrame:
+    """演示 PIT 财务长表。
+
+    ``pub_date = stat_date + 45 天`` 是**演示用的近似**：真实披露日随报告期
+    不同（年报可晚至次年 4 月底）。这里保证的是 PIT 语义正确（公告日之前查
+    不到），而不是披露日历精确 —— 精确日历由真实数据源提供。
+    """
+    quarters = _quarter_ends(start, end)
+    if not quarters:
+        return pl.DataFrame()
+    rows = []
+    for i, (sym, _) in enumerate(STOCK_CODES):
+        rng = np.random.default_rng(7000 + i)
+        for j, q in enumerate(quarters):
+            for item, base, vol, trend in _FIN_ITEMS:
+                value = base + vol * math.sin(i + j / 2.0) + trend * j
+                value += float(rng.normal(0, vol * 0.25))
+                rows.append({
+                    "symbol": sym,
+                    "stat_date": q,
+                    "pub_date": q + timedelta(days=45),
+                    "report_type": "Q",
+                    "item": item,
+                    "value": round(value, 4),
+                    "unit": "%",
+                    "source": "demo",
+                })
+    return pl.DataFrame(rows)
