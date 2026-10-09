@@ -57,14 +57,21 @@ class _TopNProbe:
 
 
 def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
-    col = formula.replace("_", "")
-    if formula.startswith("pct_change_"):
-        n = int(formula.rsplit("_", 1)[1])
-        return df.with_columns(pl.col("close").pct_change(n).over("symbol").alias(col))
-    if formula.startswith("rolling_std_"):
-        n = int(formula.rsplit("_", 1)[1])
-        return df.with_columns(pl.col("close").pct_change().over("symbol").rolling_std(n).alias(col))
-    raise HTTPException(422, f"暂不支持的因子公式: {formula}")
+    """现算因子列 —— 委托规范实现 ``factors.analysis.compute_factor_col``。
+
+    原为本文件与 ``backtests.py`` 各持一份的裁剪副本（只认 pct_change_/rolling_std_，
+    漏 turnover / Alpha158 内置名 / DSL）。收敛到单一实现，避免同一公式在
+    回放与因子评价两条链路口径分叉；解析失败统一 422。
+    """
+    from lquant.core.errors import FactorError
+    from lquant.factors.analysis import compute_factor_col
+
+    try:
+        return compute_factor_col(df, formula, name=formula.replace("_", ""))
+    except HTTPException:
+        raise
+    except (ValueError, KeyError, FactorError) as e:
+        raise HTTPException(422, f"暂不支持的因子公式: {formula}") from e
 
 
 @router.post("/replay")

@@ -44,6 +44,25 @@ export default function DataPanel() {
     }
   }
 
+  /** 协作式取消运行中的任务（走 /tasks/data/{id}/cancel，与其余四类任务面板一致）。
+   *  409 = 任务已结束，属可忽略的竞态，提示而非报错。 */
+  async function cancelTask(id: string) {
+    setBusy(id);
+    setMsg('');
+    try {
+      await post<{ canceled: boolean }>(`/tasks/data/${id}/cancel`, {});
+      setMsg(`✓ 已请求取消（${id.slice(0, 8)}…），任务将在下一个协作点退出`);
+      void mutate();
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      setMsg(m.includes('409') || m.includes('已结束')
+        ? `任务已结束，无需取消（${id.slice(0, 8)}…）`
+        : `✗ ${m}`);
+    } finally {
+      setBusy('');
+    }
+  }
+
   async function submitRetry() {
     if (!retry) return;
     let params: Record<string, unknown> = {};
@@ -119,6 +138,16 @@ export default function DataPanel() {
                       {done}/{total} 标的
                     </span>
                     {t.message && <span className="max-w-52 truncate" title={t.message}>{t.message}</span>}
+                    {(t.status === 'running' || t.status === 'pending') && (
+                      <button
+                        className="btn btn-sm border-up/40 text-up hover:bg-paper"
+                        aria-label={`取消任务 ${t.task_id.slice(0, 8)}`}
+                        onClick={() => cancelTask(t.task_id)}
+                        disabled={busy !== ''}
+                      >
+                        {busy === t.task_id ? '取消中…' : '取消'}
+                      </button>
+                    )}
                     {(t.status === 'failed' || t.status === 'partial' || t.status === 'interrupted') && (
                       <button
                         className="btn btn-sm"

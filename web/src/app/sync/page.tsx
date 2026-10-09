@@ -5,11 +5,17 @@ import useSWR from 'swr';
 import PageHeader from '@/components/PageHeader';
 import { Panel } from '@/components/Panel';
 import { Empty, Msg } from '@/components/States';
+import LazySection from '@/components/LazySection';
 import { get, post, del } from '@/lib/api';
 import RetryBadge from './RetryBadge';
 import { runRetryText } from './retry';
 import type { Freshness } from '../data/FreshnessHealthCard';
 import { Dot, lagTone } from '../data/FreshnessHealthCard';
+import CrosscheckPanel from '../data/CrosscheckPanel';
+import GapsPanel from '../data/GapsPanel';
+import CheckpointPanel from '../data/CheckpointPanel';
+import SourceConfigPanel from '../data/SourceConfigPanel';
+import PurgeModal from '../data/PurgeModal';
 
 type SyncJob = {
   sync_id: string;
@@ -64,6 +70,7 @@ export default function SyncPage() {
   const [busy, setBusy] = useState('');
   const [msg, setMsg] = useState('');
   const [highlight, setHighlight] = useState('');
+  const [showPurge, setShowPurge] = useState(false);
   // 新建/编辑表单
   const [form, setForm] = useState({ sync_id: '', name: '', kind: 'collect', schedule_time: '15:05', weekdays: '1,2,3,4,5', schedule: 'close' });
 
@@ -136,6 +143,11 @@ export default function SyncPage() {
       <PageHeader
         title="同步操作"
         sub="后台 worker 每 30s 检查到期作业 · 到点自动执行 · 失败自动重试"
+        actions={
+          <button onClick={() => setShowPurge(true)} className="btn">
+            数据清理
+          </button>
+        }
       />
 
       {/* 健康度摘要卡：新鲜度 + 问题作业直达 */}
@@ -323,6 +335,26 @@ export default function SyncPage() {
           </div>
         )}
       </Panel>
+
+      {/* 数据质量运维 —— 原 /data 的操作类面板，随 PR #79「概览/操作页拆分」迁移至此。
+          ChecksPanel 注释承诺的「修复动作（补齐/重跑）在 /sync」即由这一组面板兑现：
+          跨源对账 / 缺口补采 / 断点归档 / 数据源配置，配套清理入口见页头「数据清理」。 */}
+      <LazySection><CrosscheckPanel /></LazySection>
+      <LazySection><GapsPanel /></LazySection>
+      <LazySection><CheckpointPanel /></LazySection>
+      <LazySection><SourceConfigPanel /></LazySection>
+
+      {showPurge && (
+        <PurgeModal
+          onClose={() => setShowPurge(false)}
+          onPurged={(r) => {
+            setShowPurge(false);
+            setMsg(`✓ 已清理 ${r.rows_matched.toLocaleString()} 行日线数据`);
+            mutateJobs();
+            mutateHist();
+          }}
+        />
+      )}
     </div>
   );
 }
