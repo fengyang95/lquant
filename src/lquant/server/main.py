@@ -19,6 +19,7 @@ from lquant.server.api import (
     data,
     data_admin,
     etf,
+    ext_data,
     factors,
     fundamental,
     health,
@@ -70,7 +71,7 @@ def create_app() -> FastAPI:
     app.include_router(auth.router, prefix="/api")  # /api/auth/tokens 管理面
     for r in (health, data, data_admin, factors, backtests, market, paper, portfolio,
               watchlist,
-              strategies, analyses, sync, etf, news, settings, ask, agent,
+              strategies, analyses, sync, etf, ext_data, news, settings, ask, agent,
               qlib, task_center, monitor, fundamental, ml, security,
               notify):
         app.include_router(r.router, prefix="/api")
