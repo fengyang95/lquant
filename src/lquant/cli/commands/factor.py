@@ -99,6 +99,19 @@ def eval_(
     from lquant.factors.mining.submit import _panel_with_covs, prepare_segment
 
     covs = [c.strip() for c in covs_csv.split(",") if c.strip()] if covs_csv else None
+    if covs:
+        # 先校验再建面板：build_covariates 对未注册名是裸 KeyError（PROVIDERS.get），
+        # Agent 拿到 traceback + 空 stdout 无从自我修正。CLI 出口必须是可操作报错，
+        # 并给出可选清单（拼错的名字能一眼对照出正确写法）。
+        import lquant.factors  # noqa: F401  # 触发看板 provider 注册后再枚举
+        from lquant.factors.covariates import PROVIDERS
+
+        unknown = [c for c in covs if c not in PROVIDERS]
+        if unknown:
+            raise click.BadParameter(
+                f"未注册的协变量 {unknown}；可选: {PROVIDERS.keys()}",
+                param_hint="--cov",
+            )
     df, cov_cols = _panel_with_covs(start=start, covs=covs)
     if not len(df):
         raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")

@@ -184,6 +184,73 @@ def test_empty_df_degrades():
     assert profit_ratio(pl.DataFrame())["note"] == "无数据"
 
 
+def _all_null_price_df(n: int = 5) -> pl.DataFrame:
+    """价格列存在但整列为 null —— 与「缺列」应走同一档显式降级（issue 6）。"""
+    df = pl.DataFrame(
+        {
+            "trade_date": [date(2026, 1, 1) + timedelta(days=i) for i in range(n)],
+            "open": [None] * n,
+            "high": [None] * n,
+            "low": [None] * n,
+            "close": [None] * n,
+            "volume": [1e6] * n,
+        }
+    )
+    return df.with_columns([pl.col(c).cast(pl.Float64) for c in ("open", "high", "low", "close")])
+
+
+def test_all_null_price_columns_degrade_like_missing():
+    """全 null 价格列不得抛裸 TypeError，应与缺列一致地显式降级（issue 6）。"""
+    df = _all_null_price_df()
+    assert cost_distribution(df) == []
+    got = profit_ratio(df)
+    assert got == {"profit_ratio": None, "note": "无数据", "proxy": False, "caliber": None}
+    # 注册链路同样不崩：输出列存在、行数保持、全 null（缺列分支的同一语义）
+    out = compute("cyq_profit_ratio", df)["cyq_profit_ratio"]
+    assert out.len() == df.height
+    assert out.null_count() == df.height
+    assert out.dtype == pl.Float64
+
+
+def test_missing_required_columns_degrade_not_keyerror():
+    """缺列时 cost_distribution/profit_ratio 也走显式降级，不抛 KeyError（issue 6 对称防御）。"""
+    df = pl.DataFrame({"close": [1.0, 2.0, 3.0]})
+    assert cost_distribution(df) == []
+    assert profit_ratio(df)["profit_ratio"] is None
+    assert profit_ratio(df)["note"] == "无数据"
+
+
+def test_partial_null_price_row_is_none_not_crash():
+    """个别行价格缺失：该日显式 None、不落筹码，其余日照常（不崩、不伪造 0/1）。"""
+    closes = [10.0, 10.2, 10.4, 10.6]
+    df = make_df(closes).with_columns(
+        pl.when(pl.col("close") == 10.2).then(None).otherwise(pl.col("close")).alias("close")
+    )
+    ratios = compute("cyq_profit_ratio", df)["cyq_profit_ratio"].to_list()
+    assert len(ratios) == df.height
+    assert ratios[1] is None
+    assert all(r is None or 0.0 <= r <= 1.0 for r in ratios)
+    assert cost_distribution(df, bins=10)  # 不崩：缺失日不落筹码，其余日仍成分布
+
+
+def test_cost_distribution_and_profit_ratio_are_not_interchangeable():
+    """直方图（bin 中心量化）导出的获利比例 ≠ 解析式 profit_ratio（issue 5）。
+
+    两者差异是设计使然（精确 vs 量化），不是需要对齐的 bug；本测试锁住
+    「不可互相替代」这一文档口径：若某天两者恰好相等，说明网格恰好对齐，
+    需要重新审视模块 docstring 的表述。
+    """
+    rng = np.random.default_rng(3)
+    closes = list(100 + np.cumsum(rng.normal(0, 1, 60)))
+    df = make_df([float(c) for c in closes])
+    dist = cost_distribution(df, bins=60)
+    hist_pr = sum(p for c, p in dist if c < float(df["close"][-1]))
+    analytic = profit_ratio(df)["profit_ratio"]
+    assert 0.0 <= hist_pr <= 1.0
+    assert 0.0 <= analytic <= 1.0
+    assert abs(hist_pr - analytic) > 1e-9, "直方图与解析式意外相等：请复核 docstring 的口径说明"
+
+
 def test_float_shares_column_is_picked_up():
     """注册指标链路：df 自带 float_shares 列时用显式口径（与调用参数等价）。"""
     closes = [10 + 2 * i / 19 for i in range(20)]

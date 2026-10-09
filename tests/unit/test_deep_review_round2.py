@@ -213,20 +213,21 @@ def test_closeable_amount_uses_trading_day_index() -> None:
 # ------------------------------------------------------- 涨停池采集口径
 
 
-def test_limit_up_ts_to_hhmmss() -> None:
+def test_limit_up_hhmmss_to_time() -> None:
     """修复 29：fbt/lbt 是 HHMMSS 整数，不是时间戳。
 
     旧实现 fromtimestamp(92503) 把它当 Unix 秒，产出 1970 年的垃圾时间。
     """
-    from lquant.market.collectors.limit_up import _ts_to_hhmmss
+    from lquant.market.collectors.limit_up import _hhmmss_to_time
 
-    assert _ts_to_hhmmss(92503) == "09:25:03"
-    assert _ts_to_hhmmss(140100) == "14:01:00"
-    assert _ts_to_hhmmss("93000") == "09:30:00"
-    assert _ts_to_hhmmss(100630) == "10:06:30"
-    assert _ts_to_hhmmss(0) == ""
-    assert _ts_to_hhmmss(None) == ""
-    assert _ts_to_hhmmss(999999) == "999999"   # 非法值原样透传
+    assert _hhmmss_to_time(92503) == "09:25:03"
+    assert _hhmmss_to_time(140100) == "14:01:00"
+    assert _hhmmss_to_time("93000") == "09:30:00"
+    assert _hhmmss_to_time(100630) == "10:06:30"
+    # 缺失/哨兵/非法值 → NULL，绝不把垃圾值伪造成一个合法时间
+    assert _hhmmss_to_time(0) is None
+    assert _hhmmss_to_time(None) is None
+    assert _hhmmss_to_time(999999) is None
 
 
 def test_limit_up_pool_pagination(monkeypatch) -> None:

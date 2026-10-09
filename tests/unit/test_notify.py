@@ -53,10 +53,15 @@ def _clean_env(monkeypatch):
         "LQ_NOTIFY_CHANNELS",
         "LQ_WECOM_WEBHOOK_URL",
         "LQ_FEISHU_WEBHOOK_URL",
+        "LQ_FEISHU_WEBHOOK_SECRET",
         "LQ_DINGTALK_WEBHOOK_URL",
         "LQ_DINGTALK_SECRET",
         "LQ_TELEGRAM_BOT_TOKEN",
         "LQ_TELEGRAM_CHAT_ID",
+        "LQ_NTFY_URL",
+        "LQ_NTFY_TOKEN",
+        "LQ_PUSHPLUS_TOKEN",
+        "LQ_SERVERCHAN3_SENDKEY",
         "LQ_GENERIC_WEBHOOK_URL",
         "LQ_NOTIFY_TIMEOUT",
         "LQ_NOTIFY_TEXT_LIMIT",
@@ -166,6 +171,24 @@ def test_dingtalk_without_secret_keeps_url():
 def test_unconfigured_channel_is_skipped_not_failed():
     r = WecomBot().send("t", "x")
     assert r.skipped and not r.ok and "未配置" in r.error
+
+
+def test_telegram_missing_chat_id_is_skipped_without_network(monkeypatch):
+    """有 token 但缺 chat_id 时必须 skipped 且**零网络请求**。
+
+    修复前 _payload 塞 ``chat_id=""`` 一路走完发送流程，换来必然的 HTTP 400，
+    把「没配」误报成「通道故障」。
+    """
+    monkeypatch.setenv("LQ_TELEGRAM_BOT_TOKEN", "TOK")  # 故意不设 chat_id
+    calls: list = []
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda *a, **k: calls.append(a) or _FakeResp()
+    )
+
+    r = TelegramBot().send("t", "x")
+    assert r.skipped is True and r.ok is False
+    assert "LQ_TELEGRAM_CHAT_ID" in r.error
+    assert calls == []  # 一次请求都没发出去
 
 
 def test_notify_without_any_channel_returns_single_skip():
@@ -428,7 +451,35 @@ def test_ntfy_request_uses_plain_text_with_title_header():
     body, headers = NtfyChannel()._request("标题", "正文")
     assert body.decode() == "正文"
     assert headers["Content-Type"].startswith("text/plain")
-    assert "X-Title" in headers  # 非 ASCII 标题被 ascii-ignore 处理，键必在
+    assert "X-Title" in headers  # 非 ASCII 标题走 RFC 2047 编码，键必在
+
+
+def test_ntfy_title_keeps_non_ascii_via_rfc2047():
+    """中文标题必须可逆保留：header 值受 latin-1 限制，用 RFC 2047 承载 UTF-8。
+
+    修复前 ``ascii-ignore`` 把中文抹掉 —— 纯中文标题退化成 "lquant"、中英混排
+    退化成残缺串，用户看到的标题是错的且无从察觉。
+    """
+    from email.header import decode_header
+
+    def _decode(raw: str) -> str:
+        return "".join(
+            p.decode(enc or "ascii") if isinstance(p, bytes) else p
+            for p, enc in decode_header(raw)
+        )
+
+    for title in ("盯盘提醒", "demo 涨跌幅 -5%", "标题\n注入尝试"):
+        raw = NtfyChannel()._request(title, "正文")[1]["X-Title"]
+        raw.encode("latin-1")  # http.client 硬约束：编不动就整条发不出去
+        assert _decode(raw) == title.replace("\n", " ")  # 换行被折成空格（防注入）
+    # 纯 ASCII 不编码，保持可读
+    assert NtfyChannel()._request("lquant", "x")[1]["X-Title"] == "lquant"
+
+
+def test_ntfy_blank_title_falls_back_to_lquant():
+    """空白/纯换行标题折平后为空 → 兜底 "lquant"，不产生空的 X-Title。"""
+    for title in ("", "   ", "\r\n", " \n "):
+        assert NtfyChannel()._request(title, "正文")[1]["X-Title"] == "lquant", title
 
 
 def test_pushplus_payload():

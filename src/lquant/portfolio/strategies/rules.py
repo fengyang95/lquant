@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import polars as pl
 
-from lquant.portfolio.strategies.registry import _no, _ok
+from lquant.portfolio.strategies.registry import _need_rows, _no, _ok
 
 # 策略是否只看「最后一根 K 线」之后的截面 —— 全部是当日快照型判定，
 # 与 screener 的「先过滤后打分」互补：screener 排除买不到的，这里找形态。
@@ -18,16 +18,27 @@ def _run_volume_surge(df: pl.DataFrame, *, vol_ratio: float = 2.0,
                       min_amount: float = 2e8, min_pct: float = 0.0) -> pl.DataFrame:
     """放量上涨（InStock 同名策略）：
     1. 当日上涨且收阳（close > open）；
-    2. 成交量 >= vol_ratio × 5 日均量；
-    3. 成交额 >= min_amount（默认 2 亿，InStock 口径；小资金可调低）。
+    2. 当日涨幅 >= min_pct%（百分比口径，默认 0 即只要求上涨）；
+    3. 成交量 >= vol_ratio × 5 日均量；
+    4. 成交额 >= min_amount（默认 2 亿，InStock 口径；小资金可调低）。
     """
     last = df.tail(1).row(0, named=True)
+    pre_close = last["pre_close"]
+    # 涨幅是「上涨」的量化口径，没有前收就算不出来；显式说不算，而不是让它
+    # 在后面除法里崩成「计算失败」。
+    if not pre_close:
+        return _no("volume_surge", "缺少有效前收 pre_close，无法判定当日涨幅")
     vol_ma5 = df["volume"].tail(6).head(5).mean()
     amount = last["amount"] or (last["close"] * last["volume"])
-    if last["close"] <= last["open"] or last["close"] <= (last["pre_close"] or 0):
+    pct = (last["close"] / pre_close - 1) * 100
+    if last["close"] <= last["open"] or last["close"] <= pre_close:
         return _no("volume_surge",
                    f"未收阳: open={last['open']} close={last['close']} "
-                   f"pre_close={last['pre_close']}")
+                   f"pre_close={pre_close}")
+    # min_pct 此前只是签名里的装饰：调用方传了会被 _guard 的签名过滤保留、
+    # 然后被彻底忽略。这里让它真正作为当日涨幅下限参与判定。
+    if pct < min_pct:
+        return _no("volume_surge", f"涨幅不足: {pct:+.2f}% < {min_pct:.2f}%")
     ratio = last["volume"] / vol_ma5 if vol_ma5 else 0.0
     if ratio < vol_ratio:
         return _no("volume_surge",
@@ -37,11 +48,19 @@ def _run_volume_surge(df: pl.DataFrame, *, vol_ratio: float = 2.0,
                    f"成交额不足: {amount/1e8:.2f}亿 < {min_amount/1e8:.0f}亿")
     return _ok("volume_surge",
                f"量比 {ratio:.2f}x，成交额 {amount/1e8:.2f}亿，"
-               f"收阳涨幅 {(last['close']/last['pre_close']-1)*100:.2f}%")
+               f"收阳涨幅 {pct:.2f}%")
 
 
 def _run_keep_rising(df: pl.DataFrame, *, days: int = 4) -> pl.DataFrame:
     """持续上涨（InStock: keep_increasing）：最近 days 日收盘逐日抬升。"""
+    if days < 1:
+        return _no("keep_rising", f"参数非法: days={days} 必须 ≥ 1")
+    # days 是运行时参数，注册时的静态 min_rows 看不到它：days 调大后行数不足
+    # 会让 closes 取不满 → IndexError 被吞成 evidence。这里按实际 days 拦截。
+    short = _need_rows("keep_rising", df, days + 1,
+                       f"逐日抬升需 days+1={days + 1} 根收盘")
+    if short is not None:
+        return short
     closes = df["close"].tail(days + 1).to_list()
     ups = [closes[i] < closes[i + 1] for i in range(days)]
     if all(ups):
@@ -74,6 +93,14 @@ def _run_turtle_breakout(df: pl.DataFrame, *, window: int = 20) -> pl.DataFrame:
     """海龟突破（InStock: turtle_trade 的入场腿）：收盘创最近 window 日新高
     （不含当日）—— 趋势跟踪的经典入场信号；出场腿（跌破 10 日低点）属卖出
     判定，不在选股策略范围。"""
+    if window < 1:
+        return _no("turtle_breakout", f"参数非法: window={window} 必须 ≥ 1")
+    # 要取「不含当日」的前 window 根高点，实际需要 window+1 根；静态 min_rows
+    # 按默认 20 写死 21，window 调大后会静默把 20 根当成「30 日高点」。
+    short = _need_rows("turtle_breakout", df, window + 1,
+                       f"前 {window} 日高点需 window+1={window + 1} 根")
+    if short is not None:
+        return short
     prev_high = df["high"].tail(window + 1).head(window).max()
     last = df.tail(1).row(0, named=True)
     if last["close"] > prev_high:
@@ -88,6 +115,14 @@ def _run_low_atr(df: pl.DataFrame, *, window: int = 14,
                  max_atr_pct: float = 2.5) -> pl.DataFrame:
     """低波动（InStock: low_atr）：ATR(window)/收盘价 <= max_atr_pct%。
     波动小 = 容错空间大，适合作为底仓筛选条件与其他策略叠加。"""
+    if window < 1:
+        return _no("low_atr", f"参数非法: window={window} 必须 ≥ 1")
+    # 静态 min_rows 按默认 window=14 写死 15；window 调大而数据不变时，
+    # tail(window) 只会凑出更短的均值 —— 那是「半截数据的 ATR」，必须显式降级。
+    short = _need_rows("low_atr", df, window + 1,
+                       f"真 TR 需 window+1={window + 1} 根（首根只提供前收）")
+    if short is not None:
+        return short
     # 多取一根拿前收：TR = max(H-L, |H-C_prev|, |L-C_prev|)，首行 shift 为
     # null，tail(window) 截掉后恰好是完整 window 根的真 TR。
     tail = df.tail(window + 1).with_columns(

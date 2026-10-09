@@ -232,11 +232,14 @@ class Channel:
            ``SendResult.error`` 会进 API 响应体、CLI 输出与持久化日志，
            所以一律过 ``_redact``。
         """
-        url = self._url()
-        if not url:
-            return SendResult(
-                self.name, ok=False, error="未配置（缺 webhook URL / token）", skipped=True
-            )
+        # 统一走 configured() 自检，而不是只看 _url()：有些通道的「未配置」
+        # 不体现在 URL 上（Telegram 的 chat_id 在 body、PushPlus 的 token 在
+        # body），只看 url 会让它们发一次注定 400/903 的请求，把「没配」误报
+        # 成「通道故障」（status 自检也跟着说谎）。子类覆写 configured() 即可。
+        ready, why = self.configured()
+        if not ready:
+            return SendResult(self.name, ok=False, error=f"未配置（{why}）", skipped=True)
+        url = self._url() or ""
         try:
             post_url = self._post_url(url)
             scheme = urllib.parse.urlparse(post_url).scheme
@@ -408,6 +411,29 @@ class TelegramBot(Channel):
         return {"chat_id": _env("LQ_TELEGRAM_CHAT_ID") or "", "text": f"{title}\n{text}".strip()}
 
 
+def _title_header(title: str) -> str:
+    """把标题编码成可安全放进 HTTP header 的值（RFC 2047，非 ASCII 走 base64）。
+
+    为什么不用 ``encode("ascii","ignore")``：那会把中文直接抹掉 —— 纯中文
+    标题退化成 "lquant"，中英混排退化成残缺的空格串，用户端看到的标题是错的
+    且无从察觉。ntfy 官方支持 UTF-8 标题，但 ``http.client`` 要求 header 值能
+    用 latin-1 编码，中文裸塞会 ``UnicodeEncodeError`` 让整条通知发不出去；
+    RFC 2047 的 ``=?UTF-8?B?..?=`` 既能承载 UTF-8 又可被 latin-1 编码，是
+    header 里带非 ASCII 的标准做法（``email.header.decode_header`` 可逆）。
+
+    自己拼 base64 而不用 ``email.header.Header``：Header 会按 maxlinelen
+    折行并插入裸 ``\\n``，在 HTTP header 里非法，会被 ``http.client`` 拒绝。
+    """
+    # header 注入防线：CR/LF 一律折成空格，否则可以被用来伪造额外 header。
+    flat = title.replace("\r", " ").replace("\n", " ").strip()
+    if not flat:
+        return "lquant"  # 空标题给个兜底，与旧行为一致
+    if flat.isascii():
+        return flat
+    b64 = base64.b64encode(flat.encode("utf-8")).decode("ascii")
+    return f"=?UTF-8?B?{b64}?="
+
+
 class NtfyChannel(Channel):
     """ntfy 手机推送。env: LQ_NTFY_URL（含 topic，如 https://ntfy.sh/my-topic）
     [+ LQ_NTFY_TOKEN]。纯文本 POST + X-Title 头，零门槛的个人手机通知。"""
@@ -423,7 +449,7 @@ class NtfyChannel(Channel):
     def _request(self, title: str, text: str) -> tuple[bytes, dict[str, str]]:
         headers = {
             "Content-Type": "text/plain; charset=utf-8",
-            "X-Title": title.encode("ascii", "ignore").decode() or "lquant",
+            "X-Title": _title_header(title),
         }
         token = _env("LQ_NTFY_TOKEN")
         if token:

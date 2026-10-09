@@ -7,6 +7,7 @@ from datetime import date
 import polars as pl
 
 import lquant.market.collectors.money_flow as mf
+from lquant.core.types import today_cn
 from lquant.market.collectors.money_flow import fetch_money_flow
 
 
@@ -48,9 +49,8 @@ def test_fetch_money_flow_demo_deterministic_sorted():
 def test_fetch_money_flow_demo_default_date_today():
     df = fetch_money_flow(demo=True, top=3)
     assert df.height == 3
-    from lquant.core.types import today_cn
-
-    # 缺省业务日是 today_cn()，不是进程本地 date.today()
+    # 缺省业务日与生产侧同源（core.types.today_cn）。不能用 date.today()：
+    # CI 跑在 UTC，UTC 16:00 之后就是 CN 的次日，断言会假红。
     assert df["trade_date"].unique().to_list() == [today_cn()]
 
 

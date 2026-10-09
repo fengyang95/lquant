@@ -145,6 +145,67 @@ def test_empty_report_raises():
         extract_proposals("   ", llm_fn=fake_llm([]))
 
 
+# ---------- 输入长度门禁：不静默截断，也不等到 LLM 侧 HTTP 400 ----------
+
+
+def test_oversized_report_rejected_before_llm_call():
+    """超长研报显式报错，且拦在 LLM 调用之前（不会先烧一次请求）。"""
+    called: list[str] = []
+
+    def spy_llm(system: str, user: str) -> str:
+        called.append(user)
+        return json.dumps({"proposals": [{"expr": GOOD}]})
+
+    with pytest.raises(ValueError, match="超长"):
+        extract_proposals("研" * 40, llm_fn=spy_llm, max_input_chars=10)
+    assert called == []  # 长度门禁先于任何网络调用
+
+
+def test_input_limit_env_override(monkeypatch):
+    """LQ_LLM_MAX_INPUT_CHARS 覆盖默认上限：调小则拒绝，调大后同一文本通过。"""
+    monkeypatch.setenv("LQ_LLM_MAX_INPUT_CHARS", "20")
+    with pytest.raises(ValueError, match="超长"):
+        extract_proposals("研" * 50, llm_fn=fake_llm([{"expr": GOOD}]))
+    res = extract_proposals("研" * 5, llm_fn=fake_llm([{"expr": GOOD}]))
+    assert res["accepted"][0]["expr"] == GOOD
+
+
+def test_input_limit_default_is_positive():
+    from lquant.research.report_extract import DEFAULT_MAX_INPUT_CHARS, _max_input_chars
+
+    assert DEFAULT_MAX_INPUT_CHARS > 0
+    assert _max_input_chars() == DEFAULT_MAX_INPUT_CHARS
+
+
+def test_invalid_input_limit_env_raises_loudly(monkeypatch):
+    """配置写错（非整数）不能静默退回默认值，否则门禁形同虚设。"""
+    monkeypatch.setenv("LQ_LLM_MAX_INPUT_CHARS", "not-a-number")
+    with pytest.raises(ValueError, match="LQ_LLM_MAX_INPUT_CHARS"):
+        extract_proposals("研报", llm_fn=fake_llm([{"expr": GOOD}]))
+
+
+def test_nonpositive_input_limit_raises_loudly(monkeypatch):
+    """上限 ≤ 0 同样是配置错误：env 与调用参数两条入口都必须显式报错。
+
+    静默当成「无上限」会让长度门禁形同虚设（0 字上限下任何研报都超长，
+    静默放行则相反），所以两条路径都不允许悄悄吞掉。
+    """
+    from lquant.research.report_extract import _max_input_chars
+
+    called: list[str] = []
+
+    def spy_llm(system: str, user: str) -> str:
+        called.append(user)
+        return json.dumps({"proposals": [{"expr": GOOD}]})
+
+    monkeypatch.setenv("LQ_LLM_MAX_INPUT_CHARS", "0")
+    with pytest.raises(ValueError, match="LQ_LLM_MAX_INPUT_CHARS 须为正整数"):
+        _max_input_chars()
+    with pytest.raises(ValueError, match="max_input_chars 须为正整数"):
+        extract_proposals("研报", llm_fn=spy_llm, max_input_chars=0)
+    assert called == []  # 参数校验先于任何网络调用
+
+
 # ---------- env 与密钥卫生 ----------
 
 

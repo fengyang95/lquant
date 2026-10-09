@@ -54,11 +54,15 @@ def client(fake_env):
 
 def _cls_df() -> pd.DataFrame:
     """财联社电报假 DataFrame：一条命中平安银行 + 半导体关键词，
-    一条无关（不应被 000001.SZ 过滤命中）。发布日期取今天，summary 按
-    published_at 当日计数才命中。"""
-    # 业务日必须用 today_cn()：采集/汇总按 Asia/Shanghai 记 trade_date，
-    # 而 UTC 跑批在 16:00-24:00 期间 date.today() 会比业务日早一天
-    # （CI 在 UTC 傍晚必红，本地 CST 白天看不出来）。
+    一条无关（不应被 000001.SZ 过滤命中）。发布日期取**业务日**
+    （``today_cn()``，与 news/tasks.py 的口径一致），summary 按
+    published_at 当日计数才命中。
+
+    不能用 ``date.today()``：采集侧刻意用 ``today_cn()``（服务器时区非
+    Asia/Shanghai 时 ``date.today()`` 会错位一天），CI 跑在 UTC、UTC 16:00 之后
+    就是 CN 的次日 —— 假数据日期与采集业务日不一致，任务会写 0 行、
+    ``rows_written`` 变成 None。本机 TZ=CST 所以过去一直没暴露。
+    """
     today = today_cn().isoformat()
     # 时间必须是常量：若每次调用取 datetime.now()，第二次采集跨秒时
     # external_id（发布日期+发布时间）变化，去重失效（测试曾因此翻倍）

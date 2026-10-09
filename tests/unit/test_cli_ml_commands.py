@@ -29,6 +29,13 @@ def cli_env(tmp_path_factory):
     # run_ml_pipeline 会顺带跑回测引擎，引擎要读 config/rules/cn_a_share.yaml
     shutil.copytree(Path(__file__).resolve().parents[2] / "config",
                     base / "config", dirs_exist_ok=True)
+    # 必须显式钉住 LQ_ROOT：core.config.find_root() 是按**包文件位置**上溯找
+    # pyproject.toml 的，不看进程 CWD —— 只 os.chdir 不隔离，duckdb / 模型
+    # artifact 会落到真实仓库里（模型进 data/models、ml_registry 进仓库库），
+    # 于是本文件**跑第二次**就会因 assert version == 1 失败，并污染开发机数据湖。
+    # 与 test_board_features.py 的 board_env 同一隔离姿势。
+    prev_root = os.environ.get("LQ_ROOT")
+    os.environ["LQ_ROOT"] = str(base)
     from lquant.core.config import get_settings
 
     get_settings.cache_clear()
@@ -43,6 +50,10 @@ def cli_env(tmp_path_factory):
     generate_demo(start="2024-01-01", end="2026-06-30")
     yield base
     os.chdir(prev_cwd)
+    if prev_root is None:
+        os.environ.pop("LQ_ROOT", None)
+    else:
+        os.environ["LQ_ROOT"] = prev_root
     get_settings.cache_clear()
 
 

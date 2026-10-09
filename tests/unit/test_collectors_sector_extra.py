@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date
 
+from lquant.core.types import today_cn
 from lquant.market.collectors import sector as sec
 
 
@@ -16,9 +17,8 @@ def test_norm_keeps_invalid_code() -> None:
 
 
 def test_as_date_variants() -> None:
-    # 采集器缺省业务日走 today_cn()（Asia/Shanghai），不是服务器本地日期
-    from lquant.core.types import today_cn
-
+    # 缺省业务日与生产侧同源（core.types.today_cn）。不能用 datetime.now()：
+    # CI 跑在 UTC，UTC 16:00 之后就是 CN 的次日，断言会假红。
     assert sec._as_date(None) == today_cn()
     assert sec._as_date("2026-09-17") == date(2026, 9, 17)
     assert sec._as_date("20260917") == date(2026, 9, 17)

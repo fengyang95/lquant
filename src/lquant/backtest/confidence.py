@@ -24,7 +24,7 @@ lquant 是多重检验的高危用户：GP/LLM 挖掘一轮几百候选、sweep 
 from __future__ import annotations
 
 import math
-from itertools import combinations
+from itertools import combinations, islice
 
 import numpy as np
 
@@ -41,6 +41,12 @@ _EULER_GAMMA = 0.5772156649015329
 # CSCV 组合枚举的分块上限（元素数）：每块物化 chunk × k/2 × N 的中间张量，
 # 4e6 个 float64 ≈ 32MB —— 与配置数 C(k,k/2) 无关地封顶峰值内存。
 _CSCV_CHUNK_CELLS = 4_000_000
+
+# CSCV 组合数 C(k, k/2) 的硬上界。k=20 时 C=184756、k=24 时 2.7e6，
+# 都在可算范围；k=100 时 C≈1e29 —— 旧实现的 ``combinations(...)`` 会先把
+# 这个天文数字物化成 (C, k/2) 索引数组直接卡死。即使本实现逐组合流式累计，
+# 组合数爆炸也只是「永远算不完」，所以在枚举前显式拒绝并给出可操作建议。
+_CSCV_MAX_COMBOS = 5_000_000
 
 
 def normal_cdf(x: float) -> float:
@@ -153,6 +159,12 @@ def cscv_pbo(returns_matrix, *, n_partitions: int = 16) -> dict:
 
     返回 dict：pbo ∈ [0,1]（越低越好；纯噪声 ≈ 0.5，>0.5 说明排名在
     样本内外**系统性反转** —— 比碰巧还差）、n_combos、n_partitions、t_used。
+
+    退化输入显式 raise：所有配置列完全相同（全常数矩阵，或各列被复制成同一
+    序列）时样本内/外排名没有任何可区分的配置，``argmax`` 只会命中 index 0，
+    PBO 会「算出」一个全判过拟合的 1.0 —— 那不是发现，是输入无效。与
+    ``_sr_moments`` 对零方差收益的 fail-loudly 口径一致。组合数超过
+    ``_CSCV_MAX_COMBOS`` 也 raise（提示 n_partitions 取 8~16）。
     """
     m = np.asarray(returns_matrix, dtype=float)
     if m.ndim != 2:
@@ -172,36 +184,55 @@ def cscv_pbo(returns_matrix, *, n_partitions: int = 16) -> dict:
     t_used = k * block
     block_means = m[:t_used].reshape(k, block, n_cfg).mean(axis=1)  # (k, N)
 
-    combos = np.array(list(combinations(range(k), k // 2)))  # (C, k/2)
-    n_combos = len(combos)
-    is_means = np.empty((n_combos, n_cfg))
-    oos_means = np.empty((n_combos, n_cfg))
+    # 退化输入：所有配置列完全相同（每个块内各列取值一致）→ 样本内冠军的
+    # argmax 是任意 tie，omega 恒为 1、λ 恒 < 0，PBO 会假报 1.0（实测
+    # np.full((64,4),0.001) → 1.0）。没有可区分的配置就没有 PBO 可言，
+    # 显式 raise（与 _sr_moments 对零方差的 fail-loudly 对齐），别把
+    # 「输入无效」伪装成「发现严重过拟合」。
+    if float(np.ptp(block_means, axis=1).max()) <= 1e-12:
+        raise ValueError(
+            "收益矩阵各配置列完全相同（无可区分配置）：PBO 排名无意义，"
+            "请检查是否误传了常数/重复序列"
+        )
+
+    n_combos = math.comb(k, k // 2)
+    if n_combos > _CSCV_MAX_COMBOS:
+        raise ValueError(
+            f"n_partitions={k} 的组合数 C({k},{k // 2})={n_combos} 超过上限 "
+            f"{_CSCV_MAX_COMBOS}：枚举不可能完成，建议 n_partitions 取 8~16"
+        )
+
     block_sum = block_means.sum(axis=0)
-    # 分块累加：直接 ``block_means[combos].mean(axis=1)`` 会物化 (C, k/2, N)
-    # 的中间张量 —— k=16/万级配置时是 GB 级（C(16,8)=12870 × 8 × 10000 × 8B
-    # ≈ 8GB），正好在模块 docstring 瞄准的「万级网格」上 MemoryError。
-    # 每块只物化 chunk × k/2 × N，峰值内存与 C 无关。
     half = k - k // 2
+    # 逐组合**行内**累计命中数：j_star 是行内 argmax、omega 是行内比较、
+    # pbo 是 (λ≤0) 的均值 —— 三者都不需要跨组合的 C 维数组。旧实现物化
+    # is_means/oos_means 两个 (C, N) 张量（k=20/N=400 时 C=184756，实测
+    # 峰值 1278MB；目标场景 k=16/N=10000 两张表 ≈2GB）。这里只保留
+    # chunk × k/2 × N 的分块中间量，峰值与 C 无关。
     chunk = max(1, int(_CSCV_CHUNK_CELLS // max(1, (k // 2) * n_cfg)))
-    for s in range(0, n_combos, chunk):
-        blk = combos[s : s + chunk]
+    hits = 0
+    combo_iter = combinations(range(k), k // 2)
+    while True:
+        blk = list(islice(combo_iter, chunk))
+        if not blk:
+            break
+        blk = np.asarray(blk)
         blk_is = block_means[blk].mean(axis=1)  # (chunk, N)
-        is_means[s : s + chunk] = blk_is
         # 补集（OOS）块的均值 = 全块均值 − 样本内块均值。
         # 注意 ``blk_is`` 是 k/2 个 IS 块的**均值**，不是它们的和 ——
         # 写成 ``(block_sum - blk_is) / half`` 会把 ``(1 - 1/half) · IS均值``
         # 泄漏进「样本外」表现（k=16 时泄漏系数 0.875），使 PBO 系统性低报
         # （纯噪声应 ≈0.5，实测掉到 0.14），即「越该报警越不报警」。
-        oos_means[s : s + chunk] = block_sum / half - blk_is
-    j_star = is_means.argmax(axis=1)  # 样本内冠军
-    rows = np.arange(n_combos)
-    # 相对排名 ω：1 = 冠军在样本外**最差**（Bailey et al. 2017 口径）——
-    # ω 越小越像过拟合（样本内选出的冠军样本外垫底）
-    omega = (oos_means < oos_means[rows, j_star][:, None]).sum(axis=1) + 1
-    lam = np.log(omega / (n_cfg + 1 - omega))
-    return {
+        blk_oos = block_sum / half - blk_is  # (chunk, N)
+        rows = np.arange(len(blk))
+        # 相对排名 ω：1 = 冠军在样本外**最差**（Bailey et al. 2017 口径）——
+        # ω 越小越像过拟合（样本内选出的冠军样本外垫底）
+        j_star = blk_is.argmax(axis=1)  # 样本内冠军
+        omega = (blk_oos < blk_oos[rows, j_star][:, None]).sum(axis=1) + 1
         # λ ≤ 0 ⇔ 冠军的样本外排名掉到中位以下（含 N 奇数时的中位本身）
-        "pbo": float((lam <= 0).mean()),
+        hits += int((np.log(omega / (n_cfg + 1 - omega)) <= 0).sum())
+    return {
+        "pbo": hits / n_combos,
         "n_combos": int(n_combos),
         "n_partitions": k,
         "t_used": int(t_used),

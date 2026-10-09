@@ -205,6 +205,129 @@ def test_trend_n_validation():
             add_shooting_star(df, trend_n=bad)
 
 
+def test_min_range_pct_guards_narrow_hammer_and_star():
+    """窄幅 K 线（相对 close 的振幅下界）不产生锤头/射击之星信号（issue 1）。
+
+    没有这道下界时，振幅只有万分之几、实体≈0 的日常 K 线也会被比例判据
+    误报成形态：极小分母下 body/rng 没有统计意义。
+    """
+    # rng/close ≈ 0.013%，body=0，长下影 + 跌势 → 旧实现（等价于下界=0）报 1
+    down = [
+        (10.5, 10.6, 10.4, 10.5),
+        (10.5, 10.6, 10.4, 10.4),
+        (10.4, 10.5, 10.3, 10.3),
+        (10.3, 10.4, 10.2, 10.2),
+        (10.2, 10.3, 10.1, 10.1),
+        (10.0, 10.0003, 9.999, 10.0),
+    ]
+    narrow = ohlc(down)
+    assert add_hammer(narrow, min_range_pct=0.0)["pattern_hammer"].to_list()[-1] == 1
+    assert add_hammer(narrow)["pattern_hammer"].to_list()[-1] == 0  # 缺省 0.004 挡住
+
+    # 镜像：窄幅长上影 + 涨势
+    up = [
+        (10.0, 10.1, 9.9, 10.0),
+        (10.0, 10.1, 9.9, 10.1),
+        (10.1, 10.2, 10.0, 10.2),
+        (10.2, 10.3, 10.1, 10.3),
+        (10.3, 10.4, 10.2, 10.4),
+        (10.5, 10.501, 10.4998, 10.5),
+    ]
+    narrow_up = ohlc(up)
+    assert add_shooting_star(narrow_up, min_range_pct=0.0)["pattern_shooting_star"].to_list()[-1] == 1
+    assert add_shooting_star(narrow_up)["pattern_shooting_star"].to_list()[-1] == 0
+
+
+def test_min_range_pct_name_and_default_match_doji():
+    """三个形态的振幅下界同参数名、同缺省量级（issue 1 的“同量级”要求）。"""
+    import inspect
+
+    for fn in (add_doji, add_hammer, add_shooting_star):
+        p = inspect.signature(fn).parameters["min_range_pct"]
+        assert p.default == 0.004, fn.__name__
+
+
+@pytest.mark.parametrize(
+    ("fn", "kw"),
+    [
+        (add_doji, {"body_ratio": -1.0}),
+        (add_doji, {"body_ratio": 0.0}),
+        (add_doji, {"body_ratio": 1.5}),
+        (add_doji, {"min_range_pct": -1.0}),
+        (add_hammer, {"body_max": -1.0}),
+        (add_hammer, {"upper_max": 2.0}),
+        (add_hammer, {"shadow_min": 0.0}),
+        (add_hammer, {"min_range_pct": -1.0}),
+        (add_shooting_star, {"body_max": -1.0}),
+        (add_shooting_star, {"upper_max": 2.0}),
+        (add_morning_star, {"small_body_ratio": -1.0}),
+        (add_morning_star, {"recover_ratio": 2.0}),
+        (add_morning_star, {"recover_ratio": -1.0}),
+    ],
+)
+def test_ratio_params_fail_loudly(fn, kw):
+    """比例/阈值参数越界显式 ValueError，不静默退化（issue 2）。
+
+    旧实现里 ``recover_ratio=2.0``（漏报全部正例）、``body_ratio=-1.0``
+    （判据恒 False，静默全 0）、``min_range_pct=-1.0``（判据恒 True）都不报错。
+    """
+    df = random_ohlc(20)
+    with pytest.raises(ValueError, match=next(iter(kw))):
+        fn(df, **kw)
+
+
+def test_morning_star_recover_boundary_is_inclusive_from_body_start():
+    """第三根恰好收复第一根实体的 recover_ratio 即算命中（issue 3）。
+
+    第一根 (open=11.00, close=10.00)，实体下沿=10.00、高度=1.00。
+    recover_ratio=0.5 → 阈值 10.50；close_3=10.50 必须判 1（含等号），
+    10.4999 判 0。旧实现拿实体中点 10.50 当基准且用严格 ``>``，10.50 → 0。
+    """
+    base = [
+        (11.00, 11.10, 10.90, 10.00),
+        (9.80, 9.90, 9.60, 9.70),
+    ]
+    hit = ohlc(base + [(9.90, 10.70, 9.80, 10.50)])
+    miss = ohlc(base + [(9.90, 10.70, 9.80, 10.4999)])
+    assert add_morning_star(hit)["pattern_morning_star"].to_list()[-1] == 1
+    assert add_morning_star(miss)["pattern_morning_star"].to_list()[-1] == 0
+
+
+def test_null_ohlc_is_null_not_zero():
+    """当根 OHLC 缺任一项 → 输出 null，不把「数据缺失」伪装成「形态未命中」（issue 4）。"""
+    raw = ohlc(
+        [
+            (10.50, 11.00, 10.00, 10.55),  # 十字星命中
+            (10.00, 11.00, 10.00, 10.80),  # 非命中
+        ]
+    )
+    for col in ("open", "high", "low", "close"):
+        df = raw.with_columns(
+            pl.when(pl.col("trade_date") == raw["trade_date"][0])
+            .then(None)
+            .otherwise(pl.col(col))
+            .cast(pl.Float64)
+            .alias(col)
+        )
+        out = add_doji(df)["pattern_doji"]
+        assert out.dtype == pl.Int8, col
+        assert out.to_list() == [None, 0], col
+        assert out.null_count() == 1, col
+
+
+def test_null_ohlc_does_not_create_lookahead():
+    """null 语义改动后仍须前缀不变（不同前缀下同一行的 null/取值不漂移）。"""
+    raw = ohlc([(10.50, 11.00, 10.00, 10.55), (10.00, 11.00, 10.00, 10.80)] * 6)
+    df = raw.with_columns(
+        pl.when((pl.col("trade_date") - raw["trade_date"][0]).dt.total_days() % 4 == 0)
+        .then(None)
+        .otherwise(pl.col("close"))
+        .cast(pl.Float64)
+        .alias("close")
+    )
+    assert_no_lookahead(add_doji, df, out_cols=["pattern_doji"])
+
+
 def test_doji_boundary_is_inclusive():
     """body 恰等于 body_ratio×rng（<= 判据）→ 信号 1，锁住边界语义。"""
     # rng=1.0, body=0.1 = 0.1×1.0

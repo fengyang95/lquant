@@ -119,20 +119,26 @@ def test_watchlist_symbols_missing_table_is_empty_not_crash(tmp_path, monkeypatc
     from lquant.core.config import get_settings
 
     get_settings.cache_clear()
-    (tmp_path / "data" / "duckdb").mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(get_settings().duckdb_path))
-    con.execute("CREATE TABLE security (symbol VARCHAR)")  # 库在，但没 watchlist
-    con.close()
+    try:
+        (tmp_path / "data" / "duckdb").mkdir(parents=True, exist_ok=True)
+        con = duckdb.connect(str(get_settings().duckdb_path))
+        try:
+            con.execute("CREATE TABLE security (symbol VARCHAR)")  # 库在，但没 watchlist
+        finally:
+            con.close()
 
-    assert dg._watchlist_symbols() == []
-    # 端到端：默认读自选清单的日报退化成「清单为空」，而不是异常
-    spy = NotifySpy()
-    res = run_watchlist_digest(analyze_fn=lambda s, a: make_report(s), notify_fn=spy)
-    assert res["sent"] is False and res["ok"] == [] and res["failed"] == []
-    assert res["skipped"] == "清单为空"
-    assert res["pages"] == 0 and res["truncated"] is False
-    assert spy.calls == []
-    get_settings.cache_clear()
+        assert dg._watchlist_symbols() == []
+        # 端到端：默认读自选清单的日报退化成「清单为空」，而不是异常
+        spy = NotifySpy()
+        res = run_watchlist_digest(analyze_fn=lambda s, a: make_report(s), notify_fn=spy)
+        assert res["sent"] is False and res["ok"] == [] and res["failed"] == []
+        assert res["skipped"] == "清单为空"
+        assert res["pages"] == 0 and res["truncated"] is False
+        assert spy.calls == []
+    finally:
+        # 收尾必须放 finally：中途任一条断言失败时若不还原，全局 settings
+        # 缓存会残留 tmp 的 LQ_ROOT，后续用例连锁 FileNotFoundError。
+        get_settings.cache_clear()
 
 
 

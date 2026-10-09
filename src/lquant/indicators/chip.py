@@ -19,14 +19,20 @@
     三种口径都严格因果（只用截至当日的信息）—— 这是滚动指标通过前缀不变性门禁的
     前提；代理口径会显式标注（``CYQ_PROXY_NOTE``）。
 
-**无网格解析式 vs 直方图**（为什么有两套实现）：
+**无网格解析式 vs 直方图（两套口径，数值不等价，不可互相替代）**：
     - ``profit_ratio`` / 注册指标 ``cyq_profit_ratio`` 用**解析式滚动**：
       每日筹码视作单点（成交代表价 ``(H+L+2C)/4``），权重随衰减累积，
       获利比例 = Σ(成本 < 现价的权重) / Σ(总权重)。无全局网格 →
       每日值只依赖前缀数据，严格满足 ``assert_no_lookahead`` 门禁。
-    - ``cost_distribution`` 用**直方图**（bins 等宽价格格），网格边界依赖
-      全量数据的 min/max —— 前缀重算会漂移，**只用于末端快照可视化**，
-      不进滚动序列、不参与回测信号。
+      **这是获利盘比例的唯一权威口径。**
+    - ``cost_distribution`` 用**直方图**（bins 等宽价格格）：把当日筹码按
+      代表价落进价格格，输出**bin 中心**，网格边界取全量数据的 min/max ——
+      前缀重算会漂移，**只用于末端快照可视化**，不进滚动序列、不参与回测信号。
+      用「bin 中心 < 现价」从直方图再反推一个「获利比例」是**粗粒度近似**：
+      量化到 bin 中心后与解析式（用真实代表价逐点比较）必然有偏差，
+      价格跨度大 / bins 少时甚至可能得到 1.0。**不要拿直方图导出的比例
+      替代 ``profit_ratio``** —— 两者数值不等价是设计使然（精确 vs 量化），
+      不是需要对齐的 bug。
 
 输出：
     - ``cost_distribution(df, bins)``：末端成本分布（bin 中心 → 概率和 1）
@@ -73,6 +79,19 @@ _REQUIRED = ("high", "low", "close", "volume")
 def _price(df: pl.DataFrame) -> pl.Series:
     """当日成交代表价：经典 CYQ 用 ``(H+L+2C)/4`` —— 比单 close 更贴真实成交重心。"""
     return ((df["high"] + df["low"] + 2 * df["close"]) / 4).rename("_px")
+
+
+def _usable_price(df: pl.DataFrame) -> bool:
+    """价格列齐备且至少有一行能算出成交代表价。
+
+    为什么「列存在但全 null」要和「缺列」走同一档显式降级：列在而值全空时，
+    ``float(df["low"].min())`` 拿到 None、``np.float64(None)`` 直接抛裸
+    ``TypeError`` —— 调用方看到的是实现细节崩溃，而不是「无数据」；
+    缺列路径却能优雅降级。两条路径必须一致（issue 6）。
+    """
+    if any(c not in df.columns for c in _REQUIRED):
+        return False
+    return _price(df).drop_nulls().len() > 0
 
 
 def _proxy_turnover(v: list[float], window: int = _PROXY_TURNOVER_WINDOW) -> list[float]:
@@ -205,7 +224,15 @@ def _rolling_ratios(
     for i in range(n):
         if size:
             ws[:size] *= 1.0 - ts[i]
-        ps[size] = px[i]
+        p_i = px[i]
+        c_i = closes[i]
+        if p_i is None or c_i is None:
+            # 价格缺失：该日筹码落点/现价不可知 → 显式 None（数据缺失 ≠ 0/1），
+            # 且不新增筹码。已有筹码仍按当日换手率衰减（换手真实发生了）。
+            # 不打补丁的话 ``ps[size] = None`` 会抛裸 TypeError。
+            out.append(None)
+            continue
+        ps[size] = p_i
         ws[size] = ts[i]
         size += 1
         total = float(ws[:size].sum())
@@ -213,7 +240,7 @@ def _rolling_ratios(
             # 历史清零且当日无成交：无筹码信息，显式 None，不伪造 0 或 1
             out.append(None)
             continue
-        profit = float(ws[:size][ps[:size] < closes[i]].sum())
+        profit = float(ws[:size][ps[:size] < c_i].sum())
         out.append(round(profit / total, 4))
     return out
 
@@ -228,8 +255,16 @@ def cost_distribution(
 
     迭代：每根 K 线后 ``dist = dist*(1-t) + t*day_bin``。bins 是常数量级
     （默认 60），纯 Python 循环足够，性能瓶颈不在这里。
+
+    **口径警告**：权重记在 bin 中心，用「bin 中心 < 现价」反推的获利比例
+    与 :func:`profit_ratio` 的解析式**不等价**（量化 vs 精确），不可互相替代
+    —— 详见模块 docstring。
+
+    **降级语义**：缺列、全 null 价格列、空表一律返回 ``[]``（空分布），
+    与 `compute` 缺列分支的显式降级一致，不抛裸 TypeError；个别行价格
+    缺失时该日不落筹码（换手衰减照常），不崩溃。
     """
-    if df.is_empty():
+    if df.is_empty() or not _usable_price(df):
         return []
     px = df.with_columns(_price(df))
     lo, hi = float(df["low"].min()), float(df["high"].max())
@@ -240,10 +275,12 @@ def cost_distribution(
     ts, _ = _turnover_caliber(df, float_shares)
 
     for row, t in zip(px.iter_rows(named=True), ts, strict=True):
-        p = row["_px"]
-        idx = min(int((p - lo) / width), bins - 1)
         for i in range(bins):
             dist[i] *= 1 - t
+        p = row["_px"]
+        if p is None:
+            continue  # 价格缺失的交易日不落筹码：不把 None 当成某个价格格
+        idx = min(int((p - lo) / width), bins - 1)
         dist[idx] += t
     total = sum(dist) or 1.0
     return [(lo + (i + 0.5) * width, dist[i] / total) for i in range(bins) if dist[i] > 0]
@@ -253,13 +290,18 @@ def profit_ratio(df: pl.DataFrame, float_shares=None) -> dict:
     """末端获利盘比例：成本低于现价的筹码占比（0~1）。>0.9 常被视为「高位获利盘重」。
 
     与滚动指标 ``cyq_profit_ratio`` 同一解析式实现（同一 ``_turnover_caliber``
-    口径解析），两者对同一输入给同一答案。
+    口径解析），两者对同一输入给同一答案。**它是获利盘比例的权威口径**：
+    从 :func:`cost_distribution` 直方图（bin 中心）反推的比例是量化近似，
+    数值不等价，不可替代。
 
     ``proxy`` / ``note`` 由**实际使用的口径**决定，不由入参反推 —— 此前
     ``float_shares=0`` 会静默走代理口径却宣称「显式给定」，恰好在本函数
     唯一的意义（把口径诚实回传给调用方）上说谎。
+
+    **降级语义**：空表、缺列、全 null 价格列一律返回 ``profit_ratio=None``
+    且 ``note="无数据"``，与 `compute` 缺列分支一致，不抛裸 TypeError。
     """
-    if df.is_empty() or "close" not in df.columns:
+    if df.is_empty() or not _usable_price(df):
         return {"profit_ratio": None, "note": "无数据", "proxy": False, "caliber": None}
     ts, caliber = _turnover_caliber(df, float_shares)
     ratios = _rolling_ratios(df, float_shares, ts)

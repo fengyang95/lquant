@@ -149,13 +149,13 @@ def test_fetch_pool_stops_at_defensive_page_cap(monkeypatch) -> None:
     assert len(calls) == 20
 
 
-def test_ts_to_hhmmss_nonpositive_returns_empty() -> None:
-    """fbt/lbt 非正值（含负数）视为缺失返回空串，而不是算出 1970 年时间。"""
-    from lquant.market.collectors.limit_up import _ts_to_hhmmss
+def test_hhmmss_to_time_nonpositive_returns_none() -> None:
+    """fbt/lbt 非正值（含负数）视为缺失落 NULL，而不是算出 1970 年时间。"""
+    from lquant.market.collectors.limit_up import _hhmmss_to_time
 
-    assert _ts_to_hhmmss(92503) == "09:25:03"
-    assert _ts_to_hhmmss(-5) == ""
-    assert _ts_to_hhmmss(0) == ""
+    assert _hhmmss_to_time(92503) == "09:25:03"
+    assert _hhmmss_to_time(-5) is None
+    assert _hhmmss_to_time(0) is None
 
 
 # ------------------------------------------------------- 看板表加列迁移
