@@ -437,6 +437,14 @@ def _stamp(df: pl.DataFrame, source: str = "baostock") -> pl.DataFrame:
     fatal 抛 DataQualityError 会让整批不入湖 —— 这是设计行为
     （§3.8.6：fatal 阻断下游，回滚到上一 data_version）。
     warn 只打 quality_flags 标，批次照常落地。
+
+    快照哨兵契约（与 ``quality/integrity.py::partition_is_snapshot`` 对齐）：
+    ``_stamp`` 是**盘后权威批量行**的唯一盖章入口，所以在这里**显式**写
+    ``quote_ts = NULL``。为什么必须显式而不是依赖「列缺失自然为 null」：
+    integrity 判定「整分区缺列」为 **UNKNOWN** 而不是 **AUTHORITATIVE** ——
+    缺列 = 没有证据，会被当成可疑分区永远进不了复用/修复流程；而显式 NULL
+    才是「这批行是权威批量拉取的」的正面证据。反过来说，谁也**不能**在这里
+    给批量行编造采集时刻：那等于把盘后权威行谎称成盘中快照，哨兵语义反了。
     """
     from lquant.data import lineage
     from lquant.data.quality.pipeline import gate_daily
@@ -447,6 +455,8 @@ def _stamp(df: pl.DataFrame, source: str = "baostock") -> pl.DataFrame:
         source=pl.lit(source),
         ingested_at=pl.lit(now_cn().replace(tzinfo=None), dtype=pl.Datetime),
         data_version=pl.lit(version),
+        # 盘后批量权威行 = 显式 NULL（哨兵契约：非空才是采集时刻）
+        quote_ts=pl.lit(None, dtype=pl.Int64),
     )
     out, _issues = gate_daily(stamped, data_version=version)
     return out

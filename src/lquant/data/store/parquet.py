@@ -306,6 +306,21 @@ def _reject_demo_overwrite(old: pl.DataFrame, new: pl.DataFrame, path: Path) -> 
 
 
 def write_daily(df: pl.DataFrame) -> list[Path]:
+    """日线湖按年单文件的批量写入（同 key 覆盖合并 + 原子写）。
+
+    快照哨兵契约（``quality/integrity.py::partition_is_snapshot`` 的读取侧在
+    ``data/schema.py::DAILY_BAR["quote_ts"]``）：
+
+    - 批量写入的行**必须显式带 ``quote_ts = NULL``**（NULL = 盘后权威批量行）。
+      这里对「调用方没给该列」的行补一个显式 NULL：缺列在读侧会被 integrity
+      判成 **UNKNOWN**（没有证据，绝不等于 AUTHORITATIVE），而 batch 路径
+      （``ingest/daily.py::_stamp`` / ``demo`` / ``ingest/adj.py`` /
+      ``ingest/crosscheck.py``）本来就都是盘后权威行，补 NULL 即是如实标注。
+      这是防哨兵语义漂移的兜底：新增批量写入方时忘了带上这列，也不会退化成
+      UNKNOWN。
+    - 已经带 ``quote_ts`` 的行（未来的盘中落盘路径）原样保留 —— 绝不在这里
+      无条件清空，否则会把盘中快照伪装成权威行，正好把哨兵语义写反。
+    """
     if not len(df):
         return []
     out: list[Path] = []
@@ -314,6 +329,9 @@ def write_daily(df: pl.DataFrame) -> list[Path]:
         p = _daily_path(y)
         p.parent.mkdir(parents=True, exist_ok=True)
         g = g.drop("y")
+        if "quote_ts" not in g.columns:
+            # 显式 NULL（Int64）而非缺列：缺列 → integrity UNKNOWN，不是权威
+            g = g.with_columns(quote_ts=pl.lit(None, dtype=pl.Int64))
         # 同key覆盖：读旧 → 演示数据护栏 → flags 合并 → 覆盖合并 → 原子写
         with _file_lock(p):
             if p.exists():
