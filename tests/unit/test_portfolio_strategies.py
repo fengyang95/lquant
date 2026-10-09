@@ -222,6 +222,41 @@ def test_turtle_window_beyond_rows_does_not_fake_prev_high():
     assert "close=" not in r.evidence  # 未拿半截算出 close/prev_high
 
 
+# ---------- 审阅修复回归：参数非法 / 缺前收必须显式降级 ----------
+
+
+def test_keep_rising_rejects_nonpositive_days():
+    """days<1 是参数错误：显式说清，而不是退化成「最近 0 日全涨」这种假命中。"""
+    r = run_strategy("keep_rising", make_df([10.0] * 5), days=0)
+    assert not r.passed
+    assert "参数非法" in r.evidence and "days=0" in r.evidence
+
+
+def test_turtle_breakout_rejects_nonpositive_window():
+    r = run_strategy("turtle_breakout", make_df([10.0 + 0.1 * i for i in range(21)]), window=0)
+    assert not r.passed
+    assert "参数非法" in r.evidence and "window=0" in r.evidence
+
+
+def test_low_atr_rejects_nonpositive_window():
+    r = run_strategy("low_atr", make_df([10.0 + 0.01 * i for i in range(15)]), window=0)
+    assert not r.passed
+    assert "参数非法" in r.evidence and "window=0" in r.evidence
+
+
+def test_volume_surge_without_pre_close_is_explicit():
+    """末日前收缺/为 0 → 涨幅算不出来：显式降级，而不是除零崩成「计算失败」。"""
+    df = make_df([10.0] * 6).with_columns(
+        pl.when(pl.col("trade_date") == "d005")
+        .then(0.0)
+        .otherwise(pl.col("pre_close"))
+        .alias("pre_close")
+    )
+    r = run_strategy("volume_surge", df)
+    assert not r.passed
+    assert "pre_close" in r.evidence and "计算失败" not in r.evidence
+
+
 # ---------- 审阅修复回归：min_pct 从「装样子参数」变为真过滤 ----------
 
 

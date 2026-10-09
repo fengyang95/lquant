@@ -301,6 +301,59 @@ def test_cli_confidence_auto_counts_ledger(runs_env):
     assert "expected_max_sharpe_annual" in out
 
 
+def test_cli_confidence_rejects_non_integer_n_trials(runs_env):
+    """--n-trials 既非整数也非 auto：用户输入错误，转成 Click 用法错误而非裸栈。"""
+    import pathlib
+
+    from lquant.cli.commands.backtest import backtest
+
+    r = np.random.default_rng(7).normal(0.001, 0.01, 500)
+    p = pathlib.Path("returns.csv")
+    p.write_text("ret\n" + "\n".join(str(float(x)) for x in r) + "\n")
+    res = CliRunner().invoke(
+        backtest, ["confidence", "--returns", str(p), "--n-trials", "abc"]
+    )
+    assert res.exit_code != 0
+    assert "需为整数或 auto" in res.output
+
+
+def test_cli_confidence_auto_without_ledger_is_explicit(runs_env):
+    """auto 数到 0 条台账是「N 未知」，不能说成「无选择偏差可校正」（说反方向）。"""
+    import pathlib
+
+    from lquant.cli.commands.backtest import backtest
+
+    r = np.random.default_rng(7).normal(0.001, 0.01, 500)
+    p = pathlib.Path("returns.csv")
+    p.write_text("ret\n" + "\n".join(str(float(x)) for x in r) + "\n")
+    res = CliRunner().invoke(
+        backtest,
+        ["confidence", "--returns", str(p), "--n-trials", "auto", "--strategy", "nope"],
+    )
+    assert res.exit_code == 0, res.output
+    out = json.loads(res.output)
+    assert out["n_trials"] == 0
+    assert "N 未知" in out["note"] and "DSR 不可用" in out["note"]
+
+
+def test_cli_confidence_single_trial_skips_dsr(runs_env):
+    """--n-trials 1：DSR 需 N≥2，显式说明跳过，而不是算出个没有意义的 DSR。"""
+    import pathlib
+
+    from lquant.cli.commands.backtest import backtest
+
+    r = np.random.default_rng(7).normal(0.001, 0.01, 500)
+    p = pathlib.Path("returns.csv")
+    p.write_text("ret\n" + "\n".join(str(float(x)) for x in r) + "\n")
+    res = CliRunner().invoke(
+        backtest, ["confidence", "--returns", str(p), "--n-trials", "1"]
+    )
+    assert res.exit_code == 0, res.output
+    out = json.loads(res.output)
+    assert out["n_trials"] == 1
+    assert "dsr" not in out and "n_trials=1 < 2" in out["note"]
+
+
 def test_cli_confidence_dirty_csv_reports_clean_error(runs_env):
     """CSV 含 NaN/Inf 是用户数据问题，不该吐整段 traceback。
 

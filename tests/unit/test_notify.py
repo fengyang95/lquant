@@ -476,6 +476,12 @@ def test_ntfy_title_keeps_non_ascii_via_rfc2047():
     assert NtfyChannel()._request("lquant", "x")[1]["X-Title"] == "lquant"
 
 
+def test_ntfy_blank_title_falls_back_to_lquant():
+    """空白/纯换行标题折平后为空 → 兜底 "lquant"，不产生空的 X-Title。"""
+    for title in ("", "   ", "\r\n", " \n "):
+        assert NtfyChannel()._request(title, "正文")[1]["X-Title"] == "lquant", title
+
+
 def test_pushplus_payload():
     assert PushPlusChannel()._payload("t", "c")["template"] == "txt"
 

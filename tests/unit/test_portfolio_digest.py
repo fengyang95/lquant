@@ -375,6 +375,53 @@ def test_reconcile_notify_failed_send_allows_retry(monkeypatch):
     assert len(calls) == 2  # 没送出去就不占用幂等键
 
 
+def test_reconcile_notify_skipped_report_is_silent(monkeypatch):
+    """rep 带 skipped（非交易日）：本次根本没有对账，发告警只会制造噪音。"""
+    from lquant.paper.service import _notify_reconcile
+
+    fired = _spy_reconcile_notify(monkeypatch)
+    _notify_reconcile("demo", "2026-09-17", _reconcile_report(skipped=True))
+    assert fired == []
+
+
+def test_reconcile_notify_sends_when_dedup_state_unavailable(monkeypatch):
+    """幂等状态不可用（DB 异常）不能退化成漏告警：宁可重发一次。"""
+    from lquant.paper import service
+
+    fired = _spy_reconcile_notify(monkeypatch)
+
+    def boom(*a, **kw):
+        raise RuntimeError("dedup 表炸了")
+
+    monkeypatch.setattr(service, "_claim_reconcile_alert", boom)
+    service._notify_reconcile(
+        "demo", "2026-09-17",
+        _reconcile_report(verdict="critical", nav_intraday=94877.0, rel_dev=0.05123),
+    )
+    assert len(fired) == 1
+
+
+def test_release_reconcile_alert_safely_swallows_failure(monkeypatch):
+    """撤销幂等登记失败最坏是少一次重试，绝不能掀翻对账主链路。"""
+    from lquant.paper import service
+
+    def boom(*a, **kw):
+        raise RuntimeError("撤销炸了")
+
+    monkeypatch.setattr(service, "_release_reconcile_alert", boom)
+    service._release_reconcile_alert_safely("demo", "2026-09-17", "critical")  # 不抛
+
+
+def test_alert_delivered_unknown_shape_counts_as_delivered():
+    """无法判定「是否真的送出」时按已送出处理，避免重复刷屏。"""
+    from lquant.paper.service import _alert_delivered
+
+    assert _alert_delivered(None) is True      # 注入的 notify_fn 无返回值
+    assert _alert_delivered(123) is True       # 非可迭代的测试替身 → TypeError
+    assert _alert_delivered([SimpleNamespace(ok=False)]) is False
+    assert _alert_delivered([SimpleNamespace(ok=True)]) is True
+
+
 def test_day_close_non_trading_day_skips_nav_write(paper_env, monkeypatch):
     """非交易日 day_close 不落 official 净值，返回值显式 skipped。
 
