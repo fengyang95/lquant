@@ -81,20 +81,23 @@ class MonitorMiddleware:
             await self.app(scope, receive, send)
         else:
             start = time.perf_counter()
-            err_recorded = {"flag": False}  # 同一请求只记一条错误（500 响应后又抛异常的双记防护）
+            # 已发出的响应状态（response.start 只来一次）。响应起点拿不到异常，
+            # 而 Starlette 处理未捕获异常的顺序是「先发 500 → 再抛出」——
+            # 若在 response.start 处就地记账，错误日志只会留下一行状态码，
+            # error_type/message/traceback 全空（监控页上显示为「— / —」）。
+            # 因此 5xx 的记账延后到 app 返回/抛出之后再做一次。
+            started: dict[str, int] = {}
 
             async def send_wrapper(message: Message) -> None:
                 if message["type"] == "http.response.start":
                     try:
                         elapsed = (time.perf_counter() - start) * 1000.0
                         status = int(message.get("status", 0))
+                        started["status"] = status
                         ring_mod.api_ring.append(ApiMetricPoint(
                             ts=time.time(), route=_route_template(scope),
                             method=str(scope.get("method", "")), status=status,
                             duration_ms=elapsed, dur_category=_classify(status, elapsed)))
-                        if status >= 500:
-                            _record_error(scope, status, None)
-                            err_recorded["flag"] = True
                     except Exception:  # noqa: BLE001 - 采集失败不影响响应
                         pass
                 await send(message)
@@ -102,13 +105,22 @@ class MonitorMiddleware:
             try:
                 await self.app(scope, receive, send_wrapper)
             except Exception as exc:
-                # 异常路径也记一笔（Starlette 会在内层转 500；此处兜住裸 ASGI 直调）
-                elapsed = (time.perf_counter() - start) * 1000.0
-                with contextlib.suppress(Exception):
-                    ring_mod.api_ring.append(ApiMetricPoint(
-                        ts=time.time(), route=_route_template(scope),
-                        method=str(scope.get("method", "")), status=500,
-                        duration_ms=elapsed, dur_category="error"))
-                if not err_recorded["flag"]:
-                    _record_error(scope, 500, exc)
+                # 异常路径：详情只有这里拿得到（含内层已发的 500）。
+                # 响应起点已记过采样就不重复补 —— 否则同一请求在耗时曲线上被记两次。
+                if "status" not in started:
+                    elapsed = (time.perf_counter() - start) * 1000.0
+                    with contextlib.suppress(Exception):
+                        ring_mod.api_ring.append(ApiMetricPoint(
+                            ts=time.time(), route=_route_template(scope),
+                            method=str(scope.get("method", "")), status=500,
+                            duration_ms=elapsed, dur_category="error"))
+                # 已开流的响应可能先报 200 再中途炸：对错误日志而言仍是失败请求，
+                # 不能把 2xx/3xx 记进错误表。
+                status = max(int(started.get("status") or 500), 500)
+                _record_error(scope, status, exc)
                 raise
+            else:
+                # 正常返回：只有「处理器直接返回 5xx」才需要记一笔（无异常详情）。
+                status = int(started.get("status") or 0)
+                if status >= 500:
+                    _record_error(scope, status, None)

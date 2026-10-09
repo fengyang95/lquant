@@ -87,7 +87,7 @@ def _safe(fn, *args, **kwargs):
     try:
         return fn(*args, **kwargs)
     except Exception as e:  # noqa: BLE001 - 表未建 / 湖缺失 / 源不可用
-        log.debug("security loader 降级: %s", e)
+        log.debug(f"security loader 降级: {e}")
         return None
 
 
@@ -127,7 +127,7 @@ def load_benchmark(asof: date, lookback_days: int = BAR_LOOKBACK_DAYS
         try:
             df = _read_index(code, start, asof)
         except Exception as e:  # noqa: BLE001 - 读失败不该伪装成「没有这个指数」
-            log.warning("基准指数 %s 读取失败，不降级到其他基准: %s", code, e)
+            log.warning(f"基准指数 {code} 读取失败，不降级到其他基准: {e}")
             return pl.DataFrame(), None
         if not df.is_empty():
             return df, code
@@ -225,7 +225,7 @@ def load_financial_own(con, symbol: str, asof: date) -> pl.DataFrame:
     try:
         df = con.execute(sql, [symbol, *FINANCIAL_ITEMS, asof]).pl()
     except Exception as e:  # noqa: BLE001 - 表未建 / 未同步
-        log.debug("financial_pit 读取失败: %s", e)
+        log.debug(f"financial_pit 读取失败: {e}")
         return pl.DataFrame()
     if df.is_empty():
         return df
@@ -254,7 +254,7 @@ def load_financial_cross(con, symbols: list[str], asof: date) -> pl.DataFrame:
     try:
         return con.execute(sql, [*symbols, *FINANCIAL_ITEMS, asof]).pl()
     except Exception as e:  # noqa: BLE001
-        log.debug("financial_pit 截面读取失败: %s", e)
+        log.debug(f"financial_pit 截面读取失败: {e}")
         return pl.DataFrame()
 
 
@@ -272,7 +272,7 @@ def load_industry(con, symbol: str, asof: date
             [symbol, asof],
         ).fetchone()
     except Exception as e:  # noqa: BLE001
-        log.debug("industry_classify 读取失败: %s", e)
+        log.debug(f"industry_classify 读取失败: {e}")
         return None, None, []
     if not row:
         return None, None, []
@@ -300,7 +300,7 @@ def load_money_flow(con, symbol: str, asof: date,
             [symbol, asof, asof - timedelta(days=days)],
         ).pl()
     except Exception as e:  # noqa: BLE001
-        log.debug("money_flow 读取失败: %s", e)
+        log.debug(f"money_flow 读取失败: {e}")
         return pl.DataFrame()
 
 
@@ -316,7 +316,7 @@ def load_news(con, symbol: str, asof: date,
              datetime.combine(asof - timedelta(days=days), datetime.min.time())],
         ).pl()
     except Exception as e:  # noqa: BLE001
-        log.debug("news_item 读取失败: %s", e)
+        log.debug(f"news_item 读取失败: {e}")
         return pl.DataFrame()
 
 
