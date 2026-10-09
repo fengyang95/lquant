@@ -17,6 +17,12 @@ from lquant.research.ml.backtest import (
     signal_backtest,
     train_and_predict,
 )
+from lquant.research.ml.cv import (
+    PurgedSplit,
+    assign_paths,
+    combinatorial_purged_splits,
+    purged_kfold_splits,
+)
 from lquant.research.ml.dataset import (
     Dataset,
     DatasetConfig,
@@ -80,6 +86,7 @@ from lquant.research.ml.registry import (
 
 __all__ = [
     "Dataset", "DatasetConfig", "build_dataset", "walk_forward_splits",
+    "PurgedSplit", "purged_kfold_splits", "combinatorial_purged_splits", "assign_paths",
     "Model", "LGBMModel", "SklearnModel", "RidgeModel", "EnsembleModel",
     "make_model", "available_backends",
     "train_and_predict", "signal_backtest", "run_ml_pipeline", "MLResult",

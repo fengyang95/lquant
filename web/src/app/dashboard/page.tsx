@@ -22,7 +22,15 @@ type Overview = {
     broken_rate: number | null; max_consecutive: number | null; trade_date: string | null;
   };
   sentiment_history: { trade_date: string; sentiment_score: number; limit_up_count: number; broken_rate: number }[];
-  northbound: { trade_date: string; sh_net_inflow: number; sz_net_inflow: number; total_net_inflow: number }[];
+  northbound: {
+    trade_date: string;
+    sh_deal_amt: number | null; sz_deal_amt: number | null; total_deal_amt: number | null;
+    deal_num: number | null;
+    // 2024-08-19 起净买额停发：其后的日期这几个字段为 null（不是 0），
+    // 用 net_published 区分「口径停发」与「真的为零」
+    sh_net_inflow: number | null; sz_net_inflow: number | null;
+    total_net_inflow: number | null; net_published: boolean | null;
+  }[];
 };
 
 type BreadthRow = {
@@ -47,6 +55,16 @@ type IndexRow = {
 };
 
 const DEFAULT_POOL = '600519.SH,000001.SZ,601318.SH,510300.SH,159915.SZ,511260.SH';
+
+type NorthboundTop10 = {
+  board: string; symbol: string; name: string; rank_no: number;
+  close: number | null; change_pct: number | null;
+  deal_amt: number | null; mutual_ratio: number | null;
+};
+type NorthboundData = { flow: unknown[]; top10: NorthboundTop10[]; net_last_date: string };
+
+/** 元 → 亿（两位内），空值显示破折号而不是 0.0 */
+const yi = (v: number | null | undefined) => (v == null ? '—' : (v / 1e8).toFixed(1));
 
 /** 温度计：0~100 合成分 → 分段横条 + 针标 + 状态词 */
 function TempScale({ temp }: { temp: number }) {
@@ -85,6 +103,7 @@ export default function DashboardPage() {
   const { data: breadth } = useSWR<{ latest: BreadthRow | null; history: BreadthRow[] }>(
     '/market/breadth?days=90', get, { refreshInterval: 60_000 });
   const { data: indexQuotes } = useSWR<IndexRow[]>('/market/index?days=60', get, { refreshInterval: 60_000 });
+  const { data: northbound } = useSWR<NorthboundData>('/market/northbound?days=30', get, { refreshInterval: 60_000 });
 
   const [pool, setPool] = useState(DEFAULT_POOL);
   const [input, setInput] = useState(DEFAULT_POOL);
@@ -362,35 +381,86 @@ export default function DashboardPage() {
             </table>
           )}
         </Panel>
-        <Panel title="北向资金" meta="近 10 日 · 亿">
+        <Panel title="北向成交额" meta="近 10 日 · 亿">
           {!overview?.northbound?.length ? (
             <div className="border border-dashed border-line-strong py-8 text-center text-sm text-ink-faint">暂无数据</div>
           ) : (
-            <table className="table-dense">
-              <thead>
-                <tr>
-                  <th className="text-left">日期</th>
-                  <th className="text-right">沪股通</th>
-                  <th className="text-right">深股通</th>
-                  <th className="text-right">合计</th>
-                </tr>
-              </thead>
-              <tbody>
-                {overview.northbound.slice(0, 10).map((r) => (
-                  <tr key={r.trade_date} className="hover:bg-white">
-                    <td className="tabular-nums">{r.trade_date}</td>
-                    <td className="text-right tabular-nums">{(r.sh_net_inflow / 1e8).toFixed(1)}</td>
-                    <td className="text-right tabular-nums">{(r.sz_net_inflow / 1e8).toFixed(1)}</td>
-                    <td className={`text-right tabular-nums ${r.total_net_inflow > 0 ? 'text-up' : 'text-down'}`}>
-                      {(r.total_net_inflow / 1e8).toFixed(1)}
-                    </td>
+            <>
+              <table className="table-dense">
+                <thead>
+                  <tr>
+                    <th className="text-left">日期</th>
+                    <th className="text-right">沪股通</th>
+                    <th className="text-right">深股通</th>
+                    <th className="text-right">合计</th>
+                    <th className="text-right">笔数(万)</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {overview.northbound.slice(0, 10).map((r) => (
+                    <tr key={r.trade_date} className="hover:bg-white">
+                      <td className="tabular-nums">{r.trade_date}</td>
+                      <td className="text-right tabular-nums">{yi(r.sh_deal_amt)}</td>
+                      <td className="text-right tabular-nums">{yi(r.sz_deal_amt)}</td>
+                      <td className="text-right tabular-nums">{yi(r.total_deal_amt)}</td>
+                      <td className="text-right tabular-nums">
+                        {r.deal_num == null ? '—' : (r.deal_num / 1e4).toFixed(0)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {/* 净买额 2024-08-19 起停发：只对已披露的日期显示净额，其余显示口径说明。
+                  绝不把停发当 0 画出来。 */}
+              <p className="mt-2 text-xs text-ink-faint">
+                2024-08-19 起交易所不再公布北向净买入，本表只展示仍披露的成交额与笔数
+                {overview.northbound[0]?.net_published
+                  ? `；当日净买额合计 ${yi(overview.northbound[0].total_net_inflow)} 亿`
+                  : '。'}
+              </p>
+            </>
           )}
         </Panel>
       </div>
+
+      <Panel title="北向前十大成交活跃证券" meta="最新交易日 · 按成交额">
+        {!northbound?.top10?.length ? (
+          <div className="border border-dashed border-line-strong py-8 text-center text-sm text-ink-faint">
+            暂无数据 —— 跑 <code className="bg-paper px-1">POST /api/market/collect</code> 或等待调度
+          </div>
+        ) : (
+          <table className="table-dense">
+            <thead>
+              <tr>
+                <th className="text-left">通道</th>
+                <th className="text-right">#</th>
+                <th className="text-left">代码</th>
+                <th className="text-left">名称</th>
+                <th className="text-right">收盘</th>
+                <th className="text-right">涨跌</th>
+                <th className="text-right">成交额(亿)</th>
+                <th className="text-right">占个股成交</th>
+              </tr>
+            </thead>
+            <tbody>
+              {northbound.top10.map((r) => (
+                <tr key={`${r.board}-${r.rank_no}`} className="hover:bg-white">
+                  <td>{r.board}</td>
+                  <td className="text-right tabular-nums">{r.rank_no}</td>
+                  <td className="tabular-nums">{r.symbol}</td>
+                  <td>{r.name}</td>
+                  <td className="text-right tabular-nums">{r.close?.toFixed(2) ?? '—'}</td>
+                  <td className="text-right"><Pct value={r.change_pct} /></td>
+                  <td className="text-right tabular-nums">{yi(r.deal_amt)}</td>
+                  <td className="text-right tabular-nums">
+                    {r.mutual_ratio == null ? '—' : `${r.mutual_ratio.toFixed(1)}%`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Panel>
     </div>
   );
 }

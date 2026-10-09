@@ -14,6 +14,7 @@ from datetime import date
 
 import polars as pl
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, model_validator
 
 from lquant.backtest.benchmark import DEFAULT_BENCHMARK
@@ -209,6 +210,27 @@ def list_exit_strategies() -> dict:
     return {"strategies": EXIT_STRATEGIES.describe()}
 
 
+@router.get("/risk-rules")
+def list_risk_rules(scope: str = "batch") -> dict:
+    """枚举事前风控规则（前端/CLI 选择器的数据源）。
+
+    scope=batch 为回测（整批下单前），scope=order 为模拟盘（逐单）。
+    每条给出默认开关、是否需要整批上下文与说明 —— 让「开了哪些、为什么默认
+    是关的」一眼可见，而不是埋在代码里。
+    """
+    if scope not in ("batch", "order"):
+        raise HTTPException(422, f"scope 只能是 batch | order，收到 {scope!r}")
+    from lquant.backtest.risk import RISK_RULES
+
+    rules = RISK_RULES.describe()
+    if scope == "order":
+        rules = [r for r in rules if r.get("per_order", True)]
+        defaults = [r["name"] for r in rules if r.get("default_on")]
+    else:
+        defaults = [n for n in RISK_RULES if RISK_RULES.meta(n).get("default_on")]
+    return {"scope": scope, "defaults": defaults, "rules": rules}
+
+
 class BacktestIn(BaseModel):
     factor: str = "pct_change_20"        # 仅作展示标签；实际因子列由 formula 派生（formula.replace("_","")）
     formula: str = "pct_change_20"       # 与 factors API 同一套公式：pct_change_{n} / rolling_std_{n}
@@ -224,23 +246,21 @@ class BacktestIn(BaseModel):
     benchmark: str | None = DEFAULT_BENCHMARK
 
 
-def _parse_formula_n(formula: str) -> int:
-    """从公式尾段解析窗口参数 n；解析失败按 422 语义抛 HTTPException。"""
-    try:
-        return int(formula.rsplit("_", 1)[1])
-    except (IndexError, ValueError) as e:
-        raise HTTPException(422, f"因子公式窗口参数非法: {formula}") from e
-
-
 def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
-    if formula.startswith("pct_change_"):
-        n = _parse_formula_n(formula)
-        return df.with_columns(pl.col("close").pct_change(n).over("symbol").alias(formula.replace("_", "")))
-    if formula.startswith("rolling_std_"):
-        n = _parse_formula_n(formula)
-        return df.with_columns(pl.col("close").pct_change().over("symbol")
-                               .rolling_std(n).alias(formula.replace("_", "")))
-    raise HTTPException(422, f"暂不支持的因子公式: {formula}")
+    """现算因子列 —— 委托规范实现 ``factors.analysis.compute_factor_col``。
+
+    本文件与 ``paper.py`` 曾各有一份裁剪副本，只认 ``pct_change_`` / ``rolling_std_``
+    两种快捷公式，漏了 ``turnover`` / Qlib Alpha158 内置名 / ``$`` DSL —— 同一个公式
+    在回测链路 422、在因子评价链路却能算。收敛到单一实现后三条分支一并可用；
+    解析失败仍按 422 语义抛出（FactorError 不是 ValueError，必须显式接住）。
+    """
+    from lquant.core.errors import FactorError
+    from lquant.factors.analysis import compute_factor_col
+
+    try:
+        return compute_factor_col(df, formula, name=formula.replace("_", ""))
+    except (ValueError, KeyError, FactorError) as e:
+        raise HTTPException(422, f"暂不支持的因子公式: {formula}") from e
 
 
 class SweepIn(BaseModel):
@@ -542,19 +562,22 @@ def get_run_code(run_id: str) -> dict:
             "benchmark": params.get("benchmark"), "engine": params.get("engine")}
 
 
-@router.get("/{run_id}/attribution")
-def get_attribution(run_id: str, top: int = Query(default=15, ge=3, le=50)) -> dict:
-    """归因分析：个股收益贡献 + 分组 Brinson + α/β/信息比率。
-
-    持仓数据来自 backtest_position（run-code / run 端点都会写）；
-    老运行没有持仓数据时返回 404 提示重跑。
-    """
+def _attribution_payload(run_id: str, top: int = 15) -> dict:
+    """归因全量计算（get_attribution 与 HTML 报告共用，回归只算一次）。"""
     from lquant.backtest.attribution import (
         brinson_by_group,
+        brinson_monthly,
+        build_styles,
+        cost_drag,
+        drawdown_attribution,
         group_of_symbol,
         industry_map_from_db,
+        portfolio_profile,
+        risk_attribution,
         risk_vs_benchmark,
         stock_contribution,
+        style_regression,
+        style_return_attribution,
     )
 
     with reader() as con:
@@ -566,6 +589,9 @@ def get_attribution(run_id: str, top: int = Query(default=15, ge=3, le=50)) -> d
         pos_rows = con.execute(
             "SELECT trade_date, symbol, qty FROM backtest_position "
             "WHERE run_id = ? ORDER BY trade_date", [run_id]).fetchall()
+        order_rows = con.execute(
+            "SELECT ts, fee FROM backtest_order WHERE run_id = ? AND fee != 0",
+            [run_id]).fetchall()
         industry = industry_map_from_db(con)
 
     if not pos_rows:
@@ -596,6 +622,25 @@ def get_attribution(run_id: str, top: int = Query(default=15, ge=3, le=50)) -> d
     stocks, residual = stock_contribution(positions, prices, nav)
     group_map = {s: industry.get(s) or group_of_symbol(s) for s in set(universe) | need}
     brinson = brinson_by_group(positions, prices, nav, universe, group_map)
+    brinson_m = brinson_monthly(positions, prices, nav, universe, group_map)
+
+    # 成本拖累：逐笔费用 / 前日净值（residual 里混着的费用部分在这里显式化）
+    cost = cost_drag([{"ts": r[0], "fee": r[1]} for r in order_rows], nav)
+
+    # 持仓画像：行业权重 / 集中度 / 风格暴露（只对持仓标的，面板过滤省内存）
+    profile = portfolio_profile(positions, prices, nav, group_map,
+                                styles=build_styles(px_df, sorted(need)))
+
+    # 风格回归一次，供收益归因 / 回撤期归因 / 风险归因三处共用
+    reg = style_regression(px_df)
+    if "factors" in reg:
+        style_attr = style_return_attribution(positions, prices, nav, reg=reg)
+        risk_attr = risk_attribution(positions, prices, nav, reg)
+        drawdown = drawdown_attribution(positions, prices, nav, reg=reg)
+    else:
+        style_attr = reg
+        risk_attr = {"note": reg.get("note", "风格回归不可用，风险归因不可用")}
+        drawdown = drawdown_attribution(positions, prices, nav)  # 只有个股贡献
 
     # α/β/IR/TE：策略日收益 vs 基准日收益（基准净值差分，不能用累计值）
     _, bench_label, bench_map = _benchmark_nav_aligned(set(dates), nav_map)
@@ -619,8 +664,42 @@ def get_attribution(run_id: str, top: int = Query(default=15, ge=3, le=50)) -> d
                                "n_stocks": len(stocks)},
         "residual_by_day": residual,
         "brinson": brinson,
+        "brinson_monthly": brinson_m,
+        "cost": cost,
+        "profile": profile,
+        "style_attr": style_attr,
+        "drawdown": drawdown,
+        "risk_attr": risk_attr,
         "risk": risk,
     }
+
+
+@router.get("/{run_id}/attribution")
+def get_attribution(run_id: str, top: int = Query(default=15, ge=3, le=50)) -> dict:
+    """归因分析：个股贡献 + Brinson + 风格归因 + 回撤期归因 + 风险归因。
+
+    持仓数据来自 backtest_position（run-code / run 端点都会写）；
+    老运行没有持仓数据时返回 404 提示重跑。
+    """
+    return _attribution_payload(run_id, top)
+
+
+@router.get("/{run_id}/attribution/report",
+            response_class=HTMLResponse,
+            responses={200: {"content": {"text/html": {}}}})
+def get_attribution_report(run_id: str) -> HTMLResponse:
+    """归因 HTML 报告（自包含，可离线打开/打印/存档）。
+
+    与 /attribution 同一计算核心（_attribution_payload），仅渲染不同。
+    浏览器直接访问下载即可；Content-Disposition 带文件名方便存档。
+    """
+    from lquant.backtest.attribution_report import render_attribution_html
+
+    payload = _attribution_payload(run_id)
+    html_doc = render_attribution_html(payload)
+    return HTMLResponse(
+        content=html_doc,
+        headers={"Content-Disposition": f'inline; filename="attribution-{run_id}.html"'})
 
 
 @router.get("/{run_id}/holdings")

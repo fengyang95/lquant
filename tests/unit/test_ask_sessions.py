@@ -199,3 +199,61 @@ def test_render_briefing_skips_system_and_empty():
     text = render_briefing(_msgs(("system", "MCP 白名单：xxx"),
                                  ("user", "问"), ("assistant", "")))
     assert text == "用户：问"
+
+
+async def test_add_message_with_preset_id_and_get_message(store):
+    """mid 允许预生成：取消路径要能在 INSERT 的 await 之前就登记目标行。"""
+    ses = await store.create(None)
+    m = await store.add_message(ses.id, "assistant", "", mid="fixed-id-1")
+    assert m.id == "fixed-id-1"
+    got = await store.get_message(ses.id, "fixed-id-1")
+    assert got is not None and got.content == ""
+    # 跨会话拿不到（sid 参与匹配）
+    other = await store.create(None)
+    assert await store.get_message(other.id, "fixed-id-1") is None
+    assert await store.get_message(ses.id, "nope") is None
+
+
+async def test_mark_interrupted_is_idempotent(tmp_path):
+    """取消留痕：只要本轮 id 还登记着就补一句，补完即 pop（幂等）。
+
+    「回答已经跑完」这一档由 provider 在收尾时 pop 掉 id 来区分，**不是**
+    靠内容非空 —— 流到一半被取消的回答内容也非空，但同样需要这个标记。
+    """
+    from lquant.agent.mock import MockAgentService
+
+    svc = MockAgentService(SessionStore(str(tmp_path / "ask.db")))
+    ses = await svc.create_session(None)
+    # 没有登记 id → 空操作
+    await svc._mark_interrupted(ses.id)
+    # 登记了 id 且内容为空 → 补「（已中断）」
+    m = await svc.store.add_message(ses.id, "assistant", "", mid="mid-empty")
+    svc._ans_id[ses.id] = "mid-empty"
+    await svc._mark_interrupted(ses.id)
+    got = await svc.store.get_message(ses.id, m.id)
+    assert got.content == "（已中断）"
+    assert ses.id not in svc._ans_id
+    # 幂等：再调一次不重复补
+    await svc._mark_interrupted(ses.id)
+    assert (await svc.store.get_message(ses.id, m.id)).content == "（已中断）"
+    # 截断到一半的回答也要补
+    m2 = await svc.store.add_message(ses.id, "assistant", "（Mock 回答", mid="mid-half")
+    svc._ans_id[ses.id] = "mid-half"
+    await svc._mark_interrupted(ses.id)
+    assert (await svc.store.get_message(ses.id, m2.id)).content == "（Mock 回答（已中断）"
+
+
+async def test_mark_interrupted_swallows_store_errors(tmp_path):
+    """留痕失败不能改写取消语义（不能让取消变成 500）。"""
+    from lquant.agent.mock import MockAgentService
+
+    svc = MockAgentService(SessionStore(str(tmp_path / "ask.db")))
+    ses = await svc.create_session(None)
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("db 挂了")
+
+    svc._ans_id[ses.id] = "whatever"
+    svc.store.get_message = boom          # type: ignore[method-assign]
+    await svc._mark_interrupted(ses.id)   # 不抛
+    assert ses.id not in svc._ans_id

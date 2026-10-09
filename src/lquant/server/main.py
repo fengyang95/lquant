@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from lquant.core.logging import setup_logging
 from lquant.monitor import start_monitor, stop_monitor
 from lquant.monitor.api_mw import MonitorMiddleware
-from lquant.server import ws
+from lquant.server import auth, ws
 from lquant.server.api import (
     a2a,
     agent,
@@ -19,15 +19,18 @@ from lquant.server.api import (
     data,
     data_admin,
     etf,
+    ext_data,
     factors,
     fundamental,
     health,
+    industry,
     market,
     ml,
     monitor,
     news,
     notify,
     paper,
+    portfolio,
     qlib,
     security,
     settings,
@@ -61,9 +64,17 @@ def create_app() -> FastAPI:
         allow_origins=["http://localhost:3000"],
         allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
     )
-    for r in (health, data, data_admin, factors, backtests, market, paper, watchlist,
-              strategies, analyses, sync, etf, news, settings, ask, agent,
+    # 开放接口 Token 鉴权：一处接线，不改任何端点。没有 token 库时它整个旁路
+    # （见 auth 模块头），所以本地单机既有行为零变化；库一存在就 fail-closed。
+    # 用 add_middleware 而不是在外面再包一层 ASGI：模块级 `app.app` 必须仍是
+    # FastAPI 实例（下面 _fastapi_app 依赖它注册 startup 钩子）。
+    app.add_middleware(auth.ApiTokenMiddleware)
+    app.include_router(auth.router, prefix="/api")  # /api/auth/tokens 管理面
+    for r in (health, data, data_admin, factors, backtests, market, paper, portfolio,
+              watchlist,
+              strategies, analyses, sync, etf, ext_data, news, settings, ask, agent,
               qlib, task_center, monitor, fundamental, ml, security,
+              industry,
               notify):
         app.include_router(r.router, prefix="/api")
     app.include_router(ws.router)  # /ws/jobs/{id}，无 /api 前缀（与前端代理一致）

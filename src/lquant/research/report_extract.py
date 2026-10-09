@@ -14,6 +14,13 @@ RD-Agent（Microsoft）把「读研报 → 提出因子假设 → 形式化 → 
      同样进 ``rejected``（带结构原因），全部不可解析时直接抛错说明真实原因，
      不冒充「G0 淘汰」。
 
+**证据约束（C2）**：``evidence=`` 传入来源列表时，先经
+``research/evidence.py`` 构造成**确定性压缩包**（双上限 + 编号不变），把带编号
+的证据喂给 LLM，产出后对 accepted 逐条做**引用校验**：来源 id 必须存在、引文
+必须能在对应来源正文中命中。校验不过 → 结果标记 ``status="degraded"``，提案
+带 ``validation_failed`` 与逐条原因（保留原始提案但绝不冒充「已验证成功」）。
+未传入证据时行为与旧版一致（无引用约束）。
+
 **密钥卫生**：``LQ_LLM_API_KEY`` 只从 env 读取，不落盘、不进日志；
 HTTP 错误消息只带状态码，不带请求头。
 
@@ -33,6 +40,14 @@ import os
 import re
 import urllib.error
 import urllib.request
+
+from lquant.research.evidence import (
+    LLMFormatError,
+    LLMTransportError,
+    compress_evidence,
+    guarded_repair,
+    validate_citations,
+)
 
 DEFAULT_API_BASE = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -54,6 +69,15 @@ _SYSTEM_PROMPT = (
     "4. 每条提案给一句中文 note 说明经济学直觉与出处；\n"
     '5. 只输出 JSON：{{"proposals": [{{"expr": "...", "note": "..."}}]}}，'
     "最多 {max} 条，宁缺毋滥。"
+)
+
+# 只有传证据时才附加：强制引用编号，并要求逐字引文。缺省路径（无证据）不约束，
+# 避免给旧调用方凭空增加校验失败面。
+_CITATION_RULE = (
+    "\n6. 每条提案必须引用「证据包」中的来源编号：加 "
+    '"source_ids": ["<编号>"]，编号必须来自证据包，不得编造；\n'
+    '7. 如做逐字引用，再加 "quote"，必须是该来源正文里的连续原文片段，'
+    "不得改写、拼接或跨省略号引用。"
 )
 
 
@@ -104,8 +128,9 @@ def _env_llm(timeout: float = DEFAULT_TIMEOUT):
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read())
         except urllib.error.HTTPError as e:
-            # 只带状态码：错误体可能回显请求内容，密钥绝不能进异常链
-            raise RuntimeError(f"LLM 请求失败: HTTP {e.code}") from e
+            # 只带状态码：错误体可能回显请求内容，密钥绝不能进异常链。
+            # 用 LLMTransportError 分类：HTTP 状态错误是连接层失败，不是格式问题。
+            raise LLMTransportError(f"LLM 请求失败: HTTP {e.code}") from e
         return data["choices"][0]["message"]["content"]
 
     return fn
@@ -200,6 +225,23 @@ def _parse_llm_json(raw) -> list:
     return items
 
 
+def _parse_llm_json_with_repair(raw, repair_fn):
+    """解析 + 受闸门的格式修复。
+
+    ``_parse_llm_json`` 只在「拿到了内容但 JSON/结构不对」时抛 ``ValueError``，
+    所以这里把它包成 :class:`~lquant.research.evidence.LLMFormatError` 再交给
+    ``guarded_repair`` 判断。连接错误/取消在 ``llm_fn`` 调用处就已抛出，走不到
+    解析路径 —— 这正是「连接错误/取消不触发格式修复」的结构性保证。
+    """
+    try:
+        return _parse_llm_json(raw)
+    except ValueError as e:
+        if repair_fn is None:
+            raise
+        error = LLMFormatError(str(e))
+        return guarded_repair(lambda: _parse_llm_json(repair_fn(raw)), error)
+
+
 def _normalize_item(it) -> tuple[dict, str | None]:
     """单条 LLM 条目 → (规范化的 ``{expr, note}``, 不可用原因 or None)。
 
@@ -231,7 +273,13 @@ def _normalize_item(it) -> tuple[dict, str | None]:
         else:
             actual = f"（expr 实际为 {type(expr).__name__}）"
         return {"expr": "", "note": str(it.get("note", ""))}, f"LLM 条目缺少可用的 expr 字段{actual}"
-    return {"expr": expr.strip(), "note": str(it.get("note", ""))}, None
+    item = {"expr": expr.strip(), "note": str(it.get("note", ""))}
+    # 引用字段原样透传（不做清洗）：校验环节需要看到模型的**原始**声明，
+    # 在这里「顺手修好」会让引用校验失去意义。
+    for key in ("source_ids", "quote", "quotes"):
+        if key in it:
+            item[key] = it[key]
+    return item, None
 
 
 def extract_proposals(
@@ -241,8 +289,11 @@ def extract_proposals(
     max_proposals: int = 10,
     allowed_fields=None,
     max_input_chars: int | None = None,
+    evidence=None,
+    evidence_kwargs: dict | None = None,
+    repair_fn=None,
 ) -> dict:
-    """研报文本 → 提案。返回 ``{"accepted": [...], "rejected": [...]}``。
+    """研报文本 → 提案。返回 ``{"accepted": [...], "rejected": [...], "status": ...}``。
 
     accepted 元素为 ``{"expr", "note"}``（可直接写 JSONL 喂
     ``lq factor mine --generator proposals``）；rejected 元素多一个
@@ -251,6 +302,15 @@ def extract_proposals(
 
     ``llm_fn(system, user) -> str`` 可注入（测试用 FakeLLM；缺省走 env 配置）。
     ``max_input_chars`` 缺省取 ``LQ_LLM_MAX_INPUT_CHARS`` / 内置默认。
+
+    ``evidence`` 传入来源列表（``{id, title, content, published_at, kind}``）时
+    启用 C2 引用约束：先 :func:`~lquant.research.evidence.compress_evidence`
+    构造压缩包（编号稳定、双上限、裁剪明细可见），prompt 里带编号证据，产出后
+    对 accepted 做 :func:`~lquant.research.evidence.validate_citations`。校验
+    不过 → ``status="degraded"``、``fallback`` 给出降级口径，未通过的提案带
+    ``validation_failed=True`` 与 ``validation_reasons``；**绝不把未校验结果
+    当成功返回**。``repair_fn(raw) -> str`` 是可选格式修复：只在「模型返回了
+    内容但格式不对」时被调用，连接错误/取消不触发。
 
     Raises:
         ValueError: 研报文本为空；研报文本超长（> ``max_input_chars``）；
@@ -277,15 +337,24 @@ def extract_proposals(
             "直接送 LLM 会因上下文超限拿到 HTTP 400。"
             "请拆分/精简研报，或调大 LQ_LLM_MAX_INPUT_CHARS 后重试"
         )
+
+    # 证据包先于 LLM 调用构造：压缩失败要在这里响亮报错，而不是让模型对着
+    # 半截证据产结论。
+    pack = compress_evidence(evidence, **(evidence_kwargs or {})) if evidence is not None else None
+
     llm_fn = llm_fn or _env_llm()
-    system = _SYSTEM_PROMPT.format(max=max_proposals)
-    user = f"{capability_prompt()}\n\n--- 研报文本 ---\n{text}"
+    system = _SYSTEM_PROMPT.format(max=max_proposals) + (_CITATION_RULE if pack is not None else "")
+    sections = [capability_prompt()]
+    if pack is not None:
+        sections.append("--- 证据包（引用编号以此为准）---\n" + pack.render_prompt())
+    sections.append(f"--- 研报文本 ---\n{text}")
+    user = "\n\n".join(sections)
     raw = llm_fn(system, user)
     fields = allowed_fields if allowed_fields is not None else set(NUMERIC_FIELDS)
 
     accepted: list[dict] = []
     rejected: list[dict] = []
-    items = _parse_llm_json(raw)
+    items = _parse_llm_json_with_repair(raw, repair_fn)
     if not items:
         # 「宁缺毋滥」产空数组也是合法的，但静默返回空集合会让 CLI 把
         # 「LLM 没给提案」误报成「G0 淘汰了 0 条」。说清真实原因。
@@ -315,7 +384,26 @@ def extract_proposals(
             f"LLM 返回的 {len(items)} 条提案全部无法解析（未进入 G0）：{reasons}；"
             f"原文前 200 字: {_raw_snippet(raw)!r}"
         )
-    return {"accepted": accepted, "rejected": rejected}
+
+    result: dict = {"accepted": accepted, "rejected": rejected, "status": "ok"}
+    if pack is not None:
+        result["evidence_pack"] = pack.to_dict()
+        # accepted 为空时不跑引用校验：此时是「没有通过 G0」的问题，
+        # 报「引用校验失败」会把排障方向带偏（与上游既有错误语义保持一致）。
+        if accepted:
+            verdict = validate_citations(accepted, pack.cards)
+            result["citation_validation"] = verdict.to_dict()
+            if not verdict.ok:
+                # 降级而非丢弃：原始提案保留（便于人审与修 prompt），但明确标记
+                # 未通过校验；消费端据 status/validation_failed 决定是否采信。
+                result["status"] = "degraded"
+                result["fallback"] = verdict.fallback
+                for index, item in enumerate(accepted):
+                    reasons = verdict.reasons_for(index)
+                    if reasons:
+                        item["validation_failed"] = True
+                        item["validation_reasons"] = list(reasons)
+    return result
 
 
 def write_proposals(items: list[dict], path: str) -> int:

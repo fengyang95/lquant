@@ -8,7 +8,12 @@ from fastapi.testclient import TestClient
 
 os.environ.setdefault("LQ_SYNC_WORKER", "0")
 
-pytestmark = pytest.mark.usefixtures("api_env")
+# api_env 是 module 级（整模块共用一个临时库 + factor "edit_me"），用例间有
+# 顺序依赖，xdist 下必须整组同 worker 按序执行。
+pytestmark = [
+    pytest.mark.usefixtures("api_env"),
+    pytest.mark.xdist_group("factor_edit_api"),
+]
 
 
 @pytest.fixture(scope="module")

@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import re
+import uuid
 
 from lquant.agent.errors import AgentError
 from lquant.agent.schemas import AgentEvent, Message, Session
@@ -52,6 +52,7 @@ class MockAgentService(AgentService):
         try:
             await self._run(sid, content, ses.context, on_event)
         except asyncio.CancelledError:
+            await self._mark_interrupted(sid)
             await on_event(AgentEvent(type="error", message="已中断"))
             raise
         except Exception as e:  # noqa: BLE001
@@ -64,6 +65,7 @@ class MockAgentService(AgentService):
         return user_msg
 
     async def _run(self, sid, content, context, on_event) -> None:
+        on_event = self.trace_emitter(sid, on_event)   # 与 cli provider 同口径
         rows = []
         symbol = _extract_symbol(content, context)
         tc = {"name": "market_overview", "args": {}}
@@ -81,7 +83,10 @@ class MockAgentService(AgentService):
             await on_event(AgentEvent(type="tool_result", name="market_overview",
                                       summary="大盘概览已获取"))
 
-        ans_msg = await self.store.add_message(sid, "assistant", "", tool_calls=[tc])
+        mid = uuid.uuid4().hex
+        self._ans_id[sid] = mid            # 先登记再落库，取消才有目标可写
+        ans_msg = await self.store.add_message(sid, "assistant", "", tool_calls=[tc],
+                                               mid=mid)
         parts = ["（Mock 回答 | provider=mock，非 LLM 生成）"]
         if symbol:
             q = rows[0] if rows else None
@@ -101,10 +106,10 @@ class MockAgentService(AgentService):
                 await asyncio.sleep(0.01)
         except asyncio.CancelledError:
             # 与 claude_code provider 同口径：取消也要留下明确标记
-            with contextlib.suppress(Exception):  # noqa: BLE001
-                await self.store.append_assistant_delta(sid, ans_msg.id, "（已中断）")
+            await self._mark_interrupted(sid)
             raise
         await self.store.finish_assistant(sid, ans_msg.id)
+        self._ans_id.pop(sid, None)        # 已跑完，取消标记不再适用
         await on_event(AgentEvent(type="done", message_id=ans_msg.id))
 
     async def cancel(self, sid: str) -> None:

@@ -332,6 +332,7 @@ def add_morning_star(
     d3_bull = pl.col("close") > pl.col("open")
     # d1_bear 已保证实体向下（close_1 < open_1），故实体高度即 _body().shift(2)；
     # 以实体下沿 close_1 为基准，收复 recover_ratio 的实体高度。
+    # 含等号：文档口径是「收复 recover_ratio **以上**」，恰好收复即命中。
     d3_recover = pl.col("close") >= pl.col("close").shift(2) + recover_ratio * _body().shift(2)
     cond = d1_bear & d2_small & d2_gap & d3_bull & d3_recover
     return df.with_columns(_signal(cond, "pattern_morning_star"))

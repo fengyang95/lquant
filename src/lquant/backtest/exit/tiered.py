@@ -103,6 +103,13 @@ class TieredExitStrategy(SimpleExitStrategy):
 
     def on_bar(self, ctx: ExitContext) -> list[ExitSignal]:
         self.track_peak(ctx)
+        # 除权日同步缩放棘轮止盈线：_trailing_stop 存的是绝对价格（与
+        # peak/avg_cost 同为每股原始价口径），peak 与 avg_cost 已按 ÷ratio
+        # 缩放，棘轮若不缩会停在除权前尺度且「只升不降」永久锁死 ——
+        # 10 送 5 后在除权后横盘价上立即假触发全仓退出（2026-10 二审修复）。
+        for sym, ratio in self._turn_ratios.items():
+            if sym in self._trailing_stop and ratio > 0:
+                self._trailing_stop[sym] /= ratio
         held = {p.symbol for p in ctx.positions if p.qty > 0}
         for sym in list(self._trailing_stop):
             if sym not in held:

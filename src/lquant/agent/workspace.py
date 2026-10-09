@@ -66,6 +66,9 @@ _CLAUDE_MD_TEMPLATE = """\
 """
 
 
+#: 结论提交工具名。白名单裁剪时永远放行（见 mcp_server_spec）。
+VERDICT_TOOL = "submit_verdict"
+
 #: 角色说明要落到两个文件名：claude 认 CLAUDE.md，codex 认 AGENTS.md
 _ROLE_DOC_NAMES = ("CLAUDE.md", "AGENTS.md")
 
@@ -78,7 +81,8 @@ def _write_role_docs(workspace: Path, root: Path) -> None:
 
 
 def mcp_server_spec(root: Path, python: str | None = None,
-                    enabled_tools: set[str] | None = None) -> dict:
+                    enabled_tools: set[str] | None = None,
+                    session_id: str | None = None) -> dict:
     """lquant MCP server 的启动规格 —— **两个 provider 共用这一份**。
 
     claude 把它写成 ``.claude/mcp.json``，codex 把它翻成
@@ -94,8 +98,17 @@ def mcp_server_spec(root: Path, python: str | None = None,
         "LQ_ROOT": str(root),
         "PYTHONPATH": str(root / "src"),
     }
+    if session_id:
+        # MCP server 是独立进程，落「结论」（submit_verdict）时必须知道写给哪个
+        # 会话，还要能打开同一个 ask.db。两者都靠环境变量传 —— 别让它去猜。
+        env["LQ_AGENT_SESSION_ID"] = session_id
+        env["LQ_ASK_DB"] = str(root / "data" / "ask.db")
     if enabled_tools is not None:
-        env["LQ_MCP_ENABLED_TOOLS"] = ",".join(sorted(enabled_tools))
+        # submit_verdict 是**结论的输出通道**，不是一条数据访问权限：白名单是
+        # 用来裁「能读什么」的，把它一起裁掉只会让 agent 悄悄退回自由文本结论 ——
+        # 正是 P0-7 要消灭的那种「不可回溯」。所以无论怎么裁都放行它。
+        env["LQ_MCP_ENABLED_TOOLS"] = ",".join(
+            sorted(set(enabled_tools) | {VERDICT_TOOL}))
     return {
         "type": "stdio",
         "command": python or sys.executable,
@@ -105,8 +118,10 @@ def mcp_server_spec(root: Path, python: str | None = None,
 
 
 def _write_mcp_json(workspace: Path, root: Path,
-                    enabled_tools: set[str] | None = None) -> None:
-    mcp_config = {"mcpServers": {"lquant": mcp_server_spec(root, enabled_tools=enabled_tools)}}
+                    enabled_tools: set[str] | None = None,
+                    session_id: str | None = None) -> None:
+    mcp_config = {"mcpServers": {"lquant": mcp_server_spec(
+        root, enabled_tools=enabled_tools, session_id=session_id)}}
     claude_dir = workspace / ".claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
     (claude_dir / "mcp.json").write_text(
@@ -147,7 +162,8 @@ def _sync_skills(workspace: Path, root: Path,
 
 def ensure_workspace(workspace_dir: str, root: Path,
                      enabled_skills: set[str] | None = None,
-                     enabled_tools: set[str] | None = None) -> Path:
+                     enabled_tools: set[str] | None = None,
+                     session_id: str | None = None) -> Path:
     """幂等创建 agent 工作区并生成脚手架文件，返回工作区路径。
 
     ``enabled_skills`` / ``enabled_tools`` 是会话级能力裁剪（None = 不裁剪）。
@@ -156,6 +172,6 @@ def ensure_workspace(workspace_dir: str, root: Path,
     workspace = root / workspace_dir
     workspace.mkdir(parents=True, exist_ok=True)
     _write_role_docs(workspace, root)
-    _write_mcp_json(workspace, root, enabled_tools=enabled_tools)
+    _write_mcp_json(workspace, root, enabled_tools=enabled_tools, session_id=session_id)
     _sync_skills(workspace, root, enabled=enabled_skills)
     return workspace

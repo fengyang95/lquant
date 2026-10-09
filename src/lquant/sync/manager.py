@@ -24,6 +24,7 @@ import contextlib
 import json
 import time
 from datetime import datetime, timedelta
+from threading import Lock
 
 from lquant.core.db import reader, writer
 from lquant.core.logging import get_logger, run_scope
@@ -42,6 +43,18 @@ _KINDS = ("collect", "daily", "adj_factor", "backfill",
 # 重试耗尽 → 清空重试态，等下一档调度时刻自然再跑。
 MAX_RETRIES = 2
 RETRY_BACKOFF_MIN = (5, 15)
+
+# 进程内互斥：同一 sync_id 的作业不允许并发双跑。此前 HTTP 手动触发与
+# tick() 调度（或两个 HTTP 请求）同时进入 run_job 时，作业体会并发执行，
+# daily 作业互相撞 data_task 之外，collect/financial 等无互斥的作业会
+# 重复写入/交错断点。跨进程互斥靠 DuckDB 写锁与 data_task 状态机兜底。
+_JOB_LOCKS: dict[str, Lock] = {}
+_JOB_LOCKS_GUARD = Lock()
+
+
+def _job_lock(sync_id: str) -> Lock:
+    with _JOB_LOCKS_GUARD:
+        return _JOB_LOCKS.setdefault(sync_id, Lock())
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS sync_job (
@@ -180,11 +193,15 @@ def seed_defaults() -> int:
 
 def list_jobs() -> list[dict]:
     with reader() as con:
-        _ensure_tables(con)
-        rows = con.execute(
-            "SELECT sync_id, name, kind, schedule_time, weekdays, params, enabled, "
-            "last_run_at, last_status, last_rows, created_at, updated_at, "
-            "retry_count, next_retry_at FROM sync_job ORDER BY schedule_time").fetchall()
+        # 纯 SELECT：reader 连接不做 DDL（写收敛约定，_ensure_tables 留给
+        # 写路径 upsert_job / run_job 落库）。表未建（首次访问）返回空清单。
+        try:
+            rows = con.execute(
+                "SELECT sync_id, name, kind, schedule_time, weekdays, params, enabled, "
+                "last_run_at, last_status, last_rows, created_at, updated_at, "
+                "retry_count, next_retry_at FROM sync_job ORDER BY schedule_time").fetchall()
+        except Exception:  # noqa: BLE001 - 表不存在 = 还没有任何作业
+            rows = []
     return [{"sync_id": r[0], "name": r[1], "kind": r[2], "schedule_time": r[3],
              "weekdays": r[4], "params": json.loads(r[5]) if r[5] else {},
              "enabled": r[6], "last_run_at": str(r[7]) if r[7] else None,
@@ -311,7 +328,14 @@ def _post_sync_check(kind: str, status: str, detail: dict, params: dict) -> tupl
         if not c.get("ok"):
             status = "partial"
     elif kind == "financial":
-        c = _checkpoint_lag_check("financial_pit_tushare", today_cn(), max_lag=3)
+        # checkpoint 键含源名（financial_pit_{provider.name}）：tushare 缺
+        # token 回落 baostock 时实际写的是 financial_pit_baostock。检查名
+        # 从作业返回值取实际生效的源，猜错名会让检查恒 no_checkpoint →
+        # 每轮作业都被误判 partial（假故障刷屏，真缺口反而被淹没）。
+        cp = detail.get("checkpoint") if isinstance(detail, dict) else None
+        if not cp:
+            cp = "financial_pit_tushare"  # 兼容异常路径（detail 无 checkpoint）
+        c = _checkpoint_lag_check(cp, today_cn(), max_lag=3)
         checks["checkpoint"] = c
         if not c.get("ok"):
             status = "partial"
@@ -326,6 +350,23 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
     daily/adj/financial 的 (today - days) 窗口整体偏移一天 —— 采到错日的数据
     且看不出任何异常。
     """
+    sync_id = str(job.get("sync_id") or job.get("kind") or "unknown")
+    lock = _job_lock(sync_id)
+    if not lock.acquire(blocking=False):
+        # 调度与手动触发并发：排队语义直接跳过（与 data_task 冲突一致），
+        # 不阻塞调用线程；本轮未执行任何工作，不写 sync_run
+        log.warning(f"sync 作业并发触发，跳过本轮 sync_id={sync_id}")
+        return {"run_id": None, "status": "skipped", "rows": 0,
+                "elapsed_sec": 0.0, "attempt": 0,
+                "detail": {"skipped": True, "reason": "already_running"}}
+    try:
+        return _run_job_locked(job, demo=demo)
+    finally:
+        lock.release()
+
+
+def _run_job_locked(job: dict, *, demo: bool | None = None) -> dict:
+    """run_job 的执行体：调用方必须已持有该 sync_id 的进程内锁。"""
     with run_scope() as run_id:
         started = now_cn_naive()
         # 业务日单独取（不依赖墙钟的日期部分，避免 tz 归一逻辑分散在多处）
@@ -481,19 +522,22 @@ def run_job(job: dict, *, demo: bool | None = None) -> dict:
         # 检查完成后统一取终态时间：告警/落库/重试排程共用
         finished = now_cn_naive()
 
-        # 告警：终态非 ok/skipped → 监控错误环（monitor 错误环 → error_logs 可查）
-        # skipped（撞活跃任务）是正常排队语义，不告警
-        if status not in ("ok", "skipped"):
-            _emit_sync_error(job, kind, status, detail)
         # 0 行不算健康：日线/采集类作业空返回记 partial，避免静默缺口被掩盖
         # （skipped 不参与该判定：它发生在建任务之前，rows 本就为 0）
         # financial 同样纳入：全市场窗口内 0 只被处理时，要么断点全跳过、
         # 要么标的池为空 —— 两种都必须有人看见（此前静默报 ok）。
         # news 不纳入：同一来源重复采集由主键去重，0 新增是正常语义。
+        # 该判定必须在 emit 之前：partial 化之后才会进告警环 —— 顺序反了
+        # 的话零行作业落库是 partial、告警环却看不到（监控假绿）
         if rows == 0 and kind in ("daily", "collect", "adj_factor", "financial") \
                 and status == "ok":
             status = "partial"
             detail = {**detail, "zero_rows": True}
+
+        # 告警：终态非 ok/skipped → 监控错误环（monitor 错误环 → error_logs 可查）
+        # skipped（撞活跃任务）是正常排队语义，不告警
+        if status not in ("ok", "skipped"):
+            _emit_sync_error(job, kind, status, detail)
         try:
             with writer() as con:
                 _ensure_tables(con)
@@ -553,11 +597,14 @@ def _emit_sync_error(job: dict, kind: str, status: str, detail: dict) -> None:
 
 def history(limit: int = 50) -> list[dict]:
     with reader() as con:
-        _ensure_tables(con)
-        rows = con.execute(
-            "SELECT run_id, sync_id, job_name, kind, started_at, finished_at, "
-            "rows, status, detail FROM sync_run ORDER BY started_at DESC LIMIT ?",
-            [int(limit)]).fetchall()
+        # 纯 SELECT（同 list_jobs）：表未建返回空历史，不在 reader 上建表
+        try:
+            rows = con.execute(
+                "SELECT run_id, sync_id, job_name, kind, started_at, finished_at, "
+                "rows, status, detail FROM sync_run ORDER BY started_at DESC LIMIT ?",
+                [int(limit)]).fetchall()
+        except Exception:  # noqa: BLE001 - 表不存在 = 还没有运行记录
+            rows = []
     return [{"run_id": r[0], "sync_id": r[1], "job_name": r[2], "kind": r[3],
              "started_at": str(r[4]), "finished_at": str(r[5]), "rows": r[6],
              "status": r[7], "detail": json.loads(r[8]) if r[8] else {}} for r in rows]
@@ -673,12 +720,9 @@ def _trading_day_ok(d) -> bool:
     日历为空/未同步不能让所有作业静默全跳 —— 那会制造新的「静默缺口」。
     """
     try:
-        # is_trading_day 查不到该日返回 False —— 不能直接用，否则日历
-        # 未同步会让所有作业静默全跳。先显式查该日是否在日历里。
+        # 纯 SELECT：reader 连接不做 DDL（写收敛约定 —— 表的创建归写路径）。
+        # 表不存在时 SELECT 抛异常 → 放行，与「日历为空放行」同语义。
         with reader() as con:
-            con.execute("CREATE TABLE IF NOT EXISTS trade_calendar ("
-                        "trade_date DATE PRIMARY KEY, is_open BOOLEAN, "
-                        "source VARCHAR)")
             row = con.execute(
                 "SELECT is_open FROM trade_calendar WHERE trade_date = ?",
                 [d]).fetchone()

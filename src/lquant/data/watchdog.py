@@ -33,13 +33,41 @@ def _run(
         q.put(("err", f"{type(e).__name__}: {e}"))
 
 
+def _source_of(fn: Callable[..., Any]) -> str:
+    """从被调函数推断数据源名（``lquant.data.providers.baostock`` → ``baostock``）。
+
+    Provider 的网络调用都是模块级函数（子进程可 pickle 的要求），所以模块名就是
+    最可靠的源标识；显式传 ``source=`` 可以覆盖。
+    """
+    mod = getattr(fn, "__module__", "") or ""
+    return mod.rsplit(".", 1)[-1] or "unknown"
+
+
 def run_with_watchdog(
+    fn: Callable[..., Any],
+    *args: Any,
+    timeout: int | None = None,
+    source: str | None = None,
+    **kwargs: Any,
+) -> Any:
+    """在子进程执行 fn，超过 timeout 秒则杀掉并抛 TimeoutError。
+
+    整段执行被**源级单飞锁**包住：限流管速率，它管并发会话 —— BaoStock 的
+    黑名单错误码 10001011 明确把「并发连接」列为触发条件，两个 worker 各自
+    限流合规却同时 login 一样会被封。锁按源名（模块名）区分，嵌套安全。
+    """
+    from lquant.data.ratelimit import source_lock
+
+    with source_lock(source or _source_of(fn)):
+        return _run_with_watchdog(fn, *args, timeout=timeout, **kwargs)
+
+
+def _run_with_watchdog(
     fn: Callable[..., Any],
     *args: Any,
     timeout: int | None = None,
     **kwargs: Any,
 ) -> Any:
-    """在子进程执行 fn，超过 timeout 秒则杀掉并抛 TimeoutError。"""
     timeout = timeout or get_settings().ingest_watchdog_sec
     q: mp.Queue = mp.Queue()
     p = mp.Process(target=_run, args=(fn, q, args, kwargs), daemon=True)

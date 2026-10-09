@@ -158,8 +158,10 @@ def _expr(fam: str, d: int) -> pl.Expr:
         case "STD":   return (c.rolling_std(d) / c).over("symbol")
         case "MAX":   return (h.rolling_max(d) / c).over("symbol")
         case "MIN":   return (l.rolling_min(d) / c).over("symbol")
-        case "QTLU":  return (c.rolling_quantile(0.8, window_size=d) / c).over("symbol")
-        case "QTLD":  return (c.rolling_quantile(0.2, window_size=d) / c).over("symbol")
+        # rolling_quantile 必须显式 linear：polars 默认 nearest，与 qlib
+        # （pandas 默认线性插值）口径不同，分位值会跳档
+        case "QTLU":  return (c.rolling_quantile(0.8, interpolation="linear", window_size=d) / c).over("symbol")
+        case "QTLD":  return (c.rolling_quantile(0.2, interpolation="linear", window_size=d) / c).over("symbol")
         case "RSV":
             lo = l.rolling_min(d).over("symbol")
             hi = h.rolling_max(d).over("symbol")

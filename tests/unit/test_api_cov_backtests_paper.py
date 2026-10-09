@@ -57,7 +57,9 @@ def api_env(tmp_path_factory):
     })
     with writer() as con:
         con.register("_idx", idx)
-        con.execute("INSERT INTO index_daily SELECT *, NULL FROM _idx")
+        # OR REPLACE：generate_demo 现在也会补一段演示指数日线（基准相关角度
+        # 需要它），与本用例要固定的基准值有日期重叠 —— 用本用例的值覆盖。
+        con.execute("INSERT OR REPLACE INTO index_daily SELECT *, NULL FROM _idx")
     yield base
     os.chdir(prev_cwd)
     get_settings.cache_clear()
@@ -345,7 +347,19 @@ def test_attribution(client):
     assert a.status_code == 200, a.text
     body = a.json()
     assert "stock_contribution" in body and "brinson" in body and "risk" in body
+    # P2 补全：回撤期归因 / 方差分解风险归因（回归不可用时也须显式 note 降级）
+    assert "drawdown" in body and "periods" in body["drawdown"]
+    assert "risk_attr" in body
     assert client.get("/api/backtests/zz/attribution").status_code == 404
+
+    # HTML 报告：自包含、无外部资源、与 /attribution 同一计算核心
+    rep = client.get(f"/api/backtests/{run_id}/attribution/report")
+    assert rep.status_code == 200, rep.text
+    assert rep.headers["content-type"].startswith("text/html")
+    doc = rep.text
+    assert doc.startswith("<!DOCTYPE html>") and "回测归因报告" in doc
+    assert "http" not in doc.replace('xmlns="http://www.w3.org/2000/svg"', "")
+    assert client.get("/api/backtests/zz/attribution/report").status_code == 404
 
 
 def test_run_benchmark(client):

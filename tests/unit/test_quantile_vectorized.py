@@ -9,9 +9,11 @@ import numpy as np
 import polars as pl
 import pytest
 
+from lquant.core.errors import DataQualityError
 from lquant.factors.evaluate.costs import factor_turnover
 from lquant.factors.evaluate.excess import benchmark_series, quantile_excess_nav
 from lquant.factors.evaluate.quantile import (
+    account_samples,
     add_quantile,
     group_returns,
     long_short_nav,
@@ -190,3 +192,160 @@ def test_excess_nav_marks_incomplete_group_as_null():
         assert new[f"ex_q{q}"].null_count() == new.height, f"ex_q{q} 应为全 null"
     for q in (2, 4, 6, 8, 10):
         assert new[f"ex_q{q}"].null_count() == 0, f"ex_q{q} 不应有 null"
+
+
+def test_quantile_summary_empty_panel_has_same_keys():
+    """空数据路径必须返回**同样的键**（值全 None）。
+
+    调用方（server/api/factors.py）无条件读 ``res["quantile"]["long_short"]``：
+    早退分支少一个键，空面板就会把报表端点打成 500（KeyError）。「没有结论」
+    和「没有这个字段」对调用方是两回事。
+    """
+    empty = pl.DataFrame({"trade_date": [], "symbol": [], "f": [], "fwd_ret_1": []},
+                         schema_overrides={"trade_date": pl.Date, "f": pl.Float64,
+                                           "fwd_ret_1": pl.Float64})
+    out = quantile_summary(empty, "f", "fwd_ret_1", n_groups=5)
+    full = quantile_summary(_panel(), "factor", "fwd_ret_1", n_groups=5)
+    assert set(out) == set(full)
+    assert set(out["long_short"]) == set(full["long_short"])
+    assert all(v is None for v in out["long_short"].values())
+    assert out["groups"] == []
+
+
+# ---------- P1-4：零感知分箱 / 组内分箱 / 丢样三分账 ----------
+
+def _sign_panel(neg: int = 8, pos: int = 2, n_days: int = 3) -> pl.DataFrame:
+    """偏斜符号面板：负值多、正值少（普涨日的常态）。
+
+    普通分箱会把「一堆小负数」按名次摊进所有组；zero_aware 要求负号侧只占
+    下半区，最高组一定是**真正最正**的那只。
+    """
+    vals = [-9.0 + i for i in range(neg)] + [0.3 + i for i in range(pos)]
+    rows = []
+    for d in range(n_days):
+        for i, v in enumerate(vals):
+            rows.append({"trade_date": d, "symbol": f"S{i:03d}",
+                         "factor": v, "fwd_ret_1": 0.01 * (i + 1)})
+    return pl.DataFrame(rows)
+
+
+def test_zero_aware_bins_each_side_of_zero_separately():
+    df = _sign_panel(neg=8, pos=2)
+    plain = add_quantile(df, "factor", 5)["q"].to_list()[:10]
+    aware = add_quantile(df, "factor", 5, zero_aware=True)["q"].to_list()[:10]
+    assert plain != aware
+    # 负号侧只占 1..2（k_neg = 5//2），两个正值占最后两组
+    assert set(aware[:8]) == {1, 2}
+    assert aware[8] > 2 and aware[9] == 5
+    # 方向：因子值最大的那只落在最高组，最小那只落在最低组
+    assert aware[9] == 5 and aware[0] == 1
+
+
+def test_zero_aware_rejects_factor_without_a_negative_side():
+    allpos = _sign_panel().with_columns((pl.col("factor").abs() + 1).alias("factor"))
+    with pytest.raises(ValueError, match="以零为中心"):
+        add_quantile(allpos, "factor", 4, zero_aware=True)
+    allzero = _sign_panel().with_columns(pl.lit(0.0).alias("factor"))
+    with pytest.raises(ValueError, match="以零为中心"):
+        add_quantile(allzero, "factor", 4, zero_aware=True)
+
+
+def test_zero_aware_and_by_group_are_mutually_exclusive():
+    df = _sign_panel().with_columns((pl.int_range(pl.len()) % 2).alias("grp"))
+    with pytest.raises(ValueError, match="互斥"):
+        add_quantile(df, "factor", 4, zero_aware=True, by_group="grp")
+
+
+def test_by_group_bins_within_each_group():
+    """组内分箱：每个 (日, 组) 内部各自摊满分位，组与组之间可比。
+
+    取两组、因子均值差 100：不按组分箱时低组因子会整体落进低分位，
+    按组分箱后两组的 q 分布应当一致。
+    """
+    rows = []
+    for d in range(3):
+        for g, base in (("A", 0.0), ("B", 100.0)):
+            for i in range(10):
+                rows.append({"trade_date": d, "symbol": f"{g}{i}", "grp": g,
+                             "factor": base + i, "fwd_ret_1": 0.01})
+    df = pl.DataFrame(rows)
+    def _means(qcol: str) -> list[float]:
+        return (df.with_columns(qcol).group_by("grp").agg(pl.col("q").mean())
+                .sort("grp")["q"].to_list())
+
+    plain = _means(add_quantile(df, "factor", 5)["q"])
+    within = _means(add_quantile(df, "factor", 5, by_group="grp")["q"])
+    # 不按组分箱：A 组因子整体偏低 → 几乎全落在低分位；B 组反之
+    assert plain[0] < 2.5 and plain[1] > 3.5
+    # 按组分箱：两组各自的 q 分布完全一致（均值都回到 3.0）
+    assert within == pytest.approx([3.0, 3.0], abs=1e-9)
+
+
+def test_by_group_missing_column_raises():
+    with pytest.raises(KeyError, match="by_group"):
+        add_quantile(_sign_panel(), "factor", 4, by_group="nope")
+    with pytest.raises(KeyError, match="by_group"):
+        account_samples(_sign_panel(), "factor", by_group="nope")
+
+
+def test_account_samples_splits_every_drop_cause():
+    """丢样三分账：每一类丢样各归各的，不能合成一个数字。"""
+    df = pl.DataFrame({
+        "trade_date": [0, 0, 0, 0, 0, 0],
+        "symbol": ["a", "b", "c", "d", "e", "f"],
+        "factor": [1.0, None, float("nan"), 2.0, 3.0, 4.0],
+        "fwd_ret_1": [0.01, 0.01, 0.01, None, 0.01, 0.01],
+        "grp": ["x", "x", "x", "x", None, "x"],
+    })
+    acc = account_samples(df, "factor", "fwd_ret_1", by_group="grp")
+    # a/f 可用；b 因子 null、c 因子 NaN、d 收益缺失、e 分组键缺失 —— 各算各的
+    assert (acc.total, acc.used) == (6, 2)
+    assert acc.factor_null == 1
+    assert acc.factor_nonfinite == 1
+    assert acc.ret_missing == 1
+    assert acc.group_missing == 1
+    assert acc.dropped == 4
+    assert acc.dropped == (acc.factor_null + acc.factor_nonfinite
+                           + acc.ret_missing + acc.group_missing)
+    assert acc.loss_ratio == pytest.approx(4 / 6)
+    assert acc.to_dict()["used"] == 2
+
+
+def test_quantile_summary_reports_and_enforces_max_loss():
+    n = 40
+    rows = []
+    for d in range(20):
+        for i in range(n):
+            rows.append({"trade_date": d, "symbol": f"S{i:03d}",
+                         "factor": float(i),
+                         # 故意缺 1/5 的前瞻收益（模拟回测期末尾）
+                         "fwd_ret_1": None if i % 5 == 0 else 0.001 * i})
+    df = pl.DataFrame(rows)
+    out = quantile_summary(df, "factor", "fwd_ret_1", 5)
+    # 每天 8 只（i % 5 == 0）× 20 天 = 160 行缺前瞻收益
+    assert out["dropped"]["ret_missing"] == 160
+    assert out["dropped"]["used"] == 40 * 20 - 160
+    assert out["dropped"]["loss_ratio"] == pytest.approx(0.2)
+    # 阈值内不报错
+    assert quantile_summary(df, "factor", "fwd_ret_1", 5, max_loss=0.25)["dropped"]["used"]
+    # 超阈值 fatal，并把三分账写进消息里
+    with pytest.raises(DataQualityError, match="SAMPLE_LOSS") as e:
+        quantile_summary(df, "factor", "fwd_ret_1", 5, max_loss=0.05)
+    assert "前瞻收益缺失 160" in str(e.value)
+
+
+def test_quantile_summary_echoes_binning_choice():
+    df = _sign_panel()
+    out = quantile_summary(df, "factor", "fwd_ret_1", 5, zero_aware=True)
+    assert out["zero_aware"] is True and out["by_group"] is None
+    df2 = _sign_panel().with_columns((pl.int_range(pl.len()) % 2).alias("grp"))
+    out2 = quantile_summary(df2, "factor", "fwd_ret_1", 5, by_group="grp")
+    assert out2["by_group"] == "grp" and out2["zero_aware"] is False
+
+
+def test_nav_helpers_accept_binning_kwargs():
+    df = _sign_panel(n_days=6)
+    nav = quantile_nav(df, "factor", "fwd_ret_1", 5, zero_aware=True)
+    assert "long_short" in nav.columns and len(nav)
+    ls = long_short_nav(df, "factor", "fwd_ret_1", 5, zero_aware=True)
+    assert "ret_long_short" in ls.columns and len(ls)

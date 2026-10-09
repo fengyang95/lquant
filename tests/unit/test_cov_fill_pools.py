@@ -116,6 +116,8 @@ def test_fetch_limit_up_pool_rows(monkeypatch):
     # fbt/lbt 是 HHMMSS，不是 epoch 秒（旧实现 92500 → 01:41:40）
     assert df["first_limit_time"].to_list() == ["09:25:00", None]
     assert df["last_limit_time"][0] == "15:00:00"
+    # fund（封单资金）落 seal_amount，量纲与 amount（成交额）分离
+    assert df["seal_amount"].to_list() == [1.5e8, 0.0]
 
 
 def test_fetch_limit_up_pool_empty(monkeypatch):

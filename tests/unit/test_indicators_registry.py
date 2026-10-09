@@ -66,7 +66,8 @@ def test_price_pane_is_explicit_not_inferred_from_category():
     """
     by_name = {d["name"]: d for d in INDICATORS.describe()}
     price = {n for n, d in by_name.items() if d["pane"] == "price"}
-    assert price == {"ma", "ema", "boll", "bbi", "tiandao"}
+    # levels 与价格同量纲（关键价位线），显式声明 price 后才允许进价格轴。
+    assert price == {"ma", "ema", "boll", "bbi", "tiandao", "levels"}
     assert by_name["macd"]["pane"] == "sub"      # 同属 trend，但不进价格轴
     assert by_name["kdj"]["pane"] == "sub"
     assert by_name["volume_ratio"]["pane"] == "volume"

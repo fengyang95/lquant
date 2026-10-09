@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -55,6 +56,28 @@ def _svc(tmp_path, fake_script, **kw) -> ClaudeCodeAgentService:
                 timeout_seconds=30)
     base.update(kw)
     return ClaudeCodeAgentService(SessionStore(str(tmp_path / "ask.db")), **base)
+
+
+async def _wait_for_assistant(svc, sid: str, timeout: float = 15.0) -> None:
+    """等 assistant 占位消息落库。
+
+    「取消要留痕」测的是语义，不是竞态：子进程 spawn + attach 在满载机器上
+    可能超过固定 sleep，取消就会打在占位消息落库**之前**，于是用例偶发失败
+    （实测单独跑 3 次会红 1 次）。这里改成轮询等待，让取消动作一定发生在
+    「已经有一条 assistant 消息」之后。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if any(m.role == "assistant" for m in await svc.get_messages(sid)):
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("assistant 占位消息未在超时内落库 —— 取消路径无从留痕")
+    # 占位消息可见 ≠ 服务端协程已从 add_message 返回（aiosqlite 在 worker 线程里
+    # 提交，提交可见先于原协程被唤醒）。再让出一次事件循环，让取消打在「已经在跑
+    # 的 _consume」上，而不是打在落库的那次 await 上 —— 后者会绕过用例想验证的
+    # 路径（生产侧已由 _mark_interrupted 兜住，但用例应当测语义而不是兜底）。
+    await asyncio.sleep(0.1)
 
 
 async def _run(svc, sid, content):
@@ -123,7 +146,7 @@ async def test_cancel_leaves_marker_in_assistant_message(tmp_path, fake_script):
         return None
 
     task = asyncio.ensure_future(svc.send_message(ses.id, "慢慢想", on_event))
-    await asyncio.sleep(0.5)
+    await _wait_for_assistant(svc, ses.id)
     await svc.cancel(ses.id)
     with contextlib.suppress(TimeoutError, asyncio.CancelledError):
         await asyncio.wait_for(asyncio.shield(task), timeout=10)

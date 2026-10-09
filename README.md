@@ -202,6 +202,37 @@ lq factor eval "cov_lhb_on_board * cov_mf_main_ratio" --cov mf_main_ratio,lhb_on
 挂载的列走 —— 面板里有什么字段，校验就认什么；covariate 数据不可用时
 在 RECOMPUTE 阶段最早暴露，不会入库后因子值全 null 静默失效。
 
+## 个股分析 / 行业分析
+
+两个**对称**的能力域，产出同一种报告（0–100 分 + 分角度可解释指标），
+通用契约原语集中在 `src/lquant/core/report.py`，只有一份实现：
+
+| | 个股分析 `src/lquant/security` | 行业分析 `src/lquant/industry` |
+|---|---|---|
+| 输入 | 一个代码 `600519.SH` | 一个行业（`801780.SI` 或中文名「银行」） |
+| 角度 | 技术面 / 基本面 / 估值 / 资金面 / 行业与相对强度 / 消息面 | 趋势与轮动 / 景气度 / 估值 / 资金与拥挤度 / 宽度与情绪 |
+| API | `GET /api/security/{symbol}/analysis` | `GET /api/industry/{identifier}/analysis`、`/rotation`、`/list` |
+| 前端 | `/security/[symbol]` | `/industry`（轮动榜）+ `/industry/[identifier]`（详情） |
+
+行业分析的口径要点（详见 [`docs/行业分析能力设计.md`](docs/行业分析能力设计.md)）：
+
+- **行业指数是成分股等权合成的**，不是交易所/申万官方指数 —— 报告、API、
+  前端三处都显式声明，避免被当成官方指数用；
+- **PIT 安全**：行业归属按 `industry_classify.std_date` 做 as-of join
+  （分类变更逐日生效），财务按 `pub_date`，行情/估值/资金流按 `trade_date`；
+- **五个角度**：趋势与轮动（含 **RRG 相对旋转图**四象限）、景气度（PIT 财务中位数
+  + 相对全市场超额 + 环比动能）、估值（自身历史分位 + 全市场横向分位）、
+  资金与拥挤度（**拥挤度为反向指标**）、宽度与情绪（含 **NH-NL 净新高占比**）；
+- **缺失即标注**：任何角度取不到数 → `available=false` + 补齐方式，
+  绝不补一个「中性 50 分」把空缺填平。
+
+```bash
+curl 'localhost:8000/api/industry/rotation?window=20'   # 全行业轮动榜
+curl 'localhost:8000/api/industry/银行/analysis'          # 单行业多角度报告
+```
+
+MCP 侧对应 `get_industry_rotation` / `get_industry_analysis` 两个工具（供「问 AI」调用）。
+
 ## 技术指标
 
 `src/lquant/indicators` 注册表驱动（趋势/摆动/量能/**形态**/通道五类），
@@ -217,8 +248,10 @@ lq factor eval "cov_lhb_on_board * cov_mf_main_ratio" --cov mf_main_ratio,lhb_on
 
 | 目录 | 职责 |
 |---|---|
-| `src/lquant/core` | 配置 / 类型 / 注册表 / 日历 / 单写者 DB 连接 |
+| `src/lquant/core` | 配置 / 类型 / 注册表 / 日历 / 单写者 DB 连接 / **报告契约通用原语**（`report.py`） |
 | `src/lquant/data` | Provider 抽象、多源适配、入库、质量校验、存储 |
+| `src/lquant/security` | **个股分析**：多角度报告（技术/基本面/估值/资金/相对强度/消息） |
+| `src/lquant/industry` | **行业分析**：行业轮动榜 + 多角度报告（趋势与 RRG/景气度/估值/拥挤度/宽度） |
 | `src/lquant/factors` | DSL、算子、预处理、评价、在线监控（IC 日表 + 健康度）、看板另类数据协变量（EP-9） |
 | `src/lquant/backtest` | 规则表、撮合引擎、账户、策略、实验记录器（list/show/diff）、统计置信度（PSR/DSR/PBO） |
 | `src/lquant/portfolio` | 选池 / 去重 / 权重（no-trade band）/ 优化器（TE + 换手约束）/ 选股策略库（一策略一纯函数）/ 仓位模型（ATR 风险预算 + Kelly） |

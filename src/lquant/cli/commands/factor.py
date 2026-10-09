@@ -116,7 +116,10 @@ def eval_(
     if not len(df):
         raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")
     dates = sorted(df["trade_date"].unique().to_list())
-    tr_d, _val_d, _test_d = split_dates(dates)
+    # 切分必须带隔离带：本命令报告「样本内 IC vs 样本外 IC」，而标签是前瞻 1 日收益
+    # —— 训练集最后一根的标签会伸进测试段，不剪掉的话「样本外」是假的。
+    # purge = 标签前瞻窗口 h（这里 h=1），embargo = 1。
+    tr_d, _val_d, _test_d = split_dates(dates, purge_bars=1, embargo_bars=1)
     train = prepare_segment(df, cov_cols, expr, tr_d)
     try:
         s_tr = ic_series(train, "f", "fwd_ret_1")
@@ -460,7 +463,9 @@ def series(expr: str, start: str | None) -> None:
     df, cov_cols = _panel_for_expr(start, expr)
     if not len(df):
         raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")
-    tr_d, _val_d, _test_d = split_dates(sorted(df["trade_date"].unique().to_list()))
+    # 同 eval：标签是前瞻 1 日收益，边界必须剪掉隔离带，否则样本外口径偏乐观。
+    tr_d, _val_d, _test_d = split_dates(
+        sorted(df["trade_date"].unique().to_list()), purge_bars=1, embargo_bars=1)
     train = prepare_segment(df, cov_cols, expr, tr_d)
     from lquant.factors.evaluate.ic import ic_series
 
@@ -622,7 +627,11 @@ def _load_segments(start: str | None, expr: str, *, horizons=(1, 5), with_pre: b
     if not len(df):
         raise click.ClickException("日线数据为空，先跑 bootstrap 或 lq data demo")
     dates = sorted(df["trade_date"].unique().to_list())
-    train_d, val_d, test_d = split_dates(dates)
+    # purge 取**实际用到的最大前瞻窗口**：衰减曲线会算到 max(horizons) 日，
+    # 训练段尾部那些天的标签同样会伸进 val/test。取 1 不够、取死值会随
+    # --horizons 变化而失准，故由参数推出。embargo 固定 1（隔开边界自相关）。
+    train_d, val_d, test_d = split_dates(
+        dates, purge_bars=max(horizons, default=1), embargo_bars=1)
     train = prepare_segment(df, cov_cols, expr, train_d, horizons=list(horizons), with_pre=with_pre)
     pre = None
     if with_pre:

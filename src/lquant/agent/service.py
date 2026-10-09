@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
@@ -33,6 +34,45 @@ class AgentService(ABC):
         #: 会话 → 本轮运行的可见信息（开始时间 / pid …）。
         #: 与 ``_tasks`` 同生命周期：``_claim`` 建、``_release`` 清。
         self._run_meta: dict[str, dict] = {}
+        #: 会话 → 本轮 assistant 占位消息 id。**先登记再落库**：取消可能正好落在
+        #: ``add_message`` 的 await 上，那时拿不到返回值，只能靠预先登记的 id
+        #: 找到目标行补文案（见 ``_mark_interrupted``）。
+        self._ans_id: dict[str, str] = {}
+
+    def trace_emitter(self, sid: str, on_event: Emit) -> Emit:
+        """把 on_event 包成「带留痕」的版本（见 agent/trace.py）。
+
+        放在基类、由 provider 在跑之前包一次：留痕是**过程数据的一次落库**，
+        不该由调用方（HTTP / A2A / 测试）各自记得去挂 —— 那样迟早有一条路径漏掉。
+        """
+        from lquant.agent.trace import TracedEmitter  # noqa: PLC0415
+
+        return TracedEmitter(sid, run_id=uuid.uuid4().hex, emit=on_event,
+                             sink=self.store.add_tool_trace,
+                             msg_id=lambda: self._ans_id.get(sid, ""))
+
+    async def _mark_interrupted(self, sid: str) -> None:
+        """取消留痕：给本轮的 assistant 消息补一句「（已中断）」。
+
+        为什么放在最外层（``send_message`` 的取消分支）而不是各 provider 的
+        循环里：取消可能落在「占位消息落库」这个 await 上，那时 provider 内部
+        的 try/finally 还没进去；只有「先登记 id + 最外层兜底」才能覆盖全部
+        取消时点。
+
+        幂等靠 ``_ans_id`` 的 pop：本轮跑出**明确结论**（done / error）时
+        provider 会先把它清掉，于是这里天然不再补 —— 所以这个方法可以
+        「只要被调用就补」，不必去猜消息内容完不完整（截断到一半的回答同样
+        需要这个标记，只看「内容非空」会把它当成完整回答）。
+        """
+        mid = self._ans_id.pop(sid, None)
+        if not mid:
+            return
+        try:
+            if await self.store.get_message(sid, mid) is not None:
+                await self.store.append_assistant_delta(sid, mid, "（已中断）")
+        except Exception:  # noqa: BLE001 - 留痕失败不该改写取消语义
+            logging.getLogger("lquant.agent").exception(
+                "取消留痕失败 sid=%s mid=%s", sid, mid)
 
     @abstractmethod
     async def create_session(self, context: dict | None,

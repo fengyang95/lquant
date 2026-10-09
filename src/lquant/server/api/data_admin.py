@@ -114,8 +114,34 @@ def resolve_issues_ep(req: IssuesResolveIn) -> dict:
     return {"requested": len(req.ids), "resolved": n}
 
 
-# ---------- 2. data_version 展示 ----------
+# ---------- 1b. 源站契约探针 ----------
 
+@router.get("/contracts")
+def list_contracts_ep() -> list[dict]:
+    """已登记的源站契约清单（不联网，只看声明）。"""
+    from lquant.data.contract import list_contracts
+
+    return list_contracts()
+
+
+@router.post("/contracts/probe")
+def probe_contracts_ep(name: str | None = Query(default=None, max_length=64,
+                                               description="只探这一条；缺省探全部"),
+                       save: bool = True) -> dict:
+    """跑一次契约探针（**会联网**），字段缺失/结构变化落 data_quality_issue。
+
+    探针请求失败只记 warn，不抛错 —— 探针自身不该把链路打挂。
+    """
+    from lquant.data.contract import run_contract_probes
+
+    names = [name] if name else None
+    try:
+        return run_contract_probes(names=names, save=save)
+    except KeyError as e:
+        raise HTTPException(404, str(e)) from e
+
+
+# ---------- 2. data_version 展示 ----------
 @router.get("/version/latest")
 def version_latest(dataset: str | None = Query(default=None, max_length=32)) -> dict | None:
     """当前最新数据版本（可按 dataset 过滤）；从未登记过 → null（不是错误）。"""

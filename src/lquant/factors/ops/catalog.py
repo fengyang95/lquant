@@ -11,7 +11,8 @@ API 与测试共用。
     - 其余标量参数 → 普通数值（如 Ts_Quantile 的 q、Power 的 p）
 
 前端**不得**自持算子定义 —— 语义分歧（Greater 取大 vs 比较、Ts_ArgMax 的
-0/1 基准、Log 的 log1p 口径）全部以这里返回的 label 为准，画布照抄。
+0/1 基准、Log=ln(x) 与 Log1p=ln(1+x) 的区分）全部以这里返回的 label 为准，
+画布照抄。
 """
 from __future__ import annotations
 

@@ -546,3 +546,36 @@ def test_price_limit_by_board_rejects_at_limit_and_fills_below(symbol, limit, is
     res = _run_limit_case(symbol, limit=limit, is_st=is_st, touched=False)
     assert res.error is None, res.error
     assert len(res.trades) == 1, f"{symbol} 板内应成交: {res.trades} {res.rejected}"
+
+
+# ---------- 严格复权：缺 adj_factor 不许静默按 1.0 顶替 ----------
+
+def test_strict_adj_raises_on_missing_factor():
+    """strict_adj=True：bar 没有有效复权因子 → 抛错，而不是当因子=1.0。"""
+    from lquant.backtest.events import Bar
+
+    runner = JQRunner("pass", initial_cash=100_000, strict_adj=True)
+    bar = Bar("600000.SH", date(2026, 1, 5), 10.0, 10.5, 9.5, 10.0, 10.0,
+              1e6, 1e7, adj_factor=0.0)
+    with pytest.raises(ValueError, match="复权缺因子"):
+        runner._bar_field_fq("600000.SH", bar, "close", "post", f_now=1.0)
+
+
+def test_lenient_adj_warns_once_and_keeps_raw():
+    """默认口径：退回原始价，但每只标的最多告警一次（不再无声）。"""
+    from loguru import logger as _lg
+
+    from lquant.backtest.events import Bar
+
+    runner = JQRunner("pass", initial_cash=100_000, strict_adj=False)
+    bar = Bar("600000.SH", date(2026, 1, 5), 10.0, 10.5, 9.5, 10.0, 10.0,
+              1e6, 1e7, adj_factor=0.0)
+    seen: list[str] = []
+    sink = _lg.add(lambda m: seen.append(m), level="WARNING")
+    try:
+        assert runner._bar_field_fq("600000.SH", bar, "close", "post", f_now=1.0) == 10.0
+        # 同一标的再来一次不再重复告警
+        assert runner._bar_field_fq("600000.SH", bar, "close", "post", f_now=1.0) == 10.0
+    finally:
+        _lg.remove(sink)
+    assert sum("复权缺因子" in m for m in seen) == 1

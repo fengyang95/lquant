@@ -118,6 +118,28 @@ async def get_messages(sid: str):
     return [m.model_dump() for m in await svc.get_messages(sid)]
 
 
+@router.get("/sessions/{sid}/trace")
+async def get_trace(sid: str, limit: int = 200):
+    """已落库的工具调用留痕（过程轨的事实源）。
+
+    与前端内存里的过程轨（``web/src/lib/ask-stream.ts``）分工不同：那边是
+    **这一轮**的可视化，刷新即失；这里是**可回溯**的落库记录。
+    """
+    svc = await get_service_for_session(sid)
+    if await svc.store.get(sid) is None:
+        raise HTTPException(404, "会话不存在")
+    return await svc.store.list_tool_trace(sid, limit=limit)
+
+
+@router.get("/sessions/{sid}/verdicts")
+async def get_verdicts(sid: str, limit: int = 50):
+    """本会话提交过的结构化结论（新→旧）。"""
+    svc = await get_service_for_session(sid)
+    if await svc.store.get(sid) is None:
+        raise HTTPException(404, "会话不存在")
+    return await svc.store.list_verdicts(sid, limit=limit)
+
+
 @router.post("/sessions/{sid}/messages")
 async def send_message(sid: str, body: dict):
     # 按会话锁定的 provider 路由：运行时引用（任务/子进程）是**按 service 实例**

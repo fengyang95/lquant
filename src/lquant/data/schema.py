@@ -36,6 +36,33 @@ DAILY_BAR = {
     "source": pl.Utf8,
     "ingested_at": pl.Datetime,
     "data_version": pl.Utf8,
+    # ---- 快照哨兵（data/quality/integrity.py 的 partition_is_snapshot 读取）----
+    # 语义：**该行报价的采集时刻**，epoch 毫秒，按上海墙钟解释（与 integrity.py
+    # 的 `_sentinel_ms`/`_day_bounds_ms` 口径一致）。它与「交易日 trade_date」
+    # 是两件事：trade_date 说这行属于哪个交易日，quote_ts 说这份报价**什么时候
+    # 采集到**。哨兵判定只认后者。
+    #
+    # 写入契约（谁写 NULL、谁写时间戳）：
+    #   1. 盘后权威批量行 —— **显式写 NULL**。这是「该行来自权威批量拉取、
+    #      不是盘中快照」的唯一证明。绝不因为「列缺失」而隐式成 null：列缺失
+    #      会被 integrity 判成 UNKNOWN（见下），而不是 AUTHORITATIVE，两者
+    #      在事故里是「知道干净」与「不知道」的天壤之别。
+    #      生产者：`data/ingest/daily.py::_stamp`（盘后回填/增量），并由
+    #      `data/store/parquet.py::write_daily` 兜底补 NULL —— 任何绕过
+    #      `_stamp` 的批量写入（demo/复权因子/跨源对拍）也不会漏列。
+    #   2. 盘中快照行 —— 写采集时刻换算成的 epoch 毫秒。判定口径是
+    #      「当日 15:00 <= quote_ts < 次日 00:00」为权威；收盘前或落在别的
+    #      日期的时刻一律算可疑快照行。
+    #   3. **现状：lquant 目前没有任何「盘中把当日行情写进日线湖」的路径。**
+    #      实时行情走 `market_snapshot`（DuckDB 表，见 MARKET_SNAPSHOT），
+    #      不落日线 parquet。所以本列现在只会是两种状态：批量写入的显式
+    #      NULL（权威），或数据层显式写入的时间戳（未来接入盘中落盘时）。
+    #      若日后新增盘中写日线的路径，必须在此列写采集时刻 —— 不要新增一条
+    #      「不写这列」的日线写入路径，那会让 partition_is_snapshot 退回 UNKNOWN。
+    #   4. 多文件分区里个别老文件缺该列时，读取侧靠 diagonal 合并补成 null；
+    #      但若**整个分区（全部文件）都没有该列**，integrity 的 `_sentinel_ms`
+    #      返回 None → 判 UNKNOWN（fail-loudly），绝不假定为权威历史。
+    "quote_ts": pl.Int64,
 }
 
 # ---- 分钟线 ----
@@ -146,6 +173,36 @@ SCHEMAS = {
     "etf_meta": ETF_META,
     "market_snapshot": MARKET_SNAPSHOT,
 }
+
+# ---- curated schema 演进纪律 ----
+#
+# curated 列是**对外契约**：落湖的 parquet、`SCHEMAS`、字段映射 yaml、
+# 因子 DSL 白名单、看板列全都在读它。经验是「悄悄删一列」比「悄悄加一列」
+# 危险得多 —— 删列会让历史 parquet 与读取代码对不上，而加列基本无害。
+#
+# 所以：**只增不改**。任何一次改动（加/删/改类型）都必须同时
+#   1) 调整 DATASET_SCHEMA_VERSION：加列 +1，删列/改类型 +1 并注明破坏性；
+#   2) 更新 SCHEMA_FINGERPRINT（`schema_fingerprint()` 的输出）。
+# `tests/unit/test_schema_contract.py` 会盯着这两者是否同步 —— 改列的人
+# 一定会看到一条要求他显式确认的失败，而不是在 code review 里被漏掉。
+DATASET_SCHEMA_VERSION = 2
+
+# 最近一次「删列 / 改类型」的说明；只增列时保持上一版说明不动。
+DATASET_SCHEMA_BREAKING_NOTE = "初始版本（建立指纹纪律时的基线）"
+
+
+def schema_fingerprint() -> str:
+    """curated schema 的稳定指纹（表 → 有序 (列, 类型) 的 sha256）。"""
+    import hashlib
+
+    payload = "\n".join(
+        f"{table}:" + ",".join(f"{c}:{dt}" for c, dt in SCHEMAS[table].items())
+        for table in sorted(SCHEMAS)
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+SCHEMA_FINGERPRINT = "acc5e30c7df013e89908906d56c3344097f0cb709bd04a38fca3cf59edfb1c6e"
 
 
 def empty(name: str) -> pl.DataFrame:

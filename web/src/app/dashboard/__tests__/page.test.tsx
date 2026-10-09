@@ -66,8 +66,23 @@ describe('DashboardPage', () => {
           { trade_date: '2026-09-16', sentiment_score: 62, limit_up_count: 60, broken_rate: 0.2 },
         ],
         northbound: [
-          { trade_date: '2026-09-16', sh_net_inflow: 5.2e8, sz_net_inflow: 3.1e8, total_net_inflow: 8.3e8 },
+          {
+            trade_date: '2026-09-16', sh_deal_amt: 3.2e11, sz_deal_amt: 2.8e11,
+            total_deal_amt: 6.0e11, deal_num: 6824276,
+            sh_net_inflow: null, sz_net_inflow: null, total_net_inflow: null,
+            net_published: false,
+          },
         ],
+      },
+      '/market/northbound': {
+        flow: [],
+        top10: [
+          {
+            board: '沪股通', symbol: '600519.SH', name: '贵州茅台', rank_no: 8,
+            close: 1255.79, change_pct: -0.22, deal_amt: 1.33e9, mutual_ratio: 36.72,
+          },
+        ],
+        net_last_date: '2024-08-16',
       },
       '/market/breadth': breadth,
       '/market/index': indexRows,
@@ -80,7 +95,10 @@ describe('DashboardPage', () => {
     expect(screen.getAllByText('贵州茅台').length).toBeGreaterThan(0);
     expect(screen.getByText('温度计')).toBeInTheDocument();
     expect(screen.getAllByText('亢奋').length).toBeGreaterThan(0);
-    expect(screen.getByText('北向资金')).toBeInTheDocument();
+    // 北向：净买额停发，面板只展示成交额；不把 null 画成 0
+    expect(screen.getByText('北向成交额')).toBeInTheDocument();
+    expect(screen.getByText('北向前十大成交活跃证券')).toBeInTheDocument();
+    expect(screen.getByText('36.7%')).toBeInTheDocument();
   });
 
   it('fetch 失败：壳仍在，降级空态，不崩溃', async () => {

@@ -118,7 +118,9 @@ def test_weights_unknown_method_falls_back_to_equal():
 
 def test_methods_registry_complete():
     assert set(METHODS) == {"equal", "inverse_vol", "risk_parity",
-                            "min_variance", "hrp", "enhanced_indexing"}
+                            "min_variance", "hrp", "enhanced_indexing",
+                            # P1-4：尾部风险（LP，需要 scipy）
+                            "cvar", "cdar"}
 
 
 #: 需要额外输入的方法：走通用入口时必须显式给这些 kw，见下面两个测试。

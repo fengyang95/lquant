@@ -16,6 +16,7 @@ from datetime import date
 import numpy as np
 import polars as pl
 
+from lquant.data.quality.flags import NEW_LISTING, SUSPENDED
 from lquant.factors.evaluate.returns import forward_return
 
 __all__ = ["DatasetConfig", "Dataset", "build_dataset", "walk_forward_splits"]
@@ -37,8 +38,25 @@ class DatasetConfig:
     #: **一律只在训练段 fit**，valid/test 只 transform —— 不填则不处理。
     processors: list[dict] | None = None
 
+    #: 入场价列。``None`` = 沿用 ``price_col``（close→close，因子评价的可比口径）；
+    #: 设成 ``"open"`` 时 label = ``close[t+h]/open[t+1] - 1`` —— 与引擎
+    #: 「T 日收盘出信号 → T+1 开盘撮合」的执行口径一致。
+    #: **默认不切换**：切了之后与历史 ML 指标不可比，必须显式选。
+    entry_price_col: str | None = None
+    entry_lag: int = 1
+
+    #: 可交易性屏蔽：把「入场那天根本买不到」的样本剔出训练集。
+    #: 面板没有 ``quality_flags`` 列时为空操作，并在报告里显式说明（不静默）。
+    tradability_mask: bool = True
+
     def label_col(self) -> str:
         return f"fwd_ret_{self.label_horizon}"
+
+    def label_kind(self) -> str:
+        """标签口径的可读描述（落进 runs/报告，避免事后猜）。"""
+        entry = self.entry_price_col or self.price_col
+        lag = self.entry_lag if self.entry_price_col else 0
+        return f"{self.price_col}[t+{self.label_horizon}]/{entry}[t+{lag}]"
 
 
 @dataclass
@@ -46,6 +64,9 @@ class Dataset:
     df: pl.DataFrame
     cfg: DatasetConfig
     dates: list[date] = field(default_factory=list)
+    #: 样本屏蔽账：{"applied", "dropped", "reasons": {原因: 行数}, "note"}。
+    #: 恒存在（哪怕没屏蔽），因为「屏蔽了多少、为什么」必须可查，不能靠猜。
+    mask_report: dict = field(default_factory=dict)
 
     @property
     def features(self) -> list[str]:
@@ -64,11 +85,46 @@ class Dataset:
             d = d.filter(pl.col(self.cfg.date_col) <= _as_date(end))
         return d
 
-    def split(self, train_end, valid_end, test_end=None):
-        """按日期切成 (train, valid, test)。"""
-        return (self.slice(end=train_end),
+    def split(self, train_end, valid_end, test_end=None, *, purge: bool = True):
+        """按日期切成 (train, valid, test)。
+
+        purge=True（默认）：train 尾部剔除 ``label_horizon`` 个交易日。
+        标签是 forward_return（``close[t+h]/close[t] - 1``）—— 训练样本 i 会读到
+        索引 ``i+h`` 的价格；要完全不碰 valid 段，需要 ``i+h <= n-1``，
+        即回退 **h** 天。只回退 h-1 天会漏掉边界那 1 个样本（它的标签恰好落在
+        valid 首日），属于静默泄漏。
+
+        要表达 purge/embargo 留下的**不对称缺口**请用 :meth:`split_window`
+        （那是 ``walk_forward_splits`` 的逐窗版本，两个端点都会剪）。
+        """
+        te = _as_date(train_end)
+        if purge and self.cfg.label_horizon > 0:
+            k = self.cfg.label_horizon
+            dd = [x for x in self.dates if x <= te]
+            if len(dd) > k:
+                te = dd[-1 - k]          # 回退 k 个交易日（dates 本身是交易日序列）
+            else:
+                # 窗口比泄漏窗还短：训练段为空（head(0)），由下游显式报错，
+                # 不能悄悄退回不 purge —— 那是静默泄漏
+                return (self.df.head(0),
+                        self.slice(start=_next_day(train_end), end=valid_end),
+                        self.slice(start=_next_day(valid_end), end=test_end))
+        return (self.slice(end=te),
                 self.slice(start=_next_day(train_end), end=valid_end),
                 self.slice(start=_next_day(valid_end), end=test_end))
+
+    def split_window(self, window: dict):
+        """按 ``walk_forward_splits`` 给出的**显式闭区间**切 (train, valid, test)。
+
+        为什么不能继续用 :meth:`split`：purge/embargo 的意义就是让相邻两段之间
+        留出一条**既不属于前段、也不属于后段**的隔离带。``split`` 只会把后段
+        从「前段结束的次日」开始，缺口会被悄悄并进后段 —— 训练集又吃到了测试期
+        的邻近样本，泄漏白防了。这里两个端点都用上，缺口被如实跳过。
+
+        ``window`` 形如 ``{"train": (start, end), "valid": ..., "test": ...}``。
+        """
+        return tuple(self.slice(start=w[0], end=w[1])
+                     for w in (window["train"], window["valid"], window["test"]))
 
     def build_processor(self):
         """按 ``cfg.processors`` 构造（未拟合的）处理器；无声明返回 None。"""
@@ -126,6 +182,10 @@ class Dataset:
             "rows": len(self.df),
             "features": len(self.features),
             "label": self.label,
+            # 标签口径与屏蔽账随 run 落库：事后不必猜「这个 fwd_ret 是 close→close
+            # 还是 close→open」「剔掉了多少不可成交样本」。
+            "label_kind": self.cfg.label_kind(),
+            "mask": self.mask_report,
             "start": self.dates[0] if self.dates else None,
             "end": self.dates[-1] if self.dates else None,
             "symbols": self.df[self.cfg.symbol_col].n_unique(),
@@ -144,15 +204,83 @@ def _next_day(v) -> date:
     return _as_date(v) + timedelta(days=1)
 
 
+def _blocked_expr(df: pl.DataFrame, cfg: DatasetConfig) -> tuple[list[pl.Expr], list[str]]:
+    """入场日「根本买不到」的判据（**在入场那一天**成立才算）。
+
+    三类，各自可查：
+
+    - 停牌（``quality_flags`` 的 SUSPENDED 位）：没有可成交价格；
+    - 新股（NEW_LISTING 位）：涨跌停口径与波动结构都特殊；
+    - 一字板：``high == low`` 且较昨收涨 ≥9.5% —— 全天一个价位封死，挂单排不上。
+      用「high==low」做前提，所以对 20% 涨跌幅板块同样安全（非涨停的一字
+      只可能是停牌，已由第一类覆盖），不需要逐板配置阈值。
+    """
+    exprs: list[pl.Expr] = []
+    reasons: list[str] = []
+    if "quality_flags" in df.columns:
+        flags = pl.col("quality_flags").fill_null(0)
+        exprs.append((flags & SUSPENDED) != 0)
+        reasons.append("停牌")
+        exprs.append((flags & NEW_LISTING) != 0)
+        reasons.append("新股")
+    if {"high", "low", "close", "pre_close"} <= set(df.columns):
+        exprs.append(
+            ((pl.col("high") - pl.col("low")).abs() < 1e-9)
+            & (pl.col("close") >= pl.col("pre_close") * 1.095))
+        reasons.append("一字板")
+    return exprs, reasons
+
+
 def build_dataset(df: pl.DataFrame, cfg: DatasetConfig) -> Dataset:
-    """从行情长表构建数据集：补前瞻收益 → 截尾 → 丢缺失 → 过滤稀疏日。"""
+    """从行情长表构建数据集：补前瞻收益 → 剔不可成交样本 → 截尾 → 丢缺失。
+
+    两处口径必须显式（否则回测 IC 会系统性虚高）：
+
+    1. **不可成交样本**（停牌/新股/一字板）默认剔掉 —— 涨停当天买不到，回测
+       却按成交价计入，等于把买不进的收益算进策略；
+    2. **标签口径**由 ``label_kind()`` 描述并随 Dataset 落库，避免事后猜
+       「这个 fwd_ret 到底是 close→close 还是 close→open」。
+    """
     missing = [f for f in cfg.features if f not in df.columns]
     if missing:
         raise KeyError(f"特征列不存在: {missing}")
 
-    d = forward_return(df, price_col=cfg.price_col, periods=[cfg.label_horizon],
-                       by=cfg.symbol_col, date_col=cfg.date_col)
     label = cfg.label_col()
+    if cfg.entry_price_col:
+        # 次日入场口径：今收决定、明开入场（与引擎的 T+1 撮合一致）
+        d = df.sort([cfg.symbol_col, cfg.date_col])
+        entry = pl.col(cfg.entry_price_col).shift(-cfg.entry_lag).over(cfg.symbol_col)
+        exit_ = pl.col(cfg.price_col).shift(-cfg.label_horizon).over(cfg.symbol_col)
+        d = d.with_columns(((exit_ / entry) - 1.0).alias(label))
+    else:
+        d = forward_return(df, price_col=cfg.price_col, periods=[cfg.label_horizon],
+                           by=cfg.symbol_col, date_col=cfg.date_col)
+
+    # ---- 可交易性屏蔽（入场日判定，因此要把标记前移到信号日）----
+    report: dict = {"applied": False, "dropped": 0, "reasons": {},
+                    "label_kind": cfg.label_kind()}
+    if cfg.tradability_mask:
+        exprs, reasons = _blocked_expr(d, cfg)
+        if not exprs:
+            report["note"] = ("面板无 quality_flags / OHLC 列，未做可交易性屏蔽"
+                              "（这不是「已检查」）")
+        else:
+            blocked = exprs[0]
+            for e in exprs[1:]:
+                blocked = blocked | e
+            entry_blocked = (blocked.shift(-cfg.entry_lag).over(cfg.symbol_col)
+                                    .fill_null(False))
+            before = len(d)
+            per_reason = {}
+            for name, e in zip(reasons, exprs, strict=True):
+                per_reason[name] = int(d.select(
+                    (e.shift(-cfg.entry_lag).over(cfg.symbol_col)
+                     .fill_null(False)).sum()).item() or 0)
+            d = d.filter(~entry_blocked)
+            report.update(applied=True, dropped=before - len(d),
+                          reasons=per_reason)
+    else:
+        report["note"] = "tradability_mask=False（显式关闭）"
 
     if cfg.clip_label is not None:
         d = d.with_columns(pl.col(label).clip(-cfg.clip_label, cfg.clip_label))
@@ -164,21 +292,54 @@ def build_dataset(df: pl.DataFrame, cfg: DatasetConfig) -> Dataset:
     d = d.filter(pl.len().over(cfg.date_col) >= cfg.min_samples_per_day)
 
     dates = sorted(d[cfg.date_col].unique().to_list())
-    return Dataset(df=d, cfg=cfg, dates=dates)
+    return Dataset(df=d, cfg=cfg, dates=dates, mask_report=report)
 
 
 def walk_forward_splits(dates: list[date], train_months: int = 24,
                         valid_months: int = 6, test_months: int = 6,
-                        step_months: int = 6):
+                        step_months: int = 6,
+                        purge_bars: int = 0, embargo_bars: int = 0):
     """滚动前移的 (train, valid, test) 日期边界序列。
 
     这是唯一能反映实盘的验证方式：每一期只用当时可得的数据训练，
     预测随后的一段时间，再整体前移。
-    """
 
+    purge / embargo（默认全 0 = 与历史行为**逐元素一致**）：
+
+    这里的标签是「前瞻 h 日收益」：t 日的样本要看到 t+h 日的价格才定型。
+    于是只要 train 的最后一根紧贴 valid/test 的第一根，这根训练样本的标签
+    就「见过」测试期了 —— 训练集与测试集在时间上重叠 h-1 期，样本外指标
+    系统性偏乐观（越是 h 大越明显）。修复只需在切分处留缺口：
+
+    - ``purge_bars``：在**每个拟合段**（train、valid）的尾部丢掉 N 根。
+      取 ``N = h`` 时，train 最后一根的标签恰好止于 train 末端，严格早于
+      下一段起点，训练样本的标签再也够不到验证/测试期。
+    - ``embargo_bars``：在**每个评估段**（valid、test）的头部再丢掉 N 根。
+      光有 purge 时两段仍然紧邻；相邻 bar 的特征窗口（如 20 日均线）、波动与
+      成交自相关会让边界处的评估样本与训练样本高度相似，仍然高估泛化。
+      留一条隔离带即可，经验取 ``1``（再多会明显浪费评估样本）。
+
+    这就是 Lopez de Prado《Advances in Financial Machine Learning》里
+    purged & embargoed CV 的口径；TSP（MIT）的实现也是「先留缺口、再取后段」。
+
+    **返回值是带缺口的闭区间**：purge/embargo 生效后，后段的起点不再等于前段
+    终点，缺口两端都不属于任何一段。消费方必须两个端点都用
+    （``Dataset.split_window``）—— 只按 ``Dataset.split`` 的连续边界重建，会把
+    缺口又并回训练集，等于没做。
+
+    purge/embargo 以**交易日根数**计（真交易日历，不是日历日）。窗口短到被剪空
+    时直接抛 :class:`ValueError`，不静默返回一个空的训练段。
+    """
+    if purge_bars < 0 or embargo_bars < 0:
+        raise ValueError(
+            f"purge_bars/embargo_bars 不能为负："
+            f"purge={purge_bars}, embargo={embargo_bars}")
     if not dates:
         return []
     start, end = dates[0], dates[-1]
+    # 只有真要做 purge/embargo 时才需要把月历边界吸附到真实交易日索引上；
+    # 默认路径完全走原逻辑，保证与改动前逐元素一致。
+    grid = sorted(set(dates)) if (purge_bars or embargo_bars) else []
     out = []
     cur = start
     while True:
@@ -187,9 +348,78 @@ def walk_forward_splits(dates: list[date], train_months: int = 24,
         te_e = _add_months(va_e, test_months)
         if te_e > end:
             break
-        out.append({"train": (tr_s, tr_e), "valid": (tr_e, va_e), "test": (va_e, te_e)})
+        if purge_bars or embargo_bars:
+            train, valid, test = _purge_embargo_window(
+                grid, tr_s, tr_e, va_e, te_e, purge_bars, embargo_bars)
+        else:
+            train, valid, test = (tr_s, tr_e), (tr_e, va_e), (va_e, te_e)
+        out.append({"train": train, "valid": valid, "test": test})
         cur = _add_months(cur, step_months)
     return out
+
+
+def _purge_embargo_window(grid: list[date], tr_s: date, tr_e: date,
+                          va_e: date, te_e: date,
+                          purge_bars: int, embargo_bars: int):
+    """把月历边界吸附到交易日网格，再按根数剪出带缺口的三个闭区间。"""
+    tr_start = _first_idx_ge(grid, tr_s)
+    tr_end = _last_idx_le(grid, tr_e)
+    va_start = _first_idx_gt(grid, tr_e)
+    va_end = _last_idx_le(grid, va_e)
+    te_start = _first_idx_gt(grid, va_e)
+    te_end = _last_idx_le(grid, te_e)
+    if None in (tr_start, tr_end, va_start, va_end, te_start, te_end):
+        raise ValueError(
+            f"窗口 train=({tr_s}~{tr_e}) valid=(~{va_e}) test=(~{te_e}) "
+            f"在交易日网格上取不到完整区间（数据边界与月历边界不匹配）")
+    tr_end = tr_end - purge_bars          # 拟合段尾部：标签会伸进下一段的都剪掉
+    va_start = va_start + embargo_bars    # 评估段头部：隔离带
+    va_end = va_end - purge_bars
+    te_start = te_start + embargo_bars
+    if tr_end < tr_start:
+        raise ValueError(
+            f"purge_bars={purge_bars} 把训练段剪空了："
+            f"train=({tr_s}~{tr_e}) 只有 {tr_end - tr_start + 1 + purge_bars} 根可用")
+    if va_start > va_end:
+        raise ValueError(
+            f"purge={purge_bars}/embargo={embargo_bars} 把验证段剪空了："
+            f"valid=(~{va_e}) 可用交易日不足")
+    if te_start > te_end:
+        raise ValueError(
+            f"embargo_bars={embargo_bars} 把测试段剪空了：test=(~{te_e}) 可用交易日不足")
+    return ((tr_s, grid[tr_end]),
+            (grid[va_start], grid[va_end]),
+            (grid[te_start], grid[te_end]))
+
+
+def _first_idx_ge(grid: list[date], d: date):
+    """``grid`` 中第一个 >= d 的下标；没有返回 None。"""
+    for i, x in enumerate(grid):
+        if x >= d:
+            return i
+    return None
+
+
+def _first_idx_gt(grid: list[date], d: date):
+    """``grid`` 中第一个 > d 的下标；没有返回 None。
+
+    用「严格大于」而不是「>=」是与 ``Dataset.split`` 对齐：边界日归前一段，
+    后一段从它之后的第一根开始。
+    """
+    for i, x in enumerate(grid):
+        if x > d:
+            return i
+    return None
+
+
+def _last_idx_le(grid: list[date], d: date):
+    """``grid`` 中最后一个 <= d 的下标；没有返回 None。"""
+    idx = None
+    for i, x in enumerate(grid):
+        if x > d:
+            break
+        idx = i
+    return idx
 
 
 def _add_months(d: date, months: int) -> date:

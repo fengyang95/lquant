@@ -97,8 +97,14 @@ class Account:
         for sym, pos in self.positions.items():
             if not pos.qty:
                 continue
+            # px<=0 是脏价（坏数据/异常除权），视同缺失继续回退：
+            # 拿 0 价估值会把整笔持仓抹成零，NAV 系统性失真。
             px = prices.get(sym)
+            if px is not None and px <= 0:
+                px = None
             if px is None and last_prices:
                 px = last_prices.get(sym)
+                if px is not None and px <= 0:
+                    px = None
             v += pos.qty * (px if px is not None else pos.avg_cost)
         return v

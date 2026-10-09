@@ -20,7 +20,10 @@ TZ = ZoneInfo("Asia/Shanghai")
 _SUFFIX_RULES = [
     (re.compile(r"^(60|68|51|56|58|50|11|5[0-9])\d{4}$"), "SH"),  # 沪股 + 沪 ETF/LOF
     (re.compile(r"^(00|30|15|16|159|12|18)\d{3,4}$"), "SZ"),  # 深股 + 深 ETF/LOF
-    (re.compile(r"^(4|8|92)\d{4}$"), "BJ"),
+    # 北交所 6 位：43/83/87/88 开头（+5 位）+ 920 开头（+4 位）。
+    # 此前 (4|8|92)\d{4} 只能匹配 920xxx 与 5 位码，430047/830799 等裸码
+    # 解析失败 → akshare 全市场清单同步整批抛 ValueError
+    (re.compile(r"^(4|8)\d{5}$|^(92)\d{4}$"), "BJ"),
 ]
 _SYMBOL_RE = re.compile(r"^(\d{6})\.(SH|SZ|BJ)$")
 

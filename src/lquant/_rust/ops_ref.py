@@ -53,6 +53,8 @@ def ts_regbeta(y: list[float | None], x: list[float | None],
     """滚动窗口回归 beta（y 对 x，与 Rust ts_regbeta(y, x, n) 一致）。"""
     out: list[float | None] = []
     L = len(y)
+    if n <= 0:
+        raise ValueError(f"窗口 n 必须 >= 1，收到 {n}")
     for i in range(L):
         if i + 1 < n:
             out.append(None)
@@ -68,10 +70,16 @@ def ts_regbeta(y: list[float | None], x: list[float | None],
                 sxx += a * a
                 sxy += a * b
                 cnt += 1
+        # 除法必须在 `cnt < n` 检查**之后**：窗口全空（长期停牌常态输入）
+        # 时 cnt=0，先除会 ZeroDivisionError —— 与 Rust（先判后算）及本文件
+        # ts_corr 的顺序不一致
+        if cnt < n:
+            out.append(None)
+            continue
         nf = float(cnt)
         cov = sxy / nf - (sx / nf) * (sy / nf)
         vx = sxx / nf - (sx / nf) ** 2
-        if cnt < n or vx <= 0.0:
+        if vx <= 0.0:
             out.append(None)
         else:
             out.append(cov / vx)

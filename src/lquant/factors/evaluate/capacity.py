@@ -93,7 +93,10 @@ def capacity_summary(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", 
             part = float(aum) * to_mean / adv
             impact_bps = impact_coef * math.sqrt(part) * 1e4
             total_bps = base_bps + impact_bps
-            annual_cost = (annual_turnover * total_bps / 1e4
+            # 换手每换掉一份持仓要付买+卖**两笔**单边成本（与 costs.py 的
+            # 「双边」口径一致）。此前漏乘 ×2，年化成本低估一半，
+            # net_annual / viable 判定系统性偏乐观。
+            annual_cost = (annual_turnover * total_bps * 2.0 / 1e4
                            if math.isfinite(annual_turnover) else float("nan"))
             net = gross - annual_cost if math.isfinite(gross) and math.isfinite(annual_cost) \
                 else float("nan")

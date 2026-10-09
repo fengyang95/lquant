@@ -42,10 +42,15 @@ SYMS = (
 D1, D2, D3, D4, D5, D6, D7, D8 = DAYS
 
 
-def _daily_df() -> pl.DataFrame:
-    """每股固定漂移的指数增长价（截面单调 → IC 可预期），全字段列。"""
+def _daily_df(days: list[date] | None = None, *, offset: int = 0) -> pl.DataFrame:
+    """每股固定漂移的指数增长价（截面单调 → IC 可预期），全字段列。
+
+    ``days`` 缺省用模块级 ``DAYS``（既有测试口径不变）；``offset`` 用于在
+    既有面板之后**续造**交易日时保持价格序列连续（``i+1`` 的幂次接着涨）。
+    """
+    days = DAYS if days is None else days
     rows = []
-    for i, d in enumerate(DAYS):
+    for i, d in enumerate(days, start=offset):
         for j, s in enumerate(SYMS):
             c = 10.0 * (1 + 0.001 * (j + 1)) ** (i + 1)
             rows.append(
@@ -505,22 +510,33 @@ def test_eval_cli_with_cov_end_to_end(board_env):
     from lquant.cli.commands.factor import factor
     from lquant.core.config import get_settings
 
+    # eval 现在带切分隔离带（purge=1/embargo=1，见 cli/commands/factor.py）：
+    # 训练段两端各被剪掉 1 天 —— covariate 的 shift(1) 让首日 cov 为 null，
+    # 标签前瞻让末日没有 fwd_ret。8 天面板切完训练段只剩 2 天 IC，断言
+    # ``n_days >= 3`` 表达的是「端到端确实算出了多天」，那就要把面板补够，
+    # 而不是把断言放宽成 >=2（等于承认只算出了一天）。
+    # 这里续造 2 个交易日并写进日线湖（同 key 覆盖合并）。
+    extra_days = [DAYS[-1] + timedelta(days=1), DAYS[-1] + timedelta(days=2)]
+    from lquant.data.store.parquet import write_daily
+
+    write_daily(_daily_df(extra_days, offset=len(DAYS)))
+
     # 零星小场景足够测 shift 语义，但撑不起每日截面 IC —— 端到端前把看板
-    # 表补密到「每票每日都有」的真实形态（含与已有行的主键共存，验证收敛）。
+    # 表补密到「每票每日都有」的真实形态（含与已有行的主键共存，验证收敛），
+    # 并把续造的交易日一起补齐：cov 若在某天恒 0，表达式就是常数、IC 无从算起。
     con = duckdb.connect(str(get_settings().duckdb_path))
     for j, s in enumerate(SYMS):
-        for i, d in enumerate(DAYS[:7]):
+        for i, d in enumerate([*DAYS[:7], *extra_days]):
             con.execute(
                 "INSERT OR REPLACE INTO money_flow (trade_date, symbol, main_net_ratio,"
                 " collected_at) VALUES (?, ?, ?, now())",
                 [d, s, 0.01 * (i + 1) * (j + 1) - 0.1],
             )
-            if i < 5:
-                con.execute(
-                    "INSERT OR REPLACE INTO dragon_tiger (trade_date, symbol, net_buy,"
-                    " reason, collected_at) VALUES (?, ?, ?, 'x', now())",
-                    [d, s, 1e4 * (i + 1) * ((-1) ** j)],
-                )
+            con.execute(
+                "INSERT OR REPLACE INTO dragon_tiger (trade_date, symbol, net_buy,"
+                " reason, collected_at) VALUES (?, ?, ?, 'x', now())",
+                [d, s, 1e4 * (i + 1) * ((-1) ** j)],
+            )
     con.close()
 
     r = CliRunner().invoke(

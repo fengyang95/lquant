@@ -175,7 +175,8 @@ async def test_session_mcp_tool_whitelist_reaches_workspace(tmp_path):
     ws = svc._workspace_for(ses.id, await store.get_agent_config(ses.id))
     env = json.loads((ws / ".claude" / "mcp.json").read_text(
         encoding="utf-8"))["mcpServers"]["lquant"]["env"]
-    assert env["LQ_MCP_ENABLED_TOOLS"] == "get_quotes"
+    # submit_verdict 永远在名单里（结论输出通道，不是数据权限）
+    assert env["LQ_MCP_ENABLED_TOOLS"] == "get_quotes,submit_verdict"
 
 
 async def test_unset_session_config_keeps_all_capabilities(tmp_path):

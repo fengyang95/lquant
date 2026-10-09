@@ -67,6 +67,8 @@ web/tsconfig.tsbuildinfo
 coverage.xml
 coverage.json
 .coverage
+# coverage 的并行临时文件：.coverage.<host>.<pid>.<rand>（并发跑测试时会生成）
+.coverage.*
 htmlcov/
 
 # qlib 接入：专用 venv 与工作流运行时产物

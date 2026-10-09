@@ -21,14 +21,121 @@ from lquant.backtest.account import Account
 from lquant.backtest.broker import Broker
 from lquant.backtest.events import Bar, Fill, Order, OrderStatus, Side
 from lquant.backtest.metrics import perf_from_returns, turnover_from_trades
+from lquant.backtest.risk import PreTradeGate, RiskContext
 from lquant.backtest.rules.loader import default_slippage, load_ruleset
 from lquant.backtest.rules.model import InstrumentRules, RuleSet
 from lquant.backtest.security_meta import load_security_meta, merge_meta
 from lquant.backtest.slippage import make_slippage
 from lquant.backtest.strategy.base import Context, Strategy
 from lquant.core.types import parse_symbol
+from lquant.data.quality.tradability import no_limit_window, parse_listing_date
 
 __all__ = ["EngineConfig", "BacktestResult", "Engine", "build_rules"]
+
+# 上市日所在的候选列名：日线湖或调用方注入，命中即用（前者优先）
+_LISTING_DATE_COLS = ("listing_date", "list_date")
+
+
+def _listing_dates_from(df: pl.DataFrame, symbol_col: str) -> dict[str, date]:
+    """df 里的上市日列 → {symbol: 上市日}；没有该列（或全空）时返回 {}。"""
+    col = next((c for c in _LISTING_DATE_COLS if c in df.columns), None)
+    if col is None:
+        return {}
+    out: dict[str, date] = {}
+    for sym, raw in zip(df[symbol_col].to_list(), df[col].to_list(), strict=False):
+        d = parse_listing_date(raw)
+        if d is not None:
+            out[str(sym)] = d
+    return out
+
+
+def _listing_dates_from_meta(meta: dict[str, dict] | None) -> dict[str, date]:
+    """security 表元数据 → {symbol: 上市日}（list_date 或 listing_date）。"""
+    out: dict[str, date] = {}
+    for sym, m in (meta or {}).items():
+        for key in _LISTING_DATE_COLS:
+            d = parse_listing_date(m.get(key))
+            if d is not None:
+                out[str(sym)] = d
+                break
+    return out
+
+
+def _no_price_limit_flags(symbols: list[str], dates: list[date],
+                          listing_dates: dict[str, date]) -> list[bool | None]:
+    """逐 (symbol, trade_date) 判定免涨跌停；None = 无法判定（退回静态值）。
+
+    「第 N 个交易日」用**该标的自己的交易日序列**数：优先精确路径。
+    但回测窗口常常晚于上市日，此时 df 内的序号并不等于真实的上市后序号，
+    直接拿来用会把「上市第 100 个交易日」误当成第 1 个 → 精确路径只在
+    数据窗口覆盖上市日（该标的在本 df 内的首个交易日 <= 上市日）时启用，
+    否则退回日历天保守估算（可能多标，绝不漏标）。
+    """
+    if not listing_dates:
+        return [None] * len(symbols)
+
+    # 列可能是 Date / Datetime / str：统一成 date 再参与比较（parse 失败 → None）
+    day_list = [parse_listing_date(d) for d in dates]
+
+    seq: dict[str, list[date]] = {}
+    for sym, d in zip(symbols, day_list, strict=False):
+        if d is not None:
+            seq.setdefault(sym, []).append(d)
+    ranks: dict[str, dict[date, int]] = {}
+    for sym, ds in seq.items():
+        listing = listing_dates.get(sym)
+        if listing is None:
+            continue
+        uniq = sorted(set(ds))
+        if uniq and uniq[0] <= listing:
+            ranks[sym] = {d: i + 1 for i, d in enumerate(uniq) if d >= listing}
+
+    out: list[bool | None] = []
+    for sym, d in zip(symbols, day_list, strict=False):
+        listing = listing_dates.get(sym)
+        if listing is None or d is None:
+            out.append(None)                 # 无法判定 → 交给静态规则兜底
+            continue
+        verdict = no_limit_window(sym, listing, d, day_rank=ranks.get(sym, {}).get(d))
+        # resolved=False（上市日非法）同样退化为 None：不猜，保守按有涨跌停处理
+        out.append(verdict.no_limit if verdict.resolved else None)
+    return out
+
+
+def _annotate_no_price_limit(bars_by_day: dict[date, dict[str, Bar]],
+                             listing_dates: dict[str, date]) -> None:
+    """给已构建的 bar 逐日补 no_price_limit（只填 None，不覆盖已有判定）。
+
+    调用方直接传 {日期: {代码: Bar}} 时走这里（prepare 的 DataFrame 路径
+    在构建 Bar 时已算好）。已有非 None 值的来源是数据层的 no_price_limit 列，
+    优先级高于按上市日现算，故不覆盖。
+    """
+    if not listing_dates:
+        return
+    # 一趟扫描同时收集：待判定的 (symbol, date) 与该 symbol 的交易日序列
+    todo: dict[str, list[date]] = {}
+    seqs: dict[str, list[date]] = {}
+    for d in sorted(bars_by_day):
+        for sym, bar in bars_by_day[d].items():
+            if sym not in listing_dates:
+                continue
+            seqs.setdefault(sym, []).append(d)
+            if bar.no_price_limit is None:
+                todo.setdefault(sym, []).append(d)
+    if not todo:
+        return
+    for sym, ds in todo.items():
+        listing = listing_dates[sym]
+        # 该标的的交易日序列用「本 dict 里它出现过的日期」近似：窗口覆盖上市日
+        # 时精确，否则退回日历天保守估算（与 prepare 路径同一取舍）
+        seq = sorted(set(seqs[sym]))
+        ranks: dict[date, int] = {}
+        if seq and seq[0] <= listing:
+            ranks = {d: i + 1 for i, d in enumerate(seq) if d >= listing}
+        for d in ds:
+            verdict = no_limit_window(sym, listing, d, day_rank=ranks.get(d))
+            if verdict.resolved:
+                bars_by_day[d][sym].no_price_limit = verdict.no_limit
 
 
 @dataclass
@@ -54,6 +161,12 @@ class EngineConfig:
     # 注入基准收盘序列 [(date, close)]，规避 DB 依赖（测试/离线回放）。
     # 给了它就不再查 index_daily；空列表 = 显式声明「没有基准」。
     benchmark_series: list[tuple[date, float]] | None = None
+    # 事前风控校验器链（P1-3）。None = 只开「结构正确性」那几条（默认配置下
+    # 不可能触发）；显式给名单才会启用行业暴露/换手/回撤熔断这些**会改变结果**
+    # 的组合级约束 —— 「事前风控宜松不宜紧」，默认不许悄悄改收益。
+    risk_rules: tuple[str, ...] | None = None
+    # 规则参数：{"max_weight": 0.1} 或 {"sector_exposure": {"max_sector_weight": 0.3}}
+    risk_params: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -61,6 +174,9 @@ class BacktestResult:
     nav: list[tuple[date, float]] = field(default_factory=list)
     trades: list[Fill] = field(default_factory=list)
     rejected: list[tuple[str, str, str]] = field(default_factory=list)   # (date, symbol, reason)
+    # 事前风控拦截：(date, rule, symbol, reason)。与 rejected（撮合失败）分开 ——
+    # 「下单前就被风控拦掉」和「报出去了但没成交」是两回事，混在一起查不出原因。
+    risk_events: list[tuple[str, str, str, str]] = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
     positions: dict[date, dict[str, float]] = field(default_factory=dict)
 
@@ -152,17 +268,26 @@ class Engine:
         self._date_index: dict[date, int] = {}
         self._delisted: set[str] = set()
         self._delist_schedule: dict[str, date] = {}
+        # 事前风控闸门（P1-3）：名单非法在这里就炸，别等回测跑到一半才发现
+        self.gate = PreTradeGate(self.cfg.risk_rules, self.cfg.risk_params)
+        self._sector: dict[str, str] = {}
+        self._peak_nav = 0.0
 
     # ---------- 数据准备 ----------
 
     @staticmethod
     def prepare(df: pl.DataFrame, *, date_col: str = "trade_date",
                 symbol_col: str = "symbol",
-                extra_fields: list[str] | None = None) -> dict[date, dict[str, Bar]]:
+                extra_fields: list[str] | None = None,
+                listing_dates: dict[str, date] | None = None) -> dict[date, dict[str, Bar]]:
         """把长表转成 {日期: {代码: Bar}}。
 
         extra_fields 里的列会塞进 Bar.fields，供策略读取因子值 ——
         策略需要什么因子就传什么，引擎不关心语义。
+
+        listing_dates 是该标的的上市日（symbol → date，通常来自 security 表），
+        用于逐日判定「上市初期无涨跌幅窗口」。df 自带的 listing_date / list_date
+        列优先；两处都没有时该列留 null（= 无法判定），由 rules 退回静态值。
         """
         need = {date_col, symbol_col, "open", "high", "low", "close", "pre_close"}
         miss = need - set(df.columns)
@@ -181,6 +306,20 @@ class Engine:
             df = df.with_columns(pl.lit(None, dtype=pl.Boolean).alias("is_st"))
         else:
             df = df.with_columns(pl.col("is_st").cast(pl.Boolean, strict=False).alias("is_st"))
+        # 逐日免涨跌停标记：与 is_st 同形，null = 未知 → 退回 InstrumentRules 静态值。
+        # 数据层若已算好 no_price_limit 列则直接消费（优先级最高）；否则用上市日现算
+        # （df 的 listing_date/list_date 列优先于调用方传入的 listing_dates）。
+        if "no_price_limit" in df.columns:
+            df = df.with_columns(
+                pl.col("no_price_limit").cast(pl.Boolean, strict=False).alias("no_price_limit"))
+        else:
+            merged = dict(listing_dates or {})
+            merged.update(_listing_dates_from(df, symbol_col))
+            df = df.with_columns(pl.Series(
+                "no_price_limit",
+                _no_price_limit_flags(df[symbol_col].to_list(),
+                                      df[date_col].to_list(), merged),
+                dtype=pl.Boolean))
         vol = pl.col("volume")
         df = df.with_columns(
             pl.when(pl.col("pre_close").fill_null(0.0) == 0.0).then(pl.col("close"))
@@ -201,7 +340,7 @@ class Engine:
         out: dict[date, dict[str, Bar]] = {}
         cols = ["open", "high", "low", "close", "pre_close",
                 "volume", "amount", "adj_factor", "halted", "suspended", "no_volume",
-                "is_st"]
+                "is_st", "no_price_limit"]
         for sub in df.sort([date_col, symbol_col]).partition_by(date_col, as_dict=False):
             d = sub[date_col][0]
             syms = sub[symbol_col].to_list()
@@ -220,6 +359,8 @@ class Engine:
                     suspended=bool(cvals["suspended"][k]),
                     no_volume=bool(cvals["no_volume"][k]),
                     is_st=None if cvals["is_st"][k] is None else bool(cvals["is_st"][k]),
+                    no_price_limit=(None if cvals["no_price_limit"][k] is None
+                                    else bool(cvals["no_price_limit"][k])),
                     fields={c: fvals[c][k] for c in fields},
                 )
             out[d] = bars
@@ -228,14 +369,21 @@ class Engine:
     # ---------- 主循环 ----------
 
     def run(self, data: pl.DataFrame | dict[date, dict[str, Bar]], **kw) -> BacktestResult:
-        bars_by_day = data if isinstance(data, dict) else self.prepare(data, **kw)
+        # 元数据先于 prepare 解析：上市日要注入逐日免涨跌停判定（prepare 参数）
+        self._meta_resolved = merge_meta(
+            load_security_meta() if self._with_db_meta else {}, self._meta)
+        listing_dates = _listing_dates_from_meta(self._meta_resolved)
+        if isinstance(data, dict):
+            bars_by_day = data
+            _annotate_no_price_limit(bars_by_day, listing_dates)
+        else:
+            kw.setdefault("listing_dates", listing_dates)
+            bars_by_day = self.prepare(data, **kw)
         dates = sorted(bars_by_day)
         if not dates:
             return BacktestResult()
 
         symbols = sorted({s for b in bars_by_day.values() for s in b})
-        self._meta_resolved = merge_meta(
-            load_security_meta() if self._with_db_meta else {}, self._meta)
         self._rules = build_rules(symbols, self.ruleset, self._meta_resolved,
                                   with_db_meta=False)
         self.broker = Broker(self._rules, self.slippage, price_mode=self.cfg.price_mode,
@@ -256,6 +404,12 @@ class Engine:
         self._seq = 0
         self._last_rebal_key = None
         self._pending = []
+        self._peak_nav = 0.0
+        # 行业映射只在真的要用行业暴露约束时才去查库（否则白付一次 IO）
+        if "sector_exposure" in self.gate.names:
+            from lquant.backtest.security_meta import load_sector_map
+
+            self._sector = load_sector_map()
 
         res = BacktestResult()
 
@@ -267,8 +421,11 @@ class Engine:
             for s, b in bars.items():
                 if b.adj_factor > 0:
                     self._last_factor[s] = b.adj_factor
-                # 停牌估值口径：记录每只股票最近一次有 bar 的 close
-                self._last_close[s] = b.close
+                # 停牌估值口径：记录每只股票最近一次有 bar 的 close。
+                # close<=0 属脏数据（源数据错误/复权异常），记进去会把持仓
+                # 估成 0 并可能以 0 价撮合 —— 只认正价，坏价视同无 bar。
+                if b.close > 0:
+                    self._last_close[s] = b.close
 
             # 0b) 退市核销：退市日当天把持仓按残值率变现，不再按最后收盘价冻结
             self._apply_delistings(d, res)
@@ -290,6 +447,7 @@ class Engine:
                     f"{d} NAV={nav:.2f} ≤ 0，账户账目异常，请检查费率/资金约束"
                 )
             res.nav.append((d, nav))
+            self._peak_nav = max(self._peak_nav, nav)
             res.positions[d] = {s: p.qty for s, p in self.account.positions.items() if p.qty}
 
         self._finalize(res)
@@ -478,6 +636,7 @@ class Engine:
         # 后买：现金 + 卖出释放的预期资金（A 股卖出资金当日可用，
         # 与聚宽「先卖后买」撮合语义一致）。买与卖都在 T+1 开盘成交，
         # 两边按同一开盘价缩放，预估缺口只在「现金残余 × 跳空幅度」量级。
+        planned_buys = 0.0        # 已排出的买单名义金额（顺序预留，防末位买单超资）
         if targets:
             for sym, w in targets:
                 pos = self.account.positions.get(sym)
@@ -490,11 +649,22 @@ class Engine:
                 delta_value = want_value - have_value
                 if delta_value <= self.cfg.min_order_value:
                     continue
-                cash = (self.account.cash + planned_proceeds) * (1 - self.cfg.cash_buffer)
+                # 每个买单只能用「资金池 - 已排出的买单」：此前各单独立对着
+                # 全额池计算，Σ目标权重≈1 时实际成交额（含滑点+费用）必然
+                # 超出 cash_buffer 余量，最后一个买单在 T+1 整单被拒
+                # （insufficient_cash=reject），边际标的一个调仓周期欠配。
+                cash = max((self.account.cash + planned_proceeds)
+                           * (1 - self.cfg.cash_buffer) - planned_buys, 0.0)
                 qty = min(delta_value, cash) / px
                 qty = self._round_lot(sym, qty, floor=True)
                 if qty > 0:
                     orders.append(self._order(sym, Side.BUY, qty))
+                    planned_buys += qty * px
+
+        # 下单前过一遍事前风控闸门（P1-3）。放在**订单已经成形之后**：
+        # 校验器看到的是最终要发的单子，所以它只能剔除、不能改单，
+        # 责任边界干净（RQAlpha validators 的同一取舍）。
+        orders = self._apply_risk_gate(orders, targets, prices, nav, d, res)
 
         if self.cfg.price_mode in ("next_open", "next_vwap", "next_close"):
             # T 日收盘生成信号，推迟到 T+1 按对应成交价撮合 —— 防未来函数
@@ -532,6 +702,31 @@ class Engine:
                 else:
                     self.account.apply_fill(f)
                     res.trades.append(f)
+
+    def _apply_risk_gate(self, orders: list[Order], targets: list[tuple[str, float]],
+                         prices: dict[str, float], nav: float, d: date,
+                         res: BacktestResult) -> list[Order]:
+        """跑事前风控链；被拦下的单子剔除并留痕（date/rule/symbol/reason）。"""
+        if not orders:
+            return orders
+        ctx = RiskContext(
+            trade_date=d, nav=nav,
+            # 买入可用资金：现金 + 本轮卖出释放（A 股卖出资金当日可用），
+            # 与上面排买单时的口径保持一致
+            cash=max(self.account.cash + sum(
+                o.qty * prices.get(o.symbol, 0.0) for o in orders
+                if o.side == Side.SELL), 0.0) * (1 - self.cfg.cash_buffer),
+            prices=prices, orders=orders,
+            targets=dict(targets),
+            held_qty={s: p.qty for s, p in self.account.positions.items()},
+            sector=self._sector,
+            peak_nav=self._peak_nav,
+            params=self.cfg.risk_params,
+        )
+        result = self.gate.apply(ctx)
+        for v in result.violations:
+            res.risk_events.append((str(d), v.rule, v.symbol, v.reason))
+        return result.orders
 
     def _sell_qty(self, sym: str, want: float, d: date) -> tuple[float, bool]:
         """T+N 约束下能卖的最大数量，以及是否属于「清仓」（允许卖零股）。
@@ -597,6 +792,8 @@ class Engine:
             "final_nav": res.nav[-1][1] if res.nav else self.cfg.initial_cash,
             "n_trades": len(res.trades),
             "n_rejected": len(res.rejected),
+            "n_risk_blocked": len(res.risk_events),
+            "risk_rules": list(self.gate.names),
             "total_fee": sum(f.fee for f in res.trades),
             "turnover": to,
         }

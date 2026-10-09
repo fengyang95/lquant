@@ -472,7 +472,8 @@ def _provenance_html(*, display_name: str, expr: str, universe: str,
                      steps, covariates, sample_filters, window: int,
                      n_groups: int, generator_version: str,
                      decay_horizons: list[int] | None = None,
-                     description: str = "") -> str:
+                     description: str = "",
+                     drop_accounting: dict | None = None) -> str:
     """样本与口径：报告的身份与前提条件。"""
     uni = universe_label(universe) if universe else "全市场"
     if data_start is not None and data_end is not None:
@@ -528,7 +529,40 @@ def _provenance_html(*, display_name: str, expr: str, universe: str,
         html_parts.append(_rows_table(filter_rows))
     else:
         html_parts.append(_hint("样本过滤：未做 ST / 停牌剔除。"))
+    if drop_accounting:
+        html_parts.append(_drop_accounting_html(drop_accounting))
     return "\n".join(html_parts)
+
+
+def _drop_accounting_html(acc: dict) -> str:
+    """丢样三分账：把「丢了多少」拆成「为什么丢」。
+
+    合成一个「丢了 30%」的数字没用 —— 因子为空、前瞻收益缺失（回测期末尾
+    必然出现）、分组键缺失是三件事，处置方式完全不同。覆盖率一掉，多空收益
+    往往反而好看，所以这张表必须和结论放在同一份交付物里。
+    """
+    total = int(acc.get("total") or 0)
+    rows = [
+        {"阶段": "参与分组的样本", "行数": _fmt_int(acc.get("used")),
+         "占比": _fmt(acc.get("used", 0) / total if total else 0.0, pct=True)},
+        {"阶段": "因子为空（null）", "行数": _fmt_int(acc.get("factor_null")),
+         "占比": _fmt(acc.get("factor_null", 0) / total if total else 0.0, pct=True)},
+        {"阶段": "因子非有限（NaN/Inf）", "行数": _fmt_int(acc.get("factor_nonfinite")),
+         "占比": _fmt(acc.get("factor_nonfinite", 0) / total if total else 0.0, pct=True)},
+        {"阶段": "前瞻收益缺失", "行数": _fmt_int(acc.get("ret_missing")),
+         "占比": _fmt(acc.get("ret_missing", 0) / total if total else 0.0, pct=True)},
+        {"阶段": "分组键缺失", "行数": _fmt_int(acc.get("group_missing")),
+         "占比": _fmt(acc.get("group_missing", 0) / total if total else 0.0, pct=True)},
+    ]
+    return "\n".join([
+        "<h3>丢样三分账</h3>",
+        _hint(f"总行数 {_fmt_int(total)}，实际参与分层 "
+              f"{_fmt_int(acc.get('used'))}（丢样 "
+              f"{_fmt(acc.get('loss_ratio', 0.0), pct=True)}）。"
+              "前瞻收益缺失主要来自回测期末尾（未来 N 日还没有数据），"
+              "属于预期损耗；因子为空/非有限则是因子构造问题，要看序列。"),
+        _rows_table(rows),
+    ])
 
 
 def _errors_html(errors: dict) -> str:
@@ -567,6 +601,8 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
                   sample_filters: list[dict] | None = None,
                   window: int = DEFAULT_WINDOW,
                   description: str = "",
+                  zero_aware: bool = False,
+                  by_group: str | None = None,
                   # ---- 结论 ----
                   rating: dict | None = None,
                   robustness: dict | None = None,
@@ -659,7 +695,8 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
             if data_start is None:
                 data_start = str(df[date_col].min())
     ic = ic_summary(df, factor, ret_col, date_col=date_col)
-    qs = quantile_summary(df, factor, ret_col, n_groups, date_col=date_col)
+    qs = quantile_summary(df, factor, ret_col, n_groups, date_col=date_col,
+                          zero_aware=zero_aware, by_group=by_group)
     prof = decay_profile(df, factor, ladder, price_col=price_col,
                          date_col=date_col, symbol_col=symbol_col)
     hl = half_life(prof)
@@ -864,7 +901,10 @@ def factor_report(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
             ret_col=ret_col, steps=steps, covariates=cov,
             sample_filters=filters, window=window, n_groups=n_groups,
             generator_version=generator_version, decay_horizons=ladder,
-            description=description),
+            description=description,
+            # 丢样账与结论同源（qs 是同一个 quantile_summary 的输出），
+            # 不另算一遍 —— 两处各算一次迟早对不上
+            drop_accounting=qs.get("dropped")),
         _errors_html(errors),
         outlier_html,
         _core_html(icv, ric, hl, qs, ls),

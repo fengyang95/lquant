@@ -104,12 +104,18 @@ def prepare_segment(df, cov_cols, expr, dates, *, horizons=(1, 5), with_pre: boo
 
 
 def _split_eval(df, cov_cols, expr):
-    """train/val 切分 + 重算 train/val IC（含中性化）。"""
+    """train/val 切分 + 重算 train/val IC（含中性化）。
+
+    切分带 purge/embargo：重验用的标签是 ``fwd_ret_1``（前瞻 1 日），训练段
+    尾部那根样本的标签正好落在 val 首日 —— 不剪掉就是「训练集看过测试期」。
+    purge 由标签口径推出（h=1），embargo 再留 1 根隔离边界自相关。
+    """
     from lquant.factors.evaluate.ic import ic_series
-    from lquant.factors.mining.runner import split_dates
+    from lquant.factors.mining.runner import horizon_from_ret_col, split_dates
 
     dates = df["trade_date"].unique().to_list()
-    train_d, val_d, _ = split_dates(dates)
+    purge = horizon_from_ret_col("fwd_ret_1")
+    train_d, val_d, _ = split_dates(dates, purge_bars=purge, embargo_bars=1)
     return {
         label: ic_series(prepare_segment(df, cov_cols, expr, dd), "f", "fwd_ret_1")
         for label, dd in (("train", train_d), ("val", val_d))

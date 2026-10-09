@@ -30,3 +30,26 @@ preprocess_default:
   - { op: winsorize, method: mad, n: 5 }
   - { op: standardize, method: zscore }
   - { op: neutralize, method: ols, by: [market_cap, industry_sw1] }
+
+# 可选配方：CNE5 六风格中性化（显式，不改变默认口径）
+#
+# 只对 Size + 行业中性化是「假中性化」—— 残差里还留着 Beta 与波动率暴露，
+# 因子看着有效，赚的其实是风格轮动。这个配方把风格维度补全：
+#   market_cap      规模（log 市值）
+#   non_linear_size 非线性规模（规模截面 z 的立方，CNE5 三次样条的近似）
+#   beta_1y         滚动 Beta（252 日，等权市场代理）
+#   resid_vol       残差波动率（同一窗口）
+#   momentum_1m     动量（20 日）
+#   turnover_1m     流动性（20 日平均换手）
+#   industry_sw1    PIT 行业
+#
+# 为什么不做成默认：beta_1y / resid_vol 需要 252 个交易日才出值，
+# 换全历史的第一步会带走大量样本（覆盖率在报告里显式上报，不静默丢）。
+# 用法：POST /api/factors/evaluate 的 steps 传下面这段，或 CLI 的 --steps。
+preprocess_cne5_style:
+  - { op: winsorize, method: mad, n: 5 }
+  - { op: standardize, method: zscore }
+  - op: neutralize
+    method: ols
+    by: [market_cap, non_linear_size, beta_1y, resid_vol, momentum_1m,
+         turnover_1m, industry_sw1]

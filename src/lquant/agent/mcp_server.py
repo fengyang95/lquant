@@ -3,7 +3,8 @@
 协议：JSON-RPC 2.0，换行分隔（每行一个请求/响应），stdout 只输出响应，
 日志一律走 stderr。仅实现 initialize / tools/list / tools/call。
 
-工具**全部只读**，且都直接调函数、不走 HTTP（不要求 API 服务在跑）：
+工具**只读**（唯一例外是 `submit_verdict`：它只往 ask.db 落一条结论，
+不碰数据湖、不发外部请求），且都直接调函数、不走 HTTP（不要求 API 服务在跑）：
 
 行情 / 日线 / 因子
 - get_quotes(symbols)                        实时快照（lquant.market.ticks.fetch_quotes）
@@ -21,6 +22,7 @@
 - get_heat(top=15)                           热榜（涨/跌/放量/龙虎榜）
 - get_index_quotes(days=20)                  主要指数行情 + 近 N 日收盘
 - get_etf_list(limit=200)                    ETF 元数据（跟踪指数/规模/申赎 T+N）
+- submit_verdict(...)                        提交结构化结论（数字必须带 source/as_of）
 
 ⚠️ 这些函数内部用 ``reader()`` 打开 DuckDB，而 reader 是**读写模式**连接：
    主服务正在写库时可能撞锁（bounded retry 之后仍失败会退化成空数据）。
@@ -33,6 +35,7 @@ import logging
 import os
 import sys
 from collections.abc import Callable
+from datetime import date
 from typing import Any
 
 logger = logging.getLogger("lquant.mcp")
@@ -148,15 +151,47 @@ def _tool_sectors(kind: str = "industry") -> list[dict]:
     return _market().sectors(kind=kind)
 
 
-def _tool_money_flow(top: int = 20, symbol: str = "") -> list[dict]:
+def _tool_industry_rotation(window: int = 20, std: str = "",
+                            asof: str = "") -> dict:
+    """行业轮动榜（横截面）：区间收益 / 成员数 / 成交额 / 估值中位数 + 排名。"""
+    from lquant.industry import industry_rotation
+
+    return industry_rotation(_blank_to_none(asof), _blank_to_none(std), window)
+
+
+def _tool_industry_analysis(industry: str, std: str = "",
+                            asof: str = "") -> dict:
+    """单个行业的多角度分析报告（趋势与 RRG / 景气度 / 估值 / 资金拥挤 / 宽度）。"""
+    from lquant.industry import analyze_industry
+
+    return analyze_industry(industry, _blank_to_none(asof), _blank_to_none(std))
+
+
+def _blank_to_none(v: str | None) -> str | None:
+    """MCP 的字符串参数默认是空串；空串不能当成「指定了该参数」。"""
+    s = (v or "").strip()
+    return s or None
+
+
+def _tool_money_flow(top: int = 20, symbol: str = "", as_of: str = "") -> Any:
+    if as_of:
+        # 传了 as_of 就**只**按历史时点取；symbol 一起给时在快照内再过滤，
+        # 而不是悄悄退回「最近 30 日历史」或忽略 symbol。
+        return _dated_snapshot("money_flow", as_of, limit=top,
+                               sort="main_net_inflow", symbol=symbol.strip())
     return _market().money_flow(top=top, symbol=symbol.strip() or None)
 
 
-def _tool_limit_up(limit: int = 50) -> list[dict]:
+def _tool_limit_up(limit: int = 50, as_of: str = "") -> Any:
+    if as_of:
+        return _dated_snapshot("limit_up_pool", as_of, limit=limit,
+                               sort="first_limit_time", descending=False)
     return _market().limit_up(limit=limit)
 
 
-def _tool_dragon_tiger(limit: int = 50) -> list[dict]:
+def _tool_dragon_tiger(limit: int = 50, as_of: str = "") -> Any:
+    if as_of:
+        return _dated_snapshot("dragon_tiger", as_of, limit=limit)
     return _market().dragon_tiger(limit=limit)
 
 
@@ -166,6 +201,76 @@ def _tool_heat(top: int = 15) -> dict:
 
 def _tool_index_quotes(days: int = 20) -> list[dict]:
     return _market().index_quotes(days=days)
+
+
+def _dated_snapshot(table: str, as_of: str, *, limit: int = 50,
+                    sort: str | None = None, descending: bool = True,
+                    symbol: str = "") -> Any:
+    """按 `as_of` 取某个交易日快照；取不到就**明确**返回 unavailable。
+
+    这是 P0-7「禁止静默用当前数据顶替」的落地点：模型问的是历史时点，而表里
+    只有最近几天 —— 旧行为是直接把最新一天的数据给它，它再当成历史时点讲出来，
+    没人能发现。传了 `as_of` 时：
+
+    - 有数据 → `{"as_of": 实际数据时点, "unavailable": false, "rows": [...]}`；
+    - 没有 → `{"as_of": "", "unavailable": true, "requested_as_of": ..., "reason": ...}`
+      ，**不带 rows 键**，模型没法把它当数据用。
+
+    不传 `as_of` 时保持原样（返回行列表），既有调用方与 skill 不受影响。
+    """
+    import polars as pl
+
+    from lquant.server.api import market
+
+    df = market._read(table, 2000)
+    if not len(df):
+        return {"as_of": "", "unavailable": True, "requested_as_of": as_of,
+                "reason": f"{table} 表当前没有数据"}
+    if as_of:
+        try:
+            want = date.fromisoformat(as_of)
+        except ValueError as e:
+            raise ValueError(f"as_of 必须是 YYYY-MM-DD：{as_of}") from e
+        sub = df.filter(pl.col("trade_date") <= want)
+        if not len(sub):
+            return {"as_of": "", "unavailable": True, "requested_as_of": as_of,
+                    "reason": f"{as_of} 及之前没有数据；不会用最新数据顶替"}
+        df = sub
+    if symbol:
+        from lquant.core.types import parse_symbol
+
+        try:
+            want_symbol = str(parse_symbol(symbol))
+        except ValueError:
+            want_symbol = symbol
+        if "symbol" in df.columns:
+            df = df.filter(pl.col("symbol") == want_symbol)
+            if not len(df):
+                return {"as_of": "", "unavailable": True, "requested_as_of": as_of,
+                        "reason": f"{want_symbol} 在 {table} 里没有数据；不会用别的标的顶替"}
+    day = df["trade_date"].max()
+    rows = df.filter(pl.col("trade_date") == day)
+    if sort and sort in rows.columns:
+        rows = rows.sort(sort, descending=descending)
+    return {"as_of": str(day), "unavailable": False,
+            "rows": rows.head(limit).to_dicts()}
+
+
+def _tool_submit_verdict(**kwargs: Any) -> dict:
+    """落一条结构化结论（数字必须带 source/as_of，否则拒收）。"""
+    from lquant.agent.sessions import verdict_db_path, write_verdict_sync
+    from lquant.agent.verdict import parse_verdict, verdict_payload
+
+    verdict = parse_verdict(kwargs)      # 不合契约 → ValueError → 工具报错给模型
+    sid = (os.environ.get("LQ_AGENT_SESSION_ID") or "").strip()
+    if not sid:
+        raise RuntimeError("当前 MCP 进程没有绑定会话（LQ_AGENT_SESSION_ID 缺失）")
+    db = verdict_db_path()
+    if not db:
+        raise RuntimeError("当前 MCP 进程没有绑定会话库（LQ_ASK_DB 缺失）")
+    vid = write_verdict_sync(db, sid, verdict_payload(verdict))
+    return {"ok": True, "verdict_id": vid, "abstain": verdict.abstain,
+            "ticker": verdict.ticker, "direction": verdict.direction}
 
 
 def _tool_etf_list(limit: int = 200) -> list[dict]:
@@ -182,12 +287,15 @@ TOOL_HANDLERS: dict[str, Callable[..., Any]] = {
     "get_market_overview": _tool_market_overview,
     "get_market_breadth": _tool_market_breadth,
     "get_sectors": _tool_sectors,
+    "get_industry_rotation": _tool_industry_rotation,
+    "get_industry_analysis": _tool_industry_analysis,
     "get_money_flow": _tool_money_flow,
     "get_limit_up": _tool_limit_up,
     "get_dragon_tiger": _tool_dragon_tiger,
     "get_heat": _tool_heat,
     "get_index_quotes": _tool_index_quotes,
     "get_etf_list": _tool_etf_list,
+    "submit_verdict": _tool_submit_verdict,
 }
 
 
@@ -234,7 +342,7 @@ TOOLS_SPEC: list[dict] = [
     },
     {
         "name": "get_market_overview",
-        "description": "大盘概览：情绪分 + 涨跌停家数 + 破板率 + 北向资金（看板首屏）",
+        "description": "大盘概览：情绪分 + 涨跌停家数 + 破板率 + 北向成交额（看板首屏）",
         "inputSchema": _input_schema({}, []),
     },
     {
@@ -256,13 +364,45 @@ TOOLS_SPEC: list[dict] = [
         ),
     },
     {
+        "name": "get_industry_rotation",
+        "description": ("行业轮动榜：各行业的区间收益、成员数、成交额、估值中位数与排名。"
+                        "回答「哪个行业在领跑 / 资金流向哪里 / 估值贵不贵」用这个。"),
+        "inputSchema": _input_schema(
+            {"window": {"type": "integer", "default": 20, "minimum": 5,
+                        "maximum": 250, "description": "排名用的区间窗口（交易日）"},
+             "std": {"type": "string", "default": "",
+                     "description": "行业分类标准（SW/CICS/em），留空自动挑"},
+             "asof": {"type": "string", "default": "",
+                      "description": "观察日 YYYY-MM-DD，留空取湖内最新交易日"}},
+            [],
+        ),
+    },
+    {
+        "name": "get_industry_analysis",
+        "description": ("单个行业的多角度分析报告（趋势与 RRG 相对旋转图 / 景气度 / 估值分位 / "
+                        "资金与拥挤度 / 宽度与情绪）。industry 可为代码 801780.SI 或中文名 银行。"),
+        "inputSchema": _input_schema(
+            {"industry": {"type": "string",
+                          "description": "行业代码（801780.SI）或中文名（银行）"},
+             "std": {"type": "string", "default": "",
+                     "description": "行业分类标准，留空自动挑"},
+             "asof": {"type": "string", "default": "",
+                      "description": "观察日 YYYY-MM-DD，留空取湖内最新交易日"}},
+            ["industry"],
+        ),
+    },
+    {
         "name": "get_money_flow",
         "description": "资金流：不传 symbol 返回最新交易日全市场主力净流入 Top；传 symbol 返回该票近 30 日历史",
         "inputSchema": _input_schema(
             {"top": {"type": "integer", "default": 20, "minimum": 1, "maximum": 200,
                      "description": "全市场榜单条数（传 symbol 时忽略）"},
              "symbol": {"type": "string", "default": "",
-                        "description": "证券代码，如 600519；留空查全市场 Top"}},
+                        "description": "证券代码，如 600519；留空查全市场 Top"},
+             "as_of": {"type": "string", "default": "",
+                       "description": "（可选）YYYY-MM-DD。只取该日及之前的最近"
+                                      "一个交易日；查不到会返回 unavailable，"
+                                      "不会用最新数据顶替"}},
             [],
         ),
     },
@@ -270,7 +410,10 @@ TOOLS_SPEC: list[dict] = [
         "name": "get_limit_up",
         "description": "涨停池：最新交易日涨停个股（含首次封板时间/连板数/所属行业）",
         "inputSchema": _input_schema(
-            {"limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500}},
+            {"limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500},
+             "as_of": {"type": "string", "default": "",
+                       "description": "（可选）YYYY-MM-DD；历史时点，查不到返回 "
+                                      "unavailable 而不是最新数据"}},
             [],
         ),
     },
@@ -278,7 +421,10 @@ TOOLS_SPEC: list[dict] = [
         "name": "get_dragon_tiger",
         "description": "龙虎榜：最新交易日上榜个股与上榜原因",
         "inputSchema": _input_schema(
-            {"limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500}},
+            {"limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500},
+             "as_of": {"type": "string", "default": "",
+                       "description": "（可选）YYYY-MM-DD；历史时点，查不到返回 "
+                                      "unavailable 而不是最新数据"}},
             [],
         ),
     },
@@ -295,6 +441,47 @@ TOOLS_SPEC: list[dict] = [
         "description": "主要指数最新行情（收盘/涨跌）与近 N 日收盘序列，用于回答大盘走势",
         "inputSchema": _input_schema(
             {"days": {"type": "integer", "default": 20, "minimum": 1, "maximum": 250}},
+            [],
+        ),
+    },
+    {
+        "name": "submit_verdict",
+        "description": (
+            "提交本次分析的结构化结论。**任何带数字的论断都必须放在 claims 里并"
+            "带 source 与 as_of**，否则会被拒收。证据不足就 abstain=true，并在 "
+            "withheld 里写清为什么放弃（数据缺/口径不明/样本不足），不要给一个"
+            "没有依据的方向。同一会话可多次提交，最后一次为准。"),
+        "inputSchema": _input_schema(
+            {
+                "ticker": {"type": "string", "description": "标的代码；abstain 时可为空"},
+                "as_of": {"type": "string", "description": "结论依据的数据时点"},
+                "direction": {"type": "string", "enum": ["看多", "看空", "中性", "abstain"]},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "summary": {"type": "string", "description": "一句话结论"},
+                "claims": {"type": "array", "items": {
+                    "type": "object",
+                    "properties": {
+                        "metric": {"type": "string"},
+                        "value": {"type": "number"},
+                        "unit": {"type": "string"},
+                        "source": {"type": "string",
+                                   "description": "数据来源，如 northbound_flow / get_daily"},
+                        "as_of": {"type": "string", "description": "该数字的数据时点"},
+                    },
+                    "required": ["metric", "value", "source", "as_of"]}},
+                "evidence": {"type": "array", "items": {
+                    "type": "object",
+                    "properties": {
+                        "source": {"type": "string"},
+                        "as_of": {"type": "string"},
+                        "quote": {"type": "string"},
+                    },
+                    "required": ["source", "as_of"]}},
+                "abstain": {"type": "boolean",
+                            "description": "true = 本次不下结论（必须给 withheld）"},
+                "withheld": {"type": "array", "items": {"type": "string"},
+                             "description": "放弃下结论的原因"},
+            },
             [],
         ),
     },

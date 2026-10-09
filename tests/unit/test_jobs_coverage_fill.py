@@ -413,9 +413,13 @@ def test_enqueue_rq_branch(local_env, monkeypatch) -> None:
 
     monkeypatch.setattr(rq, "Queue", FakeQueue)
     monkeypatch.setattr(rq.exceptions, "InvalidJobOperation", _InvalidJobOperation)
+    # 覆盖重入队的前提是残留 job 已是终态：get_status 返回 finished
+    # （修复 43：queued/started/deferred/scheduled 会被拒绝而非覆盖）
     monkeypatch.setattr(rq.job, "Job", type("Job", (object,), {
         "fetch": staticmethod(
-            lambda jid, connection: types.SimpleNamespace(delete=lambda: None))}))
+            lambda jid, connection: types.SimpleNamespace(
+                delete=lambda: None,
+                get_status=lambda refresh=False: "finished"))}))
 
     def task(x, cancel_check=None, progress=None):
         return x

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# 推送前检查：密钥扫描（快，先跑）+ 跑测试（比 pre-commit 严格）+ 改动行覆盖率门禁 ≥95%
+# 推送前检查：密钥扫描（快，先跑）+ 改动相关测试（全量逃生门见下）
 #
-# 注意：全量测试里有依赖数据的用例（API / sync），所以先做环境自愈 ——
+# 注意：测试里有依赖数据的用例（API / sync），所以先做环境自愈 ——
 # 缺库建库、缺数据生成演示数据兜底，避免把"没跑过 bootstrap"误判成代码问题。
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-echo "==> pre-push: 密钥扫描 + 测试 + diff 覆盖率门禁"
+echo "==> pre-push: 密钥扫描 + 改动相关测试（覆盖率门禁在 CI）"
 
 # 扫描脚本解析：优先当前工作树的；旧分支的 worktree 里没有这个文件，
 # 退回钩子所在的主仓 —— 否则那 60+ 个 worktree 的 push 会以「疑似密钥」
@@ -87,16 +87,26 @@ if [ -d tests ]; then
     echo "    无任何 parquet 数据，生成演示数据兜底（换真数据: ./lquant.sh bootstrap）"
     "$PY" -c "from lquant.cli.main import cli; cli(['data','demo'], standalone_mode=False)" >/dev/null
   fi
-  "$PY" -m pytest -x -q tests/ --cov=src/lquant --cov-report=xml:coverage.xml || {
-    echo "✗ 测试失败，修复后再 push（临时放行: LQ_SKIP_PUSH_CHECK=1 git push 或 git push --no-verify）"; exit 1; }
-
-  # 增量覆盖率门禁：只看本次改动（vs origin/main）的行覆盖，≥95% 才放行
-  if git diff --name-only origin/main...HEAD -- '*.py' | grep -q .; then
-    echo "==> pre-push: diff-cover（改动行覆盖率 ≥95%）"
-    "$PY" -m diff_cover.diff_cover_tool coverage.xml \
-      --compare-branch=origin/main --fail-under=95 || {
-      echo "✗ 改动行覆盖率不足 95%（详情见上方报告，补测试或 LQ_SKIP_PUSH_CHECK=1 放行）"; exit 1; }
+  # 测试策略（2026-10 起改为增量）：
+  #   默认只跑「改动相关」的测试文件（scripts/test_changed.sh，文件名启发式
+  #   映射 + 全局面改动自动回退全量）——300+ 文件全量 × --cov 插桩曾是 push
+  #   的最大等待源，而它的两个产物各有归宿：
+  #     · 失败拦截  → 改动相关测试 + CI 全量双保险，足够拦住；
+  #     · 覆盖率门禁（diff-cover ≥95%）→ 移到 CI 用全量 coverage.xml 执行
+  #       （本地增量测试的覆盖数据算不出可信的改动行覆盖，留在 pre-push 是
+  #       名不副实的门禁）。本地想自查：make coverage && make diff-cov。
+  #   全量逃生门：LQ_PUSH_FULL_TEST=1 git push（test_changed.sh 内识别）。
+  #   跳过测试：LQ_SKIP_PUSH_CHECK=1 git push 或 git push --no-verify。
+  if [ "${LQ_PUSH_FULL_TEST:-0}" = "1" ]; then
+    echo "==> pre-push: 全量测试（LQ_PUSH_FULL_TEST=1）"
+    "$PY" -m pytest -x -q tests/ || {
+      echo "✗ 测试失败，修复后再 push（临时放行: LQ_SKIP_PUSH_CHECK=1 git push 或 git push --no-verify）"; exit 1; }
+  else
+    echo "==> pre-push: 改动相关测试（全量逃生门: LQ_PUSH_FULL_TEST=1 git push）"
+    bash scripts/test_changed.sh || {
+      echo "✗ 测试失败，修复后再 push（临时放行: LQ_SKIP_PUSH_CHECK=1 git push 或 git push --no-verify）"; exit 1; }
   fi
+  echo "    覆盖率门禁（改动行 ≥95%）由 CI 全量执行；本地自查: make coverage && make diff-cov"
 else
   echo "    无 tests/，跳过"
 fi

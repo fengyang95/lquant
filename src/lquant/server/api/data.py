@@ -80,7 +80,8 @@ _COVER_TABLES: list[tuple[str, str]] = [
     ("sector_daily", "板块日度"),
     ("sentiment_daily", "市场情绪"),
     ("dragon_tiger", "龙虎榜"),
-    ("northbound_flow", "北向资金"),
+    ("northbound_flow", "北向成交额"),
+    ("northbound_top10", "北向前十大活跃"),
     ("backtest_run", "回测记录"),
     ("ml_run", "ML 实验记录"),
 ]

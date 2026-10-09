@@ -13,66 +13,20 @@
 """
 from __future__ import annotations
 
-from lquant.security.contract import ANGLES, NEUTRAL, grade, stance_of
+from lquant.core.report import composite_scores
+from lquant.security.contract import ANGLES, grade
 
 
 def composite(angles: list[dict]) -> dict:
-    """角度结果列表 → 综合评分 + 结论骨架。"""
-    scored = [a for a in angles
-              if a.get("score") is not None and (a.get("weight") or 0) > 0]
+    """角度结果列表 → 综合评分 + 结论骨架。
 
-    total_weight = sum(a.weight for a in ANGLES if a.weight > 0)
-    scored_weight = sum(a["weight"] for a in scored)
-
-    if not scored or scored_weight <= 0:
-        return {
-            "score": None,
-            "grade": "无法评分",
-            "stance": None,
-            "n_scored": 0,
-            "n_angles": len(ANGLES),
-            "angle_coverage": 0.0,
-            "data_coverage": 0.0,
-            "weights": {},
-            "contributions": [],
-        }
-
-    contributions = []
-    total = 0.0
-    for a in scored:
-        eff = a["weight"] / scored_weight          # 归一化后的实际权重
-        contrib = eff * (a["score"] - NEUTRAL)     # 相对中性的贡献
-        total += contrib
-        contributions.append({
-            "id": a["id"],
-            "label": a["label"],
-            "score": a["score"],
-            "stance": a["stance"],
-            "weight": a["weight"],
-            "effective_weight": round(eff, 4),
-            "contribution": round(contrib, 2),
-        })
-
-    final = round(NEUTRAL + total, 2)
-    final = max(0.0, min(100.0, final))
-    # 内部数据覆盖度：按归一化权重加权（只统计参与评分的角度）
-    data_cov = sum(
-        (a["weight"] / scored_weight) * float(a.get("coverage") or 0.0) for a in scored
-    )
-    contributions.sort(key=lambda c: abs(c["contribution"]), reverse=True)
-    return {
-        "score": final,
-        "grade": grade(final),
-        "stance": stance_of(final, band=2.0),
-        "n_scored": len(scored),
-        "n_angles": len(ANGLES),
-        "angle_coverage": round(scored_weight / total_weight, 4) if total_weight else 0.0,
-        "data_coverage": round(data_cov, 4),
-        "weights": {a.id: a.weight for a in ANGLES if a.weight > 0},
-        "contributions": contributions,
-        "unscored": [a["id"] for a in angles
-                     if a.get("score") is None or (a.get("weight") or 0) <= 0],
-    }
+    聚合算法（权重归一化、双覆盖度）在 :func:`lquant.core.report.composite_scores`
+    —— 个股分析与行业分析共用同一份实现，避免「两套口径算同一个综合分」。
+    这里只补个股自己的分级措辞。
+    """
+    out = composite_scores(angles, ANGLES)
+    out["grade"] = grade(out["score"]) if out["score"] is not None else "无法评分"
+    return out
 
 
 def build_verdict(angles: list[dict], score: dict, risk: dict,

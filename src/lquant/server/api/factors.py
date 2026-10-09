@@ -131,6 +131,21 @@ class EvaluateIn(BaseModel):
     aum_list: list[float] | None = Field(
         default=None, max_length=12,
         description="容量分析的资金规模档位；None = 用内置默认档")
+    zero_aware: bool = Field(
+        default=False,
+        description="零感知分箱：以零为界、正负两侧各自成箱。反转/情绪这类"
+                    "**围绕零构造**的因子应打开 —— 否则「普涨日的一堆小负数」"
+                    "也会被归进空头组，多空两端都不是真正的极端")
+    by_group: str | None = Field(
+        default=None, max_length=32,
+        description="组内分箱的列名（如 industry）：在 (交易日, 该列) 内各自打分位，"
+                    "直接去掉「整个行业同涨同跌」对分组收益的污染。"
+                    "与 zero_aware 互斥")
+    max_loss: float | None = Field(
+        default=None, ge=0.0, le=1.0,
+        description="丢样比例阈值（0.3 = 30%）：分层可用样本跌破该比例即报错，"
+                    "而不是在报告里印一行小字 —— 覆盖率一掉，多空收益反而好看。"
+                    "None = 只统计不拦截")
 
     @field_validator("steps")
     @classmethod
@@ -588,6 +603,13 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
     _step(20, "构建协变量")
     errors: dict[str, str] = {}
     cov_names_all = ["market_cap", "industry_sw1", "turnover_1m", "momentum_1m"]
+    # 用户配方里显式引用的 cov_*（如 CNE5 风格的 cov_beta_1y）按需构建 ——
+    # 默认口径不变，但「注册了却调不到」的退化被堵住。
+    from lquant.factors.covariates import (  # noqa: PLC0415 - 惰性导入，启动提速
+        covariates_for_steps as _cov_for_steps,
+    )
+
+    cov_names_all = _cov_for_steps(req.steps, cov_names_all)
     try:
         with reader() as con:
             ind = con.execute("SELECT symbol, std, code, std_date FROM industry_classify").pl()
@@ -639,6 +661,8 @@ def _evaluate_full(req: EvaluateIn, progress=None, cancel_check=None) -> tuple[d
                    universe=req.universe, expr=req.formula, covs=cov_cols_present,
                    with_robustness=req.with_robustness,
                    with_report=False,
+                   zero_aware=req.zero_aware, by_group=req.by_group,
+                   max_loss=req.max_loss,
                    event_window=(req.event_window[0], req.event_window[1]))
     ic = res["ic"]["ic"]
     ric = res["ic"]["rank_ic"]
@@ -1474,6 +1498,13 @@ class SynthesizeIn(BaseModel):
     end: str | None = Field(default=None, description="区间终点 YYYY-MM-DD；None = 数据末端")
     universe: str = Field(default="all",
                           description="股票池：all = 全市场，或指数代码/别名")
+    # 分箱口径与单因子评价**同一组字段、同一套语义**（见 EvaluateIn）；
+    # 合成因子同样要能零感知分箱 / 组内分箱 / 卡丢样阈值
+    zero_aware: bool = Field(default=False, description="零感知分箱（以零为界）")
+    by_group: str | None = Field(default=None, max_length=32,
+                                 description="组内分箱的列名（如 industry）")
+    max_loss: float | None = Field(default=None, ge=0.0, le=1.0,
+                                   description="丢样比例阈值；None = 只统计不拦截")
 
     @field_validator("universe")
     @classmethod
@@ -1552,6 +1583,8 @@ def synthesize(req: SynthesizeIn) -> dict:
     # 成本 / 容量 / 样本过滤披露。这里补齐到与单因子报告同一套内容。
     res = evaluate(d, "_syn", ret_col=f"fwd_ret_{min(horizons)}",
                    n_groups=req.n_groups, horizons=horizons,
+                   zero_aware=req.zero_aware, by_group=req.by_group,
+                   max_loss=req.max_loss,
                    display_name=f"合成因子 {name}",
                    expr=" + ".join(req.formulas),
                    description=f"{req.method} 合成的合成因子，成分："

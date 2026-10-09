@@ -395,8 +395,17 @@ def enqueue(queue: str, fn, *args, job_id: str | None = None,
         try:
             job = q.enqueue(fn, *args, job_id=jid, **kwargs)
         except InvalidJobOperation:
-            # 同 job_id 旧 job 仍在（retry 重入队）：删旧再入，等价覆盖
-            Job.fetch(jid, connection=get_redis()).delete()
+            # 同 job_id 已存在：**先看状态再决定**。运行中的 job 不能删 ——
+            # delete 只清 registry 记录，worker 里的执行照常继续，结果就是
+            # 旧 job 变成无人可查/可取消的孤儿，还与新 job 并发写同一进度；
+            # 只有 finished/failed/stopped/canceled 的残留才等价覆盖
+            old = Job.fetch(jid, connection=get_redis())
+            st = old.get_status(refresh=True)
+            if st in ("queued", "started", "deferred", "scheduled"):
+                raise RuntimeError(
+                    f"job {jid} 仍在 {st}，拒绝覆盖提交（换 job_id 或等其结束）"
+                ) from None
+            old.delete()
             job = q.enqueue(fn, *args, job_id=jid, **kwargs)
         _register_cancelable(job.id, _CancelTarget(queue=queue, local_job=None))
         return job
