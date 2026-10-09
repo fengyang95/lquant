@@ -20,6 +20,7 @@
   "GET /api/backtests/validation": "read:factors",
   "GET /api/backtests/{run_id}": "read:factors",
   "GET /api/backtests/{run_id}/attribution": "read:factors",
+  "GET /api/backtests/{run_id}/attribution/report": "read:factors",
   "GET /api/backtests/{run_id}/code": "read:factors",
   "GET /api/backtests/{run_id}/holdings": "read:factors",
   "GET /api/data/checkpoints": "read:market",

@@ -13,7 +13,15 @@ from fastapi.testclient import TestClient
 
 os.environ.setdefault("LQ_SYNC_WORKER", "0")
 
-pytestmark = pytest.mark.usefixtures("api_env")
+# xdist_group：本模块用例共享 module 级 duckdb（见下方 api_env fixture），且
+# test_tasks_list 断言的是前面用例 POST 出来的任务 —— 存在文件内顺序依赖。
+# --dist loadgroup 把本模块钉在同一个 worker 按序执行（同 test_task_center.py）。
+# 缺这个标记时 CI 的 `-n auto --dist loadgroup` 会把 test_tasks_list 分到没有
+# 建过任务的 worker 上，于是它单独跑必红（本地全量串行却过，极难复现）。
+pytestmark = [
+    pytest.mark.usefixtures("api_env"),
+    pytest.mark.xdist_group("api_news"),
+]
 
 
 @pytest.fixture(scope="module")
