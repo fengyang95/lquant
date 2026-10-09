@@ -64,6 +64,25 @@ type Attribution = {
     totals: Record<string, number>;
     note: string;
   };
+  drawdown: {
+    periods: {
+      start: string; trough: string; end: string | null; recovered: boolean;
+      drawdown: number; days: number; ret: number;
+      stock_top: { symbol: string; contribution: number }[];
+      stock_bottom: { symbol: string; contribution: number }[];
+      common?: number; specific?: number; factors?: Record<string, number>;
+      n_dec?: number;
+    }[];
+    note: string;
+  };
+  risk_attr: {
+    n_days?: number;
+    vol_total?: number; vol_common?: number; vol_specific?: number;
+    var_total?: number; var_common?: number; var_specific?: number;
+    cross_term?: number; systematic_var_barra?: number;
+    factors?: { factor: string; var_contrib: number; pct: number | null; avg_exposure: number }[];
+    note: string;
+  };
   risk: Record<string, number | string | null>;
 };
 type HoldingsIdx = { dates: { date: string; nav: number; day_return: number | null }[] };
@@ -530,7 +549,7 @@ export default function BacktestDetailPage() {
           {!att && <Loading>归因计算中…</Loading>}
           {att && (
             <>
-              <div className="flex flex-wrap gap-1.5">
+              <div className="flex flex-wrap items-center gap-1.5">
                 <span className="tag">基准 {String(att.risk.benchmark ?? d.benchmark_label)}</span>
                 <span className="tag">跟踪误差 {pct(typeof att.risk.tracking_error === 'number' ? att.risk.tracking_error : null)}</span>
                 <span className="tag">参与个股 {att.stock_contribution.n_stocks}</span>
@@ -540,6 +559,16 @@ export default function BacktestDetailPage() {
                 {att.style_attr?.totals && (
                   <span className="tag">特异 α <span className={retCls(att.style_attr.totals.specific)}>{pct(att.style_attr.totals.specific)}</span></span>
                 )}
+                {att.risk_attr?.vol_total != null && (
+                  <span className="tag">年化波动 {pct(att.risk_attr.vol_total)}（系统性 {pct(att.risk_attr.vol_common)} / 特异 {pct(att.risk_attr.vol_specific)}）</span>
+                )}
+                <a
+                  className="tag text-indigo hover:underline"
+                  href={`/api/backtests/${runId}/attribution/report`}
+                  target="_blank" rel="noreferrer"
+                >
+                  导出 HTML 报告 ↗
+                </a>
               </div>
               <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
                 <Panel title="个股收益贡献" meta="正 / 负 前 12">
@@ -650,6 +679,86 @@ export default function BacktestDetailPage() {
                   <div className="text-sm text-ink-faint">
                     {att.style_attr?.note ?? '风格归因不可用'}
                   </div>
+                )}
+              </Panel>
+              <Panel title="回撤期归因" meta={att.drawdown?.note}>
+                {att.drawdown?.periods?.length ? (
+                  <div className="space-y-3">
+                    {att.drawdown.periods.slice(0, 5).map((p) => (
+                      <div key={p.start} className="rounded border border-line p-3">
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm font-medium">
+                          <span>{p.start} → {p.end ?? '未收复'}</span>
+                          <span className="text-down">回撤 {pct(p.drawdown, 1)}</span>
+                          <span className="text-ink-dim">{p.days} 个交易日</span>
+                          <span className={retCls(p.ret)}>区间收益 {pct(p.ret)}</span>
+                        </div>
+                        {p.factors && (
+                          <div className="mt-1.5 text-xs text-ink-dim">
+                            风格因子合计 <span className={retCls(p.common ?? null)}>{pct(p.common ?? null)}</span>
+                            {' · '}特异 <span className={retCls(p.specific ?? null)}>{pct(p.specific ?? null)}</span>
+                            {' · '}{Object.entries(p.factors).sort((a, b) => a[1] - b[1]).map(([k, v]) => `${k} ${pct(v)}`).join(' / ')}
+                          </div>
+                        )}
+                        {(p.stock_top?.length || p.stock_bottom?.length) ? (
+                          <div className="mt-2 grid grid-cols-1 gap-3 text-xs sm:grid-cols-2">
+                            <div>
+                              <div className="mb-1 text-ink-faint">拖累前 3</div>
+                              {(p.stock_bottom ?? []).slice(0, 3).map((s) => (
+                                <div key={s.symbol} className="flex justify-between">
+                                  <span>{s.symbol}</span>
+                                  <span className={retCls(s.contribution)}>{pct(s.contribution)}</span>
+                                </div>
+                              ))}
+                            </div>
+                            <div>
+                              <div className="mb-1 text-ink-faint">抗跌前 3</div>
+                              {(p.stock_top ?? []).slice(0, 3).map((s) => (
+                                <div key={s.symbol} className="flex justify-between">
+                                  <span>{s.symbol}</span>
+                                  <span className={retCls(s.contribution)}>{pct(s.contribution)}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-sm text-ink-faint">{att.drawdown?.note ?? '无回撤期数据'}</div>
+                )}
+              </Panel>
+              <Panel title="风险归因（方差分解，年化）" meta={att.risk_attr?.note}>
+                {att.risk_attr?.factors?.length ? (
+                  <>
+                    <div className="mb-2 text-sm">
+                      总波动 <b>{pct(att.risk_attr.vol_total)}</b>
+                      {' = '}系统性 <span className="text-indigo">{pct(att.risk_attr.vol_common)}</span>
+                      {' + '}特异 <span className="text-gold">{pct(att.risk_attr.vol_specific)}</span>
+                      {'（cross '}{pct(att.risk_attr.cross_term, 3)}）
+                      <span className="ml-2 text-xs text-ink-faint">{att.risk_attr.n_days} 个有效分解日</span>
+                    </div>
+                    <table className="table-dense text-xs">
+                      <thead>
+                        <tr>
+                          <th className="text-left">因子</th><th className="text-right">平均暴露</th>
+                          <th className="text-right">方差贡献（%²，年化）</th><th className="text-right">占系统性</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {att.risk_attr.factors.map((f) => (
+                          <tr key={f.factor} className="hover:bg-white">
+                            <td>{f.factor}</td>
+                            <td className="text-right">{num(f.avg_exposure, 3)}</td>
+                            <td className="text-right">{num(f.var_contrib, 4)}</td>
+                            <td className="text-right">{f.pct == null ? '--' : `${(f.pct * 100).toFixed(1)}%`}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </>
+                ) : (
+                  <div className="text-sm text-ink-faint">{att.risk_attr?.note ?? '风险归因不可用'}</div>
                 )}
               </Panel>
             </>

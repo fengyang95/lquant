@@ -14,6 +14,7 @@ from datetime import date, datetime
 
 import polars as pl
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, model_validator
 
 from lquant.backtest.benchmark import DEFAULT_BENCHMARK
@@ -535,23 +536,21 @@ def get_run_code(run_id: str) -> dict:
             "benchmark": params.get("benchmark"), "engine": params.get("engine")}
 
 
-@router.get("/{run_id}/attribution")
-def get_attribution(run_id: str, top: int = Query(default=15, ge=3, le=50)) -> dict:
-    """归因分析：个股收益贡献 + 分组 Brinson + α/β/信息比率。
-
-    持仓数据来自 backtest_position（run-code / run 端点都会写）；
-    老运行没有持仓数据时返回 404 提示重跑。
-    """
+def _attribution_payload(run_id: str, top: int = 15) -> dict:
+    """归因全量计算（get_attribution 与 HTML 报告共用，回归只算一次）。"""
     from lquant.backtest.attribution import (
         brinson_by_group,
         brinson_monthly,
         build_styles,
         cost_drag,
+        drawdown_attribution,
         group_of_symbol,
         industry_map_from_db,
         portfolio_profile,
+        risk_attribution,
         risk_vs_benchmark,
         stock_contribution,
+        style_regression,
         style_return_attribution,
     )
 
@@ -606,8 +605,16 @@ def get_attribution(run_id: str, top: int = Query(default=15, ge=3, le=50)) -> d
     profile = portfolio_profile(positions, prices, nav, group_map,
                                 styles=build_styles(px_df, sorted(need)))
 
-    # 风格收益归因：全市场截面回归（因子收益）→ 因子贡献 vs 特异 alpha
-    style_attr = style_return_attribution(positions, prices, nav, px_df)
+    # 风格回归一次，供收益归因 / 回撤期归因 / 风险归因三处共用
+    reg = style_regression(px_df)
+    if "factors" in reg:
+        style_attr = style_return_attribution(positions, prices, nav, reg=reg)
+        risk_attr = risk_attribution(positions, prices, nav, reg)
+        drawdown = drawdown_attribution(positions, prices, nav, reg=reg)
+    else:
+        style_attr = reg
+        risk_attr = {"note": reg.get("note", "风格回归不可用，风险归因不可用")}
+        drawdown = drawdown_attribution(positions, prices, nav)  # 只有个股贡献
 
     # α/β/IR/TE：策略日收益 vs 基准日收益（基准净值差分，不能用累计值）
     _, bench_label, bench_map = _benchmark_nav_aligned(set(dates), nav_map)
@@ -635,8 +642,38 @@ def get_attribution(run_id: str, top: int = Query(default=15, ge=3, le=50)) -> d
         "cost": cost,
         "profile": profile,
         "style_attr": style_attr,
+        "drawdown": drawdown,
+        "risk_attr": risk_attr,
         "risk": risk,
     }
+
+
+@router.get("/{run_id}/attribution")
+def get_attribution(run_id: str, top: int = Query(default=15, ge=3, le=50)) -> dict:
+    """归因分析：个股贡献 + Brinson + 风格归因 + 回撤期归因 + 风险归因。
+
+    持仓数据来自 backtest_position（run-code / run 端点都会写）；
+    老运行没有持仓数据时返回 404 提示重跑。
+    """
+    return _attribution_payload(run_id, top)
+
+
+@router.get("/{run_id}/attribution/report",
+            response_class=HTMLResponse,
+            responses={200: {"content": {"text/html": {}}}})
+def get_attribution_report(run_id: str) -> HTMLResponse:
+    """归因 HTML 报告（自包含，可离线打开/打印/存档）。
+
+    与 /attribution 同一计算核心（_attribution_payload），仅渲染不同。
+    浏览器直接访问下载即可；Content-Disposition 带文件名方便存档。
+    """
+    from lquant.backtest.attribution_report import render_attribution_html
+
+    payload = _attribution_payload(run_id)
+    html_doc = render_attribution_html(payload)
+    return HTMLResponse(
+        content=html_doc,
+        headers={"Content-Disposition": f'inline; filename="attribution-{run_id}.html"'})
 
 
 @router.get("/{run_id}/holdings")
