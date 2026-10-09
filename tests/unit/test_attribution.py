@@ -367,7 +367,6 @@ def test_drawdown_attribution_splits_factors_and_stocks():
 
     panel = _synthetic_panel()
     dates = sorted(panel["trade_date"].unique().to_list())
-    import polars as pl  # noqa: F401  已导入
 
     held = panel.filter(pl.col("symbol").is_in(
         sorted(panel["symbol"].unique().to_list())[:5]))
