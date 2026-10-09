@@ -292,9 +292,12 @@ def backfill_pool(
                          "kind": g.kind} for g in gaps]
             if gaps:
                 day_status = "incomplete"
+                # loguru 用 f-string/str.format 的 {} 插值，不认 stdlib 的 %s/%d：
+                # 写成 %-style 会原样打印占位符并**静默丢弃**参数（监控页运行
+                # 日志里只剩「缺口 %d 天（应写 %d 只）：%s」，数值一个都没有）。
+                gaps_brief = "；".join(g.detail() for g in gaps[:5])
                 logger.warning(
-                    "日级完整性缺口 %d 天（应写 %d 只）：%s",
-                    len(gaps), total, "；".join(g.detail() for g in gaps[:5]))
+                    f"日级完整性缺口 {len(gaps)} 天（应写 {total} 只）：{gaps_brief}")
                 try:
                     from lquant.data.quality.issues import save_issues
 

@@ -65,9 +65,22 @@ class InterceptHandler(logging.Handler):
             level: str | int = record.levelname
         except ValueError:
             level = record.levelno
-        # 透传调用点：跳过 stdlib 内部帧，让 name/line 指向真实业务代码
-        frame, depth = logging.currentframe(), 2
-        while frame and (depth == 0 or frame.f_code.co_filename == logging.__file__):
+        # 透传调用点：从 emit 起逐层上溯，直到走出 stdlib logging 内部帧
+        # （handle/_log/warning/callHandlers 全在 logging.__file__ 里），
+        # 让 name/function/line 指向真实业务代码。
+        #
+        # 旧实现把起点当成「已跳过 emit」直接给 depth=2，但 currentframe()
+        # 返回的就是 emit 自己的帧 —— 循环条件首轮即假，depth 恒为 2，
+        # 恰好落在 logging.callHandlers 上。于是所有经 stdlib 转发的日志
+        # （A2A 告警、agent 任务、uvicorn 等）在监控页运行日志里都显示成
+        # `logging:callHandlers:1762`，真实来源全丢。
+        frame, depth = logging.currentframe(), 0
+        while frame:
+            filename = frame.f_code.co_filename
+            is_logging = filename == logging.__file__
+            is_frozen = "importlib" in filename and "_bootstrap" in filename
+            if depth > 0 and not (is_logging or is_frozen):
+                break
             frame = frame.f_back
             depth += 1
         logger.opt(depth=depth, exception=record.exc_info).log(

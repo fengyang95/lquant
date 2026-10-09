@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import re
 
 import pytest
 from loguru import logger
@@ -81,6 +82,86 @@ def test_file_sink_creates_dir_and_writes(tmp_path):
     assert f.exists()
     assert "file-sink-marker" in f.read_text()
     logger.remove()
+
+
+def test_intercept_handler_reports_real_caller(sink_records):
+    """stdlib 记录必须指向真实业务调用点，而不是 logging 内部帧。
+
+    回归：旧实现把 depth 写死成 2，且循环首轮条件即为假（currentframe()
+    返回的就是 emit 自己的帧）—— depth 恒为 2，恰好落在
+    `logging.callHandlers` 上。于是所有经 stdlib 转发的日志（A2A 告警、
+    agent 任务、uvicorn 等）在监控页运行日志里都显示成
+    `logging:callHandlers:1762`，真实来源全丢。
+    """
+    logging.getLogger("my.stdlib.caller").warning("caller-marker")
+    rec = next(m.record for m in sink_records if "caller-marker" in str(m))
+    assert rec["name"] == __name__
+    assert rec["function"] == "test_intercept_handler_reports_real_caller"
+    assert rec["line"] > 0
+
+
+def test_no_percent_style_args_on_loguru():
+    """静态守卫：loguru 只认 str.format 的 {} 占位，%-style 会静默丢参数。
+
+    回归：`daily.py::backfill_pool` 用 `logger.warning("缺口 %d 天…", n)`
+    调 loguru，格式化参数被整体丢弃，监控页运行日志里只剩
+    「日级完整性缺口 %d 天（应写 %d 只）：%s」—— 数值一个都没有，
+    缺口天数/应有标的数/明细全不可见。
+    """
+    import ast
+    import pathlib
+
+    src_root = pathlib.Path(__file__).resolve().parents[2] / "src"
+    pct = re.compile(r"%[-#0 +]?\d*(?:\.\d+)?[sdrfgeExXo]|%\(\w+\)")
+    offenders: list[str] = []
+    for p in sorted(src_root.rglob("*.py")):
+        text = p.read_text(encoding="utf-8")
+        if "loguru" not in text and "get_logger(" not in text:
+            continue
+        tree = ast.parse(text)
+        loguru_names, stdlib_names = set(), set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "loguru":
+                loguru_names.update(a.asname or a.name for a in node.names)
+            elif isinstance(node, ast.Assign):
+                targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+                callee = getattr(node.value, "func", None)
+                dotted = _dotted(callee) if isinstance(node.value, ast.Call) else ""
+                if dotted == "get_logger":
+                    loguru_names.update(targets)
+                elif dotted == "logging.getLogger":
+                    stdlib_names.update(targets)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            owner = node.func.value
+            if not isinstance(owner, ast.Name) or owner.id not in loguru_names - stdlib_names:
+                continue
+            fmt = node.args[0] if node.args else None
+            if not isinstance(fmt, ast.Constant) or not isinstance(fmt.value, str):
+                continue
+            if len(node.args) > 1 and pct.search(fmt.value):
+                offenders.append(f"{p.relative_to(src_root)}:{node.lineno}")
+
+    assert not offenders, (
+        "loguru 不认 %-style 占位符，参数会被静默丢弃；请改用 {} 或 f-string：\n  "
+        + "\n  ".join(offenders))
+
+
+def _dotted(node) -> str:
+    """把 `a.b.c`（或裸名字 `a`）还原成点号字符串；认不出返回空串。"""
+    import ast
+
+    if isinstance(node, ast.Name):
+        return node.id
+    parts: list[str] = []
+    cur = node
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if not isinstance(cur, ast.Name):
+        return ""
+    return ".".join([cur.id, *reversed(parts)])
 
 
 def test_get_logger_returns_callable():
