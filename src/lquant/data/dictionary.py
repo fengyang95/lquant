@@ -46,6 +46,7 @@ FIELD_NOTES: dict[str, dict[str, str]] = {
         "quality_flags": "质量位掩码（0 = 干净）",
         "source": "数据来源",
         "ingested_at": "入库时间",
+        "quote_ts": "报价采集时刻（epoch 毫秒，上海墙钟；NULL = 盘后批量权威行，缺列 = 无法判定）",
         "data_version": "数据版本",
     },
     "daily_basic": {

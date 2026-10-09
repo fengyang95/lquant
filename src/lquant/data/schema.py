@@ -185,7 +185,7 @@ SCHEMAS = {
 #   2) 更新 SCHEMA_FINGERPRINT（`schema_fingerprint()` 的输出）。
 # `tests/unit/test_schema_contract.py` 会盯着这两者是否同步 —— 改列的人
 # 一定会看到一条要求他显式确认的失败，而不是在 code review 里被漏掉。
-DATASET_SCHEMA_VERSION = 1
+DATASET_SCHEMA_VERSION = 2
 
 # 最近一次「删列 / 改类型」的说明；只增列时保持上一版说明不动。
 DATASET_SCHEMA_BREAKING_NOTE = "初始版本（建立指纹纪律时的基线）"
@@ -202,7 +202,7 @@ def schema_fingerprint() -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-SCHEMA_FINGERPRINT = "a4c35ef693b48fe133c713b2a7402bbaac651da5b5e65c4f79582939d05f7881"
+SCHEMA_FINGERPRINT = "acc5e30c7df013e89908906d56c3344097f0cb709bd04a38fca3cf59edfb1c6e"
 
 
 def empty(name: str) -> pl.DataFrame:

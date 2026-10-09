@@ -126,6 +126,11 @@ _RULES: list[tuple[str, str, str | None]] = [
     ("POST", "/api/market/backfill", "write:data"),
     ("POST", "/api/data", "write:data"),
     ("DELETE", "/api/data", "write:data"),
+    # 扩展数据表（BYO 数据）：写/上传/回补/注册因子都改数据语义 → write:data。
+    # 显式登记而不是靠宽泛前缀兜底：否则一旦将来加了别的前缀规则，
+    # 这些端点会静默变成「默认拒绝」，调用方只会看到 401 而不知道为什么。
+    ("POST", "/api/ext-data", "write:data"),
+    ("DELETE", "/api/ext-data", "write:data"),
     ("POST", "/api/news", "write:data"),
     ("POST", "/api/sync", "write:data"),
     ("DELETE", "/api/sync", "write:data"),
@@ -163,6 +168,7 @@ _RULES: list[tuple[str, str, str | None]] = [
     ("*", "/api/health", SCOPE_ANY),
     ("GET", "/api/market", "read:market"),
     ("GET", "/api/data", "read:market"),
+    ("GET", "/api/ext-data", "read:market"),
     ("GET", "/api/etf", "read:market"),
     ("GET", "/api/news", "read:market"),
     ("GET", "/api/fundamental", "read:market"),
