@@ -67,3 +67,26 @@ async def test_error_event_on_failure(svc):
     # 错误也要落库为 assistant 消息，便于历史回放
     msgs = await svc.get_messages(ses.id)
     assert msgs[-1].role == "assistant"
+
+
+async def test_cancel_leaves_marker_in_assistant_message(svc):
+    """mock provider 取消也要留痕（与 claude_code 同口径）。"""
+    import asyncio
+
+    ses = await svc.create_session({"symbol": "600519"})
+
+    async def on_event(_e):
+        return None
+
+    task = asyncio.ensure_future(svc.send_message(ses.id, "贵州茅台", on_event))
+    # 等占位消息落库再取消：测的是语义而不是「谁先跑」
+    for _ in range(200):
+        if any(m.role == "assistant" for m in await svc.get_messages(ses.id)):
+            break
+        await asyncio.sleep(0.01)
+    await svc.cancel(ses.id)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    msgs = await svc.get_messages(ses.id)
+    assistant = [m for m in msgs if m.role == "assistant"]
+    assert assistant and "已中断" in assistant[-1].content

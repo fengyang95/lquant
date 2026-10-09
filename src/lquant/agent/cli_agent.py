@@ -42,6 +42,7 @@ import asyncio
 import contextlib
 import logging
 import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
@@ -228,6 +229,7 @@ class CliAgentService(AgentService):
         try:
             await self._run(sid, content, on_event)
         except asyncio.CancelledError:
+            await self._mark_interrupted(sid)
             await on_event(AgentEvent(type="error", message="已中断"))
             raise
         except Exception as e:  # noqa: BLE001
@@ -322,7 +324,11 @@ class CliAgentService(AgentService):
                 _LOG.warning("[%s stderr] %s", self.stderr_tag, line)
 
         stderr_task = asyncio.create_task(pump_stderr())
-        ans_msg = await self.store.add_message(sid, "assistant", "")
+        # 先登记 id 再落库：取消可能正好落在下面的 await 上，那时拿不到返回值，
+        # 但补文案必须有目标（见 _mark_interrupted）。
+        mid = uuid.uuid4().hex
+        self._ans_id[sid] = mid
+        ans_msg = await self.store.add_message(sid, "assistant", "", mid=mid)
         started = time.monotonic()
         saw_done = False
         error_text = ""  # kind=error 时记录，收尾跳过二次 fail
@@ -392,17 +398,19 @@ class CliAgentService(AgentService):
                         await self.store.finish_assistant(sid, ans_msg.id)
                         await on_event(AgentEvent(
                             type="error", message=ev["text"]))
-        except asyncio.CancelledError:
-            # 用户取消：给增量消息补一个明确标记，别留下一条「有头无尾」的空记录
-            # （与超时路径 _fail_with 的「不留空 assistant 消息」口径一致）
-            with contextlib.suppress(Exception):  # noqa: BLE001 - 标记失败不改写取消语义
-                await self.store.append_assistant_delta(sid, ans_msg.id, "（已中断）")
-            raise
         finally:
+            # 取消已请求但**还没投递**时，投递点会落在 finally 里的第一个 await
+            # 上（进程回收），回收与留痕都会被半途打断。先吃掉这个请求让收尾
+            # 跑完，结束后再原样抛出 —— 取消语义不变，少一次「进程没回收干净」。
+            task = asyncio.current_task()
+            cancelling = task is not None and task.cancelling() > 0
+            if cancelling:
+                with contextlib.suppress(Exception):  # noqa: BLE001
+                    task.uncancel()
             if proc.returncode is None:
                 with contextlib.suppress(ProcessLookupError):
                     proc.terminate()
-            with contextlib.suppress(TimeoutError):
+            with contextlib.suppress(TimeoutError, asyncio.CancelledError):
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
             stderr_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, TimeoutError):
@@ -411,6 +419,12 @@ class CliAgentService(AgentService):
             # 那种情况下不能再动（否则会误伤后续接手的那个 run）
             if self._procs.get(sid) is proc:
                 self._procs.pop(sid, None)
+            if cancelling:
+                raise asyncio.CancelledError()
+        # 跑出明确结论（正常收尾或 CLI 自己报了错）→ 取消标记不再适用。
+        # 注意这行必须在 finally **之后**：取消落在回收阶段时上面已经 raise，
+        # 不会走到这里，标记才能补上。
+        self._ans_id.pop(sid, None)
         if not saw_done and not error_text:
             tail = "\n".join(stderr_lines[-5:])[-400:]
             await self._fail_with(sid, ans_msg.id,

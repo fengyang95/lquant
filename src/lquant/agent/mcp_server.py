@@ -258,7 +258,7 @@ TOOLS_SPEC: list[dict] = [
     },
     {
         "name": "get_market_overview",
-        "description": "大盘概览：情绪分 + 涨跌停家数 + 破板率 + 北向资金（看板首屏）",
+        "description": "大盘概览：情绪分 + 涨跌停家数 + 破板率 + 北向成交额（看板首屏）",
         "inputSchema": _input_schema({}, []),
     },
     {

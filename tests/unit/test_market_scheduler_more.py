@@ -204,6 +204,37 @@ def test_collect_and_save_non_critical_error(monkeypatch, fake_db, fake_collecto
     assert out["collected"]["northbound"] == 0
 
 
+def test_collect_failure_also_lands_in_quality_issues(monkeypatch, fake_db, fake_collectors):
+    """采集失败要同时进 data_quality_issue。
+
+    只落在 collect_log（运行视角）里的失败，看数据的人看不到 —— 北向那次
+    源站停发字段后采集器把 0 当值写库，collect_log 全程 "ok"。
+    """
+    from lquant.data.quality import issues as qissues
+
+    meta, get = fake_collectors
+    monkeypatch.setattr(sched, "upsert", lambda table, df: len(df))
+    monkeypatch.setattr(sched, "TABLE_COLUMNS", {"t_c": ["x"]}, raising=False)
+
+    def boom(**kw):
+        raise ValueError("net down")
+
+    monkeypatch.setattr(sched.COLLECTORS, "get",
+                        lambda k: boom if k == "northbound" else get(k))
+    seen = []
+    monkeypatch.setattr(qissues, "save_issues", lambda items, *a, **k: seen.extend(items))
+
+    sched.collect_and_save(schedule="evening")
+    rule = [i.rule for i in seen if i.dataset == "northbound"]
+    assert rule == ["COLLECTOR_FAILED"]
+    assert seen[0].severity == "error"
+
+    # demo 跑出来的失败不入质量问题表
+    seen.clear()
+    sched.collect_and_save(schedule="evening", demo=True)
+    assert seen == []
+
+
 def test_status_rows(monkeypatch, fake_db):
     def execute(sql):
         return SimpleNamespace(fetchone=lambda: (5, "2024-01-02", "2026-06-30"))
@@ -245,3 +276,24 @@ def test_log_one_records_and_swallows(monkeypatch):
     monkeypatch.setattr(cl_mod, "record", boom)
     sched._log_one("job", "2026-01-01", datetime(2026, 1, 1), datetime(2026, 1, 1), 0, "failed")
     assert len(calls) == 1
+
+
+def test_collect_failure_issue_write_failure_is_swallowed(monkeypatch, fake_db, fake_collectors):
+    """留痕写库失败不能把采集主流程带崩。"""
+    from lquant.data.quality import issues as qissues
+
+    meta, get = fake_collectors
+    monkeypatch.setattr(sched, "upsert", lambda table, df: len(df))
+    monkeypatch.setattr(sched, "TABLE_COLUMNS", {"t_c": ["x"]}, raising=False)
+
+    def boom(**kw):
+        raise ValueError("net down")
+
+    def save_boom(*_a, **_k):
+        raise RuntimeError("issue 表坏了")
+
+    monkeypatch.setattr(sched.COLLECTORS, "get",
+                        lambda k: boom if k == "northbound" else get(k))
+    monkeypatch.setattr(qissues, "save_issues", save_boom)
+    out = sched.collect_and_save(schedule="evening")
+    assert out["errors"]["northbound"].startswith("ValueError")   # 采集结果照常返回
