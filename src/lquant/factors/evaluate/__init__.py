@@ -89,7 +89,8 @@ def evaluate(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
         "factor": factor,
         "ic": ic_summary(df, factor, ret_col, **_pick(kw, "date_col", "min_obs")),
         "quantile": quantile_summary(df, factor, ret_col, n_groups,
-                                     **_pick(kw, "date_col", "periods_per_year")),
+                                     **_pick(kw, "date_col", "periods_per_year",
+                                             "zero_aware", "by_group", "max_loss")),
         "decay": decay_summary(df, factor, horizons, **_pick(kw, "price_col", "date_col",
                                                              "symbol_col")),
         "attribution": attribution_summary(df, factor, ret_col,
@@ -116,7 +117,10 @@ def evaluate(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
                     "outlier_stats", "event_window",
                     "display_name", "expr", "data_start", "data_end",
                     "n_samples", "steps", "covariates", "sample_filters",
-                    "window", "extras", "description", "errors"))
+                    "window", "extras", "description", "errors",
+                    # 报告里的分层必须与 evaluate() 返回的 quantile 同口径，
+                    # 否则「报告上的多空」和「API 返回的多空」会对不上
+                    "zero_aware", "by_group"))
     return out
 
 
