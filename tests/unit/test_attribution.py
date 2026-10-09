@@ -172,7 +172,8 @@ def test_portfolio_profile_concentration_and_industry():
     p = portfolio_profile(positions, prices, nav, group_map)
 
     assert p["industry"]["dates"] == [str(d1), str(d2)]
-    ind_d1 = dict(zip(p["industry"]["dates"], p["industry"]["series"]["沪市主板"]))
+    ind_d1 = dict(zip(p["industry"]["dates"], p["industry"]["series"]["沪市主板"],
+                     strict=False))
     assert ind_d1[str(d1)] == pytest.approx(0.5, abs=1e-9)
     assert ind_d1[str(d2)] == pytest.approx(1.0, abs=1e-9)
     # 创业板 day2 无持仓 → 0
@@ -366,7 +367,6 @@ def test_drawdown_attribution_splits_factors_and_stocks():
 
     panel = _synthetic_panel()
     dates = sorted(panel["trade_date"].unique().to_list())
-    import polars as pl  # noqa: F401  已导入
 
     held = panel.filter(pl.col("symbol").is_in(
         sorted(panel["symbol"].unique().to_list())[:5]))

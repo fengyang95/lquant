@@ -203,6 +203,27 @@ def list_exit_strategies() -> dict:
     return {"strategies": EXIT_STRATEGIES.describe()}
 
 
+@router.get("/risk-rules")
+def list_risk_rules(scope: str = "batch") -> dict:
+    """枚举事前风控规则（前端/CLI 选择器的数据源）。
+
+    scope=batch 为回测（整批下单前），scope=order 为模拟盘（逐单）。
+    每条给出默认开关、是否需要整批上下文与说明 —— 让「开了哪些、为什么默认
+    是关的」一眼可见，而不是埋在代码里。
+    """
+    if scope not in ("batch", "order"):
+        raise HTTPException(422, f"scope 只能是 batch | order，收到 {scope!r}")
+    from lquant.backtest.risk import RISK_RULES
+
+    rules = RISK_RULES.describe()
+    if scope == "order":
+        rules = [r for r in rules if r.get("per_order", True)]
+        defaults = [r["name"] for r in rules if r.get("default_on")]
+    else:
+        defaults = [n for n in RISK_RULES if RISK_RULES.meta(n).get("default_on")]
+    return {"scope": scope, "defaults": defaults, "rules": rules}
+
+
 class BacktestIn(BaseModel):
     factor: str = "pct_change_20"        # 仅作展示标签；实际因子列由 formula 派生（formula.replace("_","")）
     formula: str = "pct_change_20"       # 与 factors API 同一套公式：pct_change_{n} / rolling_std_{n}
