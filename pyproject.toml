@@ -94,7 +94,7 @@ markers = ["slow: 需要网络或大数据", "rust: 依赖 Rust 扩展",
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-src = ["src", "tests"]
+src = ["src", "tests", "scripts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "PL"]
@@ -126,6 +126,10 @@ warn_unused_ignores = false
 
 [tool.coverage.run]
 source = ["src/lquant"]
+# 数据文件里存相对路径。CI 是分片跑（各自 runner）、由另一个 job 合并，绝对路径
+# 一旦因 runner 镜像/workspace 变化而不一致，合并后的报告就会匹配不到文件
+# （表现为 "No data to report"，属 fail-closed，但会变成假失败）。
+relative_files = true
 
 [tool.coverage.report]
 # 全局门禁：2026-09-17 全仓补测后 95.0%，随演进保持
