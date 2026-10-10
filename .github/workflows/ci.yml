@@ -103,6 +103,17 @@ jobs:
         # 增量门禁（原 pre-push 本地门禁，随增量测试改造迁到 CI）。
         env:
           PYTHONFAULTHANDLER: "1"
+          # 覆盖率的 sys.monitoring 后端（Python 3.12+；3.14 起才是默认核，
+          # 所以 3.12 上这行确实换掉了 C tracer）。C tracer 在本仓真实用例上把
+          # 测试拖慢 ~80%（热路径微基准实测慢 2.5x），sysmon 只慢 ~1.15x ——
+          # CI 的 pytest 步占整个 job 时长的 83%，这是最大的一处无损提速。
+          # 抽样对比过两种核的 covered/statements/missing 完全一致
+          # （1874/28990/27116）；sysmon 不可用时是 fail-loud（CoverageWarning
+          # + 退回 ctrace），不会静默少算。
+          # 前提：branch coverage 关闭且无 dynamic_context —— 这两者在 3.12 上
+          # sysmon 不支持，届时只打一次警告并静默退回 ctrace（收益消失但不报错）。
+          # 将来若加 --cov-branch，需重新评估本行。
+          COVERAGE_CORE: sysmon
         run: |
           # -vv：卡死时**必须能定位到用例**。已经发生过三次「跑到 97~99% 后无声
           # 卡住 30+ 分钟直到 job 超时」——`-q` 只打点，SIGABRT 的栈里又只有
