@@ -14,9 +14,9 @@ import { useRouter } from 'next/navigation';
 import useSWR from 'swr';
 import PageHeader from '@/components/PageHeader';
 import { Panel } from '@/components/Panel';
-import { Empty, ErrorNote, Loading } from '@/components/States';
+import { Empty, ErrorNote, Loading, Msg } from '@/components/States';
 import { Pct, fmtNum } from '@/components/QuoteTable';
-import { fetcher } from '@/lib/api';
+import { fetcher, post } from '@/lib/api';
 
 type UniverseItem = {
   symbol: string;
@@ -90,6 +90,8 @@ export default function SecurityIndexPage() {
   const [secType, setSecType] = useState('');
   const [board, setBoard] = useState('');
   const [page, setPage] = useState(0);
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [syncMsg, setSyncMsg] = useState('');
 
   // 输入防抖 300ms 再发请求（与自选页同口径）
   useEffect(() => {
@@ -111,8 +113,8 @@ export default function SecurityIndexPage() {
   params.set('offset', String(page * PAGE_SIZE));
   const universeKey = `/data/securities/universe?${params.toString()}`;
 
-  const { data: universe, isLoading: uniLoading, error: uniError } =
-    useSWR<UniverseResp>(universeKey, fetcher);
+  const { data: universe, isLoading: uniLoading, error: uniError,
+          mutate: mutateUniverse } = useSWR<UniverseResp>(universeKey, fetcher);
   const { data: watch, isLoading: watchLoading, error: watchError } =
     useSWR<WatchRow[]>('/watchlist', fetcher);
   const { data: angleMeta } = useSWR<{ angles: AngleRow[] }>('/security/angles', fetcher);
@@ -141,6 +143,21 @@ export default function SecurityIndexPage() {
     setBoard('');
     setPage(0);
   };
+
+  /** 触发后端 POST /data/reference/sync（202 后台跑）—— 标的主档为空时的自助入口。
+   *  只走快路径（sync_details=false）：慢路径逐只补上市日要 20-40 分钟，不适合按钮。 */
+  async function syncReference() {
+    setSyncBusy(true);
+    setSyncMsg('');
+    try {
+      await post('/data/reference/sync', { sync_details: false });
+      setSyncMsg('✓ 已提交后台同步（日历 / 标的清单 / 退市名单）—— 约 1 分钟后点「刷新」');
+    } catch (e) {
+      setSyncMsg(`✗ ${e instanceof Error ? e.message : e}`);
+    } finally {
+      setSyncBusy(false);
+    }
+  }
 
   return (
     <div className="space-y-5">
@@ -224,7 +241,20 @@ export default function SecurityIndexPage() {
         title="全量标的"
         meta={universe ? `共 ${total} 只 · 第 ${page + 1}/${pageCount} 页` : undefined}
         bodyClass=""
+        actions={
+          <>
+            <button type="button" className="btn text-xs"
+                    onClick={() => mutateUniverse()}>
+              刷新
+            </button>
+            <button type="button" className="btn text-xs" disabled={syncBusy}
+                    onClick={syncReference}>
+              {syncBusy ? '提交中…' : '同步标的清单'}
+            </button>
+          </>
+        }
       >
+        {syncMsg ? <div className="px-4 pt-3"><Msg text={syncMsg} /></div> : null}
         {uniLoading ? (
           <Loading />
         ) : uniError ? (
@@ -232,9 +262,14 @@ export default function SecurityIndexPage() {
         ) : !items.length ? (
           <div className="p-4">
             <Empty>
-              {filtered
-                ? '没有匹配的标的 —— 换个筛选条件，或点「重置」'
-                : '标的库为空 —— 先同步标的清单：lq data reference'}
+              {filtered ? (
+                '没有匹配的标的 —— 换个筛选条件，或点「重置」'
+              ) : (
+                <>
+                  标的库为空 —— 点右上角「同步标的清单」从数据源拉取
+                  （等价于 <code className="bg-paper px-1">lq data reference</code>）
+                </>
+              )}
             </Empty>
           </div>
         ) : (

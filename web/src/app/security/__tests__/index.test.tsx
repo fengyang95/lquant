@@ -4,6 +4,10 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 const push = vi.fn();
+const { swrMutate, postMock } = vi.hoisted(() => ({
+  swrMutate: vi.fn(),
+  postMock: vi.fn(),
+}));
 vi.mock('next/navigation', () => ({
   useRouter: () => ({ push }),
   useParams: () => ({}),
@@ -60,17 +64,21 @@ const requestedKeys: string[] = [];
 vi.mock('swr', () => ({
   default: (key: string | null) => {
     if (key) requestedKeys.push(key);
-    if (!key) return { data: undefined, isLoading: false, error: undefined };
+    if (!key) return { data: undefined, isLoading: false, error: undefined, mutate: swrMutate };
     if (key.startsWith('/data/securities/universe')) {
-      return { data: universeData, isLoading: false, error: universeError };
+      return { data: universeData, isLoading: false, error: universeError, mutate: swrMutate };
     }
-    if (key === '/watchlist') return { data: watchData, isLoading: false, error: undefined };
-    if (key === '/security/angles') return { data: ANGLE_META, isLoading: false, error: undefined };
-    return { data: undefined, isLoading: false, error: undefined };
+    if (key === '/watchlist') {
+      return { data: watchData, isLoading: false, error: undefined, mutate: swrMutate };
+    }
+    if (key === '/security/angles') {
+      return { data: ANGLE_META, isLoading: false, error: undefined, mutate: swrMutate };
+    }
+    return { data: undefined, isLoading: false, error: undefined, mutate: swrMutate };
   },
 }));
 
-vi.mock('@/lib/api', () => ({ fetcher: vi.fn() }));
+vi.mock('@/lib/api', () => ({ fetcher: vi.fn(), post: postMock }));
 
 import SecurityIndexPage from '../page';
 
@@ -84,6 +92,9 @@ function universeQueries(): URLSearchParams[] {
 describe('个股分析入口页', () => {
   beforeEach(() => {
     push.mockClear();
+    swrMutate.mockClear();
+    postMock.mockReset();
+    postMock.mockResolvedValue({ accepted: true, sync_details: false });
     requestedKeys.length = 0;
     universeData = UNIVERSE;
     universeError = undefined;
@@ -220,5 +231,27 @@ describe('个股分析入口页', () => {
     watchData = [];
     render(<SecurityIndexPage />);
     expect(await screen.findByText(/自选为空/)).toBeInTheDocument();
+  });
+
+  it('「同步标的清单」提交后台同步并给出反馈', async () => {
+    render(<SecurityIndexPage />);
+    await userEvent.click(await screen.findByRole('button', { name: '同步标的清单' }));
+    await waitFor(() => {
+      expect(postMock).toHaveBeenCalledWith('/data/reference/sync', { sync_details: false });
+    });
+    expect(await screen.findByText(/已提交后台同步/)).toBeInTheDocument();
+  });
+
+  it('同步失败（如上一次还没跑完的 409）如实提示', async () => {
+    postMock.mockRejectedValue(new Error('409 /data/reference/sync'));
+    render(<SecurityIndexPage />);
+    await userEvent.click(await screen.findByRole('button', { name: '同步标的清单' }));
+    expect(await screen.findByText(/409/)).toBeInTheDocument();
+  });
+
+  it('「刷新」重新校验清单', async () => {
+    render(<SecurityIndexPage />);
+    await userEvent.click(await screen.findByRole('button', { name: '刷新' }));
+    expect(swrMutate).toHaveBeenCalled();
   });
 });
