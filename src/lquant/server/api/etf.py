@@ -1,14 +1,22 @@
-"""ETF 专区 API（/etf）：元数据 + 相关性，走统一封套。
+"""ETF 专区 API（/etf）：元数据 + 相关性 + **ETF 专属因子**，走统一封套。
 
 附录 A：ETF 元数据字段（折溢价、跟踪指数、T+N）—— etf_meta 表。
 correlation：基于日线收益率两两相关，样本不足时返回空并附说明（不 500）。
 ETF 源数据由数据采集/同步负责；这里只读，缺数据即空态。
+
+因子子域（/etf/universes、/etf/factors、/etf/evaluate、/etf/backtest）：
+ETF 因子与个股因子是两套口径（ETF 池按基金类型细分、无行业中性化、评级阈值不同），
+见 ``lquant.factors.etf``。这里只是 HTTP 薄封装，计算全在 factors/backtest 层。
 """
 from __future__ import annotations
 
+import math
+
 from fastapi import HTTPException, Query
+from pydantic import BaseModel, Field, field_validator
 
 from lquant.core.db import reader
+from lquant.factors.evaluate.defaults import DEFAULT_N_GROUPS
 from lquant.server.envelope import make_router
 
 router = make_router(prefix="/etf", tags=["etf"])
@@ -130,3 +138,141 @@ def correlation(
                 pairs.append({"a": cols[i], "b": cols[j], "corr": round(float(v), 4)})
     pairs.sort(key=lambda p: -p["corr"])
     return {"symbols": cols, "pairs": pairs, "note": None}
+
+
+# ─────────────────────── ETF 因子子域（池/因子/评价/回测）───────────────────────
+
+
+def _clean_json(obj):
+    """NaN/Inf → None：封套最终会 json 序列化，裸 NaN 会让客户端解析失败。"""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _clean_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_clean_json(v) for v in obj]
+    return obj
+
+
+def _check_etf_universe(v: str) -> str:
+    """ETF 子域只接受 ETF 池名 —— 个股池/指数量/净值量混进来一定是误用。"""
+    from lquant.factors.etf import is_etf_universe
+
+    if not is_etf_universe(v):
+        from lquant.factors.etf import ETF_UNIVERSE_OPTIONS
+
+        allowed = "/".join(k for k, _, _ in ETF_UNIVERSE_OPTIONS)
+        raise ValueError(f"universe 需为 ETF 池（{allowed}），收到 {v!r}")
+    return v
+
+
+@router.get("/universes")
+def etf_universes() -> list[dict]:
+    """ETF 标的池选项（按基金类型细分）。"""
+    from lquant.factors.etf import etf_universe_options
+
+    return [{"key": k, "fund_type": ft, "label": label}
+            for k, ft, label in etf_universe_options()]
+
+
+@router.get("/factors")
+def etf_factors() -> list[dict]:
+    """ETF 因子清单（config/factors/etf.yaml，逐条过 ETF 字段白名单校验）。"""
+    from lquant.factors.etf import load_etf_factors
+
+    return [
+        {"name": r["name"], "expression": r["expression"], "category": r["category"],
+         "description": r["description"], "min_window": r["min_window"]}
+        for r in load_etf_factors()
+    ]
+
+
+class EtfEvaluateIn(BaseModel):
+    factor: str = Field(min_length=1, max_length=200, description="因子 DSL 表达式")
+    universe: str = Field(default="etf_all", description="ETF 池（etf_all/etf_equity/…）")
+    start: str | None = Field(default=None, description="数据窗口起点 YYYY-MM-DD")
+    end: str | None = Field(default=None, description="数据窗口终点 YYYY-MM-DD")
+    n_groups: int = Field(default=DEFAULT_N_GROUPS, ge=2, le=20)
+    with_robustness: bool = Field(default=False, description="是否跑 L3 稳健性（较慢）")
+
+    @field_validator("universe")
+    @classmethod
+    def _v_universe(cls, v: str) -> str:
+        return _check_etf_universe(v)
+
+
+@router.post("/evaluate")
+def etf_evaluate(req: EtfEvaluateIn) -> dict:
+    """ETF 因子评价：IC/ICIR + 分层 + 衰减 + 归因 + 评级（ETF 口径）。
+
+    数据为空 → 503（缺数据，不是请求非法）；表达式非法 → 422。
+    """
+    from lquant.core.errors import FactorError
+    from lquant.factors.etf import evaluate_etf
+
+    try:
+        res = evaluate_etf(
+            req.factor, universe=req.universe, start=req.start, end=req.end,
+            n_groups=req.n_groups, with_report=False,
+            with_robustness=req.with_robustness,
+        )
+    except ValueError as e:      # 面板为空 / train 段为空 → 数据问题
+        raise HTTPException(503, f"ETF 因子评价失败（数据不足）: {e}") from e
+    except FactorError as e:     # 表达式/字段非法 → 请求问题
+        raise HTTPException(422, f"因子表达式非法: {e}") from e
+    res.pop("report", None)
+    return _clean_json(res)
+
+
+class EtfBacktestIn(BaseModel):
+    factor: str = Field(min_length=1, max_length=200, description="因子 DSL 表达式")
+    universe: str = Field(default="etf_all", description="ETF 池")
+    start: str | None = None
+    end: str | None = None
+    top_n: int = Field(default=10, ge=1, le=200)
+    rebalance: str = Field(default="monthly", pattern="^(daily|weekly|monthly|none)$")
+    initial_cash: float = Field(default=1_000_000.0, gt=0, le=1e15)
+    benchmark: str | None = None
+    exit_strategy: str | None = None
+    exit_params: dict = Field(default_factory=dict)
+
+    @field_validator("universe")
+    @classmethod
+    def _v_universe(cls, v: str) -> str:
+        return _check_etf_universe(v)
+
+
+@router.post("/backtest")
+def etf_backtest(req: EtfBacktestIn) -> dict:
+    """ETF 因子 TopN 等权回测（自动套用 ETF 交易规则），落库并返回 run_id。"""
+    import uuid
+
+    from lquant.backtest.etf import etf_factor_backtest
+    from lquant.core.errors import FactorError
+    from lquant.server.api.backtests import _metrics_response, _persist_result
+
+    try:
+        res, meta = etf_factor_backtest(
+            req.factor, universe=req.universe, start=req.start, end=req.end,
+            top_n=req.top_n, rebalance=req.rebalance, initial_cash=req.initial_cash,
+            benchmark=req.benchmark, exit_strategy=req.exit_strategy,
+            exit_params=req.exit_params,
+        )
+    except ValueError as e:
+        raise HTTPException(503, f"ETF 回测失败（数据不足）: {e}") from e
+    except KeyError as e:        # 未注册的退出策略名
+        raise HTTPException(422, f"未注册的退出策略: {e}") from e
+    except (TypeError, FactorError) as e:
+        raise HTTPException(422, f"因子表达式或参数非法: {e}") from e
+
+    run_id = uuid.uuid4().hex[:12]
+    _persist_result(run_id, "etf_factor_topn", meta, res)
+    return {
+        "run_id": run_id,
+        "metrics": _metrics_response(res.metrics),
+        "n_nav_points": len(res.nav),
+        "n_trades": res.metrics.get("n_trades", 0),
+        "universe": meta["universe"],
+        "universe_note": meta.get("universe_note"),
+        "n_symbols": meta["n_symbols"],
+    }

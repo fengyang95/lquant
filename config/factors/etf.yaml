@@ -1,0 +1,106 @@
+# ETF 专属因子清单（factors/etf.py:load_etf_factors 读取）
+#
+# 与 custom.yaml（个股因子）分开的理由，见 factors/etf.py 模块头：
+#   - 面板不同：这里跑在「只含 ETF/LOF + 已挂 etf_meta」的面板上；
+#   - 字段不同：允许引用 fund_size / share_outstanding / *_fee（ETF 元数据）；
+#   - 口径不同：无行业中性化（ETF 无申万分类），改用基金类型分组。
+#
+# 数据边界：只用日线湖（OHLCV/成交额/换手）+ etf_meta。
+# 日线湖没有 IOPV / 折溢价 / 份额日序列，所以「折溢价套利」类因子暂不可得 ——
+# 要做需要先补数据管道（market_snapshot 只有实时快照，不落历史）。
+#
+# 每条 min_window 由 analyzer 用 expr 自动推导，这里也显式写出便于人读。
+factors:
+  # ── 价格动量 / 反转 ──────────────────────────────────────────────
+  - name: etf_mom_20
+    expr: "Ts_Return($close, 20)"
+    category: momentum
+    description: 20 日动量（中期趋势跟随）
+    min_window: 20
+
+  - name: etf_rev_5
+    expr: "-Ts_Return($close, 5)"
+    category: reversal
+    description: 5 日反转（短期超买回摆）
+    min_window: 5
+
+  - name: etf_ma_dev_20
+    expr: "$close / Ts_Mean($close, 20) - 1"
+    category: momentum
+    description: 均线偏离度（价格相对 20 日均线的乖离）
+    min_window: 20
+
+  - name: etf_tsrank_20
+    expr: "Ts_Rank($close, 20)"
+    category: momentum
+    description: 20 日时序位置（当前价在近 20 日区间中的分位 0~1）
+    min_window: 20
+
+  # ── 波动 ────────────────────────────────────────────────────────
+  - name: etf_vol_20
+    expr: "Ts_Std(Ts_Return($close, 1), 20)"
+    category: volatility
+    description: 20 日已实现波动（低波偏好：数值越低越优）
+    min_window: 21
+
+  # ── 流动性（ETF 无 float_mv，用成交额/换手）────────────────────────
+  - name: etf_amt_liq_20
+    expr: "Ts_Mean($amount, 20)"
+    category: liquidity
+    description: 20 日平均成交额（流动性/可交易性）
+    min_window: 20
+
+  - name: etf_turn_20
+    expr: "Ts_Mean($turnover_rate, 20)"
+    category: liquidity
+    description: 20 日平均换手率（交易活跃度）
+    min_window: 20
+
+  # ── 量价 ────────────────────────────────────────────────────────
+  - name: etf_pv_div
+    expr: "Ts_Corr($close, $volume, 20)"
+    category: volume_price
+    description: 量价相关（正相关=量价齐升；负值=放量下跌的背离）
+    min_window: 20
+
+  # ── 截面相对强弱（ETF 池内部横截面）──────────────────────────────
+  - name: etf_xs_rs_20
+    expr: "Rank(Ts_Return($close, 20))"
+    category: cross_section
+    description: 20 日动量的 ETF 池内横截面排名（相对强弱）
+    min_window: 20
+
+  # ── 规模 / 份额 / 费率（来自 etf_meta）───────────────────────────
+  - name: etf_size
+    expr: "-Log($fund_size)"
+    category: size
+    description: 基金规模（取负：小规模 ETF 的弹性溢价；单位亿元）
+    min_window: 0
+
+  - name: etf_share_chg_20
+    expr: "Ts_Return($share_outstanding, 20)"
+    category: flow
+    description: 份额 20 日变动率（申赎方向：份额增加=资金净流入）
+    min_window: 20
+
+  - name: etf_fee
+    expr: "-$management_fee"
+    category: cost
+    description: 管理费率（取负：低费率 ETF 长期占优）
+    min_window: 0
+
+# ETF 默认预处理配方。
+#
+# 与个股默认（custom.yaml）的**唯一但关键**差异：中性化协变量换成
+# [etf_fund_size, turnover_1m, momentum_1m]，**去掉 industry_sw1**——
+# ETF 没有申万行业分类，挂上去只会得到覆盖率 0 的「假中性化」。
+# etf_fund_size 是 log1p(fund_size)，见 factors/covariates.py:etf_fund_size。
+#
+# 注意：evaluate_etf 走 prepare_segment，其内置配方等价于下面这条；
+# 这里的清单用于报告「口径披露」，两处必须一致。
+preprocess_default:
+  - { op: winsorize, method: mad, n: 5 }
+  - { op: standardize, method: zscore }
+  - op: neutralize
+    method: ols
+    by: [etf_fund_size, turnover_1m, momentum_1m]

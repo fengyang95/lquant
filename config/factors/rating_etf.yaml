@@ -1,0 +1,28 @@
+# ETF 因子评级阈值（factors/evaluate/rating.py:load_thresholds 读取）。
+#
+# 为什么 ETF 要单独一份，不沿用个股的 rating.yaml：
+# ETF 的横截面**又薄又高度相关**（全市场数百只，同类型往往只有几十只，且大量
+# ETF 跟踪的宽基指数彼此高度同涨同跌），横截面 IC 的天然上限比个股低得多。
+# 用个股线（|IC|≥0.02 及格）会把一批真实有效的 ETF 因子误判成 weak，
+# 反过来诱导使用者去追「看起来 IC 高」的伪信号。
+#
+# 注意：调低绝对线**不等于放松标准** —— 该线只是「绝对量级」闸门，
+# 真正的判别仍靠 ICIR / 单调性 / 多空夏普 / 多重检验校正门槛。
+# 因此这里只下调 IC 两条线，ICIR 与夏普维持个股口径。
+#
+# 参考：ETF 日频、按基金类型分组的横截面。|IC|>0.05 属极罕见（先怀疑数据问题）。
+rating:
+  ic_strong: 0.025         # |IC| 强信号线（ETF 横截面薄，比个股 0.03 略低）
+  ic_moderate: 0.015       # |IC| 有效线（低于它直接 weak）
+
+  icir_strong: 0.5         # |ICIR| 强线（维持个股口径，不放松）
+  icir_moderate: 0.3
+
+  ls_sharpe_strong: 1.0    # 多空夏普
+  ls_sharpe_moderate: 0.5
+
+  monotonicity_strong: 0.8 # 分组收益与组序号的 Spearman 相关
+  monotonicity_moderate: 0.5
+
+  # >0 时作为附加 t 门槛，与「多重检验校正门槛 sqrt(2·ln n_trials)」取较大者。
+  t_stat_strong: 0.0

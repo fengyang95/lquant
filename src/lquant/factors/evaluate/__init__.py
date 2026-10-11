@@ -98,7 +98,10 @@ def evaluate(df: pl.DataFrame, factor: str, ret_col: str = "fwd_ret_1", *,
     }
     out["ic"].pop("series", None)      # 序列太大，不放进汇总 dict，需要时单独调 ic_series
     # 评级：把 IC/ICIR/单调性/多空夏普/多重检验校正收敛成「强/中/弱 + 差在哪」
+    # ``rating_thresholds`` 允许调用方替换阈值口径（如 ETF 用 rating_etf.yaml）：
+    # 缺省 None = 读 config/factors/rating.yaml，与既有行为零漂移。
     out["rating"] = factor_rating(out["ic"], out["quantile"],
+                                  thresholds=kw.get("rating_thresholds"),
                                   n_trials=kw.get("n_trials"))
     if with_robustness:
         out["robustness"] = robustness_summary(

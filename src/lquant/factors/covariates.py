@@ -118,6 +118,39 @@ def _p_mcap(panel, industry_df=None):
     return v.select(["trade_date", "symbol", "market_cap"])
 
 
+# ---------------------------------------------------------------- ETF 专属
+# ETF 没有 ``float_mv``（无流通市值概念），所以 ``market_cap`` 对 ETF 覆盖率恒为 0。
+# 规模维度改用 ``etf_meta.fund_size``（基金规模，亿元）——这是 ETF 唯一可得的
+# 「体量」代理。取 log1p 进回归（同 market_cap 的理由：不被巨无霸绑架）。
+#
+# 这两个 provider 依赖面板**已经挂上** etf_meta 列（见 factors/etf.py:attach_etf_meta）。
+# 没挂就抛 CovariateUnavailable → build_covariates 记 coverage=0 并显式上报，
+# 绝不静默去均值（与 N6 的硬约束一致）。
+
+
+def _size_like(panel, column: str, out_name: str) -> pl.DataFrame:
+    if column not in panel.columns:
+        raise CovariateUnavailable(
+            f"panel has no {column} column (ETF meta not joined; 见 factors/etf.py)"
+        )
+    v = _panel_sorted(panel).with_columns(
+        # clip 下界 0：坏数据里的负规模若直接 log1p 会得到 NaN，null_count 数不到它，
+        # 覆盖率会虚高 —— 先夹到 0 再 log1p，NaN 就不可能混进来。
+        pl.col(column).clip(lower_bound=0.0).log1p().alias(out_name)
+    )
+    return v.select(["trade_date", "symbol", out_name])
+
+
+@provider("etf_fund_size", label="log1p(ETF fund_size, 亿元)")
+def _p_etf_fund_size(panel, industry_df=None):
+    return _size_like(panel, "fund_size", "etf_fund_size")
+
+
+@provider("etf_share", label="log1p(ETF share_outstanding, 亿份)")
+def _p_etf_share(panel, industry_df=None):
+    return _size_like(panel, "share_outstanding", "etf_share")
+
+
 # ---------------------------------------------------------------- 风格因子
 # 补齐 CNE5 的六个风格维度：原来只有 Size（market_cap）、Momentum（momentum_1m）、
 # Liquidity（turnover_1m）+ 行业，缺 **Beta / 残差波动率 / 非线性规模**。

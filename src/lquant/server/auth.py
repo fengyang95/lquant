@@ -112,6 +112,11 @@ _RULES: list[tuple[str, str, str | None]] = [
     ("POST", "/api/ml/retrain", "run:backtest"),
     ("POST", "/api/ml/predict", "run:backtest"),
     ("POST", "/api/ml/jobs", "run:backtest"),
+    # ETF 因子子域的「算」入口：与 /factors/evaluate、/backtests/run 同档。
+    # 不登记会落到默认拒绝（admin）—— 同一个计算换到 /etf 前缀就要更高权限，
+    # 是纯粹的口径不一致。ETF 读入口（/etf/meta 等）在下面 read:market 段。
+    ("POST", "/api/etf/evaluate", "run:backtest"),
+    ("POST", "/api/etf/backtest", "run:backtest"),
 
     # ── read:factors：用 POST 传 body 但**无副作用**的只读计算 ──────────
     # 必须排在下面的宽泛 POST /api/factors（write:data）之前：AST/求值追踪/
