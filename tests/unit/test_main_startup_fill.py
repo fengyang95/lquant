@@ -93,6 +93,41 @@ def test_startup_failure_branches_swallowed(startup_env, monkeypatch) -> None:
     _call_startup(monkeypatch, mark_raise=True, migrate_raise=True)
 
 
+# ---------- 缠论预热（daemon 线程的线程体，直调以避开异步竞态）----------
+
+def test_warm_chan_engine_swallows_missing_dependency(capsys, monkeypatch) -> None:
+    """未装 czsc 时只提示降级，不抛异常 —— optional extra 没装不是启动错误。"""
+    import sys
+
+    from lquant.server import main
+
+    monkeypatch.setitem(sys.modules, "czsc", None)  # 令 `import czsc` 抛 ImportError
+    main._warm_chan_engine()
+    assert "czsc" in capsys.readouterr().out
+
+
+def test_warm_chan_engine_swallows_unexpected_error(capsys, monkeypatch) -> None:
+    """预热本身出错也只打印，不阻断启动。"""
+    from lquant.indicators import chan
+    from lquant.server import main
+
+    def _boom() -> bool:
+        raise RuntimeError("czsc 内部炸了")
+
+    monkeypatch.setattr(chan, "warmup", _boom)
+    main._warm_chan_engine()
+    assert "缠论预热跳过" in capsys.readouterr().out
+
+
+def test_warm_chan_engine_silent_when_available(capsys) -> None:
+    """装了 czsc 时静默完成（成功路径不该刷启动日志）。"""
+    pytest.importorskip("czsc")
+    from lquant.server import main
+
+    main._warm_chan_engine()
+    assert capsys.readouterr().out == ""
+
+
 def test_startup_data_news_seed_failure_swallowed(startup_env, monkeypatch) -> None:
     """数据任务/资讯任务/同步种子失败 → print 跳过，不阻断启动。"""
     monkeypatch.setenv("LQ_SYNC_WORKER", "1")

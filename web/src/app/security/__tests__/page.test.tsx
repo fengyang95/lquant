@@ -40,6 +40,18 @@ const QUOTE = { symbol: '600519.SH', name: '贵州茅台', available: true,
 const FUND = { symbol: '600519.SH', asof: '2026-04-01', available: false,
                hint: '财务数据为空：先执行 lq data financial', score: null, items: [] };
 
+const CHAN = {
+  symbol: '600519.SH', freq: '日线', available: true, asof: '2026-06-30', n_bars: 600,
+  fx: [{ dt: '2026-06-20', mark: 'G', value: 2 }],
+  bi: [{ sdt: '2026-06-01', edt: '2026-06-20', direction: 'up',
+         high: 2, low: 1, n_bars: 9 }],
+  zs: [{ sdt: '2026-06-01', edt: '2026-06-30', zg: 1.9, zd: 1.1,
+         gg: 2, dd: 1, n_bis: 3 }],
+  signals: { latest: { buy1: '一买' }, events: [
+    { dt: '2026-06-20', kind: 'buy1', label: '一买', detail: '9笔' }] },
+  notes: ['线段未实现：czsc 1.0.1 无线段（XD）实现。'],
+};
+
 const requestedKeys: string[] = [];
 
 vi.mock('swr', () => ({
@@ -58,6 +70,9 @@ vi.mock('swr', () => ({
     if (key.startsWith('/fundamental/score')) {
       return { data: FUND, isLoading: false, error: undefined };
     }
+    if (key.includes('/chan')) {
+      return { data: CHAN, isLoading: false, error: undefined };
+    }
     return { data: [], isLoading: false, error: undefined };
   },
 }));
@@ -69,10 +84,16 @@ vi.mock('next/navigation', () => ({
   useRouter: () => ({ push: vi.fn() }),
 }));
 
-// KChart 依赖 lightweight-charts 的 DOM 测量，测试里替换成占位节点
+// KChart 依赖 lightweight-charts 的 DOM 测量，测试里替换成占位节点。
+// 顺带把 chan 是否传入暴露出来（叠加层本身在浏览器里画，测试只验接线）。
 vi.mock('@/components/KChart', () => ({
-  default: ({ overlays }: { overlays?: { name: string }[] }) => (
-    <div data-testid="kchart">{overlays?.map((o) => o.name).join(',')}</div>
+  default: ({ overlays, chan }: {
+    overlays?: { name: string }[];
+    chan?: { available: boolean };
+  }) => (
+    <div data-testid="kchart" data-chan={chan ? String(chan.available) : 'none'}>
+      {overlays?.map((o) => o.name).join(',')}
+    </div>
   ),
 }));
 
@@ -135,5 +156,18 @@ describe('SecurityPage 指标接线', () => {
     render(<SecurityPage />);
     expect(await screen.findByText('基本面评分')).toBeInTheDocument();
     expect(await screen.findByText(/财务数据为空/)).toBeInTheDocument();
+  });
+
+  it('按 symbol 拉取缠论结构，并把数据同时给到面板与 K 线叠加层', async () => {
+    render(<SecurityPage />);
+    await waitFor(() => {
+      expect(requestedKeys.some((k) => k.includes('/chan?limit=250'))).toBe(true);
+    });
+    expect(await screen.findByText('缠论结构')).toBeInTheDocument();
+    expect(await screen.findByText('已确认笔数')).toBeInTheDocument();
+    expect(await screen.findByText('1.10 ~ 1.90')).toBeInTheDocument();
+    // K 线叠加层拿到的是同一份 chan（available=true）
+    const chart = await screen.findByTestId('kchart');
+    await waitFor(() => expect(chart.getAttribute('data-chan')).toBe('true'));
   });
 });

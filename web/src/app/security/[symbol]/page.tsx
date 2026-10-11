@@ -16,7 +16,9 @@ import IndicatorPicker, {
   type IndicatorMeta,
 } from '@/components/IndicatorPicker';
 import FundamentalCard from '@/components/FundamentalCard';
+import ChanPanel from '@/components/ChanPanel';
 import SecurityAnalysisView from '@/components/SecurityAnalysis';
+import { type ChanData } from '@/lib/chan';
 import { Pct, fmtNum, fmtYi } from '@/components/QuoteTable';
 import { SERIES_COLORS } from '@/lib/chart';
 import { fetcher } from '@/lib/api';
@@ -99,6 +101,10 @@ export default function SecurityPage() {
   // 多角度分析报告（技术/基本面/估值/资金/相对强度/消息面 + 风险）
   const { data: analysis, isLoading: analysisLoading } = useSWR(
     `/security/${encodeURIComponent(symbol)}/analysis`, fetcher,
+  );
+  // 日线缠论结构（独立加载：czsc 是 optional extra，未装时后端返回 available=false）
+  const { data: chan, isLoading: chanLoading, error: chanErr } = useSWR<ChanData>(
+    `/security/${encodeURIComponent(symbol)}/chan?limit=250`, fetcher,
   );
 
   // bars/overlays 仅随 rows（日线）变化；行情 5s 轮询不改 rows 引用，
@@ -253,6 +259,14 @@ export default function SecurityPage() {
         )}
       </Panel>
 
+      {/* 缠论结构：笔/中枢/背驰/一二三类买卖点（日线，只展示已确认结构） */}
+      <Panel
+        title="缠论结构"
+        meta="日线 · 仅已确认结构 · 不参与评分"
+      >
+        <ChanPanel data={chan} isLoading={chanLoading} error={chanErr} />
+      </Panel>
+
       {/* K 线 + 动态叠加 */}
       <Panel
         title="日 K"
@@ -271,7 +285,7 @@ export default function SecurityPage() {
           </div>
         }
       >
-        <KChart bars={bars} overlays={overlays} />
+        <KChart bars={bars} overlays={overlays} chan={chan} />
       </Panel>
 
       {/* 资金流 */}

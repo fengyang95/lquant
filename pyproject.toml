@@ -44,6 +44,12 @@ factors = [
   "statsmodels>=0.14",
   "skfolio>=0.6",
 ]
+# 缠论（日线）：czsc 的 Rust 核编译期锁 polars 0.52，与本仓 polars 1.44 不冲突 ——
+# 边界是 `format_standard_kline(pandas_df) -> list[RawBar]`，不跨界传 polars。
+# 净增 ~145M（wbt/plotly 本仓用不上），故按需安装；未装时缠论面板优雅降级。
+chan = [
+  "czsc>=1.0.1,<1.1",
+]
 # 机器学习选股
 ml = [
   "lightgbm>=4.5",

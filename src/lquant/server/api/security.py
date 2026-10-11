@@ -49,6 +49,43 @@ def security_analysis(
     return analyze_security(sym, day)
 
 
+@router.get("/{symbol}/chan")
+def security_chan(
+    symbol: str,
+    limit: int = Query(
+        default=250, ge=30, le=500,
+        description="展示窗口的日线根数；结构按全量历史算，只截展示窗口"),
+) -> dict:
+    """日线缠论结构（分型 / 笔 / 中枢 / MACD 面积背驰 / 一二三类买卖点）。
+
+    三条契约要点：
+
+    - **只返回已确认结构**：无条件丢弃最新一笔，因此结果不会随后续数据改变
+      （前缀不变性，见 ``lquant.indicators.chan`` 的模块说明）。
+    - **不参与评分**：缠论只作展示，不影响 ``/analysis`` 的技术面得分。
+    - **缺失即降级**：未安装 czsc 或日线不足时返回 ``available=false`` + ``reason``，
+      不抛 5xx —— 前端据此显示提示而不是整页报错。
+
+    ``limit`` 只截**展示窗口**：笔/中枢仍用全量历史算出（近期结构才正确），
+    信号也只算窗口内（``signal_tail``，纯性能开关，不改变取值）。
+    """
+    sym = resolve_symbol(symbol)
+
+    from lquant.data.store.parquet import read_daily
+    from lquant.indicators.chan import ChanUnavailable, compute_chan, tail_result
+
+    df = read_daily([sym]).collect()
+    if df.is_empty():
+        return {"symbol": sym, "available": False, "reason": "湖内无该标的日线数据"}
+    df = df.sort("trade_date")
+    since = df.tail(limit)["trade_date"][0]
+    try:
+        result = compute_chan(df, symbol=sym, signal_tail=limit)
+    except ChanUnavailable as exc:
+        return {"symbol": sym, "available": False, "reason": exc.reason}
+    return tail_result(result, since).to_dict()
+
+
 @router.get("/angles")
 def security_angles() -> dict:
     """角度注册表（id / 名称 / 权重 / 说明）—— 前端图例与文档用。"""

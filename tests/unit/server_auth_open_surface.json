@@ -119,6 +119,7 @@
   "GET /api/qlib/status": "read:factors",
   "GET /api/security/angles": "read:factors",
   "GET /api/security/{symbol}/analysis": "read:factors",
+  "GET /api/security/{symbol}/chan": "read:factors",
   "GET /api/settings": "admin",
   "GET /api/settings/providers": "admin",
   "GET /api/strategies": "read:factors",
