@@ -9,7 +9,11 @@ function makeWsMock() {
     onclose: (() => void) | null;
     close: ReturnType<typeof vi.fn>;
   }> = [];
-  const Ctor = vi.fn().mockImplementation(() => {
+  // 必须是 function 而非箭头函数：streaming.ts 用 `new WebSocket(url)` 构造，
+  // 而 vitest 4 起 mock 的 `new` 会直接 Reflect.construct 实现体 —— 箭头函数没有
+  // [[Construct]]，会抛 "is not a constructor"（vitest 3 时代由 mock 内部代劳，
+  // 所以旧写法能过）。见 https://vitest.dev/api/vi#vi-spyon 。
+  const Ctor = vi.fn(function () {
     const inst = {
       onmessage: null as ((ev: { data: string }) => void) | null,
       onclose: null as (() => void) | null,
