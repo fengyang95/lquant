@@ -60,16 +60,43 @@ jobs:
         # 真相源 —— 矩阵加了片而 SHARDS 没跟上时，多出来的片号本该覆盖的文件
         # 就永远不会被任何 job 跑到，而 CI 依然全绿（实测：SHARDS 偏大时会静默
         # 漏掉约 25% 的测试文件）。改成推导后两者不可能脱节。
-        shard: [1, 2, 3]
+        # 5 片：单片约 15s 固定开销（Rust 扩展命中缓存时）+ ~45s 测试。再加片收益
+        # 递减（固定开销摊薄的同时，单片 pytest 的启动/收集开销不会变小），且
+        # Web job 会变成新瓶颈。
+        shard: [1, 2, 3, 4, 5]
+        # Python 版本走矩阵而不是写死字符串：它同时被 setup-uv 和 Rust 扩展的
+        # 缓存 key 引用（扩展用 pyo3 且**没开 abi3**，与 CPython 小版本强绑定），
+        # 两处必须一致，否则会拿 3.12 的 .so 去 3.13 上跑。
+        python: ["3.12"]
     env:
       SHARDS: ${{ strategy.job-total }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
+
+      # Rust 扩展跨 run 复用：PR 绝大多数不动 crates/，命中时能跳过 rust-cache
+      # 恢复（16s）+ maturin 编译（13s）—— 每片省约 29s。
+      # key 只含真正决定产物的输入：crates 下的源码与全部 toml（含 workspace 级
+      # Cargo.toml、.cargo/config.toml）、Cargo.lock、Python 版本、OS/arch。
+      # **故意不含 uv.lock**：这几个 crate 只在编译期用 pyo3，运行期不碰 polars
+      # （crates 里没有任何 polars 运行时调用），所以 Python 侧依赖升级不会让产物
+      # 失效。真正的耦合是 pyo3↔CPython（未开 abi3），那由 Python 版本这一项覆盖。
+      # 目录名不带点：actions/cache 对隐藏路径的处理不像 upload-artifact 那样有
+      # 显式开关，用普通目录名避免「缓存下来却是空的」。
+      # 末尾 v1 是「构建配方」版本：改了下面 maturin 的调用方式就 +1。
+      - name: 复用已构建的 Rust 扩展
+        id: rustext
+        uses: actions/cache@v4
+        with:
+          path: rust-ext
+          key: rust-ext-${{ runner.os }}-${{ runner.arch }}-py${{ matrix.python }}-v1-${{ hashFiles('crates/**/*.rs', 'crates/**/*.toml', 'crates/Cargo.lock') }}
+
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.rustext.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
+        if: steps.rustext.outputs.cache-hit != 'true'
         with:
           workspaces: crates
           key: python-maturin
@@ -81,11 +108,43 @@ jobs:
 
       - name: Build Rust 扩展（验证 pyo3/polars ABI）
         run: |
-          uv pip install --python .venv/bin/python maturin
-          source .venv/bin/activate
-          for c in lq-ops lq-backtest lq-metrics; do
-            (cd crates/$c && maturin develop)
-          done
+          set -euo pipefail
+          SITE=$(.venv/bin/python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+
+          build() {
+            uv pip install --python .venv/bin/python maturin
+            source .venv/bin/activate
+            for c in lq-ops lq-backtest lq-metrics; do
+              (cd crates/$c && maturin develop)
+            done
+            # 先清空再写，且**三个 .so 全拷完才写 COMPLETE**：恢复时校验这个哨兵，
+            # 免得「编译中途挂掉」留下的半截目录被当成有效缓存。
+            rm -rf rust-ext && mkdir -p rust-ext
+            for m in lq_ops lq_backtest lq_metrics; do cp "$SITE"/$m*.so rust-ext/; done
+            touch rust-ext/COMPLETE
+          }
+          loads() {
+            .venv/bin/python -c "from lquant._rust.loader import has_rust; assert has_rust()"
+          }
+
+          if [ "${{ steps.rustext.outputs.cache-hit }}" = "true" ] && [ -f rust-ext/COMPLETE ]; then
+            # 拷贝必须容错：万一缓存里没有 .so，不能让 set -e 在这里先炸掉 ——
+            # 得让它落到下面的 loads 判定，再走重编译那条路。
+            if ls rust-ext/*.so >/dev/null 2>&1; then
+              cp rust-ext/*.so "$SITE"/
+            fi
+            if loads; then
+              echo "复用缓存扩展：$(ls rust-ext)"
+            else
+              # 缓存命中却加载失败：条目本身坏了/过期了。就地重编译保证不假红，
+              # 但**同 key 的缓存无法被覆盖** —— 不告警的话，之后每次运行都会静默
+              # 重编译。要让缓存重新生效，需把 key 末尾的 v1 加一。
+              echo "::warning::缓存的 Rust 扩展加载失败，已就地重编译；该 key 的缓存条目已失效，需把 key 末尾的 v1 加一才能恢复命中"
+              build
+            fi
+          else
+            build
+          fi
 
       - name: ABI 冒烟（断言 Rust 扩展真实加载，而非 python-fallback）
         run: |

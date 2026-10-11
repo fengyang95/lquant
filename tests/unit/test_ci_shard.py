@@ -76,7 +76,7 @@ def test_shards_of_real_repo_partition_all_test_files() -> None:
     all_files = _mod.test_files(_REPO)
     assert len(all_files) > 100, "测试文件数异常，glob 可能写错了"
 
-    for shards in (2, 3, 4):
+    for shards in (2, 3, 4, 5, 6):
         flat = [f for i in range(1, shards + 1)
                 for f in _mod.shard_for(i, shards, _REPO)]
         assert sorted(flat) == sorted(all_files)
