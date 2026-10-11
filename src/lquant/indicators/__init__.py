@@ -20,6 +20,8 @@ from lquant.indicators import (  # noqa: F401  触发注册
     levels,
     momentum,
     patterns,
+    patterns_full,
+    talib_set,
     tiandao,
     trend,
     volume,
