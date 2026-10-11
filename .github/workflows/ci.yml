@@ -262,7 +262,7 @@ jobs:
         # 数据文件里带解释器版本，跨版本合并同样会读不了。改版本时两处一起改。
         run: |
           uv venv --python 3.12 --clear .venv
-          uv pip install --python .venv/bin/python -e ".[sources,factors,ml,server,dev]"
+          uv pip install --python .venv/bin/python -e ".[sources,factors,ml,server,dev,chan]"
       - uses: actions/download-artifact@v4
         with:
           pattern: coverage-shard-*
