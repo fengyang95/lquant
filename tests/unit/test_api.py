@@ -137,6 +137,57 @@ def test_data_quote_graceful(client):
     assert "available" in r.json()
 
 
+# ---------- security 缠论 ----------
+
+def test_security_chan_ok(client):
+    """日线缠论结构：可用时返回已确认的笔/中枢/信号，且 JSON 形状稳定。"""
+    r = client.get("/api/security/600519.SH/chan", params={"limit": 120})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["available"] is True
+    assert body["freq"] == "日线"
+    assert body["bi"], "demo 湖有 2 年半日线，应能走出笔"
+    assert body["notes"], "口径说明（线段缺失 / MACD 柱口径）必须透出"
+    assert set(body["signals"]) == {"latest", "events"}
+    assert set(body["signals"]["latest"]) == {
+        "beichi", "buy1", "sell1", "buy2", "sell2", "buy3", "sell3"}
+    for z in body["zs"]:
+        assert z["n_bis"] >= 3 and z["zg"] >= z["zd"]
+    dirs = [b["direction"] for b in body["bi"]]
+    assert all(dirs[i] != dirs[i + 1] for i in range(len(dirs) - 1))
+    # 展示窗口截尾：结构不得早于窗口起点
+    assert all(b["edt"] >= body["bi"][0]["edt"] for b in body["bi"])
+
+
+def test_security_chan_limit_bounds(client):
+    """limit 越界由 FastAPI 校验挡住（30..500）。"""
+    assert client.get("/api/security/600519.SH/chan",
+                      params={"limit": 10}).status_code == 422
+    assert client.get("/api/security/600519.SH/chan",
+                      params={"limit": 999}).status_code == 422
+
+
+def test_security_chan_degrades_when_no_data(client):
+    """湖内无该标的日线时 available=false，而不是 500 或空 200。"""
+    r = client.get("/api/security/999999.SZ/chan")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["available"] is False
+    assert "日线数据" in body["reason"]
+
+
+def test_security_chan_degrades_without_czsc(client, monkeypatch):
+    """未安装 czsc 时必须 available=false + 可执行提示，而不是 500。"""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "czsc", None)  # 令 `import czsc` 抛 ImportError
+    r = client.get("/api/security/600519.SH/chan")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["available"] is False
+    assert "chan" in body["reason"], body["reason"]
+
+
 # ---------- watchlist ----------
 
 def test_watchlist_crud_roundtrip(client):

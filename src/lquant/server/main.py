@@ -120,6 +120,24 @@ app = create_app()
 _fastapi_app = app.app if isinstance(app, MonitorMiddleware) else app
 
 
+def _warm_chan_engine() -> None:
+    """预热缠论引擎（czsc 导入约 2.3s）—— 由 :func:`_startup` 在 daemon 线程里跑。
+
+    独立成模块级函数是为了**可直调测试**：写在线程闭包里就只能靠异步等待断言，
+    既慢又易 flaky（线程跑没跑完不确定）。
+
+    三种情况都必须**不抛异常**：装了 → 静默预热；没装 → 提示降级；预热本身出错 →
+    只打印。缠论是 optional extra，它的问题不该拖垮服务启动。
+    """
+    try:
+        from lquant.indicators.chan import warmup
+
+        if not warmup():
+            print("[startup] 未安装 czsc，缠论面板将降级（uv sync --extra chan）")
+    except Exception as e:  # noqa: BLE001 - 预热失败不该影响服务
+        print(f"[startup] 缠论预热跳过: {e}")
+
+
 @_fastapi_app.on_event("startup")
 def _startup() -> None:
     from lquant._rust.loader import print_status
@@ -220,3 +238,9 @@ def _startup() -> None:
 
         threading.Thread(target=_startup_backfill, name="startup-backfill",
                          daemon=True).start()
+
+    # 缠论引擎预热：czsc 的 import 实测约 2.3s，进程内只付一次。
+    # 放在 daemon 线程里，把「首屏多转 2s」挪到服务启动之后 —— 不阻塞启动，
+    # 未装 czsc（optional extra）时静默跳过。daemon 是为了不拖住解释器退出。
+    threading.Thread(target=_warm_chan_engine, name="chan-warmup",
+                     daemon=True).start()
