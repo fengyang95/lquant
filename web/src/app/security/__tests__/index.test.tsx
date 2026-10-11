@@ -1,4 +1,4 @@
-/** 个股分析入口页：默认全量清单 + 行业/代码/名称/类型/板块筛选 + 分页。 */
+/** 个股分析入口页：默认全量清单 + 行业/代码/名称/类型/板块/价·市值·成交额筛选 + 分页。 */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -17,6 +17,10 @@ type Item = {
   symbol: string; name: string; sec_type: string; board: string;
   list_date: string; is_st: boolean;
   industry: string | null; industry_code: string | null;
+  close: number | null; pct_chg: number | null;
+  amount: number | null; total_mv: number | null; float_mv: number | null;
+  turnover_rate: number | null; pe_ttm: number | null;
+  price_date: string | null; mv_date: string | null;
 };
 
 const UNIVERSE = {
@@ -28,12 +32,21 @@ const UNIVERSE = {
   items: [
     { symbol: '000001.SZ', name: '平安银行', sec_type: 'stock', board: 'main',
       list_date: '1991-04-03', is_st: false,
-      industry: '银行', industry_code: '801780.SI' },
+      industry: '银行', industry_code: '801780.SI',
+      close: 11.59, pct_chg: -1.61, amount: 12.6e8, total_mv: 2251e8,
+      float_mv: 2251e8, turnover_rate: 0.55, pe_ttm: 5.18,
+      price_date: '2026-06-30', mv_date: '2026-06-26' },
     { symbol: '600519.SH', name: '贵州茅台', sec_type: 'stock', board: 'main',
       list_date: '2001-08-27', is_st: false,
-      industry: '食品饮料', industry_code: '801120.SI' },
+      industry: '食品饮料', industry_code: '801120.SI',
+      close: 1263.0, pct_chg: 0.57, amount: 44.5e8, total_mv: 15642e8,
+      float_mv: 15642e8, turnover_rate: 0.25, pe_ttm: 19.21,
+      price_date: '2026-06-30', mv_date: '2026-06-26' },
     { symbol: '510300.SH', name: '沪深300ETF', sec_type: 'etf', board: 'unknown',
-      list_date: '2012-05-28', is_st: false, industry: null, industry_code: null },
+      list_date: '2012-05-28', is_st: false, industry: null, industry_code: null,
+      close: 4.2, pct_chg: 0.24, amount: 8.1e8, total_mv: null,
+      float_mv: null, turnover_rate: null, pe_ttm: null,
+      price_date: '2026-06-30', mv_date: null },
   ] as Item[],
   industries: [
     { code: '801780.SI', name: '银行', n_members: 2 },
@@ -154,13 +167,85 @@ describe('个股分析入口页', () => {
     await waitFor(() => {
       expect(universeQueries().some((p) => p.get('industry') === '801780.SI')).toBe(true);
     });
+    await userEvent.type(screen.getByLabelText('股价下限'), '10');
+    await waitFor(() => {
+      expect(universeQueries().some((p) => p.get('min_price') === '10')).toBe(true);
+    }, { timeout: 2000 });
+
     await userEvent.click(screen.getByRole('button', { name: '重置' }));
     await waitFor(() => {
       const last = universeQueries().at(-1)!;
       expect(last.get('industry')).toBeNull();
       expect(last.get('q')).toBeNull();
+      expect(last.get('min_price')).toBeNull();
+      expect(last.get('sort')).toBe('symbol');
       expect(last.get('offset')).toBe('0');
     });
+  });
+
+  it('股价 / 总市值 / 成交额区间进入请求参数（单位：元 / 亿元）', async () => {
+    render(<SecurityIndexPage />);
+    await userEvent.type(await screen.findByLabelText('股价下限'), '10');
+    await userEvent.type(screen.getByLabelText('股价上限'), '50');
+    await userEvent.type(screen.getByLabelText('总市值下限'), '100');
+    await userEvent.type(screen.getByLabelText('总市值上限'), '2000');
+    await userEvent.type(screen.getByLabelText('成交额下限'), '1');
+
+    await waitFor(() => {
+      const last = universeQueries().at(-1)!;
+      expect(last.get('min_price')).toBe('10');
+      expect(last.get('max_price')).toBe('50');
+      expect(last.get('min_mv')).toBe('100');
+      expect(last.get('max_mv')).toBe('2000');
+      expect(last.get('min_amount')).toBe('1');
+    }, { timeout: 3000 });
+  });
+
+  it('非法 / 空区间不发参数（敲到一半的 `-`、`1e` 不该打给后端）', async () => {
+    render(<SecurityIndexPage />);
+    await userEvent.type(await screen.findByLabelText('股价下限'), '-');
+    await userEvent.type(screen.getByLabelText('总市值下限'), 'e');
+
+    await waitFor(() => {
+      // 等到防抖窗口过去（参数里出现 limit 说明请求已重发）
+      expect(universeQueries().length).toBeGreaterThan(1);
+    }, { timeout: 2000 });
+    const last = universeQueries().at(-1)!;
+    expect(last.get('min_price')).toBeNull();
+    expect(last.get('min_mv')).toBeNull();
+  });
+
+  it('排序下拉切换 sort / order 参数', async () => {
+    render(<SecurityIndexPage />);
+    await userEvent.selectOptions(await screen.findByLabelText('排序'), 'total_mv:desc');
+    await waitFor(() => {
+      const last = universeQueries().at(-1)!;
+      expect(last.get('sort')).toBe('total_mv');
+      expect(last.get('order')).toBe('desc');
+    });
+  });
+
+  it('清单展示最新价 / 成交额 / 总市值，并给出市值口径日', async () => {
+    render(<SecurityIndexPage />);
+    const row = (await screen.findByText('贵州茅台')).closest('tr') as HTMLElement;
+    // 列序：代码 名称 行业 板块 类型 最新价 涨跌幅 成交额 总市值 上市日 操作
+    const cells = Array.from(row.querySelectorAll('td')).map((td) => td.textContent);
+    expect(cells[5]).toBe('1263.00');                    // 最新价
+    expect(cells[6]).toContain('+0.57%');                // 涨跌幅（百分数 → 小数）
+    expect(cells[7]).toBe('44.50亿');                    // 成交额
+    expect(cells[8]).toBe('1.56万亿');                   // 总市值（≥1 万亿自动换档）
+    // 口径日透出：估值湖滞后时不能让用户以为市值是当天的
+    expect(screen.getByText(/行情口径 2026-06-30/)).toBeInTheDocument();
+    expect(screen.getByText(/市值口径 2026-06-26/)).toBeInTheDocument();
+  });
+
+  it('市值 / 成交额缺数据的行显示 —，不编 0', async () => {
+    render(<SecurityIndexPage />);
+    const row = (await screen.findByText('沪深300ETF')).closest('tr') as HTMLElement;
+    const cells = Array.from(row.querySelectorAll('td')).map((td) => td.textContent);
+    // ETF 没有估值行：总市值为 —，成交额照常（同一行里两个数据源各给各的）
+    expect(cells[8]).toBe('—');
+    expect(cells[7]).toBe('8.10亿');
   });
 
   it('分页：下一页 offset=50，首页「上一页」禁用', async () => {

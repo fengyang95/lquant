@@ -26,7 +26,10 @@ import { fetcher } from '@/lib/api';
 type Quote = {
   symbol: string;
   name?: string | null;
+  /** 实时行情（东财）是否可用。湖内日线兜底不会把它变成 true */
   available: boolean;
+  /** 数据来源：realtime=实时行情；daily=湖内日线 + 估值湖兜底 */
+  source?: 'realtime' | 'daily' | null;
   price?: number | null;
   change?: number | null;
   change_pct?: number | null;
@@ -36,6 +39,12 @@ type Quote = {
   prev_close?: number | null;
   amount?: number | null;
   market_cap?: number | null;
+  float_mv?: number | null;
+  turnover_rate?: number | null;
+  pe_ttm?: number | null;
+  /** 价 / 额的日线口径日；市值来自估值湖，通常滞后，单列 mv_date */
+  trade_date?: string | null;
+  mv_date?: string | null;
 };
 
 /** /data/indicators 返回行：OHLC + 被选中的指标列（列集合由 names 参数决定） */
@@ -132,11 +141,15 @@ export default function SecurityPage() {
 
   const last = rows?.[rows.length - 1];
   const prev = rows && rows.length > 1 ? rows[rows.length - 2] : undefined;
-  const price = quote?.available && quote.price != null ? quote.price : last?.close;
-  const chgPct = quote?.available && quote.change_pct != null
+  // 后端已在实时行情不可用时用湖内日线兜底（source='daily'），所以这里直接取
+  // quote.price；只有接口整个失败（或该标的湖内无数据）才退回图表末根收盘价。
+  const price = quote?.price ?? last?.close;
+  const chgPct = quote?.change_pct != null
     ? quote.change_pct / 100
     : price && prev?.close ? price / prev.close - 1 : null;
   const name = quote?.name;
+  const quoteDate = quote?.trade_date ?? last?.trade_date ?? null;
+  const realtime = quote?.source === 'realtime';
   // 个股分析报告里带了所属行业（PIT 归属）—— 拿它做个股 ↔ 行业 的互链，
   // 不用再单独请求一次行业接口。
   const industryName = (analysis as { overview?: { industry?: string } } | undefined)
@@ -151,10 +164,10 @@ export default function SecurityPage() {
         sub={
           <>
             <span className="font-mono">{symbol}</span>
-            {quote?.available
+            {realtime
               ? ` · 实时 · 开 ${fmtNum(quote.open)} 高 ${fmtNum(quote.high)} 低 ${fmtNum(quote.low)} 昨收 ${fmtNum(quote.prev_close)}`
-              : last
-                ? ` · 实时行情不可用，显示 ${last.trade_date} 收盘价`
+              : price != null
+                ? ` · 实时行情不可用 · 湖内日线 ${quoteDate ?? '—'} 收盘价`
                 : ' · 暂无行情'}
           </>
         }
@@ -177,9 +190,17 @@ export default function SecurityPage() {
             <span className="pb-1 text-lg"><Pct value={chgPct} /></span>
           </div>
           <div className="grid grid-cols-3 gap-x-10">
-            <Stat label="成交额" value={fmtYi(quote?.available ? quote.amount : null)} />
-            <Stat label="总市值" value={quote?.available ? fmtYi(quote.market_cap) : '—'} />
-            <Stat label="数据截至" value={last?.trade_date ?? '—'} />
+            <Stat
+              label="成交额"
+              value={fmtYi(quote?.amount)}
+              hint={quoteDate ? `口径 ${quoteDate}` : undefined}
+            />
+            <Stat
+              label="总市值"
+              value={fmtYi(quote?.market_cap)}
+              hint={quote?.mv_date ? `口径 ${quote.mv_date}` : undefined}
+            />
+            <Stat label="数据截至" value={quoteDate ?? '—'} />
           </div>
         </div>
       </Panel>

@@ -482,6 +482,142 @@ def latest_top_by_amount(limit: int = 200) -> list[str]:
     )
 
 
+#: 快照取数窗口。日线 40 天：停牌两三周的票也能取到自己的末根，不至于因为
+#: 「最近 5 天没成交」就从列表里消失。daily_basic 90 天：估值湖的同步节奏明显
+#: 落后于日线（实测落后两周以上是常态），窗口太窄会让总市值整列变空 ——
+#: 那正是本函数要修的问题。
+_SNAPSHOT_DAILY_DAYS = 40
+_SNAPSHOT_BASIC_DAYS = 90
+
+#: 快照固定列。全空也返回这些列（0 行），调用方不必逐列判存在。
+SNAPSHOT_SCHEMA: dict[str, pl.DataType] = {
+    "symbol": pl.String,
+    "trade_date": pl.Date,      # 日线末根日期（价格 / 成交额的口径日）
+    "open": pl.Float64,
+    "high": pl.Float64,
+    "low": pl.Float64,
+    "close": pl.Float64,
+    "pre_close": pl.Float64,
+    "pct_chg": pl.Float64,      # 百分数（+1.86 = 涨 1.86%），与湖内口径一致
+    "volume": pl.Float64,
+    "amount": pl.Float64,       # 元
+    "mv_date": pl.Date,         # daily_basic 取值日（估值湖常滞后于日线）
+    "total_mv": pl.Float64,     # 元
+    "float_mv": pl.Float64,     # 元
+    "pe_ttm": pl.Float64,
+    "turnover_rate": pl.Float64,
+}
+
+_DAILY_SNAPSHOT_COLS = ("symbol", "trade_date", "open", "high", "low", "close",
+                        "pre_close", "pct_chg", "volume", "amount")
+_BASIC_SNAPSHOT_COLS = ("symbol", "trade_date", "total_mv", "float_mv",
+                        "pe_ttm", "turnover_rate")
+_BASIC_VALUE_COLS = ("total_mv", "float_mv", "pe_ttm", "turnover_rate")
+
+
+def empty_snapshot() -> pl.DataFrame:
+    """0 行但列齐的快照帧：调用方（左连接 / 区间筛选）不必判列存在。"""
+    return pl.DataFrame(schema=SNAPSHOT_SCHEMA)
+
+
+def latest_snapshot(symbols: list[str] | None = None,
+                    asof: date | str | None = None) -> pl.DataFrame:
+    """每只标的「最新一日」的价 / 量 / 额 / 市值横向快照。
+
+    为什么要有这个函数：个股列表页要按股价 / 总市值筛选并展示成交额，个股详情页
+    也要显示成交额与总市值 —— 这两处在行情源（东财实时接口）不可用时全是空的。
+    数据其实一直在湖里：日线湖有 ``close`` / ``amount``，估值湖
+    （``daily_basic``）有 ``total_mv`` / ``float_mv``。这个函数把两个湖按标的
+    横向拼起来，且**各取自己最新的一天**（估值湖天然滞后，按同一天内连接会让
+    总市值整列变空）。
+
+    参数：
+
+    - ``symbols``：None = 全市场；给了就下推到 scan，只读这些标的的行组。
+    - ``asof``：观察日（含）。None 取湖内最新交易日；空湖时退回自然日。
+
+    返回列见 :data:`SNAPSHOT_SCHEMA`；**任何情况下都返回这些列**（空湖 / 单只
+    无数据时为 0 行），调用方用 ``symbol`` 左连接即可，不必先判列存在。
+    """
+    from datetime import date as _date
+    from datetime import timedelta
+
+    end = asof
+    if isinstance(end, str):
+        end = _date.fromisoformat(end)
+    if end is None:
+        end = latest_trade_date()
+    if end is None:
+        from lquant.core.types import today_cn
+
+        end = today_cn()
+
+    sym_filter = list(symbols) if symbols else None
+
+    daily = read_daily(symbols=sym_filter,
+                       start=end - timedelta(days=_SNAPSHOT_DAILY_DAYS),
+                       end=end).collect()
+    if daily.height:
+        daily = (daily.select([c for c in _DAILY_SNAPSHOT_COLS if c in daily.columns])
+                      .sort(["symbol", "trade_date"])
+                      .group_by("symbol", maintain_order=True)
+                      .last())
+    else:
+        daily = pl.DataFrame(schema={k: v for k, v in SNAPSHOT_SCHEMA.items()
+                                     if k in _DAILY_SNAPSHOT_COLS})
+
+    basic = read_daily_basic(symbols=sym_filter,
+                             start=end - timedelta(days=_SNAPSHOT_BASIC_DAYS),
+                             end=end)
+    if basic.height:
+        basic = basic.select([c for c in _BASIC_SNAPSHOT_COLS if c in basic.columns])
+        # 只要「至少有一个估值字段」的行：daily_basic 里存在整行 NULL 的占位
+        # （源当天没出数），拿它当最新一行会把上一日的市值抹成空。
+        value_cols = [c for c in _BASIC_VALUE_COLS if c in basic.columns]
+        if value_cols:
+            basic = basic.filter(pl.any_horizontal(
+                [pl.col(c).is_not_null() for c in value_cols]))
+        basic = (basic.sort(["symbol", "trade_date"])
+                      .group_by("symbol", maintain_order=True)
+                      .last()
+                      .rename({"trade_date": "mv_date"}))
+    else:
+        basic = pl.DataFrame(schema={("mv_date" if k == "trade_date" else k): v
+                                     for k, v in SNAPSHOT_SCHEMA.items()
+                                     if k in _BASIC_SNAPSHOT_COLS})
+
+    if daily.height and basic.height:
+        out = daily.join(basic, on="symbol", how="full", coalesce=True)
+    elif daily.height:
+        out = daily
+    elif basic.height:
+        out = basic
+    else:
+        return empty_snapshot()
+
+    # pct_chg 可能整列不存在（部分源不出涨跌幅，且没有任何文件带这列时
+    # missing_columns="insert" 也补不出来）—— 用 pre_close 现算，仍缺则留 null。
+    if {"pct_chg", "close", "pre_close"} <= set(out.columns):
+        out = out.with_columns(
+            pl.when(pl.col("pct_chg").is_null() & pl.col("close").is_not_null()
+                    & pl.col("pre_close").is_not_null()
+                    & (pl.col("pre_close") != 0))
+              .then((pl.col("close") / pl.col("pre_close") - 1) * 100)
+              .otherwise(pl.col("pct_chg"))
+              .alias("pct_chg"))
+    elif {"close", "pre_close"} <= set(out.columns):
+        out = out.with_columns(
+            pl.when(pl.col("close").is_not_null() & pl.col("pre_close").is_not_null()
+                    & (pl.col("pre_close") != 0))
+              .then((pl.col("close") / pl.col("pre_close") - 1) * 100)
+              .otherwise(None)
+              .alias("pct_chg"))
+    return out.with_columns(
+        [pl.lit(None, dtype=v).alias(k) for k, v in SNAPSHOT_SCHEMA.items()
+         if k not in out.columns]
+    ).select(list(SNAPSHOT_SCHEMA)).sort("symbol")
+
+
 def write_factor(factor: str, df: pl.DataFrame) -> Path:
     p = _root() / "factors" / f"name={factor}"
     p.mkdir(parents=True, exist_ok=True)

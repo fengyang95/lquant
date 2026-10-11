@@ -287,6 +287,210 @@ def test_quote_degrades(client):
     assert r.json()["available"] in (True, False)
 
 
+# ---------------- 价 / 额 / 市值（湖内快照 + 区间筛选 + 排序） ----------------
+
+def _universe(client, **params):
+    return client.get("/api/data/securities/universe", params=params).json()
+
+
+def test_securities_universe_exposes_price_amount_and_mv(client):
+    """清单行带上最新价 / 成交额 / 总市值与各自的口径日（不依赖实时行情源）。"""
+    body = _universe(client, q="600519", limit=1)
+    it = body["items"][0]
+    assert it["symbol"] == "600519.SH"
+    assert it["close"] is not None and it["close"] > 0
+    assert it["amount"] is not None and it["amount"] > 0
+    assert it["total_mv"] is not None and it["total_mv"] > 0
+    assert it["float_mv"] is not None and it["float_mv"] > 0
+    # 口径日：价 / 额来自日线湖，市值来自估值湖，两者各给各的日期
+    assert it["price_date"] == body["asof"]
+    assert it["mv_date"] is not None
+    assert it["pct_chg"] is not None
+
+
+def test_securities_universe_price_range_filter(client):
+    base = _universe(client, limit=200)
+    assert base["total"] == 30
+    target = next(i for i in base["items"] if i["symbol"] == "600519.SH")
+
+    above = _universe(client, min_price=target["close"], limit=200)
+    assert above["total"] < base["total"]
+    assert above["items"]
+    assert all(i["close"] >= target["close"] for i in above["items"])
+
+    below = _universe(client, max_price=target["close"], limit=200)
+    assert below["items"]
+    assert all(i["close"] <= target["close"] for i in below["items"])
+    # 上下限同时给 = 闭区间
+    both = _universe(client, min_price=target["close"], max_price=target["close"],
+                     limit=200)
+    assert [i["symbol"] for i in both["items"]] == [target["symbol"]]
+
+
+def test_securities_universe_mv_and_amount_range_filter(client):
+    """市值单位是**亿元**，成交额同理 —— 传参按亿元，湖里是元。"""
+    base = _universe(client, limit=200)
+    target = max((i for i in base["items"] if i["total_mv"] is not None),
+                 key=lambda i: i["total_mv"])
+    top_mv = target["total_mv"] / 1e8
+
+    big = _universe(client, min_mv=top_mv, limit=200)
+    assert [i["symbol"] for i in big["items"]] == [target["symbol"]]
+
+    small = _universe(client, max_mv=top_mv / 2, limit=200)
+    assert small["items"]
+    assert all(i["total_mv"] <= top_mv / 2 * 1e8 for i in small["items"])
+    assert target["symbol"] not in {i["symbol"] for i in small["items"]}
+
+    busiest = max((i for i in base["items"] if i["amount"] is not None),
+                  key=lambda i: i["amount"])
+    min_amt = busiest["amount"] / 1e8
+    liquid = _universe(client, min_amount=min_amt, limit=200)
+    assert [i["symbol"] for i in liquid["items"]] == [busiest["symbol"]]
+
+    # 上限：最冷清的票单独成表
+    quietest = min((i for i in base["items"] if i["amount"] is not None),
+                   key=lambda i: i["amount"])
+    illiquid = _universe(client, max_amount=quietest["amount"] / 1e8, limit=200)
+    assert [i["symbol"] for i in illiquid["items"]] == [quietest["symbol"]]
+
+
+def test_securities_universe_range_filter_drops_rows_without_data(client):
+    """没有湖内数据的标的：不筛时照常列出（列为 —），一旦按价/市值筛就被剔除。
+
+    宁可少几行，也不能把「市值不明」的票混进「市值 < 50 亿」的结果里。
+    """
+    from lquant.core.db import writer
+
+    with writer() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO security "
+            "(symbol, name, sec_type, board, list_date, is_st, source) "
+            "VALUES ('999997.SZ', '无行情测试', 'stock', 'main', "
+            "DATE '2020-01-01', FALSE, 'test')")
+    try:
+        plain = _universe(client, q="999997", limit=5)
+        assert plain["total"] == 1
+        row = plain["items"][0]
+        assert row["close"] is None and row["total_mv"] is None
+        assert row["price_date"] is None and row["mv_date"] is None
+
+        assert _universe(client, q="999997", min_price=0.01)["total"] == 0
+        assert _universe(client, q="999997", max_mv=100000)["total"] == 0
+    finally:
+        with writer() as con:
+            con.execute("DELETE FROM security WHERE symbol = '999997.SZ'")
+
+
+def test_securities_universe_sort(client):
+    body = _universe(client, sort="total_mv", order="desc", limit=200)
+    mvs = [i["total_mv"] for i in body["items"]]
+    assert mvs == sorted(mvs, reverse=True, key=lambda v: (v is None, v))
+
+    asc = _universe(client, sort="close", order="asc", limit=200)
+    closes = [i["close"] for i in asc["items"]]
+    assert closes == sorted(closes, key=lambda v: (v is None, v))
+
+    by_amount = _universe(client, sort="amount", order="desc", limit=5)
+    assert [i["amount"] for i in by_amount["items"]] == \
+        sorted([i["amount"] for i in by_amount["items"]], reverse=True)
+
+    # 默认仍是代码升序（翻页稳定性的前提）
+    default = _universe(client, limit=200)
+    syms = [i["symbol"] for i in default["items"]]
+    assert syms == sorted(syms)
+
+
+def test_securities_universe_sort_whitelist(client):
+    """排序字段走白名单：客户端传任意列名一律 422，不放任内部 schema 外泄。"""
+    assert client.get("/api/data/securities/universe",
+                      params={"sort": "name"}).status_code == 422
+    assert client.get("/api/data/securities/universe",
+                      params={"order": "sideways"}).status_code == 422
+    assert client.get("/api/data/securities/universe",
+                      params={"min_price": -1}).status_code == 422
+    assert client.get("/api/data/securities/universe",
+                      params={"min_mv": -1}).status_code == 422
+
+
+def test_securities_universe_snapshot_failure_degrades(client, monkeypatch):
+    """快照读取失败 → 清单照常出（价/额/市值为空 + note），不是 500 也不是空表。"""
+    from lquant.data.store import parquet as pq
+
+    def _boom(*a, **k):
+        raise RuntimeError("lake down")
+
+    monkeypatch.setattr(pq, "latest_snapshot", _boom)
+    body = _universe(client, limit=5)
+    assert body["total"] == 30
+    assert len(body["items"]) == 5
+    assert all(i["close"] is None and i["total_mv"] is None for i in body["items"])
+    assert any("读取失败" in n for n in body["notes"])
+
+
+# ---------------- quote：实时不可用时用湖内日线兜底 ----------------
+
+def _no_network(*a, **k):
+    raise RuntimeError("no network")
+
+
+def test_quote_falls_back_to_lake_when_realtime_unavailable(client, monkeypatch):
+    """实时源挂掉时成交额 / 总市值不该是空的 —— 湖里有，就照实给，并标 source。"""
+    from lquant.market import em_client as em_mod
+
+    monkeypatch.setattr(em_mod, "em_get", _no_network)
+    body = client.get("/api/data/quote", params={"symbol": "600519.SH"}).json()
+
+    assert body["available"] is False          # available 语义不变：只表示实时
+    assert body["source"] == "daily"
+    assert body["price"] and body["price"] > 0
+    assert body["prev_close"] and body["prev_close"] > 0
+    assert body["amount"] and body["amount"] > 0
+    assert body["market_cap"] and body["market_cap"] > 0
+    assert body["change"] == pytest.approx(body["price"] - body["prev_close"])
+    assert body["trade_date"] and body["mv_date"]
+
+
+def test_quote_backfills_missing_live_fields_from_lake(client, monkeypatch):
+    """实时可用但缺 f48/f116 时用湖内补，source 仍是 realtime（口径以实时为准）。"""
+    from lquant.market import em_client as em_mod
+
+    class _R:
+        def json(self):
+            return {"data": {"f57": "600519", "f58": "贵州茅台", "f43": 1500.0,
+                             "f169": 12.0, "f170": 0.8, "f46": 1490.0,
+                             "f44": 1510.0, "f45": 1480.0, "f60": 1488.0,
+                             "f47": 1000.0}}
+
+    monkeypatch.setattr(em_mod, "em_get", lambda url, qps=None: _R())
+    body = client.get("/api/data/quote", params={"symbol": "600519.SH"}).json()
+
+    assert body["available"] is True and body["source"] == "realtime"
+    assert body["price"] == 1500.0            # 实时值优先，不被湖内覆盖
+    assert body["amount"] and body["amount"] > 0            # 湖内兜底
+    assert body["market_cap"] and body["market_cap"] > 0    # 湖内兜底
+
+
+def test_quote_without_realtime_or_lake_data(client, monkeypatch):
+    """实时不可用且湖内没有该标的 → source=None（前端显示 —，不编数）。"""
+    from lquant.market import em_client as em_mod
+
+    monkeypatch.setattr(em_mod, "em_get", _no_network)
+    body = client.get("/api/data/quote", params={"symbol": "999999.SZ"}).json()
+    assert body == {"symbol": "999999.SZ", "available": False, "source": None}
+
+
+def test_quote_survives_lake_read_failure(client, monkeypatch):
+    """湖内兜底读取失败不该把实时路径一起带崩（source=None）。"""
+    from lquant.data.store import parquet as pq
+    from lquant.market import em_client as em_mod
+
+    monkeypatch.setattr(em_mod, "em_get", _no_network)
+    monkeypatch.setattr(pq, "latest_snapshot", _no_network)
+    body = client.get("/api/data/quote", params={"symbol": "600519.SH"}).json()
+    assert body == {"symbol": "600519.SH", "available": False, "source": None}
+
+
 # ---------------- gaps / repair ----------------
 
 def _fake_rep(missing):

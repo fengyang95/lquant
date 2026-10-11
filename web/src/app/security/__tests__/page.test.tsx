@@ -34,8 +34,18 @@ const ROWS = [
 ];
 
 const QUOTE = { symbol: '600519.SH', name: '贵州茅台', available: true,
-                price: 1.6, change_pct: 2.1, open: 1, high: 2, low: 0.5,
-                prev_close: 1.5, amount: 1e8, market_cap: 1e11 };
+                source: 'realtime', price: 1.6, change_pct: 2.1, open: 1,
+                high: 2, low: 0.5, prev_close: 1.5, amount: 1e8,
+                market_cap: 1e11 };
+
+/** 实时不可用时的湖内兜底响应（后端 /data/quote 的 source='daily' 分支） */
+const QUOTE_DAILY = { symbol: '600519.SH', available: false, source: 'daily',
+                      price: 1.6, change_pct: 2.1, open: 8, high: 9, low: 7,
+                      prev_close: 1.5, amount: 4.45e9, market_cap: 1.56e12,
+                      trade_date: '2026-06-30', mv_date: '2026-06-26' };
+
+/** 实时与湖内都没有（source=null）：价格退回日线末根，额 / 市值显示 — */
+const QUOTE_EMPTY = { symbol: '600519.SH', available: false, source: null };
 
 const FUND = { symbol: '600519.SH', asof: '2026-04-01', available: false,
                hint: '财务数据为空：先执行 lq data financial', score: null, items: [] };
@@ -53,6 +63,8 @@ const CHAN = {
 };
 
 const requestedKeys: string[] = [];
+/** 可变夹具：实时 / 兜底 / 全空三条报价分支不必重载模块即可覆盖 */
+let quoteData: typeof QUOTE | typeof QUOTE_DAILY | typeof QUOTE_EMPTY = QUOTE;
 
 vi.mock('swr', () => ({
   default: (key: string | null) => {
@@ -62,7 +74,7 @@ vi.mock('swr', () => ({
       return { data: REGISTRY, isLoading: false, error: undefined };
     }
     if (key.startsWith('/data/quote')) {
-      return { data: QUOTE, isLoading: false, error: undefined };
+      return { data: quoteData, isLoading: false, error: undefined };
     }
     if (key.startsWith('/data/indicators?')) {
       return { data: ROWS, isLoading: false, error: undefined };
@@ -104,6 +116,7 @@ const indicatorRequests = () => requestedKeys.filter((k) => k.startsWith('/data/
 describe('SecurityPage 指标接线', () => {
   beforeEach(() => {
     requestedKeys.length = 0;
+    quoteData = QUOTE;
   });
 
   it('首屏按默认指标集请求，并把可叠加列画到 K 线上', async () => {
@@ -169,5 +182,44 @@ describe('SecurityPage 指标接线', () => {
     // K 线叠加层拿到的是同一份 chan（available=true）
     const chart = await screen.findByTestId('kchart');
     await waitFor(() => expect(chart.getAttribute('data-chan')).toBe('true'));
+  });
+});
+
+describe('SecurityPage 报价口径（实时 / 湖内兜底）', () => {
+  beforeEach(() => {
+    requestedKeys.length = 0;
+    quoteData = QUOTE;
+  });
+
+  it('实时可用：标「实时」并给出开高低昨收', async () => {
+    render(<SecurityPage />);
+    expect(await screen.findByText(/实时 · 开 1\.00/)).toBeInTheDocument();
+    expect(screen.getByText('1.00亿')).toBeInTheDocument();     // 成交额
+    expect(screen.getByText('1000.00亿')).toBeInTheDocument();  // 总市值
+  });
+
+  it('实时不可用：成交额 / 总市值取湖内值而不是「—」，并标注口径日', async () => {
+    quoteData = QUOTE_DAILY;
+    render(<SecurityPage />);
+
+    expect(await screen.findByText(/实时行情不可用 · 湖内日线 2026-06-30/))
+      .toBeInTheDocument();
+    expect(screen.getByText('44.50亿')).toBeInTheDocument();      // 成交额（湖内）
+    expect(screen.getByText('1.56万亿')).toBeInTheDocument();     // 总市值（湖内）
+    // 市值口径日单列：估值湖滞后于日线，不能混成一个日期
+    expect(screen.getByText('口径 2026-06-26')).toBeInTheDocument();
+    expect(screen.getByText('口径 2026-06-30')).toBeInTheDocument();
+    expect(screen.getAllByText('2026-06-30').length).toBeGreaterThan(0);  // 数据截至
+  });
+
+  it('实时与湖内都没有时如实显示「—」，并用日线末根兜底价格', async () => {
+    quoteData = QUOTE_EMPTY;
+    render(<SecurityPage />);
+
+    expect(await screen.findByText(/实时行情不可用/)).toBeInTheDocument();
+    // 成交额 / 总市值两栏都是 —（不编 0）
+    expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(2);
+    // 价格退回 K 线末根（ROWS 末根 close=1.6），仍有一个数可看
+    expect(screen.getByText('1.60')).toBeInTheDocument();
   });
 });

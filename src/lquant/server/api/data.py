@@ -324,6 +324,19 @@ def securities(
 _UNIVERSE_MAX_LIMIT = 200
 
 
+#: 清单可排序的列 → 湖内列名。白名单而非自由字符串：``sort`` 直接进
+#: ``pl.sort``，让客户端传任意列名等于把内部 schema 暴露成 API 面。
+_UNIVERSE_SORTS = {
+    "symbol": "symbol",
+    "close": "close",
+    "amount": "amount",
+    "total_mv": "total_mv",
+    "float_mv": "float_mv",
+    "turnover_rate": "turnover_rate",
+    "pe_ttm": "pe_ttm",
+}
+
+
 @router.get("/securities/universe")
 def securities_universe(
     q: str = Query(default="", max_length=20, description="代码/名称关键字"),
@@ -335,18 +348,37 @@ def securities_universe(
     include_delisted: bool = Query(default=False, description="是否含已退市标的"),
     std: str | None = Query(default=None, max_length=16,
                             description="行业分类标准 SW/CICS/em，缺省自动挑"),
+    min_price: float | None = Query(default=None, ge=0, description="最新收盘价下限（元）"),
+    max_price: float | None = Query(default=None, ge=0, description="最新收盘价上限（元）"),
+    min_mv: float | None = Query(default=None, ge=0, description="总市值下限（亿元）"),
+    max_mv: float | None = Query(default=None, ge=0, description="总市值上限（亿元）"),
+    min_amount: float | None = Query(default=None, ge=0,
+                                     description="最新交易日成交额下限（亿元）"),
+    max_amount: float | None = Query(default=None, ge=0,
+                                     description="最新交易日成交额上限（亿元）"),
+    sort: str = Query(default="symbol", pattern="^(" + "|".join(_UNIVERSE_SORTS) + ")$",
+                      description="排序字段：symbol/close/amount/total_mv/float_mv/"
+                                  "turnover_rate/pe_ttm"),
+    order: str = Query(default="asc", pattern="^(asc|desc)$", description="排序方向"),
     limit: int = Query(default=50, ge=1, le=_UNIVERSE_MAX_LIMIT),
     offset: int = Query(default=0, ge=0),
 ) -> dict:
-    """全量标的清单：默认返回全部（分页），支持行业 / 代码 / 名称 / 类型 / 板块筛选。
+    """全量标的清单：默认返回全部（分页），支持行业 / 代码 / 名称 / 类型 / 板块 +
+    股价 / 总市值 / 成交额区间筛选，并可排序。
 
     与 ``/securities`` 的分工：那个是搜索框的轻量关键字搜索，返回裸列表；这个是
-    「全量清单」页面的取数口 —— 需要**总数**（翻页）、**行业归属**（列 + 下拉）
-    和**分页**，所以返回 ``{items,total,limit,offset,industries,notes}`` 信封。
+    「全量清单」页面的取数口 —— 需要**总数**（翻页）、**行业归属**（列 + 下拉）、
+    **最新价 / 成交额 / 总市值**（列 + 筛选）和**分页**，所以返回
+    ``{items,total,limit,offset,industries,notes}`` 信封。
 
     行业归属走 PIT（``industry_classify.std_date <= asof``，每只取生效日最晚的
     一条），与行业分析 / 因子中性化同一口径。``industries`` 是**不随 q/类型/板块
     过滤收缩**的全量行业清单 —— 否则筛完一个行业后下拉框自己就空了。
+
+    价 / 额 / 市值来自本地湖（``latest_snapshot``：日线湖的 ``close`` / ``amount``
+    + 估值湖的 ``total_mv``），**不依赖实时行情源** —— 实时接口不可用时这些列
+    照样有值（此前详情页的成交额 / 总市值就是这样整片变空的）。估值湖滞后于
+    日线，故 ``mv_date`` 单列透出，前端据此说明市值是哪天的口径。
     """
     from lquant.core.types import today_cn
     from lquant.industry.loader import (
@@ -428,6 +460,24 @@ def securities_universe(
                              notes=[*notes, f"行业 {key!r} 未匹配到任何分类，列表为空"])
         sec = sec.filter(pl.col("industry_code") == hit[0])
 
+    # 价 / 额 / 市值：本地湖横向快照（不依赖实时行情源）。读失败只降级为 NULL 列，
+    # 不影响清单本身 —— 筛选条件在这种情况下筛掉全部，走「列表为空 + note」路径。
+    snap = _universe_snapshot(sec["symbol"].to_list(), day, notes)
+    sec = sec.join(snap, on="symbol", how="left")
+
+    sec = _apply_universe_ranges(
+        sec, min_price=min_price, max_price=max_price, min_mv=min_mv,
+        max_mv=max_mv, min_amount=min_amount, max_amount=max_amount)
+
+    key = _UNIVERSE_SORTS[sort]
+    if key == "symbol":
+        sec = sec.sort("symbol", descending=order == "desc")
+    else:
+        # 数值列一律 nulls_last：升序时「没有市值」不该排在 0 前面，降序时也不该
+        # 抢在真正的龙头前面。并列时按代码兜底，保证翻页稳定。
+        sec = sec.sort([key, "symbol"], descending=[order == "desc", False],
+                       nulls_last=True)
+
     total = sec.height
     items = [
         {
@@ -439,12 +489,74 @@ def securities_universe(
             "is_st": r["is_st"],
             "industry": r["industry_name"],
             "industry_code": r["industry_code"],
+            "close": r["close"],
+            "pct_chg": r["pct_chg"],
+            "amount": r["amount"],
+            "total_mv": r["total_mv"],
+            "float_mv": r["float_mv"],
+            "turnover_rate": r["turnover_rate"],
+            "pe_ttm": r["pe_ttm"],
+            "price_date": str(r["trade_date"]) if r["trade_date"] else None,
+            "mv_date": str(r["mv_date"]) if r["mv_date"] else None,
         }
         for r in sec.slice(offset, limit).iter_rows(named=True)
     ]
     return {"asof": day.isoformat(), "std": used_std, "total": total,
             "limit": limit, "offset": offset, "items": items,
             "industries": industries, "notes": notes}
+
+
+def _universe_snapshot(symbols: list[str], day, notes: list[str]) -> pl.DataFrame:
+    """清单用的湖内快照；读失败时给「全 NULL 但列齐」的空帧 + note。
+
+    为什么不是直接 try 包住 join：筛选条件（min_mv 等）依赖这些列存在，
+    列都不在的帧会让 polars 抛 ColumnNotFound（500）。空帧则自然筛出空列表。
+    """
+    from lquant.data.store.parquet import empty_snapshot, latest_snapshot
+
+    if not symbols:
+        # 空清单不必读湖：latest_snapshot([]) 的语义是「全市场」，会白读一遍
+        return empty_snapshot()
+    try:
+        return latest_snapshot(symbols=symbols, asof=day)
+    except Exception as e:  # noqa: BLE001 - 读湖失败不该让整页 500
+        from loguru import logger
+
+        logger.warning(f"行情/市值快照读取失败（价/额/市值列降级为空）: {e}")
+        notes.append("最新价 / 成交额 / 总市值读取失败 —— 先执行 `lq data daily` "
+                     "与 `lq data basic` 补齐湖内数据")
+        return empty_snapshot()
+
+
+def _apply_universe_ranges(
+    sec: pl.DataFrame,
+    *,
+    min_price: float | None,
+    max_price: float | None,
+    min_mv: float | None,
+    max_mv: float | None,
+    min_amount: float | None,
+    max_amount: float | None,
+) -> pl.DataFrame:
+    """按 价（元）/ 总市值（亿元）/ 成交额（亿元）区间过滤。
+
+    缺数据的行在「有该条件」时一律剔除（polars 的 null 比较结果为 null → 不保留）：
+    市值不明的票混进「市值 < 50 亿」的结果里比少几行危险得多。
+    """
+    out = sec
+    if min_price is not None:
+        out = out.filter(pl.col("close") >= min_price)
+    if max_price is not None:
+        out = out.filter(pl.col("close") <= max_price)
+    if min_mv is not None:
+        out = out.filter(pl.col("total_mv") >= min_mv * 1e8)
+    if max_mv is not None:
+        out = out.filter(pl.col("total_mv") <= max_mv * 1e8)
+    if min_amount is not None:
+        out = out.filter(pl.col("amount") >= min_amount * 1e8)
+    if max_amount is not None:
+        out = out.filter(pl.col("amount") <= max_amount * 1e8)
+    return out
 
 
 @router.get("/daily")
@@ -532,32 +644,101 @@ def _secid(symbol: str) -> str:
 
 @router.get("/quote")
 def quote(symbol: str = Query(min_length=6, max_length=16)) -> dict:
-    """实时行情（东财）。不可用时 available=false，前端兜底日线末价。"""
+    """最新行情：**实时源优先，湖内日线兜底**。
+
+    为什么要有兜底：实时行情走东财 push2，代理/断网/源站限流任一环节出问题都拿不到
+    数 —— 此时页面上的成交额与总市值会整片变成「—」，而这两项其实一直在本地湖里
+    （日线湖 ``amount`` + 估值湖 ``total_mv``）。所以这里在实时不可用（或实时缺字段）
+    时用湖内最新一日补齐，并用 ``source`` 如实标注数据来自哪一侧：
+
+    - ``source="realtime"``：实时行情可用（``available=true``），字段以实时为准，
+      实时缺的字段用湖内值补（例如 push2 偶发不返回 f116 总市值）；
+    - ``source="daily"``：实时不可用，全部取自湖内日线 + 估值湖，``trade_date`` /
+      ``mv_date`` 分别给出价格/成交额口径日与市值口径日（估值湖通常滞后）；
+    - ``source=None``：实时不可用且湖内也没有该标的（``available=false``）。
+
+    ``available`` 仍只表示**实时行情**是否可用（前端据此决定是否标「实时」），
+    不会因为有了湖内兜底就变成 true。
+    """
     sym = resolve_symbol(symbol)
+    live: dict | None = None
     try:
         from lquant.market.em_client import em_get
 
-        r = em_get(_QT_URL.format(secid=_secid(sym)), qps=3.0)
-        data = r.json().get("data") or {}
-    except Exception:  # noqa: BLE001 - 代理/断网都走这里
-        return {"symbol": sym, "available": False}
-    if not data.get("f57"):
-        return {"symbol": sym, "available": False}
+        data = em_get(_QT_URL.format(secid=_secid(sym)), qps=3.0).json().get("data") or {}
+        if data.get("f57"):
+            live = {
+                "name": data.get("f58"),
+                "price": data.get("f43"),
+                "change": data.get("f169"),
+                "change_pct": data.get("f170"),
+                "open": data.get("f46"),
+                "high": data.get("f44"),
+                "low": data.get("f45"),
+                "prev_close": data.get("f60"),
+                "volume": data.get("f47"),
+                "amount": data.get("f48"),
+                "turnover_rate": data.get("f50"),
+                "market_cap": data.get("f116"),
+            }
+    except Exception:  # noqa: BLE001 - 代理/断网都走湖内兜底
+        live = None
+
+    snap = _quote_snapshot(sym)
+
+    if live is None:
+        if snap is None:
+            return {"symbol": sym, "available": False, "source": None}
+        return {"symbol": sym, "available": False, "source": "daily", **snap}
+
+    # 实时缺的字段用湖内补：push2 对部分标的/时段不返回成交额或总市值。
+    # 两侧键名一致（快照已按响应契约命名），补的是同一个字段。
+    for key in ("amount", "market_cap", "turnover_rate"):
+        if live.get(key) is None and snap is not None:
+            live[key] = snap.get(key)
+    return {"symbol": sym, "available": True, "source": "realtime", **live}
+
+
+def _quote_snapshot(sym: str) -> dict | None:
+    """单只标的的湖内最新一日行情（读不到 / 无数据 → None）。
+
+    字段与实时路径对齐（``market_cap`` 取估值湖 ``total_mv``），前端两条路径
+    共用同一套渲染，不必分支。
+    """
+    from lquant.data.store.parquet import latest_snapshot
+
+    try:
+        df = latest_snapshot(symbols=[sym])
+    except Exception as e:  # noqa: BLE001 - 读湖失败按「没有兜底数据」处理
+        from loguru import logger
+
+        logger.warning(f"湖内行情兜底读取失败 {sym}: {e}")
+        return None
+    if df.height == 0:
+        return None
+    r = df.row(0, named=True)
+
+    def _iso(v):
+        return str(v) if v is not None else None
+
     return {
-        "symbol": sym,
-        "name": data.get("f58"),
-        "available": True,
-        "price": data.get("f43"),
-        "change": data.get("f169"),
-        "change_pct": data.get("f170"),
-        "open": data.get("f46"),
-        "high": data.get("f44"),
-        "low": data.get("f45"),
-        "prev_close": data.get("f60"),
-        "volume": data.get("f47"),
-        "amount": data.get("f48"),
-        "turnover_rate": data.get("f50"),
-        "market_cap": data.get("f116"),
+        "name": None,
+        "price": r["close"],
+        "change": (r["close"] - r["pre_close"]
+                   if r["close"] is not None and r["pre_close"] is not None else None),
+        "change_pct": r["pct_chg"],
+        "open": r["open"],
+        "high": r["high"],
+        "low": r["low"],
+        "prev_close": r["pre_close"],
+        "volume": r["volume"],
+        "amount": r["amount"],
+        "turnover_rate": r["turnover_rate"],
+        "market_cap": r["total_mv"],
+        "float_mv": r["float_mv"],
+        "pe_ttm": r["pe_ttm"],
+        "trade_date": _iso(r["trade_date"]),
+        "mv_date": _iso(r["mv_date"]),
     }
 
 
