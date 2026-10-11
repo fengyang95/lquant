@@ -19,6 +19,22 @@ LIB = REPO_ROOT / "scripts" / "lib" / "git_guard.sh"
 def _env(**extra: str) -> dict[str, str]:
     # 隔离全局/系统 git 配置，避免污染（需 git >= 2.32）
     env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+    # 只隔离 GIT_CONFIG_* 还不够：git 在**链接工作树**里执行 pre-push 钩子时会把
+    # GIT_DIR 注入钩子环境（在主工作树里则不会）。本文件用真实临时仓库验证守卫，
+    # 一旦继承这些变量，子进程里的 git 就会绕过 cwd 打到**调用方仓库**上 ——
+    # 实测从 worktree push 时把主仓 core.bare 置成了 true，并把临时仓库的 f.txt
+    # 提交进了当前分支。
+    # 「仓库定位」类变量对本文件「在 tmp_path 里建自己的仓」只有害处，一律剔除。
+    # 放在 update(extra) 之前：确有需要的用例仍可显式传入。
+    for var in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ):
+        env.pop(var, None)
     env.update(extra)
     return env
 

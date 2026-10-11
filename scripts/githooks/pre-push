@@ -6,6 +6,15 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
+# git 在**链接工作树**里执行 pre-push 时会把 GIT_DIR 注入钩子环境（主工作树不会）。
+# 下面的测试要起真实临时仓库来验证 git 守卫，继承这些变量会让子进程里的 git
+# 打到**调用方仓库**上 —— 实测能把主仓 core.bare 置成 true，并把临时仓库的
+# f.txt 提交进当前分支。此处已 cd 到工作树根目录，仓库定位类变量对钩子自身无用，
+# 统一剔除，不再把仓库上下文漏给测试（用例侧 tests/unit/test_git_guard.py 的
+# _env() 也做了同样的剔除，两层都有）。
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE \
+      GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+
 echo "==> pre-push: 密钥扫描 + 改动相关测试（覆盖率门禁在 CI）"
 
 # 扫描脚本解析：优先当前工作树的；旧分支的 worktree 里没有这个文件，
