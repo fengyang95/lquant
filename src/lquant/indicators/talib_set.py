@@ -17,6 +17,8 @@ Supertrend。
 
 from __future__ import annotations
 
+import math
+
 import polars as pl
 
 from lquant.indicators.registry import register_indicator
@@ -42,6 +44,28 @@ __all__ = [
 _OHLC = ("open", "high", "low", "close")
 
 
+def _check_n(n: int, name: str = "n") -> None:
+    """周期参数 fail-loudly：必须为正整数。
+
+    ``n=0`` 会让 ``ewm_mean(alpha=1/n)`` 抛 ``ZeroDivisionError``、负周期让窗口
+    语义整体反向 —— 都属于「调用方写错了」，不该以陌生异常或静默垃圾值的形式
+    漏到下游（与 patterns 系列同一条纪律）。
+    """
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise ValueError(f"{name} 必须为正整数，收到 {n!r}")
+
+
+def _check_positive(name: str, value: float) -> None:
+    """正数阈值（SAR 加速因子、通道倍数等）：<= 0 会让递推/通道失去意义。"""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0.0
+    ):
+        raise ValueError(f"{name} 必须 > 0，收到 {value!r}")
+
+
 @register_indicator(
     "atr", label="ATR 真实波幅", category="oscillator", pane="sub", min_window=40,
     inputs=("high", "low", "close"), outputs=("atr14",),
@@ -49,9 +73,11 @@ _OHLC = ("open", "high", "low", "close")
 def add_atr(df: pl.DataFrame, n: int = 14) -> pl.DataFrame:
     """Wilder ATR：TR（真实波幅）的指数平滑（alpha=1/n）。
 
-    TR = max(高-低, |高-昨收|, |昨收-低|)；首行无昨收，TR 置 null，
-    ATR 自首行起用首个非 null 值递推（ewm 会跳过前导 null）。
+    TR = max(高-低, |高-昨收|, |昨收-低|)；首行没有昨收，``max_horizontal``
+    会忽略这个 null 项，于是 TR[0] = 高-低（不是 null）。ATR 自首行起用
+    ``ewm_mean(adjust=False)`` 递推。
     """
+    _check_n(n)
     tr = pl.max_horizontal(
         pl.col("high") - pl.col("low"),
         (pl.col("high") - pl.col("close").shift(1)).abs(),
@@ -89,6 +115,7 @@ def add_dmi(df: pl.DataFrame, n: int = 14) -> pl.DataFrame:
     ADX = Wilder 平滑(DX)。分母为 0（无波动）时 DI 置 null、DX 置 null，
     不用 0 冒充方向信息。
     """
+    _check_n(n)
     up_move = pl.col("high") - pl.col("high").shift(1)
     down_move = pl.col("low").shift(1) - pl.col("low")
     pdm = pl.when((up_move > down_move) & (up_move > 0)).then(up_move).otherwise(0.0)
@@ -127,14 +154,26 @@ def add_dmi(df: pl.DataFrame, n: int = 14) -> pl.DataFrame:
 def add_cci(df: pl.DataFrame, n: int = 14) -> pl.DataFrame:
     """CCI：典型价 (H+L+C)/3 对其 n 日均线的偏离，用平均绝对偏差标准化。
 
+    口径为 Lambert 原始定义（= TA-Lib ``TA_CCI``）：
+    ``MD_i = mean_j |TP_j − MA_i|``，其中 ``j`` 遍历**以 i 结尾的同一个窗口**、
+    ``MA_i`` 是该窗口自身的均值（也就是当根 SMA）。
+
+    ⚠️ 注意别写成「各点先减去自己的滚动均值再取均值」——那是
+    ``rolling_mean(|TP − rolling_mean(TP)|)``，分母会系统性偏小（线性序列上
+    恰好小一半，于是 CCI 大整整两倍）。MD 关于窗口均值取绝对偏差，先取绝对值
+    再求和不可分解为滚动累积量，只能用逐窗口 map（与 ``Ts_ArgMax`` 同类代价）。
+
     分母为 0（窗口内典型价恒定）时置 null。常数 0.015 为 Lambert 原始口径。
     """
+    _check_n(n)
     tp = (pl.col("high") + pl.col("low") + pl.col("close")) / 3
     df = df.with_columns(tp.alias("_tp"))
     ma = pl.col("_tp").rolling_mean(n)
-    mad = (pl.col("_tp") - ma).abs().rolling_mean(n)
+    mad = pl.col("_tp").rolling_map(
+        lambda s: (s - s.mean()).abs().mean(), window_size=n
+    )
     cci = pl.when(mad <= 0).then(None).otherwise((pl.col("_tp") - ma) / (0.015 * mad))
-    df = df.with_columns(cci.alias("cci14"))
+    df = df.with_columns(cci.alias(f"cci{n}"))
     return df.drop("_tp")
 
 
@@ -147,6 +186,7 @@ def add_wr(df: pl.DataFrame, n: int = 14) -> pl.DataFrame:
 
     高=低的窗口（连续一字板）置 50 中性，不产生 NaN。
     """
+    _check_n(n)
     hhv = pl.col("high").rolling_max(n)
     llv = pl.col("low").rolling_min(n)
     span = hhv - llv
@@ -160,6 +200,7 @@ def add_wr(df: pl.DataFrame, n: int = 14) -> pl.DataFrame:
 )
 def add_roc(df: pl.DataFrame, n: int = 12, col: str = "close") -> pl.DataFrame:
     """ROC：n 日价格变动率（%）。前收盘 ≤ 0 的脏价置 null。"""
+    _check_n(n)
     prev = pl.col(col).shift(n)
     roc = pl.when(prev <= 0).then(None).otherwise((pl.col(col) - prev) / prev * 100)
     return df.with_columns(roc.alias(f"roc{n}"))
@@ -172,6 +213,7 @@ def add_roc(df: pl.DataFrame, n: int = 12, col: str = "close") -> pl.DataFrame:
 def add_dpo(df: pl.DataFrame, n: int = 20, col: str = "close") -> pl.DataFrame:
     """DPO：收盘价减去 shift(n/2+1) 的 n 日均线 —— 右对齐均线的历史参照，
     天然无未来数据（TA-Lib 同口径）。"""
+    _check_n(n)
     half = n // 2 + 1
     dpo = pl.col(col) - pl.col(col).rolling_mean(n).shift(half)
     return df.with_columns(dpo.alias(f"dpo{n}"))
@@ -190,6 +232,8 @@ def add_supertrend(df: pl.DataFrame, n: int = 10, mult: float = 3.0) -> pl.DataF
     方向 dir = 1 多头 / -1 空头。递推是确定性的因果状态机，满足前缀不变性
     （前缀重算与全量计算在共同前缀上逐行一致，测试门禁锁定）。
     """
+    _check_n(n)
+    _check_positive("mult", mult)
     tr = pl.max_horizontal(
         pl.col("high") - pl.col("low"),
         (pl.col("high") - pl.col("close").shift(1)).abs(),
@@ -245,11 +289,15 @@ def add_adxr(df: pl.DataFrame, n: int = 14) -> pl.DataFrame:
     """ADXR：ADX 与其 shift(n) 的均值 —— 趋势强度的平滑确认（TA-Lib 同口径）。
 
     实现在 ``dmi`` 之上：ADX 用 Wilder 平滑（alpha=1/n），ADXR 取当前与
-    n 根前 ADX 的算术平均，天然只用历史值。
+    n 根前 ADX 的算术平均，天然只用历史值。**只输出 adxr 本身**：``dmi`` 的
+    中间列（dmi_pdi/dmi_mdi/dmi_adx）在 ``compute_many`` 链式拼接里会变成
+    未登记的「野列」，所以算完即丢。
     """
+    _check_n(n)
     df = add_dmi(df, n=n)
     adxr = (pl.col("dmi_adx") + pl.col("dmi_adx").shift(n)) / 2
-    return df.with_columns(adxr.alias(f"adxr{n}"))
+    df = df.with_columns(adxr.alias(f"adxr{n}"))
+    return df.drop(["dmi_pdi", "dmi_mdi", "dmi_adx"])
 
 
 @register_indicator(
@@ -262,6 +310,7 @@ def add_mfi(df: pl.DataFrame, n: int = 14) -> pl.DataFrame:
     MFI = 100 − 100/(1 + 正流向/负流向)；分母（负流向）为 0 时置 100
     （全为正向资金，超买极值）。窗口内无昨收的行不参与（首行 null）。
     """
+    _check_n(n)
     tp = (pl.col("high") + pl.col("low") + pl.col("close")) / 3
     raw = tp * pl.col("volume")
     diff = tp.diff()
@@ -285,6 +334,11 @@ def add_ppo(df: pl.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -
     PPO = 100·(EMA_fast − EMA_slow)/EMA_slow；signal = EMA_9(PPO)；
     hist = PPO − signal。分母（慢 EMA）≤ 0 的脏价置 null。
     """
+    _check_n(fast, "fast")
+    _check_n(slow, "slow")
+    _check_n(signal, "signal")
+    if fast >= slow:
+        raise ValueError(f"fast 必须 < slow，收到 fast={fast!r} slow={slow!r}")
     ema_fast = pl.col("close").ewm_mean(span=fast, adjust=False)
     ema_slow = pl.col("close").ewm_mean(span=slow, adjust=False)
     ppo = pl.when(ema_slow <= 0).then(None).otherwise(100 * (ema_fast - ema_slow) / ema_slow)
@@ -292,6 +346,23 @@ def add_ppo(df: pl.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -
     sig = pl.col("ppo").ewm_mean(span=signal, adjust=False)
     df = df.with_columns(sig.alias("ppo_signal"))
     return df.with_columns((pl.col("ppo") - pl.col("ppo_signal")).alias("ppo_hist"))
+
+
+def _rsi_expr(col: str, n: int) -> pl.Expr:
+    """Wilder RSI 表达式：``100·avg_gain/(avg_gain+avg_loss)``。
+
+    与 ``100 − 100/(1+avg_gain/avg_loss)`` 在 ``avg_loss > 0`` 时等价，但**零亏损
+    窗口**（纯上涨）下前者给出 100（超买极值），后者会因除零被置 null —— 恰好把
+    最该报警的位置抹掉。窗口内既无涨也无跌（avg_gain = avg_loss = 0）时，
+    RSI 在数学上无定义，显式置 null 而不是用 0 或 50 冒充方向信息。
+    """
+    delta = pl.col(col).diff()
+    gain = pl.when(delta > 0).then(delta).otherwise(0.0)
+    loss = pl.when(delta < 0).then(-delta).otherwise(0.0)
+    avg_gain = gain.ewm_mean(alpha=1 / n, adjust=False)
+    avg_loss = loss.ewm_mean(alpha=1 / n, adjust=False)
+    denom = avg_gain + avg_loss
+    return pl.when(denom <= 0).then(None).otherwise(100 * avg_gain / denom)
 
 
 @register_indicator(
@@ -302,16 +373,13 @@ def add_stochrsi(df: pl.DataFrame, n: int = 14, k: int = 3, d: int = 3) -> pl.Da
     """StochRSI：把 RSI 再做一次随机指标（KD）标准化到 0~1。
 
     StochRSI = (RSI − min_n(RSI)) / (max_n(RSI) − min_n(RSI))；
-    %K = SMA_k(StochRSI)·100，%D = SMA_d(%K)。窗口内 RSI 恒定（分母 0）置 null。
+    %K = SMA_k(StochRSI)·100，%D = SMA_d(%K)。窗口内 RSI 恒定（分母 0）置 null；
+    RSI 本身由 :func:`_rsi_expr` 给出（纯上涨窗口 = 100，不是 null）。
     """
-    delta = pl.col("close").diff()
-    gain = pl.when(delta > 0).then(delta).otherwise(0.0)
-    loss = pl.when(delta < 0).then(-delta).otherwise(0.0)
-    avg_gain = gain.ewm_mean(alpha=1 / n, adjust=False)
-    avg_loss = loss.ewm_mean(alpha=1 / n, adjust=False)
-    rs = pl.when(avg_loss <= 0).then(None).otherwise(avg_gain / avg_loss)
-    rsi = 100 - 100 / (1 + rs)
-    df = df.with_columns(rsi.alias("_rsi"))
+    _check_n(n)
+    _check_n(k, "k")
+    _check_n(d, "d")
+    df = df.with_columns(_rsi_expr("close", n).alias("_rsi"))
     hhv = pl.col("_rsi").rolling_max(n)
     llv = pl.col("_rsi").rolling_min(n)
     span = hhv - llv
@@ -338,6 +406,7 @@ def add_tema(df: pl.DataFrame, n: int = 20, col: str = "close") -> pl.DataFrame:
     TEMA = 3·EMA1 − 3·EMA2 + EMA3，其中 EMA1=EMA(close)，
     EMA2=EMA(EMA1)，EMA3=EMA(EMA2)；全部 ewm 递推（adjust=False）。
     """
+    _check_n(n)
     ema1 = pl.col(col).ewm_mean(span=n, adjust=False)
     df = df.with_columns(ema1.alias("_e1"))
     df = df.with_columns(pl.col("_e1").ewm_mean(span=n, adjust=False).alias("_e2"))
@@ -356,6 +425,8 @@ def add_trix(df: pl.DataFrame, n: int = 12, signal: int = 9, col: str = "close")
     TRIX = 100·(TEMA3_t − TEMA3_{t−1})/TEMA3_{t−1}，其中 TEMA3 为三重 EMA；
     分母 ≤ 0 的脏价置 null；signal = EMA_9(TRIX)。
     """
+    _check_n(n)
+    _check_n(signal, "signal")
     e1 = pl.col(col).ewm_mean(span=n, adjust=False)
     df = df.with_columns(e1.alias("_t1"))
     df = df.with_columns(pl.col("_t1").ewm_mean(span=n, adjust=False).alias("_t2"))
@@ -376,41 +447,61 @@ def add_sar(df: pl.DataFrame, af_step: float = 0.02, af_max: float = 0.2) -> pl.
     """SAR（Parabolic SAR）：抛物线止转点，用加速因子递推的跟踪止损线。
 
     递推状态机纯因果（只用当根与历史），与 ``supertrend`` 同为逐行状态机，
-    满足前缀不变性。``sar_dir`` = 1 多头（SAR 在价下）/ −1 空头。
-    空值行重置状态，不向下游传播 NaN。
+    满足前缀不变性（含第 0 根）。``sar_dir`` = 1 多头（SAR 在价下）/ −1 空头。
+
+    空值语义：缺口行置 null，状态机**保持**（不重置）——缺口后的第一个有效行
+    仍从陈旧状态继续，因为「跳空/停牌」时没有可用的前一根翻转判据。前导空值
+    行同样置 null（种子取第一对相邻有效 K 线）。
 
     ⚠️ 与 TA-Lib 的差异：TA-Lib 用「前两根 + 更早的上下文」确定初始方向与
-    初始极值（EP），本实现以**前两根**高低关系定初始方向、以前两根极值定
-    初始 EP/SAR。两者在若干根之后收敛到同一条轨线（实测尾部一致），
-    差异仅集中在序列开头的初始相位，对回测无实质影响。
+    初始极值（EP），本实现以**第一对相邻有效 K 线**的高低关系定初始方向、
+    以其极值定初始 EP/SAR，且初始 SAR 记在**后一根**上（前一根为 null）。
+    两者在若干根之后收敛到同一条轨线（实测尾部一致），差异仅集中在序列开头的
+    初始相位，对回测无实质影响。
     """
+    _check_positive("af_step", af_step)
+    _check_positive("af_max", af_max)
+    if af_max < af_step:
+        raise ValueError(f"af_max 必须 >= af_step，收到 af_max={af_max!r} af_step={af_step!r}")
     h = df["high"].to_list()
     l = df["low"].to_list()
     n_rows = len(h)
     sar_vals: list[float | None] = [None] * n_rows
     dirs: list[int | None] = [None] * n_rows
-    if n_rows < 2:
+    # 种子 = 第一对「两根都有效」的相邻 K 线。种子 SAR/EP 只用这两根算，
+    # 且只写在后一根上：任何一根的输出都只依赖当根与更早的数据，第 0 根
+    # 永远是 null（首根没有前一根，无从定方向），不会出现「用下一根定当根」
+    # 的前视；前导空值行也在这里被安全跳过（不再直接读 h[0]/h[1]）。
+    seed = next((i for i in range(1, n_rows)
+                 if None not in (h[i - 1], l[i - 1], h[i], l[i])), None)
+    if seed is None:
         return df.with_columns(
             pl.Series("sar", sar_vals, dtype=pl.Float64),
             pl.Series("sar_dir", dirs, dtype=pl.Int8),
         )
-    # 初始方向按前两根走势定
-    long = h[1] >= h[0]
+    long = h[seed] >= h[seed - 1]
     af = af_step
-    ep = max(h[0], h[1]) if long else min(l[0], l[1])
-    sar = min(l[0], l[1]) if long else max(h[0], h[1])
-    dirs[0] = 1 if long else -1
-    sar_vals[0] = sar
-    for i in range(1, n_rows):
+    ep = max(h[seed - 1], h[seed]) if long else min(l[seed - 1], l[seed])
+    sar = min(l[seed - 1], l[seed]) if long else max(h[seed - 1], h[seed])
+    dirs[seed] = 1 if long else -1
+    sar_vals[seed] = sar
+    for i in range(seed + 1, n_rows):
         if h[i] is None or l[i] is None or h[i - 1] is None or l[i - 1] is None:
-            # 中间出现空值行：本行置 null 并**重置状态机**，避免 None 参与
-            # 比较（TypeError）或把陈旧状态带过缺口。
+            # 缺口行：本行置 null，状态机保持原值（缺口后没有干净的前一根
+            # 可用于翻转判据，重置反而会凭空造出一个新方向）。
             sar_vals[i] = None
             dirs[i] = None
             continue
         sar = sar + af * (ep - sar)
+        # 夹逼只用**前两根**（Wilder 原始规则：SAR 不得进入前两个周期的价格
+        # 区间）。这里绝不能把当根的 l[i]/h[i] 也夹进来 —— 那样多头分支下
+        # ``sar <= l[i]`` 恒成立，``l[i] < sar`` 的翻转判据永远为假，SAR 就再也
+        # 不会转向（实测 25% 的单边下跌全程 dir=1）。翻转判据必须在夹逼之后、
+        # 用当根极值来判，这才是「抛物线**转向**」的语义。
+        prior_lows = [l[j] for j in (i - 1, i - 2) if j >= 0 and l[j] is not None]
+        prior_highs = [h[j] for j in (i - 1, i - 2) if j >= 0 and h[j] is not None]
         if long:
-            sar = min(sar, l[i - 1], l[i])
+            sar = min([sar, *prior_lows])
             if l[i] < sar:
                 long = False
                 sar = ep
@@ -420,7 +511,7 @@ def add_sar(df: pl.DataFrame, af_step: float = 0.02, af_max: float = 0.2) -> pl.
                 ep = h[i]
                 af = min(af + af_step, af_max)
         else:
-            sar = max(sar, h[i - 1], h[i])
+            sar = max([sar, *prior_highs])
             if h[i] > sar:
                 long = True
                 sar = ep

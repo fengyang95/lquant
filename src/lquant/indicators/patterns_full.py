@@ -26,7 +26,14 @@ import math
 
 import polars as pl
 
-from lquant.indicators.patterns import _body, _lower_shadow, _rng, _signal, _upper_shadow
+from lquant.indicators.patterns import (
+    _body,
+    _check_min_range,
+    _lower_shadow,
+    _rng,
+    _signal,
+    _upper_shadow,
+)
 from lquant.indicators.registry import register_indicator
 
 __all__: list[str] = []  # 新增形态由下方 add_* 装饰器注册进注册表
@@ -62,7 +69,14 @@ def _check_tolerance(name: str, value: float) -> None:
 
 
 def _base(min_range_pct: float) -> list[pl.Expr]:
-    """窄幅/脏价防线：振幅下界 + 一字板排除。所有比例判据形态共用。"""
+    """窄幅/脏价防线：振幅下界 + 一字板排除。所有比例判据形态共用。
+
+    入口即校验 ``min_range_pct``，口径与 :func:`lquant.indicators.patterns.
+    _check_min_range` 一致（[0, 1]，显式 0 = 关闭防御）。此前 55 个形态拿了
+    参数不校验：``min_range_pct=-1`` 会把窄幅防线整条关掉（一字板之外都算
+    「够宽」），``=2`` 又让指标恒不命中 —— 两种都是静默的语义漂移。
+    """
+    _check_min_range(min_range_pct)
     return [
         (_rng() > 0),
         (pl.col("close") > 0),
@@ -485,7 +499,7 @@ def add_dark_cloud_cover(df: pl.DataFrame, *, open_gap: bool = False,
     ``open_gap=False``（缺省）用宽松口径「当根开盘高于前根收盘」（A 股
     高开常见平开观察）；``open_gap=True`` 用 TA-Lib 严格口径「开盘高于
     前根最高价」。收盘须低于前根实体中点且高于前根开盘。"""
-    _check_unit_interval("min_range_pct", min_range_pct)
+    _check_min_range(min_range_pct)
     gap = (pl.col("open") > pl.col("high").shift(1)) if open_gap else (
         pl.col("open") > pl.col("close").shift(1))
     mid = pl.min_horizontal("open", "close").shift(1) + 0.5 * _body().shift(1)
@@ -510,7 +524,7 @@ def add_dark_cloud_cover(df: pl.DataFrame, *, open_gap: bool = False,
 def add_piercing(df: pl.DataFrame, *, open_gap: bool = False,
                  min_range_pct: float = 0.004) -> pl.DataFrame:
     """刺透形态：乌云盖顶的看涨镜像（CDLPIERCING）。"""
-    _check_unit_interval("min_range_pct", min_range_pct)
+    _check_min_range(min_range_pct)
     gap = (pl.col("open") < pl.col("low").shift(1)) if open_gap else (
         pl.col("open") < pl.col("close").shift(1))
     mid = pl.max_horizontal("open", "close").shift(1) - 0.5 * _body().shift(1)
@@ -882,14 +896,18 @@ def add_kicking_by_length(df: pl.DataFrame, *, shadow_ratio: float = 0.1,
 def add_morning_doji_star(df: pl.DataFrame, *, min_range_pct: float = 0.004) -> pl.DataFrame:
     """十字晨星：大阴 + 向下跳空十字 + 大阳收复（CDLMORNINGDOJISTAR，
     与 :func:`lquant.indicators.patterns.add_morning_star` 的差异在中根
-    必须是十字且要求严格跳空）。确认日第三根。"""
-    _check_unit_interval("min_range_pct", min_range_pct)
+    必须是十字且要求严格跳空）。确认日第三根。
+
+    第三根必须是**阳线且收复第一根实体一半以上**（``d3_bull``）；此前额外
+    析取了一个 ``gap_hold``（只要收盘高于十字高点，阴线也算），与本文口径
+    及 TA-Lib 都不符，等于给形态开了个不要求颜色的后门，已移除。
+    """
+    _check_min_range(min_range_pct)
     d1_bear = _black().shift(2) & (_body().shift(2) >= 0.5 * _rng().shift(2))
     d2_doji = _body().shift(1) <= 0.1 * _rng().shift(1)
     d2_gap = pl.col("high").shift(1) < pl.col("low").shift(2)
     d3_bull = _white() & (pl.col("close") > pl.col("close").shift(2) + 0.5 * _body().shift(2))
-    gap_hold = pl.col("close") > pl.col("high").shift(1)
-    cond = (*_base(min_range_pct), d1_bear, d2_doji, d2_gap, d3_bull | gap_hold)
+    cond = (*_base(min_range_pct), d1_bear, d2_doji, d2_gap, d3_bull)
     return df.with_columns(_signal(pl.all_horizontal(cond), "pattern_morning_doji_star"))
 
 
@@ -927,14 +945,18 @@ def add_evening_star(df: pl.DataFrame, *, small_body_ratio: float = 0.5,
     inputs=_OHLC,
 )
 def add_evening_doji_star(df: pl.DataFrame, *, min_range_pct: float = 0.004) -> pl.DataFrame:
-    """十字暮星：暮星的中根为十字且严格跳空（CDLEVENINGDOJISTAR）。"""
-    _check_unit_interval("min_range_pct", min_range_pct)
+    """十字暮星：暮星的中根为十字且严格跳空（CDLEVENINGDOJISTAR）。
+
+    第三根必须是**阴线且跌破第一根实体一半以上**（``d3_bear``）；此前额外
+    析取的 ``gap_hold``（收盘低于十字低点即可，阳线也算）已移除，理由同
+    :func:`add_morning_doji_star`。
+    """
+    _check_min_range(min_range_pct)
     d1_bull = _white().shift(2) & (_body().shift(2) >= 0.5 * _rng().shift(2))
     d2_doji = _body().shift(1) <= 0.1 * _rng().shift(1)
     d2_gap = pl.col("low").shift(1) > pl.col("high").shift(2)
     d3_bear = _black() & (pl.col("close") < pl.col("close").shift(2) - 0.5 * _body().shift(2))
-    gap_hold = pl.col("close") < pl.col("low").shift(1)
-    cond = (*_base(min_range_pct), d1_bull, d2_doji, d2_gap, d3_bear | gap_hold)
+    cond = (*_base(min_range_pct), d1_bull, d2_doji, d2_gap, d3_bear)
     return df.with_columns(_signal(pl.all_horizontal(cond), "pattern_evening_doji_star"))
 
 
@@ -1192,7 +1214,7 @@ def add_three_inside_down(df: pl.DataFrame, *, prev_body_min: float = 0.5,
 def add_three_outside_up(df: pl.DataFrame, *, min_range_pct: float = 0.004) -> pl.DataFrame:
     """三外部上涨：看涨吞没 + 第三根阳线创新高（CDL3OUTSIDE 向上向）。
     吞没条件与 :func:`lquant.indicators.patterns.add_bullish_engulfing` 同口径。"""
-    _check_unit_interval("min_range_pct", min_range_pct)
+    _check_min_range(min_range_pct)
     engulf = (_black().shift(2)
               & _white().shift(1)
               & (pl.col("open").shift(1) <= pl.col("close").shift(2))
@@ -1213,7 +1235,7 @@ def add_three_outside_up(df: pl.DataFrame, *, min_range_pct: float = 0.004) -> p
 )
 def add_three_outside_down(df: pl.DataFrame, *, min_range_pct: float = 0.004) -> pl.DataFrame:
     """三外部下跌：看跌吞没 + 第三根阴线创新低（CDL3OUTSIDE 向下向）。"""
-    _check_unit_interval("min_range_pct", min_range_pct)
+    _check_min_range(min_range_pct)
     engulf = (_white().shift(2)
               & _black().shift(1)
               & (pl.col("open").shift(1) >= pl.col("close").shift(2))
@@ -1236,7 +1258,7 @@ def add_three_line_strike_bull(df: pl.DataFrame, *, min_range_pct: float = 0.004
     """看涨三线打击：三连阴逐根新低，第四根大阳开盘低于第三根收盘、
     收盘收复第一根开盘（CDL3LINESTRIKE 向上向），一阴吃三阳的看涨反打。
     确认日第四根。"""
-    _check_unit_interval("min_range_pct", min_range_pct)
+    _check_min_range(min_range_pct)
     three_blacks = (_black().shift(3) & _black().shift(2) & _black().shift(1)
                     & _newer_low(2) & _newer_low(1))
     big4 = _body() >= 0.8 * _rng()
@@ -1258,7 +1280,7 @@ def add_three_line_strike_bull(df: pl.DataFrame, *, min_range_pct: float = 0.004
 )
 def add_three_line_strike_bear(df: pl.DataFrame, *, min_range_pct: float = 0.004) -> pl.DataFrame:
     """看跌三线打击：三连阳逐根新高，第四根大阴吞掉三根（向下向）。"""
-    _check_unit_interval("min_range_pct", min_range_pct)
+    _check_min_range(min_range_pct)
     three_whites = (_white().shift(3) & _white().shift(2) & _white().shift(1)
                     & _newer_high(2) & _newer_high(1))
     big4 = _body() >= 0.8 * _rng()
@@ -1332,7 +1354,7 @@ def add_falling_three_methods(df: pl.DataFrame, *, small_body: float = 0.3,
 def add_breakaway_bull(df: pl.DataFrame, *, min_range_pct: float = 0.004) -> pl.DataFrame:
     """看涨脱离：大阴跳空下探三根后，第五根阳线收复跳空缺口上沿
     （CDLBREAKAWAY 向上向）。确认日第五根。"""
-    _check_unit_interval("min_range_pct", min_range_pct)
+    _check_min_range(min_range_pct)
     mid_low = pl.min_horizontal(pl.col("low").shift(3), pl.col("low").shift(2), pl.col("low").shift(1))
     cond = (*_base(min_range_pct),
             _black().shift(4),
@@ -1354,7 +1376,7 @@ def add_breakaway_bull(df: pl.DataFrame, *, min_range_pct: float = 0.004) -> pl.
 )
 def add_breakaway_bear(df: pl.DataFrame, *, min_range_pct: float = 0.004) -> pl.DataFrame:
     """看跌脱离：向下向（CDLBREAKAWAY）。"""
-    _check_unit_interval("min_range_pct", min_range_pct)
+    _check_min_range(min_range_pct)
     mid_high = pl.max_horizontal(pl.col("high").shift(3), pl.col("high").shift(2), pl.col("high").shift(1))
     cond = (*_base(min_range_pct),
             _white().shift(4),
@@ -1377,7 +1399,7 @@ def add_breakaway_bear(df: pl.DataFrame, *, min_range_pct: float = 0.004) -> pl.
 def add_ladder_bottom(df: pl.DataFrame, *, min_range_pct: float = 0.004) -> pl.DataFrame:
     """梯底：三连阴新低 + 第四根带长上影的阴线（盘口试图反弹被压回）+
     第五根阳线收复第四根开盘价（CDLLADDERBOTTOM）。确认日第五根。"""
-    _check_unit_interval("min_range_pct", min_range_pct)
+    _check_min_range(min_range_pct)
     d4_shadow = _upper_shadow().shift(1) >= 0.3 * _rng().shift(1)
     cond = (*_base(min_range_pct),
             _black().shift(4), _black().shift(3), _black().shift(2),
@@ -1531,21 +1553,9 @@ def _register_hikkake(kind: str) -> None:
 
     @register_indicator(name, label=label, category="pattern", pane="sub",
                         min_window=6, inputs=_OHLC)
-    def _fn(df: pl.DataFrame, *, mod: bool = False) -> pl.DataFrame:
-        conds = []
-        for k in (1, 2, 3):  # 假突破发生在 d-k 日，inside bar 在 d-k-1，确认日 = 当根
-            inside = _inside(k + 1, k + 2)
-            if bull:
-                fake = pl.col("close").shift(k) < pl.col("low").shift(k + 1)
-                confirm = pl.col("close") > pl.col("high").shift(k + 1)
-                mod_ok = pl.col("low").shift(k) > pl.col("low").shift(k + 2)
-            else:
-                fake = pl.col("close").shift(k) > pl.col("high").shift(k + 1)
-                confirm = pl.col("close") < pl.col("low").shift(k + 1)
-                mod_ok = pl.col("high").shift(k) < pl.col("high").shift(k + 2)
-            conds.append(inside & fake & confirm & (mod_ok if mod else pl.lit(True)))
-        cond = (*_base(0.0), pl.any_horizontal(conds))
-        return df.with_columns(_signal(pl.all_horizontal(cond), name))
+    def _fn(df: pl.DataFrame, *, mod: bool = False,
+            min_range_pct: float = 0.004) -> pl.DataFrame:
+        return df.with_columns(_signal(_hikkake_cond(bull, mod, min_range_pct), name))
 
     _fn.__name__ = f"add_{name}"
 
@@ -1561,15 +1571,20 @@ def _register_hikkake_mod(direction: str) -> None:
 
     @register_indicator(name, label=label, category="pattern", pane="sub",
                         min_window=6, inputs=_OHLC)
-    def _fn(df: pl.DataFrame) -> pl.DataFrame:
+    def _fn(df: pl.DataFrame, *, min_range_pct: float = 0.004) -> pl.DataFrame:
         return df.with_columns(_signal(
-            _hikkake_cond(bull, mod=True), name))
+            _hikkake_cond(bull, mod=True, min_range_pct=min_range_pct), name))
 
     _fn.__name__ = f"add_{name}"
 
 
-def _hikkake_cond(bull: bool, mod: bool) -> pl.Expr:
-    """陷阱条件核心（供普通/修正两版复用），语义见 :func:`_register_hikkake`。"""
+def _hikkake_cond(bull: bool, mod: bool, min_range_pct: float = 0.004) -> pl.Expr:
+    """陷阱条件核心（普通/修正两版复用），语义见 :func:`_register_hikkake`。
+
+    与其它形态同一条防线：``_base(min_range_pct)`` 要求确认日振幅达标且非
+    一字板。此前普通版硬写 ``_base(0.0)``（窄幅确认日照样命中）、修正版
+    **完全没有** ``_base``（一字板确认日也命中），两族都违反形态纪律。
+    """
     conds = []
     for k in (1, 2, 3):
         inside = _inside(k + 1, k + 2)
@@ -1582,7 +1597,7 @@ def _hikkake_cond(bull: bool, mod: bool) -> pl.Expr:
             confirm = pl.col("close") < pl.col("low").shift(k + 1)
             mod_ok = pl.col("high").shift(k) < pl.col("high").shift(k + 2)
         conds.append(inside & fake & confirm & (mod_ok if mod else pl.lit(True)))
-    return pl.any_horizontal(conds)
+    return pl.all_horizontal([*_base(min_range_pct), pl.any_horizontal(conds)])
 
 
 _register_hikkake_mod("bull")
@@ -1606,8 +1621,14 @@ def add_two_crows(df: pl.DataFrame, *, body_min: float = 0.5,
                   min_range_pct: float = 0.004) -> pl.DataFrame:
     """两只乌鸦（CDL2CROWS，看跌反转）：大阳之后两根阴线，第一根**向上
     跳空**高开（``open > 前收``）但收回到阳线收盘之下，第二根再收更低
-    （``close < 前收``）却仍站在阳线收盘之上（``close > 阳线收盘``）——
-    两阴无力全数吞没阳线，构成上行乏力。
+    （``close < 前收``）—— 两阴无力全数吞没阳线，构成上行乏力。
+
+    第三根的收盘必须落在**第一根阳线实体之内**：既跌破阳线收盘
+    （``close < 阳线收盘``，否则两根阴线连阳线收盘都没跌破，谈不上反转），
+    又仍站在阳线开盘之上（``close > 阳线开盘``，缺口没被完全吞掉）。
+    这是 TA-Lib ``CDL2CROWS`` 的口径（官方描述：*closes down inside the
+    first white body*）—— 此前实现只查了后者、漏了前者，于是收盘已经跌穿
+    整根阳线（真正意义上的吞没）时也会误报。
 
     ⚠️ 与 TA-Lib 的差异：TA-Lib 的 ``CDL2CROWS`` 额外要求**前置趋势**
     （更早若干根显著上涨）与严格的实体比例门槛，实践中极度难触发；
@@ -1623,6 +1644,7 @@ def add_two_crows(df: pl.DataFrame, *, body_min: float = 0.5,
             (pl.col("close").shift(1) < pl.col("close").shift(2)),
             _black(),
             (pl.col("close") < pl.col("close").shift(1)),
+            (pl.col("close") < pl.col("close").shift(2)),
             (pl.col("close") > pl.col("open").shift(2)))
     return df.with_columns(_signal(pl.all_horizontal(cond), "pattern_two_crows"))
 

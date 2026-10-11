@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import random
 from datetime import date, timedelta
 
@@ -15,6 +16,7 @@ from lquant.indicators import (
     talib_set,  # noqa: F401  触发注册
 )
 from lquant.indicators.registry import outputs as ind_outputs
+from lquant.indicators.talib_set import _rsi_expr, add_sar
 
 NEW_INDICATORS = [
     "atr", "obv", "dmi", "cci", "wr", "roc", "dpo", "supertrend",
@@ -215,7 +217,8 @@ def test_sar_dir_binary_and_straddles_price():
 
 
 def test_sar_flat_reset_no_crash():
-    """空值行应重置状态且不抛异常（停牌/缺口场景）。"""
+    """空值行不得抛异常（停牌/缺口场景）；状态机保持（不重置），缺口后的
+    第一个有效行从陈旧状态继续 —— 见 add_sar docstring 的空值语义。"""
     d0 = date(2024, 1, 2)
     n = 10
     highs = [10.0, 10.5, None, 10.8, 10.6, 10.9, 11.0, 10.7, 10.9, 11.1]
@@ -229,3 +232,166 @@ def test_sar_flat_reset_no_crash():
     })
     out = compute("sar", df)
     assert out["sar"][-1] is not None
+
+
+# ---------------- 口径标定与 fail-loudly（审阅发现的缺陷回归） ----------------
+
+
+def test_cci_matches_classic_formula():
+    """CCI 的分母必须是「关于当前窗口均值」的平均绝对偏差（TA-Lib/Lambert 口径）。
+
+    反例（曾经的实现）：``rolling_mean(|TP − 各自的滚动均值|)`` —— 线性序列上
+    该值是正确 MD 的一半，CCI 于是系统性放大到两倍（实测 66.666667 vs 123.809524）。
+    这里在测试里独立复算教科书公式，不引用被测实现的任何中间量。
+    """
+    df = random_ohlc(80)
+    out = compute("cci", df)
+    n = 14
+    tp = [(h + l + c) / 3 for h, l, c in zip(df["high"].to_list(), df["low"].to_list(),
+                                             df["close"].to_list(), strict=True)]
+    got = out["cci14"].to_list()
+    checked = 0
+    for i in range(n - 1, len(tp)):
+        window = tp[i - n + 1:i + 1]
+        mean = sum(window) / n
+        md = sum(abs(x - mean) for x in window) / n
+        if got[i] is None:
+            assert md == 0.0, i
+            continue
+        assert got[i] == pytest.approx((tp[i] - mean) / (0.015 * md), rel=1e-9), i
+        checked += 1
+    assert checked > 0
+
+
+def test_cci_linear_ramp_matches_talib_value():
+    """线性序列的解析标定：TA-Lib 口径 123.809524，旧（错误）口径 66.666667。"""
+    n = 30
+    close = [10.0 + i * 0.1 for i in range(n)]
+    df = pl.DataFrame({
+        "symbol": ["T"] * n,
+        "trade_date": [date(2024, 1, 2) + timedelta(days=i) for i in range(n)],
+        "open": close,
+        "high": [c + 0.05 for c in close],
+        "low": [c - 0.05 for c in close],
+        "close": close,
+        "volume": [1e6] * n,
+    })
+    assert compute("cci", df)["cci14"][-1] == pytest.approx(123.809524, rel=1e-6)
+
+
+def test_adxr_does_not_leak_dmi_columns():
+    """adxr 在 dmi 之上实现，但只能输出自己登记的列（否则链式拼接里出现野列）。"""
+    df = random_ohlc(60)
+    out = compute("adxr", df)
+    assert set(out.columns) == set(df.columns) | {"adxr14"}
+
+
+def test_period_params_fail_loudly():
+    """所有带 n 的指标：n=0 必须是 ValueError，而不是 ZeroDivisionError。"""
+    df = random_ohlc(40)
+    checked = 0
+    for fname, fn in inspect.getmembers(talib_set, inspect.isfunction):
+        if not fname.startswith("add_") or "n" not in inspect.signature(fn).parameters:
+            continue
+        with pytest.raises(ValueError):
+            fn(df, n=0)
+        checked += 1
+    assert checked >= 10, checked
+
+
+def test_rsi_zero_loss_window_is_100_not_null():
+    """纯上涨窗口 avg_loss=0：RSI 必须是 100（超买极值），不是 null。"""
+    n = 80
+    close = [10.0 * (1.001 ** i) for i in range(n)]
+    df = pl.DataFrame({"close": close})
+    out = df.with_columns(_rsi_expr("close", 14).alias("rsi"))
+    assert out["rsi"][-1] == pytest.approx(100.0)
+
+
+@pytest.mark.parametrize("kw", [
+    {"af_step": 0.0}, {"af_step": -0.1}, {"af_max": 0.0}, {"af_max": -0.5},
+    {"af_step": 0.5, "af_max": 0.1},
+])
+def test_sar_params_fail_loudly(kw: dict):
+    with pytest.raises(ValueError):
+        add_sar(random_ohlc(20), **kw)
+
+
+def test_sar_first_bar_is_warmup_and_null_safe():
+    """第 0 根没有「前一根」，必须是 null —— 旧实现用第 1 根给它定值（前视）。
+
+    同时覆盖前导空值/全空 OHLC：旧实现直接读 ``h[0]``/``h[1]``，会抛
+    ``TypeError: '>=' not supported between 'float' and 'NoneType'``。
+    """
+    df = random_ohlc(30)
+    one = compute("sar", df.head(1))
+    assert one["sar"][0] is None and one["sar_dir"][0] is None
+    full = compute("sar", df)
+    assert full["sar"][0] is None          # 第 0 根不得依赖第 1 根
+    assert full["sar"][1] is not None
+    for col in ("high", "low"):
+        led = df.with_columns(
+            pl.when(pl.arange(0, pl.len()) == 0).then(None)
+            .otherwise(pl.col(col)).alias(col)
+        )
+        assert compute("sar", led)["sar"][-1] is not None
+    allnull = df.with_columns(
+        pl.lit(None, dtype=pl.Float64).alias("high"),
+        pl.lit(None, dtype=pl.Float64).alias("low"),
+    )
+    out = compute("sar", allnull)
+    assert out["sar"].null_count() == out.height
+
+
+def test_ppo_rejects_fast_ge_slow():
+    """fast >= slow 会让 PPO 退化成反向差值，必须 fail-loudly。"""
+    df = random_ohlc(40)
+    with pytest.raises(ValueError, match="fast"):
+        compute("ppo", df, fast=26, slow=12)
+
+
+def test_supertrend_mid_null_row_no_crash():
+    """中间缺行：不得抛异常，缺口行 null，前后照常出值。"""
+    df = random_ohlc(40)
+    hole = pl.arange(0, pl.len()) == 20
+    df = df.with_columns(
+        pl.when(hole).then(None).otherwise(pl.col("high")).alias("high"),
+        pl.when(hole).then(None).otherwise(pl.col("low")).alias("low"),
+    )
+    out = compute("supertrend", df)
+    assert out["supertrend"][20] is None
+    assert out["supertrend"][-1] is not None
+
+
+def test_sar_tracks_downtrend_and_flips():
+    """下跌段必须走空头分支（sar 在上方、dir=-1），并能在反弹时翻多。
+
+    随机游走数据几乎只走多头分支，空头那一半状态机此前没有任何用例覆盖。
+    """
+    n = 40
+    close = [20.0 - i * 0.2 for i in range(n)]
+    df = pl.DataFrame({
+        "symbol": ["T"] * n,
+        "trade_date": [date(2024, 1, 2) + timedelta(days=i) for i in range(n)],
+        "open": close, "high": [c + 0.1 for c in close],
+        "low": [c - 0.1 for c in close], "close": close, "volume": [1e6] * n,
+    })
+    out = compute("sar", df)
+    dirs = out["sar_dir"].to_list()
+    assert -1 in dirs[2:], dirs
+    assert 1 not in dirs           # 全程下跌不该翻多
+    # 空头：SAR 在价格上方（阻力）
+    for i in range(5, n):
+        assert out["sar"][i] > out["low"][i]
+
+    # 尾段拉一根长阳冲破 SAR → 翻多（SAR 用高低价判，故 OHLC 都要抬起来）
+    last = pl.arange(0, pl.len()) == n - 1
+    up = df.with_columns(
+        pl.when(last).then(12.2).otherwise(pl.col("open")).alias("open"),
+        pl.when(last).then(30.1).otherwise(pl.col("high")).alias("high"),
+        pl.when(last).then(12.2).otherwise(pl.col("low")).alias("low"),
+        pl.when(last).then(30.0).otherwise(pl.col("close")).alias("close"),
+    )
+    flipped = compute("sar", up)
+    assert flipped["sar_dir"][-1] == 1
+    assert flipped["sar"][-1] < up["close"][-1]   # 翻多后 SAR 在价格下方（支撑）

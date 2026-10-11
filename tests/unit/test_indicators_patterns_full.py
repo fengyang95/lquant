@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import inspect
 import random
 from datetime import date, timedelta
 
@@ -298,3 +299,78 @@ def test_param_validation():
         add_dark_cloud_cover(df, min_range_pct=2.0)
     with pytest.raises(ValueError):
         add_takuri(df, body_max=0)
+
+
+# ---------------- 审阅发现的防线缺口回归 ----------------
+
+
+def _replace_last_bar(df: pl.DataFrame, o: float, h: float, low: float, c: float) -> pl.DataFrame:
+    """只改最后一根（确认日），保留前面的结构 —— 用于测「确认日不合格就不该命中」。"""
+    last = pl.arange(0, pl.len()) == pl.len() - 1
+    return df.with_columns(
+        pl.when(last).then(o).otherwise(pl.col("open")).alias("open"),
+        pl.when(last).then(h).otherwise(pl.col("high")).alias("high"),
+        pl.when(last).then(low).otherwise(pl.col("low")).alias("low"),
+        pl.when(last).then(c).otherwise(pl.col("close")).alias("close"),
+    )
+
+
+@pytest.mark.parametrize("name", PATTERN_NAMES)
+def test_flat_confirmation_bar_no_signal(name: str):
+    """**带结构**的前置数据 + 一字板确认日：不得命中。
+
+    ``test_flat_board_no_signal`` 用的是全 0 一字板序列（没有形态结构），
+    抓不到「结构成立但确认日是一字板」这条路 —— hikkake 修正版当时就漏了
+    ``_base``，在这种输入上照报。
+    """
+    out = compute(name, _replace_last_bar(random_ohlc(30), 10.0, 10.0, 10.0, 10.0))
+    assert out[name][-1] in (0, None), name
+
+
+@pytest.mark.parametrize("name", PATTERN_NAMES)
+def test_narrow_range_confirmation_bar_no_signal(name: str):
+    """确认日振幅 0.01%（默认下界 0.4%）不得命中 —— 涵盖 hikkake 两族。"""
+    out = compute(name, _replace_last_bar(random_ohlc(30), 10.0, 10.001, 10.0, 10.0))
+    assert out[name][-1] in (0, None), name
+
+
+def _patterns_taking(param: str) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for name in PATTERN_NAMES:
+        fn = INDICATORS.get(name)
+        if param in inspect.signature(fn).parameters:
+            out[name] = fn
+    return out
+
+
+def test_min_range_pct_is_validated_for_every_pattern():
+    """所有接受 ``min_range_pct`` 的形态都必须 fail-loudly（规则 3）。
+
+    ``-1`` 会把窄幅防线整条关掉（只剩一字板排除）、``2`` 让形态恒不命中 ——
+    此前 55 个形态拿了参数不校验，两种越界都静默通过。
+    """
+    df = random_ohlc(20)
+    fns = _patterns_taking("min_range_pct")
+    assert len(fns) >= 60, sorted(fns)
+    for _name, fn in fns.items():
+        for bad in (-1.0, 2.0):
+            with pytest.raises(ValueError, match="min_range_pct"):
+                fn(df, min_range_pct=bad)
+
+
+def test_min_range_pct_zero_is_allowed():
+    """``0`` = 显式关闭窄幅防御，与 patterns.py 的 ``_check_min_range`` 同口径。"""
+    df = random_ohlc(20)
+    for fn in _patterns_taking("min_range_pct").values():
+        fn(df, min_range_pct=0.0)
+
+
+def test_two_crows_rejects_full_body_engulf():
+    """第三根跌穿整根阳线（收盘 < 阳线开盘）是「吞没」而非两只乌鸦，不得命中。
+
+    TA-Lib ``CDL2CROWS`` 官方口径：第三根收盘必须落在**第一根阳线实体之内**
+    （``阳线开盘 < close < 阳线收盘``）。这里把下界的反例钉住。
+    """
+    rows = [(9.0, 11.0, 8.98, 10.8), (10.9, 11.0, 10.4, 10.5), (10.3, 10.5, 8.5, 8.8)]
+    out = compute("pattern_two_crows", ohlc(rows))
+    assert out["pattern_two_crows"][-1] == 0
