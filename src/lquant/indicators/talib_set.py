@@ -2,7 +2,8 @@
 的 32 指标清单，按 lquant 纪律重写）：
 
 - **零新依赖**：不引 TA-Lib C 库（InStock 因此要求用户编译 C 共享库），
-  全部 Polars 表达式；
+  指标一律 Polars 表达式；唯一例外是 CCI 的窗口内平均绝对偏差（先取绝对值
+  再求和，不可分解为滚动累积量），用 numpy 滑窗一次算完整列；
 - **严格因果**：只用 rolling / shift / ewm（adjust=False，递推），全部过
   ``assert_no_lookahead`` 前缀不变性门禁；
 - Wilder 平滑（ATR / ADX）用 ``ewm_mean(alpha=1/n, adjust=False)``，
@@ -18,7 +19,9 @@ Supertrend。
 from __future__ import annotations
 
 import math
+import operator
 
+import numpy as np
 import polars as pl
 
 from lquant.indicators.registry import register_indicator
@@ -44,15 +47,57 @@ __all__ = [
 _OHLC = ("open", "high", "low", "close")
 
 
-def _check_n(n: int, name: str = "n") -> None:
-    """周期参数 fail-loudly：必须为正整数。
+def _check_n(n: int, name: str = "n") -> int:
+    """周期参数 fail-loudly：必须为正整数，返回规范化后的 Python ``int``。
 
     ``n=0`` 会让 ``ewm_mean(alpha=1/n)`` 抛 ``ZeroDivisionError``、负周期让窗口
     语义整体反向 —— 都属于「调用方写错了」，不该以陌生异常或静默垃圾值的形式
     漏到下游（与 patterns 系列同一条纪律）。
+
+    接受 Python ``int``、整数 ``float``（``14.0``，优化器/配置里常见）以及
+    任何实现 ``__index__`` 的整数类型（``numpy.int64`` 等），统一归一化成
+    ``int``（输出列名是 ``atr14`` 而不是 ``atr14.0``）；``bool`` 与非整数拒绝。
     """
-    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
-        raise ValueError(f"{name} 必须为正整数，收到 {n!r}")
+    if not isinstance(n, bool):
+        value: int | None = None
+        if isinstance(n, int):
+            value = n
+        else:
+            try:
+                value = operator.index(n)          # numpy 整数等
+            except TypeError:
+                if isinstance(n, float) and math.isfinite(n) and float(n).is_integer():
+                    value = int(n)
+        if value is not None and value >= 1:
+            return value
+    raise ValueError(f"{name} 必须为正整数，收到 {n!r}")
+
+
+def _mad_about_mean(col: str, n: int, df: pl.DataFrame) -> pl.Series:
+    """窗口内「关于**该窗口均值**」的平均绝对偏差（CCI 的分母）。
+
+    TA-Lib ``TA_CCI`` / Lambert 原始口径：``mean_j |TP_j − MA_i|``。
+    先取绝对值再求和，不可分解为滚动累积量，所以 ``rolling_mean`` 帮不上忙；
+    这里用 numpy ``sliding_window_view`` 一次算完整列 —— 比 ``Expr.rolling_map``
+    （逐窗口进 Python）快两个数量级（60k 行实测 12.3s → 0.08s）。
+
+    ⚠️ 刻意在**调用线程**里把整列取出来算，而不是用 ``Expr.map_batches``：后者的
+    Python 回调跑在 Polars 的 Rust 线程池里，叠加 coverage 的 C tracer 会死锁
+    （本地 ``-n 8 --cov`` 直接挂住；CI 靠 ``COVERAGE_CORE=sysmon`` 才绕开）。
+
+    缺失值语义与 ``rolling_mean(n)`` 的 min_periods 一致：窗口内出现任一空值的
+    行输出 **null**（不是 NaN），行数与输入等长。
+    """
+    values = df[col].cast(pl.Float64).to_numpy()
+    out = np.full(values.size, np.nan, dtype=np.float64)
+    if values.size >= n:
+        windows = np.lib.stride_tricks.sliding_window_view(values, n)
+        with np.errstate(invalid="ignore"):
+            ok = ~np.isnan(windows).any(axis=1)
+            mean = windows.mean(axis=1)
+            md = np.abs(windows - mean[:, None]).mean(axis=1)
+        out[n - 1:] = np.where(ok, md, np.nan)
+    return pl.Series("_mad", out, dtype=pl.Float64).fill_nan(None)
 
 
 def _check_positive(name: str, value: float) -> None:
@@ -77,7 +122,7 @@ def add_atr(df: pl.DataFrame, n: int = 14) -> pl.DataFrame:
     会忽略这个 null 项，于是 TR[0] = 高-低（不是 null）。ATR 自首行起用
     ``ewm_mean(adjust=False)`` 递推。
     """
-    _check_n(n)
+    n = _check_n(n)
     tr = pl.max_horizontal(
         pl.col("high") - pl.col("low"),
         (pl.col("high") - pl.col("close").shift(1)).abs(),
@@ -102,6 +147,37 @@ def add_obv(df: pl.DataFrame, col: str = "close", vol: str = "volume") -> pl.Dat
     return df.with_columns((sign * pl.col(vol)).cum_sum().alias("obv"))
 
 
+def _dmi_exprs(n: int) -> tuple[pl.Expr, pl.Expr, pl.Expr]:
+    """+DI / -DI / ADX 三个表达式（``dmi`` 与 ``adxr`` 共用，都只算不落列）。
+
+    ADXR 只需要 ADX，不该为此把 ``dmi_pdi/mdi/adx`` 三列塞进调用方的 frame ——
+    在 ``compute_many`` 链式拼接里那会变成「后执行的 adxr 删掉前面 dmi 请求的
+    列」这种顺序相关的静默丢列。共用同一份表达式同时避免了两份 DMI 数学。
+    """
+    up_move = pl.col("high") - pl.col("high").shift(1)
+    down_move = pl.col("low").shift(1) - pl.col("low")
+    pdm = pl.when((up_move > down_move) & (up_move > 0)).then(up_move).otherwise(0.0)
+    mdm = pl.when((down_move > up_move) & (down_move > 0)).then(down_move).otherwise(0.0)
+    tr = pl.max_horizontal(
+        pl.col("high") - pl.col("low"),
+        (pl.col("high") - pl.col("close").shift(1)).abs(),
+        (pl.col("close").shift(1) - pl.col("low")).abs(),
+    )
+    s_pdm = pdm.ewm_mean(alpha=1 / n, adjust=False)
+    s_mdm = mdm.ewm_mean(alpha=1 / n, adjust=False)
+    s_tr = tr.ewm_mean(alpha=1 / n, adjust=False)
+    pdi = pl.when(s_tr <= 0).then(None).otherwise(100 * s_pdm / s_tr)
+    mdi = pl.when(s_tr <= 0).then(None).otherwise(100 * s_mdm / s_tr)
+    dx_denom = pdi + mdi
+    dx = pl.when(dx_denom <= 0).then(None).otherwise(100 * (pdi - mdi).abs() / dx_denom)
+    adx = dx.ewm_mean(alpha=1 / n, adjust=False)
+    return (
+        pdi.alias("dmi_pdi"),
+        mdi.alias("dmi_mdi"),
+        adx.alias("dmi_adx"),
+    )
+
+
 @register_indicator(
     "dmi", label="DMI/ADX 趋向", category="trend", pane="sub", min_window=60,
     inputs=("high", "low", "close"),
@@ -115,36 +191,8 @@ def add_dmi(df: pl.DataFrame, n: int = 14) -> pl.DataFrame:
     ADX = Wilder 平滑(DX)。分母为 0（无波动）时 DI 置 null、DX 置 null，
     不用 0 冒充方向信息。
     """
-    _check_n(n)
-    up_move = pl.col("high") - pl.col("high").shift(1)
-    down_move = pl.col("low").shift(1) - pl.col("low")
-    pdm = pl.when((up_move > down_move) & (up_move > 0)).then(up_move).otherwise(0.0)
-    mdm = pl.when((down_move > up_move) & (down_move > 0)).then(down_move).otherwise(0.0)
-    tr = pl.max_horizontal(
-        pl.col("high") - pl.col("low"),
-        (pl.col("high") - pl.col("close").shift(1)).abs(),
-        (pl.col("close").shift(1) - pl.col("low")).abs(),
-    )
-    df = df.with_columns(
-        pdm.ewm_mean(alpha=1 / n, adjust=False).alias("_pdm"),
-        mdm.ewm_mean(alpha=1 / n, adjust=False).alias("_mdm"),
-        tr.ewm_mean(alpha=1 / n, adjust=False).alias("_trs"),
-    )
-    df = df.with_columns(
-        pl.when(pl.col("_trs") <= 0).then(None)
-        .otherwise(100 * pl.col("_pdm") / pl.col("_trs")).alias("dmi_pdi"),
-        pl.when(pl.col("_trs") <= 0).then(None)
-        .otherwise(100 * pl.col("_mdm") / pl.col("_trs")).alias("dmi_mdi"),
-    )
-    dx_denom = pl.col("dmi_pdi") + pl.col("dmi_mdi")
-    dx = pl.when(dx_denom <= 0).then(None).otherwise(
-        100 * (pl.col("dmi_pdi") - pl.col("dmi_mdi")).abs() / dx_denom
-    )
-    df = df.with_columns(dx.alias("_dx"))
-    df = df.with_columns(
-        pl.col("_dx").ewm_mean(alpha=1 / n, adjust=False).alias("dmi_adx")
-    )
-    return df.drop(["_pdm", "_mdm", "_trs", "_dx"])
+    n = _check_n(n)
+    return df.with_columns(*_dmi_exprs(n))
 
 
 @register_indicator(
@@ -161,20 +209,21 @@ def add_cci(df: pl.DataFrame, n: int = 14) -> pl.DataFrame:
     ⚠️ 注意别写成「各点先减去自己的滚动均值再取均值」——那是
     ``rolling_mean(|TP − rolling_mean(TP)|)``，分母会系统性偏小（线性序列上
     恰好小一半，于是 CCI 大整整两倍）。MD 关于窗口均值取绝对偏差，先取绝对值
-    再求和不可分解为滚动累积量，只能用逐窗口 map（与 ``Ts_ArgMax`` 同类代价）。
+    再求和不可分解为滚动累积量，只能用滑窗一次算完（见
+    :func:`_mad_about_mean`）。
 
     分母为 0（窗口内典型价恒定）时置 null。常数 0.015 为 Lambert 原始口径。
     """
-    _check_n(n)
+    n = _check_n(n)
     tp = (pl.col("high") + pl.col("low") + pl.col("close")) / 3
     df = df.with_columns(tp.alias("_tp"))
+    df = df.with_columns(_mad_about_mean("_tp", n, df))
     ma = pl.col("_tp").rolling_mean(n)
-    mad = pl.col("_tp").rolling_map(
-        lambda s: (s - s.mean()).abs().mean(), window_size=n
+    cci = pl.when(pl.col("_mad") <= 0).then(None).otherwise(
+        (pl.col("_tp") - ma) / (0.015 * pl.col("_mad"))
     )
-    cci = pl.when(mad <= 0).then(None).otherwise((pl.col("_tp") - ma) / (0.015 * mad))
     df = df.with_columns(cci.alias(f"cci{n}"))
-    return df.drop("_tp")
+    return df.drop(["_tp", "_mad"])
 
 
 @register_indicator(
@@ -186,7 +235,7 @@ def add_wr(df: pl.DataFrame, n: int = 14) -> pl.DataFrame:
 
     高=低的窗口（连续一字板）置 50 中性，不产生 NaN。
     """
-    _check_n(n)
+    n = _check_n(n)
     hhv = pl.col("high").rolling_max(n)
     llv = pl.col("low").rolling_min(n)
     span = hhv - llv
@@ -200,7 +249,7 @@ def add_wr(df: pl.DataFrame, n: int = 14) -> pl.DataFrame:
 )
 def add_roc(df: pl.DataFrame, n: int = 12, col: str = "close") -> pl.DataFrame:
     """ROC：n 日价格变动率（%）。前收盘 ≤ 0 的脏价置 null。"""
-    _check_n(n)
+    n = _check_n(n)
     prev = pl.col(col).shift(n)
     roc = pl.when(prev <= 0).then(None).otherwise((pl.col(col) - prev) / prev * 100)
     return df.with_columns(roc.alias(f"roc{n}"))
@@ -213,7 +262,7 @@ def add_roc(df: pl.DataFrame, n: int = 12, col: str = "close") -> pl.DataFrame:
 def add_dpo(df: pl.DataFrame, n: int = 20, col: str = "close") -> pl.DataFrame:
     """DPO：收盘价减去 shift(n/2+1) 的 n 日均线 —— 右对齐均线的历史参照，
     天然无未来数据（TA-Lib 同口径）。"""
-    _check_n(n)
+    n = _check_n(n)
     half = n // 2 + 1
     dpo = pl.col(col) - pl.col(col).rolling_mean(n).shift(half)
     return df.with_columns(dpo.alias(f"dpo{n}"))
@@ -232,7 +281,7 @@ def add_supertrend(df: pl.DataFrame, n: int = 10, mult: float = 3.0) -> pl.DataF
     方向 dir = 1 多头 / -1 空头。递推是确定性的因果状态机，满足前缀不变性
     （前缀重算与全量计算在共同前缀上逐行一致，测试门禁锁定）。
     """
-    _check_n(n)
+    n = _check_n(n)
     _check_positive("mult", mult)
     tr = pl.max_horizontal(
         pl.col("high") - pl.col("low"),
@@ -288,16 +337,15 @@ def add_supertrend(df: pl.DataFrame, n: int = 10, mult: float = 3.0) -> pl.DataF
 def add_adxr(df: pl.DataFrame, n: int = 14) -> pl.DataFrame:
     """ADXR：ADX 与其 shift(n) 的均值 —— 趋势强度的平滑确认（TA-Lib 同口径）。
 
-    实现在 ``dmi`` 之上：ADX 用 Wilder 平滑（alpha=1/n），ADXR 取当前与
-    n 根前 ADX 的算术平均，天然只用历史值。**只输出 adxr 本身**：``dmi`` 的
-    中间列（dmi_pdi/dmi_mdi/dmi_adx）在 ``compute_many`` 链式拼接里会变成
-    未登记的「野列」，所以算完即丢。
+    ADX 用 Wilder 平滑（alpha=1/n），ADXR 取当前与 n 根前 ADX 的算术平均，
+    天然只用历史值。**只输出 adxr 本身**：用共享的 :func:`_dmi_exprs` 直接算
+    ADX 表达式，不落 ``dmi_pdi/mdi/adx`` 中间列 —— 既不产生未登记的野列，也不
+    会删掉调用方在 ``compute_many`` 里先后请求的 ``dmi`` 列（先删后丢是顺序
+    相关的静默丢列）。
     """
-    _check_n(n)
-    df = add_dmi(df, n=n)
-    adxr = (pl.col("dmi_adx") + pl.col("dmi_adx").shift(n)) / 2
-    df = df.with_columns(adxr.alias(f"adxr{n}"))
-    return df.drop(["dmi_pdi", "dmi_mdi", "dmi_adx"])
+    n = _check_n(n)
+    _, _, adx = _dmi_exprs(n)
+    return df.with_columns(((adx + adx.shift(n)) / 2).alias(f"adxr{n}"))
 
 
 @register_indicator(
@@ -310,7 +358,7 @@ def add_mfi(df: pl.DataFrame, n: int = 14) -> pl.DataFrame:
     MFI = 100 − 100/(1 + 正流向/负流向)；分母（负流向）为 0 时置 100
     （全为正向资金，超买极值）。窗口内无昨收的行不参与（首行 null）。
     """
-    _check_n(n)
+    n = _check_n(n)
     tp = (pl.col("high") + pl.col("low") + pl.col("close")) / 3
     raw = tp * pl.col("volume")
     diff = tp.diff()
@@ -334,9 +382,9 @@ def add_ppo(df: pl.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -
     PPO = 100·(EMA_fast − EMA_slow)/EMA_slow；signal = EMA_9(PPO)；
     hist = PPO − signal。分母（慢 EMA）≤ 0 的脏价置 null。
     """
-    _check_n(fast, "fast")
-    _check_n(slow, "slow")
-    _check_n(signal, "signal")
+    fast = _check_n(fast, "fast")
+    slow = _check_n(slow, "slow")
+    signal = _check_n(signal, "signal")
     if fast >= slow:
         raise ValueError(f"fast 必须 < slow，收到 fast={fast!r} slow={slow!r}")
     ema_fast = pl.col("close").ewm_mean(span=fast, adjust=False)
@@ -376,9 +424,9 @@ def add_stochrsi(df: pl.DataFrame, n: int = 14, k: int = 3, d: int = 3) -> pl.Da
     %K = SMA_k(StochRSI)·100，%D = SMA_d(%K)。窗口内 RSI 恒定（分母 0）置 null；
     RSI 本身由 :func:`_rsi_expr` 给出（纯上涨窗口 = 100，不是 null）。
     """
-    _check_n(n)
-    _check_n(k, "k")
-    _check_n(d, "d")
+    n = _check_n(n)
+    k = _check_n(k, "k")
+    d = _check_n(d, "d")
     df = df.with_columns(_rsi_expr("close", n).alias("_rsi"))
     hhv = pl.col("_rsi").rolling_max(n)
     llv = pl.col("_rsi").rolling_min(n)
@@ -406,7 +454,7 @@ def add_tema(df: pl.DataFrame, n: int = 20, col: str = "close") -> pl.DataFrame:
     TEMA = 3·EMA1 − 3·EMA2 + EMA3，其中 EMA1=EMA(close)，
     EMA2=EMA(EMA1)，EMA3=EMA(EMA2)；全部 ewm 递推（adjust=False）。
     """
-    _check_n(n)
+    n = _check_n(n)
     ema1 = pl.col(col).ewm_mean(span=n, adjust=False)
     df = df.with_columns(ema1.alias("_e1"))
     df = df.with_columns(pl.col("_e1").ewm_mean(span=n, adjust=False).alias("_e2"))
@@ -425,8 +473,8 @@ def add_trix(df: pl.DataFrame, n: int = 12, signal: int = 9, col: str = "close")
     TRIX = 100·(TEMA3_t − TEMA3_{t−1})/TEMA3_{t−1}，其中 TEMA3 为三重 EMA；
     分母 ≤ 0 的脏价置 null；signal = EMA_9(TRIX)。
     """
-    _check_n(n)
-    _check_n(signal, "signal")
+    n = _check_n(n)
+    signal = _check_n(signal, "signal")
     e1 = pl.col(col).ewm_mean(span=n, adjust=False)
     df = df.with_columns(e1.alias("_t1"))
     df = df.with_columns(pl.col("_t1").ewm_mean(span=n, adjust=False).alias("_t2"))

@@ -6,6 +6,7 @@ import inspect
 import random
 from datetime import date, timedelta
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -13,6 +14,7 @@ from lquant.indicators import (
     INDICATORS,
     assert_no_lookahead,
     compute,
+    compute_many,
     talib_set,  # noqa: F401  触发注册
 )
 from lquant.indicators.registry import outputs as ind_outputs
@@ -395,3 +397,27 @@ def test_sar_tracks_downtrend_and_flips():
     flipped = compute("sar", up)
     assert flipped["sar_dir"][-1] == 1
     assert flipped["sar"][-1] < up["close"][-1]   # 翻多后 SAR 在价格下方（支撑）
+
+
+def test_adxr_does_not_drop_other_requested_columns():
+    """``compute_many(["dmi","adxr"])`` 必须保住 dmi 三列（顺序无关）。
+
+    曾经 adxr 在 dmi 之上实现又把 dmi_* 列 drop 掉：先 dmi 后 adxr 时调用方
+    明确请求的列被静默删除，而先 adxr 后 dmi 却正常 —— 顺序相关的丢列契约违规。
+    """
+    df = random_ohlc(80)
+    for names in (["dmi", "adxr"], ["adxr", "dmi"]):
+        out = compute_many(df, names)
+        assert {"dmi_pdi", "dmi_mdi", "dmi_adx", "adxr14"} <= set(out.columns), names
+    # adxr 单独跑也不得多出 dmi 野列
+    assert "dmi_adx" not in compute("adxr", df).columns
+
+
+@pytest.mark.parametrize("n", [14, 14.0, np.int64(14)])
+def test_period_params_accept_integral_forms(n):
+    """整数 float 与 numpy 整数都要接受（优化器/配置里常见），bool/非整数拒绝。"""
+    out = compute("atr", random_ohlc(40), n=n)
+    assert f"atr{int(n)}" in out.columns
+    for bad in (0, 1.5, True, "14"):
+        with pytest.raises(ValueError):
+            compute("atr", random_ohlc(40), n=bad)

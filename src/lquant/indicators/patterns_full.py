@@ -1644,6 +1644,9 @@ def add_two_crows(df: pl.DataFrame, *, body_min: float = 0.5,
             (pl.col("close").shift(1) < pl.col("close").shift(2)),
             _black(),
             (pl.col("close") < pl.col("close").shift(1)),
+            # 上界：第三条已由「收更低」+「第二根收在阳线收盘之下」隐含，但照
+            # TA-Lib 口径把「落在阳线实体之内」两侧都显式写出，避免后续只改前
+            # 两条时静默放宽。
             (pl.col("close") < pl.col("close").shift(2)),
             (pl.col("close") > pl.col("open").shift(2)))
     return df.with_columns(_signal(pl.all_horizontal(cond), "pattern_two_crows"))
