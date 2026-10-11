@@ -69,6 +69,9 @@ coverage.json
 .coverage
 # coverage 的并行临时文件：.coverage.<host>.<pid>.<rand>（并发跑测试时会生成）
 .coverage.*
+
+# CI 跨 run 复用的 Rust 扩展构建产物（本地复现 maturin develop 时也会出现）
+rust-ext/
 htmlcov/
 
 # qlib 接入：专用 venv 与工作流运行时产物
