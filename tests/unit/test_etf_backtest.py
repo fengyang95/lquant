@@ -158,3 +158,43 @@ def test_etf_backtest_bad_formula_raises(demo_lake):
 
     with pytest.raises((FactorError, ValueError)):
         etf_factor_backtest("$no_such_field", universe="etf_all")
+
+
+def test_etf_backtest_with_exit_overlay(demo_lake):
+    """显式退出策略 → ExitOverlay 包住 TopN（不改引擎，只叠一层）。"""
+    from lquant.backtest.etf import etf_factor_backtest
+
+    res, meta = etf_factor_backtest(
+        "Ts_Return($close, 20)", universe="etf_all", top_n=3,
+        rebalance="monthly", exit_strategy="simple",
+    )
+    assert meta["exit_strategy"] == "simple"
+    assert len(res.nav) > 0
+
+
+def test_etf_backtest_empty_panel_raises(monkeypatch):
+    """池解析不到标的 / 湖为空 → ValueError（由调用方转 503）。"""
+    from lquant.backtest.etf import etf_factor_backtest
+
+    monkeypatch.setattr("lquant.factors.etf.build_etf_panel",
+                        lambda **kw: (pl.DataFrame(), [], {"note": "空池"}))
+    with pytest.raises(ValueError, match="ETF 面板为空"):
+        etf_factor_backtest("Ts_Return($close, 20)", universe="etf_all")
+
+
+def test_etf_backtest_all_null_factor_raises(monkeypatch):
+    """表达式在 ETF 字段集下算出来全 null → 明确报错，而不是跑一场空回测。"""
+    from etf_helpers import bars
+
+    from lquant.backtest.etf import etf_factor_backtest
+
+    panel = bars(n_days=60)
+    monkeypatch.setattr("lquant.factors.etf.build_etf_panel",
+                        lambda **kw: (panel, [], {"note": None}))
+    monkeypatch.setattr(
+        "lquant.factors.analysis.compute_factor_col",
+        lambda df, formula, name="f": df.with_columns(
+            pl.lit(None, dtype=pl.Float64).alias(name)),
+    )
+    with pytest.raises(ValueError, match="计算后全为空"):
+        etf_factor_backtest("Ts_Return($close, 20)", universe="etf_all")

@@ -155,3 +155,89 @@ def test_generic_backtest_run_unknown_universe_503(client):
         "formula": "pct_change_20", "universe": "etf_nope", "start": "2024-06-01",
     })
     assert r.status_code in (422, 503)
+
+
+# ---------------- 异常 → 状态码（直接调路由/内部函数，不依赖真实数据） ----------------
+
+def test_etf_evaluate_maps_data_error_to_503(monkeypatch):
+    """面板为空是**数据问题**（503），不是请求非法（422）。"""
+    from fastapi import HTTPException
+
+    from lquant.server.api.etf import EtfEvaluateIn, etf_evaluate
+
+    def boom(*_a, **_k):
+        raise ValueError("ETF 面板为空（池=etf_all）")
+
+    monkeypatch.setattr("lquant.factors.etf.evaluate_etf", boom)
+    with pytest.raises(HTTPException) as ei:
+        etf_evaluate(EtfEvaluateIn(factor="Ts_Return($close, 20)", universe="etf_all"))
+    assert ei.value.status_code == 503
+    assert "数据不足" in ei.value.detail
+
+
+@pytest.mark.parametrize("exc,status", [
+    (ValueError("ETF 面板为空"), 503),
+    (KeyError("nope"), 422),
+    (TypeError("参数类型错"), 422),
+])
+def test_etf_backtest_error_mapping(monkeypatch, exc, status):
+    from fastapi import HTTPException
+
+    from lquant.server.api.etf import EtfBacktestIn, etf_backtest
+
+    def boom(*_a, _e=exc, **_k):
+        raise _e
+
+    monkeypatch.setattr("lquant.backtest.etf.etf_factor_backtest", boom)
+    with pytest.raises(HTTPException) as ei:
+        etf_backtest(EtfBacktestIn(factor="Ts_Return($close, 20)", universe="etf_all"))
+    assert ei.value.status_code == status
+
+
+def test_generic_backtest_all_null_factor_is_422(monkeypatch):
+    """公式算出来全空 → 422 + 可读原因，而不是把空结果当成功回测。"""
+    import datetime as _dt
+
+    import polars as pl
+    from fastapi import HTTPException
+
+    from lquant.server.api import backtests as api
+
+    frame = pl.DataFrame({"symbol": ["510300.SH"], "trade_date": [_dt.date(2024, 6, 3)],
+                          "close": [1.0]})
+    monkeypatch.setattr(api, "read_daily", lambda **kw: frame.lazy())
+    monkeypatch.setattr(
+        api, "_compute_factor",
+        lambda df, formula: df.with_columns(
+            pl.lit(None, dtype=pl.Float64).alias(formula.replace("_", ""))),
+    )
+    with pytest.raises(HTTPException) as ei:
+        api.run_backtest(api.BacktestIn(formula="pct_change_20", start="2024-06-01"))
+    assert ei.value.status_code == 422
+    assert "全为空" in ei.value.detail
+
+
+def test_resolve_universe_delegates_etf_pool(monkeypatch):
+    """ETF 池分流到 resolve_etf_universe，返回值形状与指数池一致。"""
+    from lquant.server.api.factors import _resolve_universe
+
+    monkeypatch.setattr("lquant.factors.etf.resolve_etf_universe",
+                        lambda u: (["510300.SH"], "etf_meta 未同步，已按 security 表兜底"))
+    assert _resolve_universe("etf_all") == (
+        ["510300.SH"], "etf_meta 未同步，已按 security 表兜底")
+
+
+def test_resolve_universe_etf_pool_failure_is_503(monkeypatch):
+    """池名合法但一条数据都没有 → 503（缺数据），不是 422。"""
+    from fastapi import HTTPException
+
+    from lquant.server.api.factors import _resolve_universe
+
+    def boom(_u):
+        raise ValueError("ETF 池为空：etf_meta / security / 日线湖都没有 ETF 标的")
+
+    monkeypatch.setattr("lquant.factors.etf.resolve_etf_universe", boom)
+    with pytest.raises(HTTPException) as ei:
+        _resolve_universe("etf_all")
+    assert ei.value.status_code == 503
+    assert "先同步 ETF 数据" in ei.value.detail
