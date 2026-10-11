@@ -103,7 +103,7 @@ jobs:
 
       - name: Install Python deps
         run: |
-          uv venv --python 3.12 --clear .venv
+          uv venv --python ${{ matrix.python }} --clear .venv
           uv pip install --python .venv/bin/python -e ".[sources,factors,ml,server,dev,chan]"
 
       - name: Build Rust 扩展（验证 pyo3/polars ABI）
@@ -120,7 +120,18 @@ jobs:
             # 先清空再写，且**三个 .so 全拷完才写 COMPLETE**：恢复时校验这个哨兵，
             # 免得「编译中途挂掉」留下的半截目录被当成有效缓存。
             rm -rf rust-ext && mkdir -p rust-ext
-            for m in lq_ops lq_backtest lq_metrics; do cp "$SITE"/$m*.so rust-ext/; done
+            for m in lq_ops lq_backtest lq_metrics; do
+              # 不假定落点：maturin 走 editable 安装时产物**不在 site-packages**
+              # （CI 实测踩过：cp site-packages/lq_ops*.so 直接 No such file）。
+              # 直接问解释器模块在哪最稳，editable 与否都对。
+              src=$(.venv/bin/python -c "import $m; print($m.__file__)")
+              case "$src" in
+                # 统一存成 <模块名>.so：editable 下原名可能是 liblq_ops.so 或带
+                # 平台标签，统一命名后恢复时才能被 import 直接找到。
+                *.so|*.pyd) cp "$src" "rust-ext/$m.so" ;;
+                *) echo "::error::$m 的产物不是扩展模块（$src），无法缓存"; exit 1 ;;
+              esac
+            done
             touch rust-ext/COMPLETE
           }
           loads() {
@@ -242,6 +253,8 @@ jobs:
         # 版本号，门禁侧若比写入侧（分片）旧，`coverage combine` 会直接读不了。
         # `uv pip install` 不读 uv.lock，所以「版本一致」靠的是两边同一份
         # pyproject + 同一组 extras 走同一个解析 —— extras 少写了就可能解出不同版本。
+        # 这里的 --python 3.12 也要跟 python job 的 matrix.python 保持一致：覆盖率
+        # 数据文件里带解释器版本，跨版本合并同样会读不了。改版本时两处一起改。
         run: |
           uv venv --python 3.12 --clear .venv
           uv pip install --python .venv/bin/python -e ".[sources,factors,ml,server,dev]"
