@@ -73,10 +73,15 @@ class FactorIn(BaseModel):
 
 
 def _check_universe(v: str) -> str:
-    """universe 共享校验：all 放行，其余必须是可解析的池名/指数代码。"""
+    """universe 共享校验：all 放行，其余必须是可解析的池名/指数代码。
+
+    ETF 池（``etf_*``）走 ``is_etf_universe`` 单独放行 —— 它们没有指数代码，
+    送进 ``resolve_index_code`` 会被当成未知股票池误拒。
+    """
+    from lquant.factors.etf import is_etf_universe
     from lquant.factors.universe import resolve_index_code
 
-    if v != "all":
+    if v != "all" and not is_etf_universe(v):
         resolve_index_code(v)   # 未知池名 → 直接 ValueError
     return v
 
@@ -439,12 +444,27 @@ def _resolve_universe(universe: str | None, *, as_of=None) -> tuple[list[str] | 
     （响应字段 + 报告口径披露），绝不静默冒充严格 point-in-time。
 
     只有「该指数一条快照都没有」才继续 503（那才是真需要先同步）。
+
+    ETF 池（``etf_*``）是另一族语义（按基金类型筛，没有成分快照概念），
+    在 ``resolve_index_code`` 之前分流到 ``factors.etf.resolve_etf_universe``：
+    两者都返回 ``(清单, 降级披露)`` 同一形状，调用方无需分支。
     """
     if not universe or universe == "all":
         return None, None
     from datetime import date as _date
 
+    from lquant.factors.etf import is_etf_universe, resolve_etf_universe
     from lquant.factors.universe import resolve_index_code
+
+    if is_etf_universe(universe):
+        try:
+            return resolve_etf_universe(universe)
+        except ValueError as e:
+            # ETF 池解析失败的口径是「数据缺失」而非「请求非法」：ETF 池名本身
+            # 已通过 ``is_etf_universe`` 校验，所以这里一定是 etf_meta/security/湖
+            # 三者都没数据 —— 用 503 + 可操作指引，而不是 422。
+            raise HTTPException(
+                503, f"{e}（ETF 池解析失败，先同步 ETF 数据）") from e
 
     code = resolve_index_code(universe)
     repo = IndexConsRepo()

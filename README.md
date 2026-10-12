@@ -204,6 +204,40 @@ lq factor eval "cov_lhb_on_board * cov_mf_main_ratio" --cov mf_main_ratio,lhb_on
 挂载的列走 —— 面板里有什么字段，校验就认什么；covariate 数据不可用时
 在 RECOMPUTE 阶段最早暴露，不会入库后因子值全 null 静默失效。
 
+## ETF 专属因子（EP-ETF）
+
+ETF 与个股是**两套口径**，不能共用一条因子链路：日线湖 `read_daily()` 不按
+`sec_type` 过滤，个股与 ETF 混在一张表里；ETF 又没有流通市值（`float_mv` 全
+NULL），个股默认协变量 `market_cap`/`industry_sw1` 对它覆盖率恒为 0 —— 沿用
+默认口径**不报错**，只会静默变成「不中性化」。所以 ETF 有独立的池、面板、
+字段白名单与评级阈值（见 `factors/etf.py`、`docs/ETF_FACTORS.md`）。
+
+```bash
+lq etf universes                     # ETF 池：etf_all / etf_equity / etf_qdii / etf_bond / …
+lq etf factors                       # ETF 因子清单（config/factors/etf.yaml，12 个）
+lq etf eval 'Ts_Return($close, 20)' --universe etf_all     # IC/分层/衰减/归因/评级
+lq etf audit 'Ts_Return($close, 20)' --universe etf_qdii   # + L3 稳健性
+lq etf report 'Ts_Return($close, 20)' --universe etf_all   # 自包含 HTML 报告
+lq etf backtest --factor 'Ts_Return($close, 20)' --universe etf_all --top-n 10
+```
+> 表达式一律用**单引号**：`$close` 在双引号里会被 shell 当变量展开成空串。
+
+三处**关键设计**：
+
+1. **池按基金类型细分**：`etf_equity/qdii/bond/commodity/money` 来自 `etf_meta.fund_type`；
+   `etf_meta` 未同步时逐级降级到 `security` 表 → 日线湖代码段，且**每一级都显式披露**。
+   ETF 与个股池共用 `/api/factors/universes` 一张选项表，解析逻辑分开。
+2. **ETF 元数据进因子**：`fund_size` / `share_outstanding` / `*_fee` 作为面板列
+   进入 `etf_allowed_fields()`（**不污染个股全局白名单**），同时 `etf_fund_size`
+   （log1p）注册为协变量用于规模中性化；`fund_type` 做截面分组键（替代行业）。
+3. **回测规则零改动**：`RuleSet.for_symbol` 已按 `parse_symbol().sec_type`
+   自动套 `etf:` 段（免印花税/过户费、佣金 min 0.1、tick 0.001、涨跌停
+   `by_track_index`、T+N by `fund_type`），ETF 标的进去就自动用对规则。
+
+数据边界（明确说明，不是实现缺陷）：日线湖**没有** IOPV/折溢价/份额日序列，
+所以折溢价套利类因子暂不可得 —— 要做需先补数据管道（`market_snapshot` 只有
+实时快照，不落历史）。
+
 ## 个股分析 / 行业分析
 
 两个**对称**的能力域，产出同一种报告（0–100 分 + 分角度可解释指标），

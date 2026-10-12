@@ -4,6 +4,7 @@ from __future__ import annotations
 import click
 
 from lquant.cli.commands import agent, backtest, data, factor, paper, portfolio, strategy
+from lquant.cli.commands import etf as etf_cmd
 from lquant.cli.commands import ext as ext_cmd
 from lquant.cli.commands import extensions as extensions_cmd
 from lquant.cli.commands import ml as ml_cmd
@@ -21,6 +22,7 @@ def cli() -> None:
 
 cli.add_command(data.data)
 cli.add_command(factor.factor)
+cli.add_command(etf_cmd.etf)
 cli.add_command(agent.agent)
 cli.add_command(backtest.backtest)
 cli.add_command(strategy.strategy)

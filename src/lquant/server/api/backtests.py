@@ -15,7 +15,7 @@ from datetime import date
 import polars as pl
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from lquant.backtest.benchmark import DEFAULT_BENCHMARK
 from lquant.backtest.engine import Engine, EngineConfig
@@ -244,6 +244,18 @@ class BacktestIn(BaseModel):
     #: 考核基准指数：默认沪深300；支持 hs300/沪深300/000300 等别名；
     #: 显式传 null = 不挂基准（只报绝对收益）
     benchmark: str | None = DEFAULT_BENCHMARK
+    #: 标的池：all = 全市场（默认，行为与历史一致）；
+    #: 指数池（hs300/zz500/…）→ 仅用该指数成分；ETF 池（etf_all/etf_equity/…）→
+    #: 仅用 ETF/LOF 并挂上 etf_meta（规模/份额类 ETF 因子才可回测）。
+    universe: str = "all"
+
+    @field_validator("universe")
+    @classmethod
+    def _v_universe(cls, v: str) -> str:
+        """与因子评价同一套池名校验 —— 未知池名 422，而不是在解析时才炸成 500。"""
+        from lquant.server.api.factors import _check_universe
+
+        return _check_universe(v)
 
 
 def _compute_factor(df: pl.DataFrame, formula: str) -> pl.DataFrame:
@@ -362,12 +374,39 @@ def run_backtest(req: BacktestIn) -> dict:
     可选叠加退出策略（``exit_strategy``）：叠加层包住 TopN 策略，不改引擎。
     参数非法（未注册的名字 / 策略自身校验失败）一律 422，不静默退化成「无退出规则」——
     否则用户以为加了止损，实际没加。
+
+    ``universe`` 把数据限制到标的池：指数池走成分股，**ETF 池**走 ETF/LOF 且挂
+    ``etf_meta``（规模/份额类 ETF 因子才有列可算）。ETF 回测的撮合规则由
+    ``RuleSet.for_symbol`` 按 ``sec_type`` 自动套用，本函数不需要任何 ETF 分支判断。
     """
-    df = read_daily(start=req.start).collect()
+    from lquant.factors.etf import build_etf_panel, is_etf_universe
+
+    universe_symbols: list[str] | None = None
+    uni_note: str | None = None
+    if req.universe and req.universe != "all":
+        from lquant.server.api.factors import _resolve_universe
+
+        universe_symbols, uni_note = _resolve_universe(req.universe, as_of=req.start)
+
+    etf_mode = is_etf_universe(req.universe)
+    engine_meta: dict[str, dict] | None = None
+    if etf_mode:
+        # ETF 池：强制 ETF 过滤 + 挂 etf_meta（covs=[] 跳过回调中性化，回测不需要）。
+        from lquant.backtest.etf import load_etf_meta_map
+
+        df, _cov_cols, info = build_etf_panel(
+            start=req.start, symbols=universe_symbols, covs=[]
+        )
+        uni_note = info.get("note") or uni_note
+        engine_meta = load_etf_meta_map()
+    else:
+        df = read_daily(symbols=universe_symbols, start=req.start).collect()
     if not len(df):
         raise HTTPException(503, "日线数据为空，先跑 bootstrap 或 lq data demo")
     col = req.formula.replace("_", "")
     d = _compute_factor(df, req.formula).drop_nulls([col])
+    if not len(d):
+        raise HTTPException(422, f"因子 {req.formula!r} 计算后全为空（数据窗口不足？）")
 
     strategy = FactorTopNStrategy(factor=col, top_n=req.top_n)
     if req.exit_strategy:
@@ -386,6 +425,7 @@ def run_backtest(req: BacktestIn) -> dict:
         strategy,
         config=EngineConfig(initial_cash=req.initial_cash, rebalance=req.rebalance,
                             benchmark=req.benchmark),
+        meta=engine_meta,
     ).run(d, extra_fields=[col])
 
     _persist_result(run_id, "factor_topn",
@@ -393,11 +433,15 @@ def run_backtest(req: BacktestIn) -> dict:
                      "formula": req.formula, "start": req.start,
                      "exit_strategy": req.exit_strategy,
                      "exit_params": req.exit_params,
-                     "benchmark": req.benchmark}, res)
+                     "benchmark": req.benchmark,
+                     "universe": req.universe,
+                     "universe_note": uni_note,
+                     "n_symbols": int(d["symbol"].n_unique())}, res)
 
     m = res.metrics
     return {"run_id": run_id, "metrics": _metrics_response(m),
-            "n_nav_points": len(res.nav), "n_trades": m.get("n_trades", 0)}
+            "n_nav_points": len(res.nav), "n_trades": m.get("n_trades", 0),
+            "universe": req.universe, "universe_note": uni_note}
 
 
 class JQCodeIn(BaseModel):
